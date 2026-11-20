@@ -35,8 +35,8 @@ use carina_core::resource::{
 use carina_core::schema::SchemaRegistry;
 use carina_core::value::PersistedValue;
 use carina_state::{
-    BackendError, DeposedInstance, DeposedKey, LoadedState, LockInfo, ResourceState, RowBasis,
-    StateBackend, StateFile,
+    BackendError, DeposedInstance, DeposedKey, LockInfo, ResourceState, RowBasis, StateBackend,
+    StateFile,
 };
 
 use crate::commands::apply::{
@@ -94,8 +94,8 @@ fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAdd
 }
 
 #[test]
-fn saved_plan_version_is_46_for_ordered_dependents() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 46);
+fn saved_plan_version_is_47_for_current_state() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 47);
 }
 
 #[test]
@@ -995,7 +995,6 @@ fn plan_file_serde_round_trip() {
                 .collect(),
             sorted_value_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
             sorted_explicit_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
-            legacy_dependency_classification: None,
             unresolved_resources: sorted_resources
                 .into_iter()
                 .map(Resource::into_value_snapshot)
@@ -2526,8 +2525,8 @@ impl StateBackend for MockBackend {
         carina_core::shutdown::CleanupBudget::TWO_SECOND
     }
 
-    async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
-        Ok(Some(LoadedState::Pristine(StateFile::new())))
+    async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
+        Ok(Some(StateFile::new()))
     }
     async fn read_state_bytes(
         &self,
@@ -2643,8 +2642,8 @@ impl StateBackend for LockTrackingBackend {
         carina_core::shutdown::CleanupBudget::TWO_SECOND
     }
 
-    async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
-        Ok(Some(LoadedState::Pristine(StateFile::new())))
+    async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
+        Ok(Some(StateFile::new()))
     }
     async fn read_state_bytes(
         &self,
@@ -2773,8 +2772,8 @@ impl StateBackend for RefreshTestBackend {
         carina_core::shutdown::CleanupBudget::TWO_SECOND
     }
 
-    async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
-        Ok(self.initial_state.clone().map(LoadedState::Pristine))
+    async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
+        Ok(self.initial_state.clone())
     }
     async fn read_state_bytes(
         &self,
@@ -4005,7 +4004,6 @@ fn plan_file_serialization_redacts_secrets() {
             ],
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
-            legacy_dependency_classification: None,
             unresolved_resources: vec![redact_secrets_in_resource(&resource_with_secret).unwrap()]
                 .into_iter()
                 .map(|resource| resource.into_value_snapshot())
@@ -4078,7 +4076,6 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
             .collect(),
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
-            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -4128,7 +4125,6 @@ fn plan_file_validation_rejects_missing_resource_identity() {
             .collect(),
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
-            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -4198,7 +4194,6 @@ fn plan_file_with_deferred_effect(effect: Effect) -> PlanFile {
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
-            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -4558,7 +4553,6 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
             .collect(),
         sorted_value_destroy_dependencies: vec![Default::default()],
         sorted_explicit_destroy_dependencies: vec![Default::default()],
-        legacy_dependency_classification: None,
         unresolved_resources: Vec::new(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -4687,7 +4681,6 @@ fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
-            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: (vec![data_source.clone().into_value_snapshot()])
@@ -4998,7 +4991,6 @@ fn recorded_builtin_only_plan_round_trips_with_current_top_level_keys() {
         "data_source_origins",
         "data_source_values",
         "data_sources",
-        "legacy_dependency_classification",
         "plan",
         "persisted_directive_changes",
         "provider_artifacts",
@@ -5063,7 +5055,6 @@ fn recorded_builtin_only_plan_round_trips_with_current_top_level_keys() {
             "sorted_resources",
             "sorted_value_destroy_dependencies",
             "sorted_explicit_destroy_dependencies",
-            "legacy_dependency_classification",
             "unresolved_resources",
             "compositions",
             "data_sources",
@@ -5225,8 +5216,8 @@ impl StateBackend for CapturingBackend {
         carina_core::shutdown::CleanupBudget::TWO_SECOND
     }
 
-    async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
-        Ok(Some(LoadedState::Pristine(StateFile::new())))
+    async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
+        Ok(Some(StateFile::new()))
     }
     async fn read_state_bytes(
         &self,

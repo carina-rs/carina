@@ -8,8 +8,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 default_kinds=(
-    fmt provider-boundaries error-source-display no-wall-clock-test-assertions
-    docs-spellings resources-access cli-hints no-home-env-reads
+    fmt provider-boundaries binding-addresses error-source-display no-wall-clock-test-assertions
+    docs-spellings doctest-module-tree resources-access cli-hints no-home-env-reads
     crates-not-publishable wit-bindgen-workspace plan-fixtures rust-cache pinned-toolchain
     vendored-patches check feature-isolation clippy validate-crn example-warnings
     wasm-fixtures nextest isolation provider-cause doctests
@@ -30,8 +30,8 @@ Bare isolation always builds its fixed workspace-wide suites, even with
 running checks (isolation-with-archive means isolation <archive>).
 
 Kinds:
-  fmt provider-boundaries error-source-display no-wall-clock-test-assertions
-  docs-spellings resources-access cli-hints no-home-env-reads
+  fmt provider-boundaries binding-addresses error-source-display no-wall-clock-test-assertions
+  docs-spellings doctest-module-tree resources-access cli-hints no-home-env-reads
   crates-not-publishable wit-bindgen-workspace plan-fixtures rust-cache pinned-toolchain
   vendored-patches check feature-isolation clippy validate-crn example-warnings
   wasm-fixtures nextest isolation provider-cause doctests
@@ -131,6 +131,13 @@ run_kind() {
         provider-boundaries)
             bash scripts/check-provider-boundaries.sh
             bash scripts/check-wit-guest-text-confinement.sh
+            bash scripts/test-check-schema-parts-exhaustive.sh
+            bash scripts/check-schema-parts-exhaustive.sh
+            bash scripts/test-check-protocol-convert-exhaustive.sh
+            bash scripts/check-protocol-convert-exhaustive.sh
+            ;;
+        binding-addresses)
+            PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_binding_address_handling.py
             ;;
         error-source-display)
             bash scripts/check-error-source-not-in-display.sh
@@ -144,6 +151,7 @@ run_kind() {
             bash scripts/test-check-docs-spellings.sh
             bash scripts/check-docs-use-new-spellings.sh
             ;;
+        doctest-module-tree) bash scripts/check-doctest-module-tree.sh ;;
         resources-access) bash scripts/check-no-direct-resources-access.sh ;;
         cli-hints) bash scripts/check-cli-hints-use-project-command.sh ;;
         no-home-env-reads) bash scripts/check-no-home-env-reads.sh ;;
@@ -161,6 +169,8 @@ run_kind() {
             bash scripts/test-release-tag-channel.sh
             bash scripts/test-classify-ci-diff.sh
             bash scripts/test-rust-cache-key.sh
+            bash scripts/test-pre-commit.sh
+            bash scripts/test-setup-hooks.sh
             bash scripts/test-verify-sh.sh
             bash scripts/test-touched-crates.sh
             ;;

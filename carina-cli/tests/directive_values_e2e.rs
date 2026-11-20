@@ -154,7 +154,7 @@ fn default_condition_does_not_taint_literal_resource_directives() {
 #[test]
 fn default_iterable_origin_only_reaches_loop_dependent_directives() {
     let scenario = Scenario::new();
-    scenario.write("module/main.crn", "arguments { flags: list(Bool) = [false] }\nlet children = for flag in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = false } } }\n");
+    scenario.write("module/main.crn", "arguments { flags: list(Bool) = [false] }\nlet children = for (_, flag) in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = false } } }\n");
     scenario.write(
         "call.crn",
         "let m = use { source = './module' }\nlet instance = m {}\n",
@@ -164,21 +164,21 @@ fn default_iterable_origin_only_reaches_loop_dependent_directives() {
     scenario.success(&["plan", "."]);
     scenario.success(&["apply", ".", "--auto-approve", "--lock=false"]);
     scenario.success(&["destroy", ".", "--auto-approve", "--lock=false"]);
-    scenario.write("module/main.crn", "arguments { flags: list(Bool) = [false] }\nlet children = for flag in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = flag } } }\n");
+    scenario.write("module/main.crn", "arguments { flags: list(Bool) = [false] }\nlet children = for (_, flag) in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = flag } } }\n");
     scenario.rejects_default_opt_out_once(&["flags"]);
 }
 
 #[test]
 fn explicit_iterable_does_not_erase_defaulted_directive_origin() {
     let scenario = Scenario::new();
-    scenario.write("module/main.crn", "arguments { flags: list(Bool) protect: Bool = false }\nlet children = for flag in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = lookup({ keep = protect }, 'keep', flag) } } }\n");
+    scenario.write("module/main.crn", "arguments { flags: list(Bool) protect: Bool = false }\nlet children = for (_, flag) in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = lookup({ keep = protect }, 'keep', flag) } } }\n");
     scenario.write(
         "call.crn",
         "let m = use { source = './module' }\nlet instance = m { flags = [true] }\n",
     );
     scenario.success(&["init", "."]);
     scenario.rejects_default_opt_out_once(&["protect"]);
-    scenario.write("module/main.crn", "arguments { flags: list(Bool) = [true] protect: Bool = false }\nlet children = for flag in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = lookup({ keep = protect }, 'keep', flag) } } }\n");
+    scenario.write("module/main.crn", "arguments { flags: list(Bool) = [true] protect: Bool = false }\nlet children = for (_, flag) in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = lookup({ keep = protect }, 'keep', flag) } } }\n");
     scenario.write(
         "call.crn",
         "let m = use { source = './module' }\nlet instance = m {}\n",
@@ -236,7 +236,7 @@ fn argument_default_references_retain_both_origins() {
 #[test]
 fn saved_defaulted_loop_opt_out_is_rejected_after_iterable_materializes() {
     let scenario = Scenario::new();
-    scenario.write("module/main.crn", "arguments { protect: Bool = false options: list(struct { key: String, value: String }) }\nlet children = for option in options { mock.test.default_prevent_destroy { name = option.key directives { prevent_destroy = lookup({ unused = true }, option.key, protect) } } }\n");
+    scenario.write("module/main.crn", "arguments { protect: Bool = false options: list(struct { key: String, value: String }) }\nlet children = for (_, option) in options { mock.test.default_prevent_destroy { name = option.key directives { prevent_destroy = lookup({ unused = true }, option.key, protect) } } }\n");
     scenario.write("call.crn", "let source = mock.test.server_added_list { name = 'source' }\nlet m = use { source = './module' }\nlet instance = m { options = source.target_group_attributes }\n");
     scenario.success(&["init", "."]);
     scenario.success(&["plan", ".", "--out", "deferred.plan"]);
@@ -493,7 +493,7 @@ fn protected_module_argument_defaults_require_explicit_opt_out() {
 fn protected_loop_argument_defaults_are_checked_during_validate() {
     for explicit in [false, true] {
         let scenario = Scenario::new();
-        scenario.write("module/main.crn", "arguments { flags: list(Bool) = [false] }\nlet children = for flag in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = flag } } }\n");
+        scenario.write("module/main.crn", "arguments { flags: list(Bool) = [false] }\nlet children = for (_, flag) in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = flag } } }\n");
         let arguments = if explicit { "flags = [false]" } else { "" };
         scenario.write(
             "call.crn",
@@ -649,7 +649,7 @@ fn non_local_loop_directives_explain_the_element_restriction() {
         "lookup({ keep = flag }, 'keep', peer.identifier)",
     ] {
         let scenario = Scenario::new();
-        scenario.write("module/main.crn", &format!("arguments {{ flags: list(Bool) }}\nlet children = for flag in flags {{\n  mock.test.resource {{ name = 'child' directives {{ prevent_destroy = {expression} }} }}\n}}\nlet peer = mock.test.resource {{ name = 'peer' }}\n"));
+        scenario.write("module/main.crn", &format!("arguments {{ flags: list(Bool) }}\nlet children = for (_, flag) in flags {{\n  mock.test.resource {{ name = 'child' directives {{ prevent_destroy = {expression} }} }}\n}}\nlet peer = mock.test.resource {{ name = 'peer' }}\n"));
         scenario.write(
             "call.crn",
             "let m = use { source = './module' }\nlet instance = m { flags = [true] }\n",
@@ -677,7 +677,7 @@ fn module_argument_loop_directives_resolve_per_element() {
     for flag in [true, false] {
         let scenario = Scenario::new();
         scenario.write("module/arguments.crn", "arguments { flags: list(Bool) }\n");
-        scenario.write("module/resources.crn", "let children = for flag in flags {\n  mock.test.resource { name = 'child' directives { prevent_destroy = flag force_delete = flag create_before_destroy = flag } }\n}\n");
+        scenario.write("module/resources.crn", "let children = for (_, flag) in flags {\n  mock.test.resource { name = 'child' directives { prevent_destroy = flag force_delete = flag create_before_destroy = flag } }\n}\n");
         scenario.write(
             "call.crn",
             &format!(
@@ -707,7 +707,7 @@ fn module_argument_loop_directives_resolve_per_element() {
 fn module_loop_directive_functions_resolve_after_substitution() {
     let scenario = Scenario::new();
     scenario.write("module/arguments.crn", "arguments { flags: list(Bool) }\n");
-    scenario.write("module/resources.crn", "let children = for flag in flags {\n  mock.test.resource { name = 'child' directives { prevent_destroy = lookup({ keep = flag }, 'keep', false) } }\n}\n");
+    scenario.write("module/resources.crn", "let children = for (_, flag) in flags {\n  mock.test.resource { name = 'child' directives { prevent_destroy = lookup({ keep = flag }, 'keep', false) } }\n}\n");
     scenario.write(
         "call.crn",
         "let m = use { source = './module' }\nlet instance = m { flags = [true] }\n",

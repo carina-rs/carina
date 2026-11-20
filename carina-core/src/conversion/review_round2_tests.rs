@@ -261,7 +261,7 @@ fn r5b_sibling_driver_does_not_repeat_a_completed_conversion_validator() {
     let mut run: crate::validation::ConversionValidation =
         crate::validation::ConversionValidation::new(judged.report());
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        let report = run
+        let (report, _prefixes_for_test) = run
             .admit_resource(ResourceAdmissionRequest::for_test(
                 resource,
                 judged.file(),
@@ -273,7 +273,8 @@ fn r5b_sibling_driver_does_not_repeat_a_completed_conversion_validator() {
                 session,
                 &schemas,
             ))
-            .values;
+            .values
+            .into_parts();
         assert_eq!(report.errors().count(), 0, "{report:?}");
         let after = calls.load(Ordering::SeqCst);
         assert!(

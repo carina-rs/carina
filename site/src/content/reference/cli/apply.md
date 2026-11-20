@@ -59,7 +59,7 @@ A saved plan also records the providers it was computed with: for each provider,
 
 Saved plans are tied to the plan-file format of the Carina version that wrote them. A plan written by another version is rejected with `Unsupported plan file version`; create it again with `carina plan --out`.
 
-The current saved-plan format is `46`, superseding `45`, with non-empty dependent
+The current saved-plan format is `47`, superseding `46`, with non-empty dependent
 lists ordered by system identity. It retains quoted condition string literals,
 `require` messages, and wait RHS strings checked for interpolation during decoding.
 It retains v13 schema
@@ -68,9 +68,9 @@ history and dependency requirements so apply can
 revalidate replacement order against each target's schema. It also retains
 typed secret expressions, the absolute source locator and canonical source
 identity, resolved lifecycle directive values and per-element loop expressions,
-and carries complete resolved dependency addresses and the legacy dependency
-migration classification that apply checks against locked state before writing state
-v21. Older plans must be regenerated.
+and carries complete resolved dependency addresses. State reads accept v21 only;
+see [State format upgrades](/guides/state-management/#state-format-upgrades) for
+rewriting older state. Older plans must be regenerated.
 
 Invalid condition literals, `require` messages, and wait operands are rejected
 before effects run. The error includes a replan command naming the saved-plan
@@ -88,8 +88,7 @@ attributes, provider configuration, and deferred templates. The provider then
 receives the rehydrated plaintext, while state stores the exact digest carried
 by the plan placeholder. If a secret changed or can no longer be found, apply stops
 before planned provider mutations and asks you to run
-`carina plan --out` again. A required state-format migration or legacy
-data-source cleanup may already have been persisted under the lock. A secret
+`carina plan --out` again. Data-source cleanup may already have been persisted under the lock. A secret
 that came through a module call is matched to that call by its position in the
 source, not by its name. Apply therefore also
 stops if such a call has moved since the plan was made, for example when a line

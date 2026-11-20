@@ -230,8 +230,8 @@ let inner = app_module {}
     for (consumer, dependency) in [
         ("direct.consumer", "direct.role"),
         ("nested.inner.consumer", "nested.inner.role"),
-        ("looped[0].consumer", "looped[0].role"),
-        ("looped[1].consumer", "looped[1].role"),
+        ("looped.blue.consumer", "looped.blue.role"),
+        ("looped.green.consumer", "looped.green.role"),
     ] {
         assert_eq!(
             graph_resource(&plan, consumer).explicit_dependencies(),
@@ -552,7 +552,7 @@ let consumer = mock.test.resource {
     .expect("update mock provider state");
     project.write(
         "modules/app/deferred.crn",
-        r#"let parts = for rule in seed.generated_rules {
+        r#"let parts = for (_, rule) in seed.generated_rules {
   mock.test.resource {
     name    = rule.action
     comment = consumer.identifier

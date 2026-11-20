@@ -7,8 +7,8 @@ use indexmap::IndexMap;
 use super::Orphan;
 use crate::effect::MoveAuthority;
 use crate::resource::{
-    Current, PersistedDestroyDependencies, PersistedDirectives, ResolvedResourceId, ResourceId,
-    SnapshotState, SnapshotValue,
+    Current, PersistedDestroyDependencies, ResolvedResourceId, ResourceId, SnapshotState,
+    SnapshotValue,
 };
 
 /// Orphans in deletion order: dependents before dependencies, with full
@@ -110,20 +110,6 @@ impl Orphans {
 
     pub fn get(&self, id: &ResourceId) -> Option<&Orphan> {
         self.by_id.get(id)
-    }
-
-    pub fn set_destroy_metadata(
-        &mut self,
-        id: &ResourceId,
-        dependencies: PersistedDestroyDependencies,
-        directives: PersistedDirectives,
-    ) -> bool {
-        let Some(orphan) = self.by_id.get_mut(id) else {
-            return false;
-        };
-        orphan.set_destroy_metadata(dependencies, directives);
-        self.order.take();
-        true
     }
 
     pub(super) fn attributes_mut(

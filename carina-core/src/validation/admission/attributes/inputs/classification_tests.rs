@@ -137,7 +137,8 @@ fn assert_both_passes<E, D, B>(
             }
         )));
         assert!(coverage.work() > 0);
-        assert_eq!(outcome.values.errors().count(), 0);
+        let (values, _prefixes_for_test) = outcome.values.into_parts();
+        assert_eq!(values.errors().count(), 0);
     });
 }
 

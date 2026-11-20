@@ -33,7 +33,7 @@ fn rejects_invalid_product_value(projected: bool) {
     let resource = tree.resources().next().unwrap();
     let mut values = resource.attributes().into_owned();
     values.insert("name".into(), Value::Concrete(ConcreteValue::Int(7)));
-    let values = resource.with_values(&values).unwrap();
+    let values = carina_core::test_utils::canonical_caller_values(resource, &values).unwrap();
     let inputs = if projected {
         assert!(resource.authored_slot("name").is_err());
         ResourceAttributeInputs::from_resolved(resource, &values, judged.report()).unwrap()
@@ -57,7 +57,8 @@ fn rejects_invalid_product_value(projected: bool) {
             >::new(judged.report());
             let outcome = validation.admit_resource(request);
             assert!(outcome.classification_diagnostics.0.is_empty());
-            outcome.values
+            let (values, _prefixes_for_test) = outcome.values.into_parts();
+            values
         };
         assert!(
             findings

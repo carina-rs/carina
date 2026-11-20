@@ -118,10 +118,8 @@ pub enum ExplicitFields {
     /// treats it like `Leaf`. A uniquely paired `ListElements` entry is
     /// different: its parent drops that whole element as server-added only
     /// when the element does not match the current desired list. Used as the
-    /// typed legacy-corruption marker
-    /// when an older state migration encounters an empty `Struct`
-    /// whose children may have been destroyed by an old write-path
-    /// bug. A later desired-backed state write can seed it from current
+    /// marker for an unknown authoring record. A later desired-backed state
+    /// write can seed it from current
     /// desired keys without treating provider-returned keys as authored.
     Unrecorded,
 }

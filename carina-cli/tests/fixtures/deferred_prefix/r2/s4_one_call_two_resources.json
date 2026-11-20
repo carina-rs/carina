@@ -1,0 +1,86 @@
+{
+  "json": {
+    "errors": [
+      {
+        "code": null,
+        "location": {
+          "file": "child/main.crn",
+          "range": {
+            "end": {
+              "column": 54,
+              "line": 1
+            },
+            "start": {
+              "column": 34,
+              "line": 1
+            }
+          }
+        },
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
+        "severity": "error"
+      },
+      {
+        "code": null,
+        "location": {
+          "file": "child/main.crn",
+          "range": {
+            "end": {
+              "column": 55,
+              "line": 2
+            },
+            "start": {
+              "column": 35,
+              "line": 2
+            }
+          }
+        },
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
+        "severity": "error"
+      }
+    ],
+    "resource_count": 0,
+    "resources": [],
+    "status": "error"
+  },
+  "json_exit": 1,
+  "json_stderr": "",
+  "lsp": {
+    "backend.crn": [],
+    "child/arguments.crn": [],
+    "child/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated",
+        "range": {
+          "end": {
+            "character": 53,
+            "line": 0
+          },
+          "start": {
+            "character": 33,
+            "line": 0
+          }
+        },
+        "severity": 1
+      },
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated",
+        "range": {
+          "end": {
+            "character": 54,
+            "line": 1
+          },
+          "start": {
+            "character": 34,
+            "line": 1
+          }
+        },
+        "severity": 1
+      }
+    ],
+    "lets.crn": [],
+    "main.crn": [],
+    "providers.crn": []
+  },
+  "text": "Validating...\nError: mock.test.resource.s.first: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply\nError: mock.test.resource.s.second: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply\n",
+  "text_exit": 1
+}

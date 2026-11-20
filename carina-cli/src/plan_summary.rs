@@ -203,13 +203,13 @@ mod tests {
         ExpandedDeferredForExpression::new(
             None,
             1,
-            "for item in upstream.items".to_string(),
+            "for (_, item) in upstream.items".to_string(),
             carina_core::parser::DeferredForTarget::bound(
                 carina_core::resource::absolute_binding_address_for_test("widgets"),
             )
             .expect("fixture binding is valid"),
             Value::resource_ref("upstream", "items", Vec::new()).resolve_root_for_test(),
-            ForBinding::Simple("item".to_string()),
+            ForBinding::Indexed("_".into(), "item".to_string()),
             Resource::new("test.Widget", "widgets"),
         )
     }

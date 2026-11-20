@@ -432,15 +432,12 @@ impl Orphan {
         &self.directives
     }
 
-    /// Refresh graph-classified destroy metadata after a legacy state file
-    /// crosses the configuration-aware migration seam.
-    pub fn set_destroy_metadata(
+    /// Refresh dependency bindings from the current persisted row.
+    pub fn set_dependency_bindings(
         &mut self,
         dependencies: crate::resource::PersistedDestroyDependencies,
-        directives: PersistedDirectives,
     ) {
         self.current.set_dependency_bindings(dependencies);
-        self.directives = directives;
     }
 
     /// Project this persisted-only resource into the minimal desired-resource
@@ -1013,8 +1010,7 @@ pub(crate) use comparison::{
 };
 
 /// Returns true when `binding` is one direct child emitted by the deferred-for
-/// template. List children use a numeric index (`items[0]`); map children use
-/// the canonical address spelling (`items.key` or `items['key with space']`).
+/// template, including historical numeric children and current value keys.
 pub fn binding_matches_deferred_template<B: crate::resource::BindingAddress>(
     binding: &B,
     target: &crate::parser::DeferredForTarget<B>,
@@ -1022,22 +1018,8 @@ pub fn binding_matches_deferred_template<B: crate::resource::BindingAddress>(
     let Some(template_binding) = target.bound_binding_address() else {
         return target.matches_legacy_binding(binding.as_str());
     };
-    let binding = binding.as_str();
-    let template_binding_name = template_binding.as_str();
-    let Some(suffix) = binding.strip_prefix(template_binding_name) else {
-        return false;
-    };
-    if let Some(key) = suffix.strip_prefix('.') {
-        return crate::utils::is_identifier_safe(key);
-    }
-    let Some(inner) = suffix.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
-        return false;
-    };
-    (!inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()))
-        || inner
-            .strip_prefix('\'')
-            .and_then(|key| key.strip_suffix('\''))
-            .is_some()
+    crate::resource::decompose_binding_address(binding.as_str())
+        .is_some_and(|address| address.is_direct_child_of(template_binding.as_str()))
 }
 
 /// Result of a diff operation

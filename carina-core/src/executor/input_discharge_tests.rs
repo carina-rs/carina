@@ -1223,10 +1223,10 @@ fn loop_effect(replace: bool) -> Effect {
     let template = crate::parser::DeferredForExpression::new(
         Some("main.crn".into()),
         1,
-        "for item in source.items".into(),
+        "for (_, item) in source.items".into(),
         crate::parser::DeferredForTarget::bound(absolute_binding("children")).unwrap(),
         Value::root_resource_ref("source", "items", vec![]),
-        crate::parser::ForBinding::Simple("item".into()),
+        crate::parser::ForBinding::Indexed("_".into(), "item".into()),
         crate::resource::Resource::new("test", "children").with_attribute(
             "name",
             crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
@@ -1900,10 +1900,10 @@ async fn input_discharge_conflicting_child_in_cbd_parent_window_keeps_old_on_rej
         let template = crate::parser::DeferredForExpression::new(
             Some("main.crn".into()),
             1,
-            "for item in source.items".into(),
+            "for (_, item) in source.items".into(),
             crate::parser::DeferredForTarget::bound(absolute_binding("children")).unwrap(),
             Value::root_resource_ref("source", "items", vec![]),
-            crate::parser::ForBinding::Simple("item".into()),
+            crate::parser::ForBinding::Indexed("_".into(), "item".into()),
             crate::resource::Resource::new("test", "children").with_attribute(
                 "name",
                 crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(

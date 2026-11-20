@@ -15,8 +15,10 @@ mod wasm_convert;
 pub(super) use diagnostic_imports::add_diagnostic_imports;
 #[cfg(test)]
 mod diagnostic_tests;
+#[cfg(any(test, feature = "test-utils"))]
+pub(super) use version_checked_bindings::SchemaOnlyBindings;
+pub(super) use version_checked_bindings::WasmBindings;
 use version_checked_bindings::wit_types;
-pub(super) use version_checked_bindings::{SchemaOnlyBindings, WasmBindings};
 
 // Raw permission text stays opaque until core admits it at ProviderBoundary.
 struct UnboundPermissions(Vec<String>);
@@ -127,6 +129,7 @@ mod version_checked_bindings {
     /// Keeping the instance unbound avoids runtime initialization and CRUD
     /// binding construction. Metadata uses the same current-protocol gate
     /// and strict schema decoders as [`WasmBindings`].
+    #[cfg(any(test, feature = "test-utils"))]
     pub(in crate::wasm_factory) struct SchemaOnlyBindings {
         instance: wasmtime::component::Instance,
         info_json: String,
@@ -217,6 +220,7 @@ mod version_checked_bindings {
         ))
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     fn untyped_string_func(
         store: &mut Store<HostState>,
         instance: &wasmtime::component::Instance,
@@ -255,6 +259,7 @@ mod version_checked_bindings {
         instance.get_typed_func::<(), (String,)>(&mut *store, &function)
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     fn untyped_identity_attributes_func(
         store: &mut Store<HostState>,
         instance: &wasmtime::component::Instance,
@@ -286,6 +291,7 @@ mod version_checked_bindings {
         instance.get_typed_func::<(), (Vec<String>,)>(&mut *store, &function)
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     impl SchemaOnlyBindings {
         pub(in crate::wasm_factory) async fn instantiate(
             store: &mut GuestStore,
@@ -1452,6 +1458,7 @@ impl WasmProviderFactory {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl SchemaOnlyWasmProviderFactory {
     pub(super) async fn bring_up_component(
         engine: Engine,
@@ -5540,9 +5547,8 @@ pub(super) mod tests {
         let mut document =
             serde_json::to_value(carina_state::StateFile::new()).expect("fixture state serializes");
         document["resources"] = serde_json::json!([row]);
-        let loaded = carina_state::state::check_and_migrate(&document.to_string())
-            .expect("v15 fixture passes the public state loader")
-            .into_state();
+        let loaded = carina_state::state::load_state(&document.to_string())
+            .expect("current fixture passes the public state loader");
         match loaded.build_state_for_resource(&id) {
             Current::CreateInFlight(pending) => pending,
             Current::Absent(state) => panic!("resume fixture loaded as absent: {state:?}"),
@@ -6373,32 +6379,6 @@ pub(super) mod tests {
         }
     }
 
-    fn migrate_legacy_state_attribute(
-        value: serde_json::Value,
-        display_type: &str,
-        identity: &str,
-        key: &str,
-    ) -> serde_json::Value {
-        let mut attributes = serde_json::Map::new();
-        attributes.insert(key.to_string(), value);
-        let mut document = serde_json::json!({
-            "version": 13,
-            "resources": [{
-                "provider": "",
-                "resource_type": display_type,
-                "identity": identity,
-                "attributes": attributes,
-                "deposed": [],
-            }],
-        });
-        carina_core::resource::legacy_secret_migration::migrate_state_document_v13(&mut document)
-            .expect("migrate legacy test state document");
-        document["resources"][0]["attributes"]
-            .as_object_mut()
-            .and_then(|attributes| attributes.remove(key))
-            .expect("migrated test document must retain its attribute")
-    }
-
     #[test]
     fn malformed_config_completions_metadata_is_rejected() {
         let error = decode_config_completions_json("not json", "mock", "1.0.0")
@@ -6783,18 +6763,15 @@ pub(super) mod tests {
         Argon2::default()
             .hash_password_into(material, salt, &mut output)
             .expect("hash legacy state fixture");
-        let encoded = migrate_legacy_state_attribute(
-            serde_json::json!(format!("_secret:argon2:{}", hex::encode(output))),
-            "mock.test.resource",
-            "legacy",
-            "comment",
-        );
+        let encoded = serde_json::json!({"$secret": format!(
+            "argon2-legacy:{}:{}", hex::encode(salt), hex::encode(output)
+        )});
         let digest = encoded[carina_core::value::PERSISTED_SECRET_KEY]
             .as_str()
-            .expect("migration produces a structural secret")
+            .expect("fixture contains a structural secret")
             .to_string();
         let hash = carina_core::resource::RedactedSecretHash::from_encoded_digest(&digest)
-            .expect("migration produces a valid digest");
+            .expect("fixture contains a valid digest");
         let attributes = HashMap::from([(
             "comment".to_string(),
             carina_core::resource::SnapshotValue::redacted(hash),

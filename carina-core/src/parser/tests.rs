@@ -298,6 +298,31 @@ fn round8_deferred_header_keeps_parsed_secret_identifiers_public() {
                read aws.route53.RecordSet {{ name = {binding} }}\n\
              }}\n"
         );
+        let (source, expected) = if binding == "item" {
+            let error = parse(
+                &source,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap_err();
+            let message = "Protected values cannot be value keys. Use `for (i, x) in ...`.";
+            assert_eq!(error.diagnostic_message(), message);
+            assert_eq!(error.to_string(), format!("test.crn:2:27: {message}"));
+            let finding = error.element_diagnostic().expect("authored iterable");
+            let span = finding.location().span();
+            assert_eq!((span.start_line(), span.start_column()), (2, 27));
+            assert_eq!((span.end_line(), span.end_column()), (2, 65));
+            let diagnostics = format!("{error} {error:?}");
+            assert!(
+                !diagnostics.contains("cert.domain_validation_options"),
+                "{diagnostics}"
+            );
+            (
+                source.replacen("for item in ", "for (i, item) in ", 1),
+                expected.replacen("for item in ", "for (i, item) in ", 1),
+            )
+        } else {
+            (source, expected.to_owned())
+        };
         let parsed = parse(
             &source,
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
@@ -921,7 +946,7 @@ fn structural_for_declarations_keep_pipe_and_postfix_behavior() {
     let resource_pipe = parse(
         r#"
         fn f(value) { 7 }
-        let n = for x in [1] {
+        let n = for (_, x) in [1] {
             mock.test.Thing { value = x }
         } |> f()
         "#,
@@ -938,7 +963,7 @@ fn structural_for_declarations_keep_pipe_and_postfix_behavior() {
     let module_pipe = parse(
         r#"
         fn f(value) { 7 }
-        let n = for x in [1] {
+        let n = for (_, x) in [1] {
             child { value = x }
         } |> f()
         "#,
@@ -954,7 +979,7 @@ fn structural_for_declarations_keep_pipe_and_postfix_behavior() {
 
     for body in ["mock.test.Thing { value = x }", "child { value = x }"] {
         let postfix = parse(
-            &format!("let n = for x in [1] {{ {body} }}.value"),
+            &format!("let n = for (_, x) in [1] {{ {body} }}.value"),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect_err("postfix access on a structural for-expression is invalid");
@@ -966,7 +991,7 @@ fn structural_for_declarations_keep_pipe_and_postfix_behavior() {
         );
 
         let arithmetic = parse(
-            &format!("let n = for x in [1] {{ {body} }} + 1"),
+            &format!("let n = for (_, x) in [1] {{ {body} }} + 1"),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect_err("integer arithmetic on a structural for-expression is invalid");
@@ -984,7 +1009,7 @@ fn structural_for_resource_pipe_is_not_exported_as_a_value() {
     let parsed = parse(
         r#"
         fn f(value) { 7 }
-        let n = for x in [1] {
+        let n = for (_, x) in [1] {
             mock.test.Thing { value = x }
         } |> f()
         exports { out: Int = n }
@@ -1079,7 +1104,7 @@ fn postfix_and_arithmetic_on_declarations_have_targeted_errors() {
     );
 
     let arithmetic = parse(
-        "let n = for x in [1] { mock.test.Thing { value = x } } + 1",
+        "let n = for (_, x) in [1] { mock.test.Thing { value = x } } + 1",
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("integer arithmetic on a structural declaration is invalid");
@@ -1227,7 +1252,7 @@ fn integer_arithmetic_in_a_for_body_resolves_after_its_deferred_iterable() {
         parse(
             r#"
             let source = mock.test.Source {}
-            let children = for item in source.items {
+            let children = for (_, item) in source.items {
                 mock.test.Target { count = item + 1 }
             }
             "#,
@@ -1346,8 +1371,8 @@ fn deferred_for_projection_evaluates_nested_env_from_the_caller_snapshot() {
                 .expand_deferred_for_expressions(&bindings.project_iterable_bindings(), session)
                 .expect("projection evaluates nested builtins with the caller's snapshot");
             assert!(expanded.deferred_for_expressions().is_empty());
-            for (index, name) in names.iter().enumerate() {
-                let binding = format!("children[{index}]");
+            for name in &names {
+                let binding = format!("children.{name}");
                 let child = expanded
                     .resources
                     .iter()
@@ -7310,20 +7335,20 @@ fn parse_for_expression_over_list() {
     // for expression expands to individual resources at parse time
     assert_eq!(result.resources.len(), 2);
 
-    // Resources should be addressed as subnets[0] and subnets[1]
+    // Resources should be addressed as subnets['ap-northeast-1a'] and subnets['ap-northeast-1c']
     assert_eq!(
         result.resources[0]
             .id
             .identity_str()
             .expect("resolved identity"),
-        "subnets[0]"
+        "subnets['ap-northeast-1a']"
     );
     assert_eq!(
         result.resources[1]
             .id
             .identity_str()
             .expect("resolved identity"),
-        "subnets[1]"
+        "subnets['ap-northeast-1c']"
     );
 
     // Each resource should have the loop variable substituted
@@ -7447,7 +7472,7 @@ fn eager_for_expansion_assigns_distinct_list_and_map_addresses() {
         .iter()
         .map(|resource| resource.id.identity_str().unwrap())
         .collect();
-    assert_eq!(list_ids, ["resources[0]", "resources[1]"]);
+    assert_eq!(list_ids, ["resources.alpha", "resources.beta"]);
     assert_ne!(list.resources[0].id, list.resources[1].id);
 
     let map = parse(
@@ -7598,11 +7623,11 @@ fn parse_for_expression_with_module_call_over_list() {
 
     assert_eq!(
         result.module_calls[0].binding_name.as_deref(),
-        Some("webs[0]")
+        Some("webs['10.0.0.0/16']")
     );
     assert_eq!(
         result.module_calls[1].binding_name.as_deref(),
-        Some("webs[1]")
+        Some("webs['10.1.0.0/16']")
     );
 
     assert_eq!(
@@ -7706,7 +7731,7 @@ fn test_chained_field_access_three_levels() {
 fn parse_index_access_with_integer() {
     // subnets[0].subnet_id should parse as ResourceRef with binding_name="subnets[0]"
     let input = r#"
-        let subnets = for az in ["ap-northeast-1a", "ap-northeast-1c"] {
+        let subnets = for (_, az) in ["ap-northeast-1a", "ap-northeast-1c"] {
             awscc.ec2.Subnet {
                 availability_zone = az
             }
@@ -8421,14 +8446,14 @@ fn parse_for_expression_with_keys_function_call() {
             .id
             .identity_str()
             .expect("resolved identity"),
-        "resources[0]"
+        "resources.Env"
     );
     assert_eq!(
         result.resources[1]
             .id
             .identity_str()
             .expect("resolved identity"),
-        "resources[1]"
+        "resources.Name"
     );
     assert_eq!(
         result.resources[0].get_attr("name"),
@@ -20009,7 +20034,7 @@ fn postfix_index_on_sibling_let_bound_computed_value_is_directory_scoped() {
 fn postfix_grammar_keeps_for_expanded_resource_address_shape() {
     let parsed = parse(
         r#"
-            let subnets = for az in ["ap-northeast-1a"] {
+            let subnets = for (_, az) in ["ap-northeast-1a"] {
                 awscc.ec2.Subnet {
                     availability_zone = az
                 }
@@ -20065,7 +20090,7 @@ fn postfix_access_preserves_deferred_for_binding_as_resource_address() {
     let parsed = parse(
         r#"
             let orgs = upstream_state { source = "../organizations" }
-            let roles = for account in orgs.accounts {
+            let roles = for (_, account) in orgs.accounts {
                 mock.test.Thing { name = account.name }
             }
             mock.test.Consumer { name = roles[0].name }
@@ -20082,7 +20107,7 @@ fn postfix_access_preserves_deferred_for_binding_as_resource_address() {
 fn postfix_access_preserves_statically_empty_for_binding_as_resource_address() {
     let parsed = parse(
         r#"
-            let roles = for account in [] {
+            let roles = for (_, account) in [] {
                 mock.test.Thing { name = "unused" }
             }
             mock.test.Consumer { name = roles[0].name }
@@ -21073,7 +21098,7 @@ fn postfix_access_reference_roots_are_canonical_reference_paths() {
     let parsed = parse(
         r#"
             let q = mock.test.Thing { name = "queue" }
-            let roles = for n in [0] {
+            let roles = for (_, n) in [0] {
                 mock.test.Thing { name = "role" }
             }
             let r0 = roles[0]
@@ -21147,7 +21172,7 @@ fn postfix_access_preserves_sibling_deferred_for_binding_as_resource_address() {
         directory.path().join("main.crn"),
         r#"
             let orgs = upstream_state { source = "../organizations" }
-            let roles = for account in orgs.accounts {
+            let roles = for (_, account) in orgs.accounts {
                 mock.test.Thing { name = account.name }
             }
             let r0 = roles[0]
@@ -21271,7 +21296,7 @@ fn for_iterable_computed_structural_handles_rejects_the_bare_element() {
             let ss = for name in ["s"] {
                 mock.test.Thing { name = name }
             }
-            let copies = for o in [q, ss[0]] {
+            let copies = for o in [q, ss['s']] {
                 mock.test.Consumer { name = o.identifier }
             }
         "#,
@@ -21579,10 +21604,10 @@ mod loop_var_field_access_matrix {
 
         let source = r#"
             let up = upstream_state { source = "../x" }
-            let list_children = for item in up.list_items {
+            let list_children = for (_, item) in up.list_items {
                 mock.test.Thing { name = item[0].nested.value }
             }
-            let map_children = for item in up.map_items {
+            let map_children = for (_, item) in up.map_items {
                 mock.test.Thing { name = item["k"].nested.value }
             }
         "#;
@@ -21694,7 +21719,7 @@ mod loop_var_field_access_matrix {
     fn deferred_template_reports_missing_key_when_placeholder_becomes_concrete() {
         let src = r#"
             let up = upstream_state { source = "../x" }
-            let children = for item in up.items {
+            let children = for (_, item) in up.items {
                 mock.test.Thing { name = item["missing"] }
             }
         "#;
@@ -21741,7 +21766,7 @@ mod loop_var_field_access_matrix {
     fn deferred_template_keeps_missing_local_iterable_element_access_deferred() {
         let src = r#"
             let q = mock.test.Source { name = "source" }
-            let children = for r in q.rules {
+            let children = for (_, r) in q.rules {
                 mock.test.Thing { name = r.missing }
             }
         "#;
@@ -22124,6 +22149,431 @@ fn round7_backend_and_provider_keys_never_expose_identity_in_debug() {
     assert!(!format!("{:?}", backend.backend).contains("CANARY"));
     let provider = parse(r#"provider mock { "${secret('CANARY')}" = 1 }"#, &context).unwrap();
     assert!(!format!("{:?}", provider.providers).contains("CANARY"));
+}
+
+mod for_value_keys_addresses {
+    use super::*;
+
+    fn bindings(source: &str) -> Vec<String> {
+        parse(
+            source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap()
+        .resources
+        .iter()
+        .map(|r| r.binding.as_ref().unwrap().to_string())
+        .collect()
+    }
+
+    #[test]
+    fn for_value_keys_parse_plan_apply_agree() {
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let eager = bindings("let rs = for x in ['b', 'a-b'] { mock.test.resource { name = x } }");
+        assert_eq!(eager, ["rs.b", "rs['a-b']"]);
+        let parsed = parse("let up = upstream_state { source = '../up' }\nlet rs = for x in up.items { mock.test.resource { name = x } }", &context).unwrap();
+        let expanded = cross_deferred_for_resolution_seam(parsed)
+            .into_expanded(&crate::schema::SchemaRegistry::new(), &context)
+            .unwrap();
+        let iterable = ExpandedValue::Concrete(ExpandedConcreteValue::List(vec![
+            ExpandedValue::Concrete(ExpandedConcreteValue::String("b".into())),
+            ExpandedValue::Concrete(ExpandedConcreteValue::String("a-b".into())),
+        ]));
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        for stage in ["plan", "apply"] {
+            let proof = if stage == "plan" {
+                iterable
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::plan(
+                        &bindings,
+                    ))
+                    .unwrap()
+                    .into_classification()
+            } else {
+                iterable
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::apply(
+                        &bindings,
+                    ))
+                    .unwrap()
+                    .into_classification()
+            };
+            let crate::resource::knowledge::Classification::Known(known) = proof else {
+                panic!("known list")
+            };
+            let iterable = crate::resource::knowledge::PlanIterable::from_known(known).unwrap();
+            let children =
+                crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                    expand_deferred_children_for_test(
+                        &expanded.deferred_for_expressions()[0],
+                        iterable,
+                        crate::resource::AccessMissPolicy::Error,
+                        session,
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                children
+                    .iter()
+                    .map(|r| r.binding.as_ref().unwrap().to_string())
+                    .collect::<Vec<_>>(),
+                eager
+            );
+        }
+    }
+
+    #[test]
+    fn address_set_is_permutation_invariant() {
+        let mut a =
+            bindings("let rs = for x in ['c', 'a', 'b'] { mock.test.resource { name = x } }");
+        let mut b =
+            bindings("let rs = for x in ['b', 'c', 'a'] { mock.test.resource { name = x } }");
+        assert_eq!(a, ["rs.c", "rs.a", "rs.b"], "traversal stays in list order");
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn for_value_keys_module_call() {
+        let parsed = parse("let child = use { source = './child' }\nlet rs = for x in ['a', 'b-c'] { child { arg = x } }", &ProviderContext::new(crate::EnvironmentSnapshot::empty())).unwrap();
+        assert_eq!(
+            parsed
+                .module_calls
+                .iter()
+                .map(|c| c.binding_name.as_ref().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            ["rs.a", "rs['b-c']"]
+        );
+        assert_ne!(parsed.module_calls[0].id(), parsed.module_calls[1].id());
+    }
+
+    #[test]
+    fn for_value_keys_read_body() {
+        let parsed = parse(
+            "let rs = for x in ['a', 'b-c'] { read mock.test.resource { name = x } }",
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed
+                .data_sources
+                .iter()
+                .map(|r| r.binding.as_ref().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            ["rs.a", "rs['b-c']"]
+        );
+    }
+
+    #[test]
+    fn for_value_keys_partial_list_is_deferred() {
+        let parsed = parse("let producer = mock.test.resource { name = 'p' }\nlet rs = for x in [producer.identifier, 'lit'] { mock.test.resource { name = x } }", &ProviderContext::new(crate::EnvironmentSnapshot::empty())).unwrap();
+        assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
+        assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
+    }
+}
+
+mod for_value_keys_rejections {
+    use super::*;
+
+    fn expand_keys(value: &ExpandedValue) -> Result<Vec<String>, DeferredForExpansionError> {
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = parse("let up = upstream_state { source = '../up' }\nlet rs = for x in up.items { mock.test.resource { name = 'constant' } }", &context).unwrap();
+        let expanded = cross_deferred_for_resolution_seam(parsed)
+            .into_expanded(&crate::schema::SchemaRegistry::new(), &context)
+            .unwrap();
+        let proof = value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .unwrap()
+            .into_classification();
+        let crate::resource::knowledge::Classification::Known(known) = proof else {
+            panic!("known collection")
+        };
+        let iterable = crate::resource::knowledge::PlanIterable::from_known(known).unwrap();
+        crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            expand_deferred_children_for_test(
+                &expanded.deferred_for_expressions()[0],
+                iterable,
+                crate::resource::AccessMissPolicy::Error,
+                session,
+            )
+        })
+        .map(|children| {
+            children
+                .iter()
+                .map(|child| child.binding.as_ref().unwrap().to_string())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn for_value_keys_reject_static_types() {
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for (ty, label) in [
+            ("Bool", "Bool"),
+            ("Int", "Int"),
+            ("Float", "Float"),
+            ("Duration", "Duration"),
+            ("list(String)", "List"),
+            ("map(String)", "Map"),
+            ("struct { key: String }", "Struct"),
+        ] {
+            let source = format!(
+                "arguments {{ items: list({ty}) }}\nlet rs = for x in items {{ mock.test.resource {{ name = 'constant' }} }}"
+            );
+            let parsed = parse(&source, &context).unwrap();
+            let schemas = crate::schema::SchemaRegistry::new();
+            let buffer =
+                crate::config_loader::load_buffer_configuration(&parsed, &schemas, &context);
+            let tree = crate::parser::AnalysisTree::try_from(buffer.parsed()).unwrap();
+            let messages = crate::validation::validate_for_iterable_types(&tree, &context)
+                .iter()
+                .map(|finding| finding.detail().to_string())
+                .collect::<Vec<_>>();
+            let expected = format!(
+                "Element type {label} cannot be a value key. Rewrite as strings or use `for (i, x) in ...`."
+            );
+            assert!(
+                messages.iter().any(|message| message == &expected),
+                "{ty}: {messages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn for_value_keys_all_authored_iterable_types() {
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for (element_type, values, label) in [
+            ("Bool", "[]", "Bool"),
+            ("String | Int", "['only-strings']", "Int"),
+        ] {
+            for deferred in [false, true] {
+                let source = if deferred {
+                    format!(
+                        "arguments {{ items: list({element_type}) }}\nlet rs = for x in items {{ mock.test.resource {{ name = 'constant' }} }}"
+                    )
+                } else {
+                    format!(
+                        "fn typed_items(): list({element_type}) {{ {values} }}\nlet items = typed_items()\nlet rs = for x in items {{ mock.test.resource {{ name = 'constant' }} }}"
+                    )
+                };
+                let parsed = parse(&source, &context).unwrap();
+                let schemas = crate::schema::SchemaRegistry::new();
+                let buffer =
+                    crate::config_loader::load_buffer_configuration(&parsed, &schemas, &context);
+                let tree = crate::parser::AnalysisTree::try_from(buffer.parsed()).unwrap();
+                let findings = crate::validation::validate_for_iterable_types(&tree, &context);
+                let messages: Vec<_> = findings
+                    .iter()
+                    .map(|finding| finding.detail().to_string())
+                    .collect();
+                assert_eq!(
+                    messages,
+                    [format!(
+                        "Element type {label} cannot be a value key. Rewrite as strings or use `for (i, x) in ...`."
+                    )],
+                    "deferred={deferred}"
+                );
+                let span = findings[0].location().span();
+                assert_eq!(span.start_line(), if deferred { 2 } else { 3 });
+            }
+            for binding in ["for x", "for (_, x)"] {
+                let source = format!(
+                    "fn typed_items(): list({element_type}) {{ {values} }}\nlet items = typed_items()\n{binding} in items {{ mock.test.resource {{ name = 'constant' }} }}"
+                );
+                let parsed = parse(&source, &context).unwrap();
+                let schemas = crate::schema::SchemaRegistry::new();
+                let buffer =
+                    crate::config_loader::load_buffer_configuration(&parsed, &schemas, &context);
+                let tree = crate::parser::AnalysisTree::try_from(buffer.parsed()).unwrap();
+                assert!(
+                    crate::validation::validate_for_iterable_types(&tree, &context).is_empty(),
+                    "anonymous {binding}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn for_value_keys_reject_literal_non_strings() {
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for iterable in [
+            "[1]",
+            "[true]",
+            "[1.25]",
+            "[1h]",
+            "[['a']]",
+            "[{ key = 'a' }]",
+            "[mock.Mode.example]",
+        ] {
+            let source = format!(
+                "let rs = for x in {iterable} {{ mock.test.resource {{ name = 'constant' }} }}"
+            );
+            let error = parse(&source, &context).expect_err("only String elements can supply keys");
+            assert!(
+                error.element_diagnostic().is_some(),
+                "key errors retain their declaration at construction"
+            );
+            assert_eq!(
+                error.diagnostic_message(),
+                "Element 1 must be a String. Rewrite as strings or use `for (i, x) in ...`.",
+                "{iterable}"
+            );
+        }
+    }
+
+    #[test]
+    fn for_value_keys_reject_protected_literal_member() {
+        let error = parse("let rs = for x in ['a', secret('MEMBER_KEY_CANARY')] { mock.test.resource { name = x } }", &ProviderContext::new(crate::EnvironmentSnapshot::empty())).expect_err("all keys are admitted before any child");
+        assert_eq!(
+            error.diagnostic_message(),
+            "Protected values cannot be value keys. Use `for (i, x) in ...`."
+        );
+        assert!(
+            error.element_diagnostic().is_some(),
+            "key errors retain their declaration at construction"
+        );
+        assert!(!format!("{error:?}").contains("MEMBER_KEY_CANARY"));
+    }
+
+    #[test]
+    fn for_value_keys_reject_concrete_non_strings() {
+        for item in [
+            ExpandedConcreteValue::Bool(true),
+            ExpandedConcreteValue::Int(7),
+            ExpandedConcreteValue::Float(crate::FiniteF64::new(1.5).unwrap()),
+            ExpandedConcreteValue::Duration(std::time::Duration::from_secs(10)),
+            ExpandedConcreteValue::List(vec![]),
+            ExpandedConcreteValue::Map(IndexMap::new()),
+            ExpandedConcreteValue::enum_identifier("mock.Mode.example"),
+            ExpandedConcreteValue::CanonicalEnum(
+                crate::resource::CanonicalEnumValue::new_for_test(
+                    TypeIdentity::new(Some("mock"), Vec::<String>::new(), "Mode"),
+                    "example",
+                ),
+            ),
+        ] {
+            let error = expand_keys(&ExpandedValue::Concrete(ExpandedConcreteValue::List(vec![
+                ExpandedValue::Concrete(item),
+            ])))
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Element 1 must be a String. Rewrite as strings or use `for (i, x) in ...`."
+            );
+        }
+    }
+
+    #[test]
+    fn for_value_keys_reject_flagged_string() {
+        let error = expand_keys(&ExpandedValue::Concrete(ExpandedConcreteValue::List(vec![
+            ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                crate::resource::ValueString::diagnostic_sensitive("FLAGGED_KEY_CANARY"),
+            )),
+        ])))
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Protected values cannot be value keys. Use `for (i, x) in ...`."
+        );
+        assert!(!format!("{error:?}").contains("FLAGGED_KEY_CANARY"));
+    }
+
+    #[test]
+    fn for_value_keys_whole_secret_rejected_before_apply() {
+        let result = parse(
+            "let rs = for x in secret(['WHOLE_KEY_CANARY']) { mock.test.resource { name = x } }",
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
+        let error = result
+            .expect_err("whole protected iterable must fail before being retained as deferred");
+        assert_eq!(
+            error.diagnostic_message(),
+            "Protected values cannot be value keys. Use `for (i, x) in ...`."
+        );
+        assert!(
+            error.element_diagnostic().is_some(),
+            "key errors retain their declaration at construction"
+        );
+        assert!(!format!("{error:?}").contains("WHOLE_KEY_CANARY"));
+    }
+
+    #[test]
+    fn for_value_keys_string_list_admission() {
+        let value = ExpandedValue::Concrete(ExpandedConcreteValue::StringList(vec![
+            "b".into(),
+            "a-b".into(),
+        ]));
+        assert_eq!(expand_keys(&value).unwrap(), ["rs.b", "rs['a-b']"]);
+        let value = ExpandedValue::Concrete(ExpandedConcreteValue::StringList(vec![
+            "a".into(),
+            "a".into(),
+        ]));
+        assert_eq!(
+            expand_keys(&value).unwrap_err().to_string(),
+            "Elements 1 and 2 produce the same key. Use `for (i, x) in ...`."
+        );
+        let value = ExpandedValue::Concrete(ExpandedConcreteValue::StringList(vec![
+            crate::resource::ValueString::diagnostic_sensitive("STRING_LIST_CANARY"),
+        ]));
+        let error = expand_keys(&value).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Protected values cannot be value keys. Use `for (i, x) in ...`."
+        );
+        assert!(!format!("{error:?}").contains("STRING_LIST_CANARY"));
+    }
+}
+
+#[test]
+fn for_value_keys_integer_subscript_diagnostic() {
+    for iterable in ["['a']", "[]", "up.items"] {
+        let source = format!(
+            "let up = upstream_state {{ source = '../up' }}\nlet rs = for x in {iterable} {{ mock.test.Thing {{ name = x }} }}\nmock.test.Consumer {{ name = rs[0].name }}"
+        );
+        let error = parse(
+            &source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("numeric access requires an indexed binding");
+        assert_eq!(
+            error.diagnostic_message(),
+            "This loop is value-keyed; use a string subscript, or `for (i, x) in ...` for index addressing.",
+            "{error}"
+        );
+        let span = error
+            .diagnostic_range()
+            .expect("the authored subscript has a span");
+        let line = source.lines().last().unwrap();
+        let start = line.find("[0]").unwrap() + 1;
+        assert_eq!(
+            (
+                span.start_line,
+                span.end_line,
+                span.start_column,
+                span.end_column
+            ),
+            (3, 3, start, start + 3),
+            "the closing bracket belongs to the diagnostic: {error:?}",
+        );
+    }
+}
+
+#[test]
+fn for_value_keys_bare_handle_hint() {
+    for (pattern, iterable, example) in [
+        ("x", "['a']", "rs['key'].<attribute>"),
+        ("(i, x)", "['a']", "rs[0].<attribute>"),
+        ("k, x", "({ a = 'a' })", "rs['key'].<attribute>"),
+    ] {
+        let source = format!(
+            "let rs = for {pattern} in {iterable} {{ mock.test.Thing {{ name = x }} }}\nlet bad = length(rs)"
+        );
+        let error = parse(
+            &source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("a loop is a structural handle");
+        assert!(error.to_string().contains(example), "{error}");
+    }
 }
 
 #[test]

@@ -314,7 +314,8 @@ fn retained_reference_boundaries_are_built_per_attribute_not_per_leaf() {
                         &mut Default::default(),
                     );
                     assert!(outcome.classification_diagnostics.0.is_empty());
-                    outcome.values
+                    let (values, _prefixes_for_test) = outcome.values.into_parts();
+                    values
                 });
                 assert_eq!(findings.errors().count(), 0, "{leaf}: {findings:?}");
                 assert_eq!(
@@ -3046,12 +3047,11 @@ fn round2_plain_reference_skips_expression_callback() {
                 ),
             );
             assert!(result.classification_diagnostics.0.is_empty());
-            result
-                .values
+            let (values, _prefixes_for_test) = result.values.into_parts();
+            values
                 .errors()
                 .chain(
-                    result
-                        .values
+                    values
                         .symbolic_errors()
                         .map(|(_, _, diagnostic)| diagnostic.error()),
                 )

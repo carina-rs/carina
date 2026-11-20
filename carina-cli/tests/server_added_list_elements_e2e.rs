@@ -155,11 +155,10 @@ impl Scenario {
     }
 
     fn state(&self) -> StateFile {
-        carina_state::check_and_migrate(
+        carina_state::load_state(
             &fs::read_to_string(self.project.join("carina.state.json")).expect("read state"),
         )
         .expect("load state")
-        .into_state()
     }
 }
 

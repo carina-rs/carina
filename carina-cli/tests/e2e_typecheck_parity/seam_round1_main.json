@@ -88,7 +88,7 @@
         "source": "carina"
       },
       {
-        "message": "Anonymous resources produced by the unbound `for` at main.crn:1 cannot be identified safely because multiple 'test.Probe' elements derive identity from mutable attributes.\nRewrite the loop with a binding and migrate its existing state addresses:\n\nlet probe = for item in values { test.Probe { payload = { needed = item first = 'a' } } }\n\nmoved {\n  from = test.Probe '_values[0]'\n  to = test.Probe 'probe[0]'\n}\n\nmoved {\n  from = test.Probe '_values[1]'\n  to = test.Probe 'probe[1]'\n}",
+        "message": "Anonymous resources produced by the unbound `for` at main.crn:1 cannot be identified safely because multiple 'test.Probe' elements derive identity from mutable attributes.\nRewrite the loop with a binding and migrate its existing state addresses:\n\nlet probe = for (_, item) in values { test.Probe { payload = { needed = item first = 'a' } } }\n\nmoved {\n  from = test.Probe '_values[0]'\n  to = test.Probe 'probe[0]'\n}\n\nmoved {\n  from = test.Probe '_values[1]'\n  to = test.Probe 'probe[1]'\n}",
         "range": {
           "end": {
             "character": 77,

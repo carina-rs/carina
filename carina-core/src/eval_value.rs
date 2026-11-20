@@ -46,7 +46,7 @@ pub(crate) struct UnexpandedStructuralHandle<B: BindingAddress = RelativeBinding
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnexpandedStructuralHandleKind {
     Resource(ResourceTypePath),
-    For,
+    For(crate::parser::ForBinding),
     If,
     Use,
     Module,
@@ -70,7 +70,7 @@ impl UnexpandedStructuralHandleKind {
     pub(crate) fn description(&self) -> &'static str {
         match self {
             Self::Resource(_) => "a resource",
-            Self::For => "a for binding",
+            Self::For(_) => "a for binding",
             Self::If => "an if binding",
             Self::Use => "a module import",
             Self::Module => "a module call",
@@ -87,8 +87,13 @@ impl UnexpandedStructuralHandleKind {
             Self::Use => {
                 "instantiate the module, then reference an output from the module call".to_string()
             }
-            Self::For => {
+            Self::For(crate::parser::ForBinding::Indexed(_, _)) => {
                 format!("reference an instance attribute, e.g. '{binding}[0].<attribute>'")
+            }
+            Self::For(
+                crate::parser::ForBinding::Simple(_) | crate::parser::ForBinding::Map(_, _),
+            ) => {
+                format!("reference an instance attribute, e.g. '{binding}['key'].<attribute>'")
             }
             Self::Provider => {
                 "use it only in 'directives.provider' where a provider handle is expected"
@@ -346,7 +351,7 @@ impl<B: BindingAddress> UnexpandedStructuralHandle<B> {
     }
 
     pub(crate) fn is_for_binding(&self) -> bool {
-        self.kind == UnexpandedStructuralHandleKind::For
+        matches!(self.kind, UnexpandedStructuralHandleKind::For(_))
     }
 
     pub(crate) fn is_parameter_handle(&self) -> bool {

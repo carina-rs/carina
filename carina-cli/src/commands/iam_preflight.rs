@@ -1229,14 +1229,14 @@ mod tests {
         let template = DeferredForExpression::new(
             None,
             1,
-            "for opt in cert.domain_validation_options".to_string(),
+            "for (_, opt) in cert.domain_validation_options".to_string(),
             carina_core::parser::DeferredForTarget::bound(
                 carina_core::resource::absolute_binding_address_for_test("validation_records"),
             )
             .expect("fixture binding is valid"),
             Value::resource_ref("cert", "domain_validation_options", Vec::new())
                 .resolve_root_for_test(),
-            ForBinding::Simple("opt".to_string()),
+            ForBinding::Indexed("_".into(), "opt".to_string()),
             template_resource,
         );
         plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
@@ -1272,14 +1272,14 @@ mod tests {
         let template = DeferredForExpression::new(
             None,
             1,
-            "for opt in cert.domain_validation_options".to_string(),
+            "for (_, opt) in cert.domain_validation_options".to_string(),
             carina_core::parser::DeferredForTarget::bound(
                 carina_core::resource::absolute_binding_address_for_test("validation_records"),
             )
             .expect("fixture binding is valid"),
             Value::resource_ref("cert", "domain_validation_options", Vec::new())
                 .resolve_root_for_test(),
-            ForBinding::Simple("opt".to_string()),
+            ForBinding::Indexed("_".into(), "opt".to_string()),
             template_resource,
         );
         plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(

@@ -1100,29 +1100,6 @@ fn snapshot_delete_orphan() {
 }
 
 #[test]
-fn snapshot_legacy_orphan_unknown_destroy_ordering() {
-    let color_mode = crate::output_style::ColorMode::Plain;
-    // Legacy dependency warnings are emitted to stderr during state migration,
-    // before the plan renderer consumes the migrated, typed dependencies.
-    let (plan, current_states, schemas, _moved) =
-        build_plan_and_states_from_fixture(color_mode, "legacy_orphan_unknown_destroy_ordering");
-    let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
-    let output = strip_ansi(&format_plan(
-        color_mode,
-        &plan,
-        DetailLevel::Full,
-        &delete_attributes,
-        Some(&schemas),
-        &HashMap::new(),
-        &[],
-        &[],
-        None,
-        None,
-    ));
-    insta::assert_snapshot!(output);
-}
-
-#[test]
 fn snapshot_deposed_delete() {
     let runtime = crate::test_support::TestCommandRuntime::new();
     let color_mode = crate::output_style::ColorMode::Plain;
@@ -1902,7 +1879,7 @@ fn assert_suggestion_round_trips(hint: &MovedBlockHint, expected_from: &str, exp
 #[test]
 fn snapshot_moved_let_to_for_bound() {
     let color_mode = crate::output_style::ColorMode::Plain;
-    assert_pure_move_snapshot(color_mode, "moved_let_to_for_bound", "vpcs[0]");
+    assert_pure_move_snapshot(color_mode, "moved_let_to_for_bound", "vpcs['10.0.0.0/16']");
 }
 
 /// An explicit move can target an unbound loop element by its stable anonymous
@@ -1967,7 +1944,12 @@ fn snapshot_moved_let_to_for_read_loop_module() {
 #[test]
 fn snapshot_moved_hint_let_to_for() {
     let color_mode = crate::output_style::ColorMode::Plain;
-    assert_suggested_move_snapshot(color_mode, "moved_hint_let_to_for", "old_vpc", "vpcs[0]");
+    assert_suggested_move_snapshot(
+        color_mode,
+        "moved_hint_let_to_for",
+        "old_vpc",
+        "vpcs['10.0.0.0/16']",
+    );
 }
 
 /// Multiple matching destroys and creates form one connected component. The
@@ -3559,14 +3541,14 @@ fn snapshot_top_level_sigil_alignment() {
     let deferred = DeferredForExpression::new(
         None,
         1,
-        "for option in cert.domain_validation_options".to_string(),
+        "for (_, option) in cert.domain_validation_options".to_string(),
         carina_core::parser::DeferredForTarget::bound(
             carina_core::resource::absolute_binding_address_for_test("validation_records"),
         )
         .expect("fixture binding is valid"),
         Value::resource_ref("cert", "domain_validation_options", Vec::new())
             .resolve_root_for_test(),
-        ForBinding::Simple("option".to_string()),
+        ForBinding::Indexed("_".into(), "option".to_string()),
         deferred_template,
     );
     let deferred_for_expressions = vec![deferred];

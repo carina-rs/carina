@@ -1,34 +1,28 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-anonymous-old-identity-name-override",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-anonymous-old-identity-name-override",
   "resources": [
     {
-      "resource_type": "test.Widget",
-      "identity": "test_widget_11111111",
-      "provider": "test",
-      "identifier": "widget-live",
-      "attributes": {
-        "external_name": "stable-replacement",
-        "legacy_token": "shared"
+      "binding": null,
+      "current": {
+        "attributes": {
+          "external_name": "stable-replacement",
+          "legacy_token": "shared"
+        },
+        "identifier": "widget-live",
+        "kind": "applied",
+        "nested_write_only": {}
       },
-      "protected": false,
+      "dependency_bindings": [],
       "directives": {
+        "create_before_destroy": false,
         "force_delete": false,
-        "create_before_destroy": false
-      },
-      "prefixes": {},
-      "name_overrides": {
-        "external_name": {
-          "temp_value": "stable-replacement",
-          "original_value": "stable"
+        "prevent_destroy": {
+          "kind": "unspecified"
         }
       },
-      "binding": null,
-      "dependency_bindings": [],
       "explicit": {
-        "kind": "struct",
         "children": {
           "external_name": {
             "kind": "leaf"
@@ -36,8 +30,22 @@
           "legacy_token": {
             "kind": "leaf"
           }
+        },
+        "kind": "struct"
+      },
+      "identity": "test_widget_11111111",
+      "name_overrides": {
+        "external_name": {
+          "original_value": "stable",
+          "temp_value": "stable-replacement"
         }
-      }
+      },
+      "prefixes": {},
+      "protected": false,
+      "provider": "test",
+      "resource_type": "test.Widget"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

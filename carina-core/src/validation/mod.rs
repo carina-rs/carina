@@ -853,7 +853,6 @@ impl std::error::Error for BindingUseReport {}
 #[derive(Debug)]
 pub struct ResolvedFile<E> {
     inner: crate::parser::ExpandedFile<E>,
-    secrecy: Option<crate::secrecy::ValidatedSecrecyGraph>,
 }
 
 impl<E> ResolvedFile<E> {
@@ -865,16 +864,16 @@ impl<E> ResolvedFile<E> {
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn for_test(inner: crate::parser::ExpandedFile<E>) -> Self {
-        Self {
-            inner,
-            secrecy: None,
-        }
+        Self { inner }
     }
 
     pub fn validated_secrecy(
         &self,
     ) -> Result<&crate::secrecy::ValidatedSecrecyGraph, crate::secrecy::PendingSecrecy> {
-        self.secrecy.as_ref().ok_or(crate::secrecy::PendingSecrecy)
+        self.inner
+            .authored_inputs()
+            .map_err(|_| crate::secrecy::PendingSecrecy)?
+            .validated_secrecy()
     }
 
     pub fn as_file(&self) -> &crate::parser::ExpandedFile<E> {
@@ -902,6 +901,8 @@ pub enum ResolveFileError {
     Expression(Box<crate::parser::Located<inference::InferenceError>>),
     #[error(transparent)]
     Secrecy(Box<crate::secrecy::Finding>),
+    #[error(transparent)]
+    TemplateSecrecy(#[from] crate::secrecy::TemplateAdmissionError),
     #[error(transparent)]
     ResourceDirective(Box<crate::parser::Located<ResourceDirectiveFinding>>),
     #[error(transparent)]
@@ -2457,12 +2458,16 @@ fn finish_binding_resolution<E: crate::parser::IntoExpandedExportParam<AbsoluteB
     let schemas = judged.schemas();
     let file = judged.into_file();
     let mut inner = file.into_expanded(schemas, provider_context)?;
-    if let Some(graph) = &secrecy
-        && let Some(inputs) = &inner.authored_inputs
+    if let Some(graph) = secrecy
+        && let Some(inputs) = inner.authored_inputs.clone()
     {
-        inner.attach_authored_inputs(inputs.with_validated_secrecy(graph.clone()));
+        for template in inner.deferred_for_expressions_mut().iter_mut() {
+            let evidence = graph.template_evidence(template)?;
+            template.attach_template_evidence(evidence);
+        }
+        inner.attach_authored_inputs(inputs.with_validated_secrecy(graph));
     }
-    Ok(ResolvedFile { inner, secrecy })
+    Ok(ResolvedFile { inner })
 }
 
 fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
@@ -5403,7 +5408,8 @@ impl ResourceAdmissionFinding {
             .join("\n");
         self
     }
-    fn prefix(error: &crate::identifier::AttributePrefixError) -> Self {
+    fn prefix(error: impl Into<crate::identifier::AttributePrefixFinding>) -> Self {
+        let error = error.into();
         let mut finding = Self::schema(
             error.resource_id(),
             &crate::schema::SchemaDiagnostic::unlocated(TypeError::AttributePrefix(Box::new(
@@ -5571,7 +5577,7 @@ type ResourceAdmissionValues = HashMap<
         crate::resource::ResourceId,
         crate::parser::DeclarationLocation,
     ),
-    crate::schema::ResourceValueValidation,
+    crate::identifier::PrefixAdmitted<crate::schema::ResourceValueValidation>,
 >;
 
 struct ResourceValidationContext<'a, B: BindingAddress> {
@@ -5662,6 +5668,7 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                 checked = outcome.values;
                 &checked
             };
+            let (values, _prefixes_reported_by_file) = values.as_parts();
             for (diagnostic, symbolic) in values.diagnostic_errors() {
                 if diagnostic
                     .coverage_path()
@@ -5767,8 +5774,10 @@ pub fn validate_resources<
     let report = canonical.validation_report(provider_context);
     let mut run: ConversionValidation = ConversionValidation::new(&report);
     let mut findings = canonical
-        .prefix_errors()
-        .iter()
+        .prefix_findings()
+        .clone()
+        .into_live_findings()
+        .into_iter()
         .map(ResourceAdmissionFinding::prefix)
         .collect::<Vec<_>>();
     match canonical.schema_validation_resources() {
@@ -5962,7 +5971,7 @@ pub fn resource_reference_findings_in<
         &subject,
         presentation::AdmissionBoundary::Live,
     )?;
-    run.ordinary(report.findings.0, subject);
+    run.ordinary(report.into_live_findings(), subject);
     Ok(())
 }
 
@@ -5995,7 +6004,10 @@ pub fn resource_reference_preflight_findings_in<F: ValidationClientError>(
         &subject,
         presentation::AdmissionBoundary::Preflight,
     )?;
-    run.ordinary(report.findings.0, subject);
+    run.ordinary(
+        PreflightResourceAdmissionReport(report).defer_prefix_findings_to_live_expansion(),
+        subject,
+    );
     Ok(())
 }
 
@@ -6049,17 +6061,18 @@ pub fn resource_admission_findings_in<
         run,
         &subject,
     )?;
-    run.ordinary(report.findings.0, subject);
+    run.ordinary(report.into_live_findings(), subject);
     Ok(())
 }
 
 fn complete_resource_admission_report<
+    'a,
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     F: ValidationClientError,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    judged: &crate::identifier::PrefixCanonicalized<
+    judged: &'a crate::identifier::PrefixCanonicalized<
         '_,
         crate::parser::retained::JudgedFile<'_, E, D, B>,
     >,
@@ -6068,7 +6081,7 @@ fn complete_resource_admission_report<
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
     run: &mut ConversionValidation<F>,
     subject: &FindingSubject,
-) -> Result<ResourceAdmissionReport, crate::parser::AnalysisTreeError> {
+) -> Result<ResourceAdmissionReport<'a>, crate::parser::AnalysisTreeError> {
     let mut report = resource_admission_report(
         judged,
         bindings,
@@ -6104,27 +6117,58 @@ fn publish_admission_diagnostics<T>(
     result.publish(sink)
 }
 
-struct ResourceAdmissionReport {
+struct ResourceAdmissionReport<'a> {
     attributes: ResourceAdmissionValues,
-    // Required prefix rejections and reference findings have one consuming exit.
+    prefixes: &'a crate::identifier::PrefixFindings,
     findings: ResourceAdmissionFindings,
 }
-impl ResourceAdmissionReport {
-    fn new<F>(
-        file: &crate::identifier::PrefixCanonicalized<'_, F>,
-        attributes: ResourceAdmissionValues,
-        mut references: ResourceAdmissionFindings,
-    ) -> Self {
-        let mut findings = file
-            .prefix_errors()
+
+/// Preflight borrows the template's complete prefix authority without consuming
+/// its argument obligations. Module expansion binds the owning template's
+/// values; only Live admission converts any remaining formals into findings.
+struct PreflightResourceAdmissionReport<'a>(ResourceAdmissionReport<'a>);
+impl PreflightResourceAdmissionReport<'_> {
+    fn defer_prefix_findings_to_live_expansion(self) -> Vec<ResourceAdmissionFinding> {
+        let ResourceAdmissionReport {
+            attributes,
+            prefixes,
+            findings,
+        } = self.0;
+        drop(attributes);
+        prefixes
+            .rejections()
             .iter()
             .map(ResourceAdmissionFinding::prefix)
-            .collect::<Vec<_>>();
-        findings.append(&mut references.0);
+            .chain(findings.0)
+            .collect()
+    }
+}
+impl<'a> ResourceAdmissionReport<'a> {
+    fn new<F>(
+        file: &'a crate::identifier::PrefixCanonicalized<'_, F>,
+        attributes: ResourceAdmissionValues,
+        references: ResourceAdmissionFindings,
+    ) -> Self {
         Self {
             attributes,
-            findings: ResourceAdmissionFindings(findings),
+            prefixes: file.prefix_findings(),
+            findings: references,
         }
+    }
+    fn into_live_findings(self) -> Vec<ResourceAdmissionFinding> {
+        let Self {
+            attributes,
+            prefixes,
+            findings,
+        } = self;
+        drop(attributes);
+        prefixes
+            .clone()
+            .into_live_findings()
+            .into_iter()
+            .map(ResourceAdmissionFinding::prefix)
+            .chain(findings.0)
+            .collect()
     }
 }
 /// Recover the lexical type of a bare value that became an entire reference
@@ -6181,12 +6225,13 @@ where
 }
 
 fn resource_admission_report<
+    'a,
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     F: ValidationClientError,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    judged: &crate::identifier::PrefixCanonicalized<
+    judged: &'a crate::identifier::PrefixCanonicalized<
         '_,
         crate::parser::retained::JudgedFile<'_, E, D, B>,
     >,
@@ -6195,7 +6240,7 @@ fn resource_admission_report<
     conversion_validation: &mut ConversionValidation<F>,
     subject: &FindingSubject,
     boundary: presentation::AdmissionBoundary,
-) -> Result<ResourceAdmissionReport, crate::parser::AnalysisTreeError> {
+) -> Result<ResourceAdmissionReport<'a>, crate::parser::AnalysisTreeError> {
     let parsed = judged.parsed();
     let mut all_errors = ResourceAdmissionFindings::default();
     let mut attributes = HashMap::new();
@@ -6235,7 +6280,8 @@ fn resource_admission_report<
                     };
                     let attrs = resource.attributes();
                     let location = resource.diagnostic_label();
-                    for (attribute, path, diagnostic) in values.symbolic_errors() {
+                    let (value_report, _prefixes_reported_by_file) = values.as_parts();
+                    for (attribute, path, diagnostic) in value_report.symbolic_errors() {
                         let located = match resource
                             .locate_schema_diagnostic(diagnostic, |_ordinary| {
                                 resource.attribute_key_location(attribute).clone()
@@ -6327,12 +6373,16 @@ fn resource_admission_report<
         diagnostics,
     )?;
 
-    if parsed.deferred_for_sites().next().is_some() {
-        all_errors.extend(validate_deferred_for_iterable_types(
-            &parsed.analysis_tree()?,
+    let analysis = parsed.analysis_tree()?;
+    all_errors.extend(match bindings.upstream_exports() {
+        Some(upstream) => validate_for_iterable_types_with_upstream(
+            &analysis,
             bindings.provider_context(),
-        ));
-    }
+            judged.schemas(),
+            upstream,
+        ),
+        None => validate_for_iterable_types(&analysis, bindings.provider_context()),
+    });
 
     Ok(ResourceAdmissionReport::new(judged, attributes, all_errors))
 }
@@ -6345,7 +6395,7 @@ enum DeferredIterableKind {
 
 #[derive(Debug, Clone, PartialEq)]
 enum DeferredIterableShape {
-    List,
+    List(Option<TypeExpr>),
     Map,
     NonIterable(TypeExpr),
 }
@@ -6353,7 +6403,7 @@ enum DeferredIterableShape {
 impl From<crate::parser::retained::CollectionKind> for DeferredIterableShape {
     fn from(kind: crate::parser::retained::CollectionKind) -> Self {
         match kind {
-            crate::parser::retained::CollectionKind::List => Self::List,
+            crate::parser::retained::CollectionKind::List => Self::List(None),
             crate::parser::retained::CollectionKind::Map => Self::Map,
         }
     }
@@ -6362,41 +6412,44 @@ impl From<crate::parser::retained::CollectionKind> for DeferredIterableShape {
 fn deferred_iterable_shape_for_phase(
     expression: &crate::parser::retained::SinkJudgedExpr<'_>,
 ) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {
-    match expression.collection_kind() {
-        Some(kind) => Ok(kind.into()),
-        None => expression
-            .static_type()
-            .cloned()
-            .map(iterable_shape_from_type),
+    match expression.static_type() {
+        Ok(inferred) => Ok(iterable_shape_from_type(inferred.clone())),
+        Err(error) => match expression.collection_kind() {
+            Some(kind) => Ok(kind.into()),
+            None => Err(error),
+        },
     }
 }
 
 fn iterable_shape_from_type(inferred: TypeExpr) -> DeferredIterableShape {
     match inferred {
-        TypeExpr::List(_) => DeferredIterableShape::List,
+        TypeExpr::List(inner) => DeferredIterableShape::List(Some(*inner)),
         TypeExpr::Map(_) => DeferredIterableShape::Map,
         non_iterable => DeferredIterableShape::NonIterable(non_iterable),
     }
 }
 
-/// Static type failure for an iterable retained as a
-/// [`crate::parser::DeferredForExpression`].
+/// Static type failure for an authored `for` iterable.
 ///
 /// The file/line identity lets the LSP reuse the exact CLI validator while
 /// anchoring only diagnostics owned by the current editor buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeferredForIterableTypeDiagnostic {
-    pub expression: String,
-    pub message: String,
+pub enum DeferredForIterableTypeDiagnostic {
+    Iterable { expression: String, message: String },
+    ForKey(crate::resource::ForKeyError),
 }
 
 impl std::fmt::Display for DeferredForIterableTypeDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "deferred-for iterable `{}`: {}",
-            self.expression, self.message
-        )
+        match self {
+            Self::Iterable {
+                expression,
+                message,
+            } => {
+                write!(f, "deferred-for iterable `{expression}`: {message}")
+            }
+            Self::ForKey(error) => error.fmt(f),
+        }
     }
 }
 
@@ -6408,60 +6461,85 @@ pub fn validate_module_iteration_shape<P: PlaceholderKind, B: BindingAddress>(
     value.module_iteration_violation().map_or(Ok(()), Err)
 }
 
-/// Validate every deferred `for` iterable against its binding pattern.
+/// Validate every authored `for` iterable against its binding pattern.
 ///
 /// Coalesce operands are checked independently: even while the left remains
 /// unresolved, a statically known scalar fallback cannot be allowed to reach
 /// apply for a loop that requires a list or map.
 ///
 /// ```compile_fail,E0308
-/// use carina_core::{parser::{ParsedFile, ProviderContext}, validation::validate_deferred_for_iterable_types};
+/// use carina_core::{parser::{ParsedFile, ProviderContext}, validation::validate_for_iterable_types};
 /// fn analyze(file: &ParsedFile, context: &ProviderContext) {
-///     validate_deferred_for_iterable_types(file, context);
+///     validate_for_iterable_types(file, context);
 /// }
 /// ```
-pub fn validate_deferred_for_iterable_types<D, B: BindingAddress, E>(
+pub fn validate_for_iterable_types<D, B: BindingAddress, E>(
     tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     provider_context: &ProviderContext,
 ) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
+    let report = tree.file().expression_report();
+    validate_authored_for_iterable_types(report, report, provider_context)
+}
+
+/// Supply upstream element types to the authored-node walk. Upstream iterable
+/// shape diagnostics retain their occurrence-aware upstream owner.
+pub fn validate_for_iterable_types_with_upstream<D, B: BindingAddress, E>(
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
+    provider_context: &ProviderContext,
+    schemas: &crate::schema::SchemaRegistry,
+    upstream: &crate::upstream_exports::UpstreamExports<B>,
+) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    let report = crate::parser::retained::judge_expressions_with_upstream(
+        tree.file(),
+        schemas,
+        provider_context,
+        Some(upstream),
+    );
+    validate_authored_for_iterable_types(tree.file().expression_report(), &report, provider_context)
+}
+
+fn validate_authored_for_iterable_types<B: BindingAddress>(
+    report: &crate::parser::retained::ExpressionReport<B>,
+    key_report: &crate::parser::retained::ExpressionReport<B>,
+    provider_context: &ProviderContext,
+) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>> {
     let mut diagnostics = Vec::new();
-    for deferred in tree.for_iterables() {
-        let expected = match deferred.binding() {
+    for authored in report.authored_for_iterables(key_report) {
+        let expected = match authored.binding {
             ForBinding::Simple(_) | ForBinding::Indexed(_, _) => DeferredIterableKind::List,
             ForBinding::Map(_, _) => DeferredIterableKind::Map,
         };
-        let judged = match tree
-            .file()
-            .expression_report()
-            .instances_at(deferred.location())
-        {
-            Ok(judged) => judged,
-            Err(error) => {
+        let (judged, key_judged) = match (authored.judged, authored.key_judged) {
+            (Ok(judged), Ok(key_judged)) => (judged, key_judged),
+            (Err(error), _) | (_, Err(error)) => {
                 diagnostics.push(crate::parser::Located::new(
-                    deferred.location().clone(),
-                    DeferredForIterableTypeDiagnostic {
-                        expression: crate::value::format_value(deferred.iterable()),
+                    authored.location.clone(),
+                    DeferredForIterableTypeDiagnostic::Iterable {
+                        expression: authored.expression,
                         message: error.to_string(),
                     },
                 ));
                 continue;
             }
         };
-        for judged in judged {
-            validate_deferred_iterable_operand(
-                DeferredIterableValidationContext {
-                    expected,
-                    judged,
-                    provider_context,
-                    location: deferred.location(),
-                    expression: deferred.iterable(),
-                },
-                &mut diagnostics,
-            );
-        }
+        validate_for_iterable_operand(
+            ForIterableValidationContext {
+                expected,
+                value_keys: matches!(authored.binding, ForBinding::Simple(_)) && authored.bound,
+                judged,
+                key_judged,
+                provider_context,
+                location: authored.location,
+                expression: &authored.expression,
+            },
+            &mut diagnostics,
+        );
     }
     diagnostics
 }
@@ -6537,32 +6615,51 @@ impl std::fmt::Display for DeferredIterableKind {
     }
 }
 
-struct DeferredIterableValidationContext<'a, B: BindingAddress> {
+struct ForIterableValidationContext<'a> {
     expected: DeferredIterableKind,
+    value_keys: bool,
     provider_context: &'a ProviderContext,
     judged: &'a crate::parser::retained::JudgedExpr,
+    key_judged: &'a crate::parser::retained::JudgedExpr,
     location: &'a crate::parser::DeclarationLocation,
-    expression: &'a GenericValue<ParserPlaceholder, B>,
+    expression: &'a str,
 }
 
-impl<B: BindingAddress> Copy for DeferredIterableValidationContext<'_, B> {}
+impl Copy for ForIterableValidationContext<'_> {}
 
-impl<B: BindingAddress> Clone for DeferredIterableValidationContext<'_, B> {
+impl Clone for ForIterableValidationContext<'_> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-fn validate_deferred_iterable_operand<B: BindingAddress>(
-    context: DeferredIterableValidationContext<'_, B>,
+fn validate_for_iterable_operand(
+    context: ForIterableValidationContext<'_>,
     diagnostics: &mut Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>>,
 ) {
     if let Some(operands) = context.judged.coalesce_operands() {
-        let mut operand_context = context;
-        operand_context.judged = &operands[0];
-        validate_deferred_iterable_operand(operand_context, diagnostics);
-        operand_context.judged = &operands[1];
-        validate_deferred_iterable_operand(operand_context, diagnostics);
+        let mut findings: Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>> =
+            Vec::new();
+        let key_operands = context
+            .key_judged
+            .coalesce_operands()
+            .expect("paired reports judge the same authored coalesce");
+        for (operand, key_operand) in operands.iter().zip(key_operands) {
+            let mut operand_context = context;
+            operand_context.judged = operand;
+            operand_context.key_judged = key_operand;
+            let mut operand_findings = Vec::new();
+            validate_for_iterable_operand(operand_context, &mut operand_findings);
+            for finding in operand_findings {
+                if !findings
+                    .iter()
+                    .any(|existing| existing.detail() == finding.detail())
+                {
+                    findings.push(finding);
+                }
+            }
+        }
+        diagnostics.extend(findings);
         return;
     }
 
@@ -6571,6 +6668,28 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
         DeferredIterableKind::Map => TypeExpr::Map(Box::new(TypeExpr::String)),
     };
     let judged = context.judged.for_sink(&sink, context.provider_context);
+    let key_judged = context.key_judged.for_sink(&sink, context.provider_context);
+    if context.value_keys
+        && (key_judged.collection_kind() == Some(crate::parser::retained::CollectionKind::List)
+            || context.key_judged.has_list_elements())
+    {
+        for member in context.key_judged.elements() {
+            if let Ok(element) = member.static_type()
+                && let Err(error) = crate::resource::classify_for_key_type(element)
+            {
+                diagnostics.push(deferred_for_key_diagnostic(context, error));
+                return;
+            }
+        }
+    }
+    if context.value_keys
+        && let Ok(DeferredIterableShape::List(Some(element))) =
+            deferred_iterable_shape_for_phase(&key_judged)
+        && let Err(error) = crate::resource::classify_for_key_type(&element)
+    {
+        diagnostics.push(deferred_for_key_diagnostic(context, error));
+        return;
+    }
     let inferred = match deferred_iterable_shape_for_phase(&judged) {
         Ok(inferred) => Some(inferred),
         Err(crate::static_type::InferenceIssue::Failed(
@@ -6611,15 +6730,15 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
         return;
     };
     match (context.expected, inferred) {
-        (DeferredIterableKind::List, DeferredIterableShape::List)
-        | (DeferredIterableKind::Map, DeferredIterableShape::Map) => {}
+        (DeferredIterableKind::List, DeferredIterableShape::List(_)) => {}
+        (DeferredIterableKind::Map, DeferredIterableShape::Map) => {}
         (DeferredIterableKind::List, DeferredIterableShape::Map) => {
             diagnostics.push(deferred_iterable_diagnostic(
                 context,
                 "expected list iterable, got map".to_string(),
             ));
         }
-        (DeferredIterableKind::Map, DeferredIterableShape::List) => {
+        (DeferredIterableKind::Map, DeferredIterableShape::List(_)) => {
             diagnostics.push(deferred_iterable_diagnostic(
                 context,
                 "expected map iterable, got list".to_string(),
@@ -6634,14 +6753,24 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
     }
 }
 
-fn deferred_iterable_diagnostic<B: BindingAddress>(
-    context: DeferredIterableValidationContext<'_, B>,
+fn deferred_for_key_diagnostic(
+    context: ForIterableValidationContext<'_>,
+    error: crate::resource::ForKeyError,
+) -> crate::parser::Located<DeferredForIterableTypeDiagnostic> {
+    crate::parser::Located::new(
+        context.location.clone(),
+        DeferredForIterableTypeDiagnostic::ForKey(error),
+    )
+}
+
+fn deferred_iterable_diagnostic(
+    context: ForIterableValidationContext<'_>,
     message: String,
 ) -> crate::parser::Located<DeferredForIterableTypeDiagnostic> {
     crate::parser::Located::new(
         context.location.clone(),
-        DeferredForIterableTypeDiagnostic {
-            expression: crate::value::format_value(context.expression),
+        DeferredForIterableTypeDiagnostic::Iterable {
+            expression: context.expression.to_string(),
             message,
         },
     )
@@ -11206,7 +11335,7 @@ where
     }
 
     // Return unused binding names, skipping structurally-required bindings
-    // (if/for/read expressions) and for-generated indexed bindings (e.g., vpcs[0])
+    // (if/for/read expressions) and children of actual loop groups.
     defined_bindings
         .into_iter()
         .filter(|(binding, scope)| {
@@ -11219,7 +11348,7 @@ where
                         })
                 })
                 && !parsed.structural_bindings.contains(binding)
-                && !binding.as_str().contains('[')
+                && crate::resolved_graph::loop_group_bindings(parsed, binding).is_empty()
         })
         .map(|(binding, _)| binding.as_str().to_string())
         .collect()
@@ -11464,5 +11593,138 @@ mod review15_error_tests {
         assert!(
             matches!(finding.kind, ReferenceFindingKind::SchemaUnavailable(SecretDiagnosticError::Public(error)) if matches!(*error, crate::parser::CustomTypeValidationError::ProvidersNotLoaded))
         );
+    }
+}
+
+#[cfg(test)]
+mod prefix_obligation_tests {
+    use super::*;
+
+    #[test]
+    fn r7b_live_formal_prefix_obligations_become_located_findings() {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            crate::schema::ResourceSchema::new("Sink")
+                .attribute(
+                    crate::schema::AttributeSchema::required(
+                        "name",
+                        crate::schema::AttributeType::string(),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for (arguments, definitions, expression, dependency) in [
+            ("prefix: String", "", "prefix", "'prefix'"),
+            (
+                "prefix: String",
+                "let p = prefix\n",
+                "p",
+                "'prefix' (through 'p')",
+            ),
+            ("prefix: String", "", "\"${prefix}-x\"", "'prefix'"),
+            ("prefix: String", "", "secret(prefix)", "'(secret)'"),
+            (
+                "first: String second: String",
+                "",
+                "\"${first}-${second}\"",
+                "'first' and 'second'",
+            ),
+        ] {
+            let source = format!(
+                "arguments {{ {arguments} }}\n{definitions}mock.Sink {{ name_prefix = {expression} }}\n"
+            );
+            let parsed = crate::parser::parse_and_resolve(&source).unwrap();
+            let canonical = crate::identifier::canonicalize_file_prefixes(
+                parsed,
+                &schemas,
+                crate::identifier::SuffixSource::Preview,
+            )
+            .judge(&context);
+            let authored = canonical.parsed().resources[0]
+                .declaration
+                .attribute_key_finding_location("name_prefix");
+            let report = ResourceAdmissionReport::new(
+                &canonical,
+                HashMap::new(),
+                ResourceAdmissionFindings::default(),
+            );
+            let findings = report.into_live_findings();
+            assert_eq!(
+                findings.len(),
+                1,
+                "Live must publish the obligation for {expression}"
+            );
+            assert_eq!(findings[0].location, authored);
+            assert_eq!(
+                findings[0].to_string(),
+                format!(
+                    "mock.Sink.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on {dependency}, which is not resolved when names are generated"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_schema_inputs_keep_the_suppression_finding_in_preflight_report() {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            crate::schema::ResourceSchema::new("Sink")
+                .attribute(
+                    crate::schema::AttributeSchema::required(
+                        "name",
+                        crate::schema::AttributeType::string(),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    crate::schema::AttributeSchema::provider_populated(
+                        "identifier",
+                        crate::schema::AttributeType::string(),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_and_resolve(
+            "let src = mock.Sink { name = 'source' }\nmock.Sink { name_prefix = src.identifier }",
+        )
+        .unwrap();
+        let canonical = crate::identifier::canonicalize_file_prefixes(
+            parsed,
+            &schemas,
+            crate::identifier::SuffixSource::Preview,
+        )
+        .judge(&context);
+        let report = ResourceAdmissionReport::new(
+            &canonical,
+            HashMap::new(),
+            ResourceAdmissionFindings::default(),
+        );
+        assert!(
+            !report.prefixes.is_empty(),
+            "preflight must retain the finding until its explicit suppress-only boundary"
+        );
+        assert_eq!(
+            report.prefixes.deferred_findings(),
+            canonical.deferred_findings()
+        );
+        assert!(
+            PreflightResourceAdmissionReport(report)
+                .defer_prefix_findings_to_live_expansion()
+                .is_empty()
+        );
+        let live = ResourceAdmissionReport::new(
+            &canonical,
+            HashMap::new(),
+            ResourceAdmissionFindings::default(),
+        );
+        assert_eq!(live.into_live_findings().len(), 1);
     }
 }

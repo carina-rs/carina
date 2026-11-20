@@ -34,3 +34,26 @@ fn lock_file_is_not_serializable_outside_provider_resolver() {
     assert!(!non_serializable_probe);
     assert!(!lock_file);
 }
+
+trait DeserializeStatus {
+    const IS_DESERIALIZE: bool = false;
+}
+impl<T> DeserializeStatus for T {}
+struct DeserializeCheck<T>(PhantomData<T>);
+impl<T: for<'de> serde::Deserialize<'de>> DeserializeCheck<T> {
+    const IS_DESERIALIZE: bool = true;
+}
+
+#[test]
+fn lock_entries_are_not_deserializable_outside_current_decoder() {
+    let positive_control = DeserializeCheck::<String>::IS_DESERIALIZE;
+    let negative_control = DeserializeCheck::<NonSerializableProbe>::IS_DESERIALIZE;
+    let entry = DeserializeCheck::<carina_provider_resolver::LockEntry>::IS_DESERIALIZE;
+    let kind = DeserializeCheck::<carina_provider_resolver::LockEntryKind>::IS_DESERIALIZE;
+    let marker = DeserializeCheck::<carina_provider_resolver::NoRegistryLock>::IS_DESERIALIZE;
+    assert!(positive_control);
+    assert!(!negative_control);
+    assert!(!entry);
+    assert!(!kind);
+    assert!(!marker);
+}

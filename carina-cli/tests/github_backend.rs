@@ -80,24 +80,3 @@ fn github_saved_plan_backend_round_trip_contains_only_destination_settings() {
     assert_eq!(value["backend_type"], "github");
     assert_eq!(value["attributes"].as_object().unwrap().len(), 3);
 }
-
-#[test]
-fn github_offline_migration_check_rejects_remote_before_constructing_any_client() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_carina"))
-        .args([
-            "state",
-            "migrate",
-            "--check",
-            ".",
-            "--state-url",
-            "github://owner/repo/prod.json?branch=states%2Fprod",
-        ])
-        .env("GITHUB_TOKEN", "")
-        .env("PATH", "/no-credential-helper")
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let message = String::from_utf8(output.stderr).unwrap();
-    assert!(message.contains("local state file"), "{message}");
-    assert!(!message.contains("credentials"), "{message}");
-}

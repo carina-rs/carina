@@ -232,7 +232,7 @@ fn state_refresh_retries_data_source_after_deferred_for_child_expands() {
         .as_array_mut()
         .expect("state resources")
         .iter_mut()
-        .find(|resource| resource["identity"] == "kids[0]")
+        .find(|resource| resource["identity"] == "kids.kid")
         .expect("expanded child state row");
     child["binding"] = Value::Null;
     fs::write(
@@ -243,7 +243,7 @@ fn state_refresh_retries_data_source_after_deferred_for_child_expands() {
     scenario.write_project_file(
         "selected.crn",
         r#"let selected = read mock.iam.Roles {
-  name_regex = kids[0].name
+  name_regex = kids['kid'].name
 }
 "#,
     );

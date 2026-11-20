@@ -414,7 +414,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             ExprKind::Parens => AuthoredForm::Parens,
             ExprKind::Convert { .. } => AuthoredForm::Convert,
             ExprKind::Definition => AuthoredForm::Definition,
-            ExprKind::Binding(_) => AuthoredForm::Binding,
+            ExprKind::Binding { .. } => AuthoredForm::Binding,
             ExprKind::Reference { .. } => AuthoredForm::Reference,
             ExprKind::List => AuthoredForm::List,
             ExprKind::Map(_) => AuthoredForm::Map,
@@ -434,7 +434,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             | ExprKind::Integer { .. }
             | ExprKind::Iterable
             | ExprKind::Resource { .. }
-            | ExprKind::For
+            | ExprKind::For { .. }
             | ExprKind::Wait
             | ExprKind::Compose
             | ExprKind::DynamicAccess
@@ -476,7 +476,11 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
     }
 
     pub(crate) fn definition(&self) -> Result<Option<Self>, MissingEvidence> {
-        let ExprKind::Binding(binding) = &self.node.node.kind else {
+        let ExprKind::Binding {
+            binding,
+            authored_binding: _,
+        } = &self.node.node.kind
+        else {
             return Ok(None);
         };
         let Some(expression) = self.node.snapshot.definitions.get(binding) else {
@@ -1047,6 +1051,7 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
                 binding,
                 attribute,
                 segments,
+                authored_binding: _,
             } => Some(SourceReference {
                 binding,
                 attribute,
@@ -1260,6 +1265,15 @@ impl<B: BindingAddress> JudgedSlot<B> {
             }
             AuthoredSlotKind::Directives => None,
         }
+    }
+
+    /// Diagnostic syntax inventory, independent of the current projection/judgement.
+    /// Inlining an alias or substituting a module argument must retain its authored name.
+    pub(crate) fn dependency_uses(&self) -> Vec<super::AuthoredDependency<B>> {
+        let mut uses = Vec::new();
+        self.root
+            .dependency_uses(crate::resource::DiagnosticScope::Public, &mut uses);
+        uses
     }
 
     pub(crate) fn secrecy_conditions(&self) -> ConditionSnapshot {
@@ -1558,7 +1572,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 | ExprKind::Parameter(_)
                 | ExprKind::LoopSlot(_)
                 | ExprKind::UntypedParameter
-                | ExprKind::Binding(_)
+                | ExprKind::Binding { .. }
                 | ExprKind::Reference { .. }
                 | ExprKind::NestedBlock { .. }
                 | ExprKind::EmptyInterpolation
@@ -1568,7 +1582,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 | ExprKind::Iterable
                 | ExprKind::Resource { .. }
                 | ExprKind::Sink { .. }
-                | ExprKind::For
+                | ExprKind::For { .. }
                 | ExprKind::Wait
                 | ExprKind::Compose
                 | ExprKind::ModuleCall
@@ -1650,6 +1664,8 @@ pub struct AuthoredSlots<B: BindingAddress = RelativeBindingName> {
     input_origin: Option<SlotDeclarationId>,
     /// Resource expansion identity, retained even when there are no attributes.
     instance: Option<ExpansionInstanceId>,
+    instantiation_origin: Option<(SlotDeclarationId, Option<ExpansionInstanceId>)>,
+    child_secrecy: Option<crate::secrecy::ChildSecrecy>,
 }
 // Admission metadata is not part of a resource's value semantics.
 impl<B: BindingAddress> PartialEq for AuthoredSlots<B> {
@@ -1672,6 +1688,8 @@ impl<B: BindingAddress> Default for AuthoredSlots<B> {
             declaration: None,
             input_origin: None,
             instance: None,
+            instantiation_origin: None,
+            child_secrecy: None,
         }
     }
 }
@@ -1688,6 +1706,22 @@ impl<B: BindingAddress> AuthoredSlots<B> {
     }
     pub(crate) fn instance(&self) -> Option<ExpansionInstanceId> {
         self.instance
+    }
+    pub(crate) fn instantiation_origin(
+        &self,
+    ) -> Option<(&SlotDeclarationId, Option<ExpansionInstanceId>)> {
+        self.instantiation_origin
+            .as_ref()
+            .map(|(declaration, instance)| (declaration, *instance))
+    }
+    pub(crate) fn child_secrecy(&self) -> Option<&crate::secrecy::ChildSecrecy> {
+        self.child_secrecy.as_ref()
+    }
+    pub(in crate::parser) fn set_child_secrecy(
+        &mut self,
+        secrecy: crate::parser::ast::DeferredChildSecrecy,
+    ) {
+        self.child_secrecy = Some(secrecy.into_inner());
     }
     pub(super) fn set_instance(&mut self, instance: ExpansionInstanceId) {
         self.instance = Some(instance);
@@ -1823,6 +1857,11 @@ impl<B: BindingAddress> AuthoredSlots<B> {
         }
     }
     pub(crate) fn reinstance(&mut self) {
+        self.instantiation_origin = self
+            .declaration
+            .clone()
+            .map(|declaration| (declaration, self.instance));
+        self.child_secrecy = None;
         let instance = ExpansionInstanceId::fresh();
         self.set_instance(instance);
         for slot in self.slots.values_mut() {
@@ -1849,6 +1888,8 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             declaration: self.declaration,
             input_origin: self.input_origin,
             instance: self.instance,
+            instantiation_origin: self.instantiation_origin,
+            child_secrecy: self.child_secrecy,
             slots: self
                 .slots
                 .into_iter()

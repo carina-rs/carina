@@ -45,7 +45,8 @@ exports { region: String = "ap-northeast-1" }"#,
     .unwrap();
 
     let state = serde_json::json!({
-        "version": 6,
+        "version": 21,
+        "exports_version": 1,
         "serial": serial,
         "lineage": lineage,
         "carina_version": "0.0.0-test",
@@ -131,7 +132,8 @@ fn concurrent_apply_between_read_and_display_emits_drift_warning() {
     let stderr = plan_with_concurrent_writer(dir, move || {
         // Simulate a concurrent `apply`: same lineage, bumped serial.
         let state = serde_json::json!({
-            "version": 6,
+            "version": 21,
+            "exports_version": 1,
             "serial": 8,
             "lineage": "lineage-A",
             "carina_version": "0.0.0-test",
@@ -192,7 +194,8 @@ fn invalid_resource_identity_at_t1_preserves_leaf_detail_once() {
     let writer_path = state_path.clone();
     let stderr = plan_with_concurrent_writer(dir, move || {
         let state = serde_json::json!({
-            "version": 6,
+            "version": 21,
+            "exports_version": 1,
             "serial": 8,
             "lineage": "lineage-A",
             "carina_version": "0.0.0-test",
@@ -200,8 +203,12 @@ fn invalid_resource_identity_at_t1_preserves_leaf_detail_once() {
                 "resource_type": "test.Resource",
                 "identity": "",
                 "provider": "mock",
-                "identifier": "legacy-resource-123",
-                "attributes": {}
+                "current": {
+                    "kind": "applied",
+                    "identifier": "legacy-resource-123",
+                    "attributes": {},
+                    "nested_write_only": {}
+                }
             }],
             "exports": { "region": "ap-northeast-1" }
         });

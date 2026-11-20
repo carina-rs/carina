@@ -1,8 +1,8 @@
 {
-  "version": 5,
-  "serial": 0,
-  "lineage": "empty-exports-fixture",
   "carina_version": "0.4.0",
+  "exports_version": 1,
+  "lineage": "empty-exports-fixture",
   "resources": [],
-  "exports": {}
+  "serial": 0,
+  "version": 21
 }

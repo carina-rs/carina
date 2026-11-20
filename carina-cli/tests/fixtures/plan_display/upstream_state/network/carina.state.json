@@ -1,33 +1,49 @@
 {
-  "version": 5,
-  "serial": 3,
-  "lineage": "remote-network-lineage",
   "carina_version": "0.1.0",
-  "resources": [
-    {
-      "resource_type": "ec2.Vpc",
-      "identity": "main-vpc",
-      "provider": "awscc",
-      "identifier": "vpc-abc123",
-      "attributes": {
-        "vpc_id": "vpc-abc123",
-        "cidr_block": "10.0.0.0/16"
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
-      "desired_keys": [
-        "cidr_block"
-      ],
-      "binding": "vpc",
-      "dependency_bindings": []
-    }
-  ],
   "exports": {
     "vpc": {
-      "vpc_id": "vpc-abc123",
-      "cidr_block": "10.0.0.0/16"
+      "cidr_block": "10.0.0.0/16",
+      "vpc_id": "vpc-abc123"
     }
-  }
+  },
+  "exports_version": 1,
+  "lineage": "remote-network-lineage",
+  "resources": [
+    {
+      "binding": "vpc",
+      "current": {
+        "attributes": {
+          "cidr_block": "10.0.0.0/16",
+          "vpc_id": "vpc-abc123"
+        },
+        "identifier": "vpc-abc123",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
+      "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
+      "identity": "main-vpc",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Vpc",
+      "explicit": {
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      }
+    }
+  ],
+  "serial": 3,
+  "version": 21
 }

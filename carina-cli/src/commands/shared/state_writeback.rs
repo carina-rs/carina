@@ -2131,23 +2131,26 @@ mod post_apply_states_tests {
 
         // state.resources carries the POST-apply value — this must win.
         let json = serde_json::json!({
-            "version": 5,
+            "version": 21,
+            "exports_version": 1,
             "serial": 1,
             "lineage": "test",
             "carina_version": "0.4.0",
             "resources": [
                 {
                     "resource_type": "s3.Bucket",
-                    "name": "log",
-                    "identifier": "log-bucket",
+                    "identity": "log",
                     "provider": "awscc",
-                    "attributes": { "versioning": "Enabled" }
+                    "current": {
+                        "kind": "applied",
+                        "identifier": "log-bucket",
+                        "attributes": { "versioning": "Enabled" },
+                        "nested_write_only": {}
+                    }
                 }
             ]
         });
-        let state = carina_state::check_and_migrate(&json.to_string())
-            .unwrap()
-            .into_state();
+        let state = carina_state::load_state(&json.to_string()).unwrap();
 
         let managed_current = crate::managed_current_from_states(managed_states);
         let post = PostApplyStates::from_current_and_state(
@@ -2717,13 +2720,13 @@ mod apply_state_save_tests {
         let template = DeferredForExpression::new(
             Some("main.crn".to_string()),
             1,
-            "for opt in cert.domain_validation_options".to_string(),
+            "for (_, opt) in cert.domain_validation_options".to_string(),
             carina_core::parser::DeferredForTarget::bound(
                 carina_core::resource::absolute_binding_address_for_test("validation_records"),
             )
             .expect("fixture binding is valid"),
             root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Simple("opt".to_string()),
+            ForBinding::Indexed("_".into(), "opt".to_string()),
             // Comparison pre-resolution keys the materialized template by
             // provider instance and type before any runtime child exists.
             Resource::pending_with_provider("aws", "route53.Record", None),
@@ -5099,9 +5102,7 @@ mod apply_state_save_tests {
 
         assert_aligned(&state);
         let serialized = serde_json::to_string(&state).expect("serialize state");
-        let round_tripped = carina_state::check_and_migrate(&serialized)
-            .expect("deserialize state")
-            .into_state();
+        let round_tripped = carina_state::load_state(&serialized).expect("deserialize state");
         assert_aligned(&round_tripped);
 
         let listener_current = round_tripped.build_state_for_resource(&id);
@@ -5418,13 +5419,13 @@ mod apply_state_save_tests {
         let template = DeferredForExpression::new(
             Some("main.crn".to_string()),
             1,
-            "for opt in cert.domain_validation_options".to_string(),
+            "for (_, opt) in cert.domain_validation_options".to_string(),
             carina_core::parser::DeferredForTarget::bound(
                 carina_core::resource::absolute_binding_address_for_test("validation_records"),
             )
             .expect("fixture binding is valid"),
             root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Simple("opt".to_string()),
+            ForBinding::Indexed("_".into(), "opt".to_string()),
             Resource::with_provider("aws", "route53.Record", "validation_records", None)
                 .with_test_binding("validation_records"),
         );
@@ -5496,13 +5497,13 @@ mod apply_state_save_tests {
             Box::new(DeferredForExpression::new(
                 Some("main.crn".to_string()),
                 1,
-                "for opt in cert.domain_validation_options".to_string(),
+                "for (_, opt) in cert.domain_validation_options".to_string(),
                 carina_core::parser::DeferredForTarget::bound(
                     carina_core::resource::absolute_binding_address_for_test("validation_records"),
                 )
                 .expect("fixture binding is valid"),
                 root_resource_ref("cert", "domain_validation_options", Vec::new()),
-                ForBinding::Simple("opt".to_string()),
+                ForBinding::Indexed("_".into(), "opt".to_string()),
                 template_resource,
             )),
         )))

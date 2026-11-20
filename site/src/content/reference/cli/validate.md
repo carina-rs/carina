@@ -151,7 +151,7 @@ Each diagnostic contains `message`, `severity`, `code`, and `location`. A diagno
 
 Empty `errors` and `warnings` arrays are omitted. Warning `type` values such as `input_rule`, `unused_binding`, and `duplicate_attribute` remain available; duplicate-attribute warnings also retain the legacy `file` field. Provider and parser warnings use the same diagnostic fields. Only safe diagnostic text is serialized, without source snippets or provider payloads.
 
-Informational loader notices, such as local-provider trust decisions, lock-format migration, and precompile-cache fallback, appear only in human output. They do not write to stderr in JSON mode.
+Informational loader notices, such as local-provider trust decisions and precompile-cache fallback, appear only in human output. They do not write to stderr in JSON mode.
 
 If a file cannot be parsed and contains `secret` followed by anything other than an ASCII letter, digit, or underscore (or followed by the end of the file), diagnostics protect the whole file. Human and editor output show only the parse error kind and position; JSON carries the kind and structured location. Source excerpts and content-based lints are suppressed for that file. Parseable files and other syntax failures keep their usual diagnostics.
 

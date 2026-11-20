@@ -1,62 +1,87 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-lineage-state-only-directive",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-lineage-state-only-directive",
   "resources": [
     {
-      "resource_type": "ec2.Vpc",
-      "identity": "vpc",
-      "provider": "awscc",
-      "identifier": "vpc-0123456789abcdef0",
-      "attributes": {
-        "cidr_block": "10.0.0.0/16",
-        "vpc_id": "vpc-0123456789abcdef0"
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "vpc",
+      "current": {
+        "attributes": {
+          "cidr_block": "10.0.0.0/16",
+          "vpc_id": "vpc-0123456789abcdef0"
+        },
+        "identifier": "vpc-0123456789abcdef0",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "cidr_block": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "vpc",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Vpc"
     },
     {
-      "resource_type": "ec2.Subnet",
-      "identity": "awscc_ec2_subnet_896cf31f",
-      "provider": "awscc",
-      "identifier": "subnet-0123456789abcdef0",
-      "attributes": {
-        "vpc_id": "vpc-0123456789abcdef0",
-        "cidr_block": "10.0.1.0/24",
-        "subnet_id": "subnet-0123456789abcdef0"
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "awscc_ec2_subnet_896cf31f",
+      "current": {
+        "attributes": {
+          "cidr_block": "10.0.1.0/24",
+          "subnet_id": "subnet-0123456789abcdef0",
+          "vpc_id": "vpc-0123456789abcdef0"
+        },
+        "identifier": "subnet-0123456789abcdef0",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [
-        "vpc"
+        {
+          "identity": "vpc",
+          "provider": "awscc",
+          "resource_type": "ec2.Vpc"
+        }
       ],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
-          "vpc_id": {
-            "kind": "leaf"
-          },
           "cidr_block": {
             "kind": "leaf"
+          },
+          "vpc_id": {
+            "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "awscc_ec2_subnet_896cf31f",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Subnet"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

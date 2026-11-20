@@ -24,7 +24,7 @@ carina providers repin-discovery <HOST> [PATH] [--force]
 
 ## repin-identity
 
-Discards every signer pin for the provider — its shared source pin and both channels' workflow pins, or its legacy certificate SAN and issuer — so the next signed artifact establishes a new source and the workflow for its channel.
+Discards every signer pin for the provider — its shared source pin and both channels' workflow pins — so the next signed artifact establishes a new source and the workflow for its channel.
 
 Use this when signature verification fails because the signing source or workflow legitimately changed. The signature *requirement* survives: after re-pinning, an unsigned artifact is still refused. The stable source-ref rule also remains in force because it is derived from the version, not stored as a pin.
 

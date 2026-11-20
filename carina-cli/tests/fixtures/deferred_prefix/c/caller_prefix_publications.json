@@ -1,0 +1,127 @@
+{
+  "b3_direct": {
+    "child/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
+        "range": {
+          "start": {
+            "line": 1,
+            "character": 2
+          },
+          "end": {
+            "line": 1,
+            "character": 22
+          }
+        },
+        "severity": 1
+      }
+    ]
+  },
+  "b3_interpolation": {
+    "child/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
+        "range": {
+          "start": {
+            "line": 1,
+            "character": 2
+          },
+          "end": {
+            "line": 1,
+            "character": 29
+          }
+        },
+        "severity": 1
+      }
+    ]
+  },
+  "b3_alias": {
+    "child/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier' (through 'p'), which is known only after apply",
+        "range": {
+          "start": {
+            "line": 1,
+            "character": 2
+          },
+          "end": {
+            "line": 1,
+            "character": 17
+          }
+        },
+        "severity": 1
+      }
+    ]
+  },
+  "b3_nested": {
+    "mod_b/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
+        "range": {
+          "start": {
+            "line": 1,
+            "character": 2
+          },
+          "end": {
+            "line": 1,
+            "character": 22
+          }
+        },
+        "severity": 1
+      }
+    ]
+  },
+  "b1_three_modules": {
+    "mod_a/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
+        "range": {
+          "start": {
+            "line": 2,
+            "character": 2
+          },
+          "end": {
+            "line": 2,
+            "character": 17
+          }
+        },
+        "severity": 1
+      }
+    ],
+    "mod_b/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
+        "range": {
+          "start": {
+            "line": 1,
+            "character": 2
+          },
+          "end": {
+            "line": 1,
+            "character": 22
+          }
+        },
+        "severity": 1
+      }
+    ]
+  },
+  "b2_hop_deferred": {
+    "child/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'r.name', which is not resolved when names are generated",
+        "range": {
+          "start": {
+            "line": 4,
+            "character": 2
+          },
+          "end": {
+            "line": 4,
+            "character": 22
+          }
+        },
+        "severity": 1
+      }
+    ]
+  },
+  "b2_hop_literal": {}
+}

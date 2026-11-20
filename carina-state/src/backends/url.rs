@@ -20,12 +20,12 @@
 //! scheme-prefixed" classification lives. The loader cannot be reached
 //! with an unclassified raw string.
 //!
-//! Offline commands use [`LocalStateFile`] and [`load_local_state_file`], which
-//! admit only local paths and never reach the general backend selector.
 
 use std::path::PathBuf;
 
-use crate::backend::{BackendError, BackendResult, StateBackend};
+#[cfg(test)]
+use crate::backend::StateBackend;
+use crate::backend::{BackendError, BackendResult};
 use crate::backend_selection::BackendSelection;
 use crate::state::{PublishedExports, StateFile};
 use crate::{GitBranch, RepositorySlug, StatePath};
@@ -77,64 +77,6 @@ fn decode_component(value: &str) -> Result<String, GitHubUrlError> {
         .decode_utf8()
         .map(|value| value.into_owned())
         .map_err(|_| GitHubUrlError::Encoding)
-}
-
-/// A local state file for offline commands. Remote URLs cannot inhabit this type.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalStateFile {
-    path: PathBuf,
-}
-
-impl LocalStateFile {
-    /// Accept a bare path or `file:///<absolute-path>`, rejecting remote schemes.
-    pub fn parse(raw: &str) -> BackendResult<Self> {
-        let path = if let Some(rest) = raw.strip_prefix("file://") {
-            if rest.is_empty() {
-                return Err(BackendError::configuration(format!(
-                    "Invalid file:// URL '{}': path is empty",
-                    raw
-                )));
-            }
-            if !rest.starts_with('/') {
-                return Err(BackendError::configuration(format!(
-                    "Invalid file:// URL '{}': use file:///<absolute-path> \
-                     (host form file://host/path is not supported)",
-                    raw
-                )));
-            }
-            rest
-        } else if raw.contains("://") {
-            return Err(BackendError::configuration(format!(
-                "Unsupported URL scheme in '{}': expected a local state file \
-                 (file:///<absolute-path> or a bare local path)",
-                raw
-            )));
-        } else if raw.is_empty() {
-            return Err(BackendError::configuration("Empty state URL"));
-        } else {
-            raw
-        };
-        Ok(Self { path: path.into() })
-    }
-}
-
-/// Read a local state file without constructing a remote backend or writing state.
-///
-/// A general state URL cannot be passed to the offline loader:
-///
-/// ```compile_fail,E0308
-/// use carina_state::{StateUrl, load_local_state_file};
-/// let remote = StateUrl::parse("s3://bucket/state.json").unwrap();
-/// let _ = load_local_state_file(&remote);
-/// ```
-pub async fn load_local_state_file(file: &LocalStateFile) -> BackendResult<StateFile> {
-    let location = crate::backend_config::LocalBackendLocation::for_file(&file.path)?;
-    let display_path = location.path().display().clone();
-    super::LocalBackend::from_location(location)?
-        .read_state()
-        .await?
-        .map(|loaded| loaded.into_state())
-        .ok_or_else(|| BackendError::InvalidState(format!("No state at {display_path}")))
 }
 
 /// A parsed `--state-url` argument.
@@ -204,9 +146,27 @@ impl StateUrl {
                 raw
             )))
         } else {
-            Ok(StateUrl::File {
-                path: LocalStateFile::parse(raw)?.path,
-            })
+            let path = if let Some(rest) = raw.strip_prefix("file://") {
+                if rest.is_empty() {
+                    return Err(BackendError::configuration(format!(
+                        "Invalid file:// URL '{}': path is empty",
+                        raw
+                    )));
+                }
+                if !rest.starts_with('/') {
+                    return Err(BackendError::configuration(format!(
+                        "Invalid file:// URL '{}': use file:///<absolute-path> \
+                             (host form file://host/path is not supported)",
+                        raw
+                    )));
+                }
+                rest
+            } else if raw.is_empty() {
+                return Err(BackendError::configuration("Empty state URL"));
+            } else {
+                raw
+            };
+            Ok(StateUrl::File { path: path.into() })
         }
     }
 
@@ -254,8 +214,7 @@ impl StateUrl {
         })
     }
 
-    /// Human-readable form, suitable for migration-warning display
-    /// targets and error messages.
+    /// Human-readable form for diagnostics.
     pub fn display_target(&self) -> String {
         match self {
             StateUrl::GitHub {
@@ -280,20 +239,13 @@ impl StateUrl {
 
 /// Load a [`StateFile`] from a parsed `--state-url`.
 ///
-/// Read-only: never acquires a lock, never persists migrations. If the
-/// on-disk state needs a schema migration, the lift happens in memory
-/// via the underlying backend (`S3Backend` / `LocalBackend`), which
-/// emits the per-backend migration warning to stderr through
-/// [`crate::state::log_state_migration_once`]. The lifted state is
-/// returned but the on-disk file is not rewritten — same shape as the
-/// existing read-only `state lookup`/`list`/`show` backend path.
+/// Read-only: never acquires a lock or writes state.
 ///
 /// Returns an error if the URL resolves to a missing object/file.
 pub async fn load_state_from_url(url: &StateUrl) -> BackendResult<StateFile> {
     let loaded = BackendSelection::explicit_url(url).read_state().await?;
 
     loaded
-        .map(|l| l.into_state())
         .ok_or_else(|| BackendError::InvalidState(format!("No state at {}", url.display_target())))
 }
 
@@ -314,57 +266,12 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn offline_locate_error_includes_file_context() {
-        let path = "invalid\0state.json";
-        let io = carina_core::paths::ResolvedPath::new(path).unwrap_err();
-        let file = LocalStateFile::parse(path).unwrap();
-        let error = load_local_state_file(&file).await.unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            format!("I/O error: Failed to locate state file: {io}")
-        );
-    }
-
-    #[tokio::test]
     async fn url_locate_error_uses_address_wording() {
         let path = "invalid\0state.json";
         let io = carina_core::paths::ResolvedPath::new(path).unwrap_err();
         let url = StateUrl::parse(path).unwrap();
         let error = load_state_from_url(&url).await.unwrap_err();
         assert_eq!(error.to_string(), format!("I/O error: {io}"));
-    }
-
-    #[test]
-    fn offline_local_state_file_rejects_remote_schemes() {
-        for raw in [
-            "s3://bucket/state.json",
-            "https://example.com/state.json",
-            "gs://bucket/state.json",
-        ] {
-            let error = LocalStateFile::parse(raw).unwrap_err();
-            assert!(error.to_string().contains("local state file"), "{error}");
-        }
-    }
-
-    #[tokio::test]
-    async fn offline_local_state_file_loads_without_writes() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("state.json");
-        let mut state = StateFile::new();
-        state.increment_serial();
-        let bytes = serde_json::to_vec_pretty(&state).unwrap();
-        std::fs::write(&path, &bytes).unwrap();
-        for raw in [
-            path.display().to_string(),
-            format!("file://{}", path.display()),
-        ] {
-            let local = LocalStateFile::parse(&raw).unwrap();
-            assert_eq!(
-                load_local_state_file(&local).await.unwrap().serial,
-                state.serial
-            );
-            assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        }
     }
 
     // ---- StateUrl::parse ----
@@ -617,14 +524,9 @@ mod terminal_locate_source_tests {
     #[tokio::test]
     async fn backend_locate_error_retains_terminal_io_cause() {
         let path = "bad\0state.json";
-        let errors = [
-            load_local_state_file(&LocalStateFile::parse(path).unwrap())
-                .await
-                .unwrap_err(),
-            load_state_from_url(&StateUrl::parse(path).unwrap())
-                .await
-                .unwrap_err(),
-        ];
+        let errors = [load_state_from_url(&StateUrl::parse(path).unwrap())
+            .await
+            .unwrap_err()];
         for error in errors {
             assert!(std::error::Error::source(&error).is_none());
             let BackendError::LocateLocal(error) = error else {
@@ -682,34 +584,25 @@ mod native_file_non_utf8_tests {
         // UTF-8 parsers cannot express these paths. Build the native carriers
         // inside their defining module, then use the production pinning seams.
         let url = StateUrl::File { path: path.clone() };
-        let file = LocalStateFile { path: path.clone() };
         let StateUrl::File { path: address } = &url else {
             panic!("expected a native file address")
         };
         assert_eq!(address.as_os_str().as_bytes(), path.as_os_str().as_bytes());
+        let location = LocalBackendLocation::for_address(address).unwrap();
+        assert!(matches!(location, LocalBackendLocation::NativeFile(_)));
         assert_eq!(
-            file.path.as_os_str().as_bytes(),
+            location.path().source_label().as_os_str().as_bytes(),
             path.as_os_str().as_bytes()
         );
-        for location in [
-            LocalBackendLocation::for_address(address).unwrap(),
-            LocalBackendLocation::for_file(&file.path).unwrap(),
-        ] {
-            assert!(matches!(location, LocalBackendLocation::NativeFile(_)));
-            assert_eq!(
-                location.path().source_label().as_os_str().as_bytes(),
-                path.as_os_str().as_bytes()
-            );
-            assert_eq!(
-                location
-                    .path()
-                    .persisted_path()
-                    .to_path_buf()
-                    .as_os_str()
-                    .as_bytes(),
-                path.as_os_str().as_bytes()
-            );
-        }
+        assert_eq!(
+            location
+                .path()
+                .persisted_path()
+                .to_path_buf()
+                .as_os_str()
+                .as_bytes(),
+            path.as_os_str().as_bytes()
+        );
     }
 
     #[tokio::test]
@@ -736,21 +629,19 @@ mod native_file_non_utf8_tests {
     }
 
     #[tokio::test]
-    async fn native_file_non_utf8_offline_file_round_trip() {
+    async fn native_file_non_utf8_local_backend_round_trip() {
         let (_directory, path) = native_path();
-        let file = LocalStateFile { path: path.clone() };
         if !create_file_if_supported(&path) {
             return;
         }
-        // The public offline entry is read-only; seed state through the same
-        // native constructor it uses, without the test-only backend shortcut.
-        let location = LocalBackendLocation::for_file(&file.path).unwrap();
+        // Exercise the native local-file constructor without a test-only backend shortcut.
+        let location = LocalBackendLocation::for_address(&path).unwrap();
         let backend = crate::backends::LocalBackend::from_location(location).unwrap();
         let mut state = StateFile::new();
         state.increment_serial();
         backend.write_state(&state).await.unwrap();
 
-        let loaded = load_local_state_file(&file).await.unwrap();
+        let loaded = backend.read_state().await.unwrap().unwrap();
         assert_eq!(
             serde_json::to_value(loaded).unwrap(),
             serde_json::to_value(state).unwrap()

@@ -1,0 +1,75 @@
+{
+  "json": {
+    "resource_count": 4,
+    "resources": [
+      "mock.test.resource.src",
+      "mock.test.resource.instance.r",
+      "mock.test.resource.instance.mock_test_resource_5f919d16",
+      "_virtual.instance"
+    ],
+    "status": "ok",
+    "warnings": [
+      {
+        "code": null,
+        "location": {
+          "file": "lets.crn",
+          "range": {
+            "end": {
+              "column": 8,
+              "line": 1
+            },
+            "start": {
+              "column": 5,
+              "line": 1
+            }
+          }
+        },
+        "message": "Unused let binding 'src'",
+        "severity": "warning",
+        "type": "unused_binding"
+      }
+    ]
+  },
+  "json_exit": 0,
+  "json_stderr": "",
+  "lsp": {
+    "backend.crn": [],
+    "child/arguments.crn": [],
+    "child/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'r.name', which is not resolved when names are generated",
+        "range": {
+          "end": {
+            "character": 22,
+            "line": 4
+          },
+          "start": {
+            "character": 2,
+            "line": 4
+          }
+        },
+        "severity": 1
+      }
+    ],
+    "lets.crn": [
+      {
+        "message": "Unused let binding 'src'. Consider using an anonymous resource instead.",
+        "range": {
+          "end": {
+            "character": 7,
+            "line": 0
+          },
+          "start": {
+            "character": 4,
+            "line": 0
+          }
+        },
+        "severity": 2
+      }
+    ],
+    "main.crn": [],
+    "providers.crn": []
+  },
+  "text": "Validating...\n✓ 4 resources validated successfully.\n  • mock.test.resource.src\n  • mock.test.resource.instance.r\n  • mock.test.resource.instance.mock_test_resource_5f919d16\n  • _virtual.instance\n⚠ Unused let binding 'src'. Consider using an anonymous resource instead.\n",
+  "text_exit": 0
+}

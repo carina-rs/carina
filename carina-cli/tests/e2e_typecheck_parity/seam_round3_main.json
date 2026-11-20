@@ -150,8 +150,8 @@
   },
   "for_argument_mismatch": {
     "cli": [
-      "child: test.Probe.probes[0]: cannot assign String to 'value': expected Int, got String (from input)",
-      "child: test.Probe.probes[1]: cannot assign String to 'value': expected Int, got String (from input)",
+      "child: test.Probe.probes.one: cannot assign String to 'value': expected Int, got String (from input)",
+      "child: test.Probe.probes.two: cannot assign String to 'value': expected Int, got String (from input)",
       "<fixture>/child/main.crn at line 2\nType mismatch: expected Int, got String (from input)",
       "<fixture>/child/main.crn at line 2\n<fixture>/child/main.crn: Type mismatch: expected Int, got String (from input) at line 2\n<fixture>/child/main.crn at line 2\nType mismatch: expected Int, got String (from input)"
     ],

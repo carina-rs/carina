@@ -740,7 +740,7 @@ impl ResourceValueValidation {
         ));
     }
 
-    pub(super) fn append_values(&mut self, values: Self) {
+    pub(crate) fn append_values(&mut self, values: Self) {
         self.errors.extend(values.errors);
         self.attributes.extend(values.attributes);
     }
