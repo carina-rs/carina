@@ -3,8 +3,8 @@
 use super::NoConversion;
 
 use super::{
-    AuthoredExpr, ConditionSnapshot, ExprKind, ExpressionInstance, ExpressionLocation,
-    ExpressionReport, JudgedExpr, MissingEvidence, Projection,
+    AuthoredExpr, AuthoredSlotKind, ConditionSnapshot, ExprKind, ExpressionInstance,
+    ExpressionLocation, ExpressionReport, JudgedExpr, MissingEvidence, Projection,
 };
 use crate::resource::knowledge::{Apply, Knowledge, PlanResolved};
 use crate::resource::{
@@ -1155,6 +1155,38 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
     }
 }
 
+/// A parser-issued capability to put evidence on a provider-attribute row.
+pub(crate) struct AttributeRowKey(String);
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RowAttributes<V>(indexmap::IndexMap<String, V>);
+
+impl<V> Default for RowAttributes<V> {
+    fn default() -> Self {
+        Self(indexmap::IndexMap::new())
+    }
+}
+
+impl<V> RowAttributes<V> {
+    pub(crate) fn insert(&mut self, key: AttributeRowKey, value: V) {
+        self.0.insert(key.0, value);
+    }
+}
+
+impl<V> std::ops::Deref for RowAttributes<V> {
+    type Target = indexmap::IndexMap<String, V>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<V: std::fmt::Debug> std::fmt::Debug for RowAttributes<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
 /// The complete attribute input, sealed by retained construction. Replacing or
 /// expanding a projection must transport this bundle and renew its generation.
 #[derive(Clone)]
@@ -1167,6 +1199,7 @@ pub struct JudgedSlot<B: BindingAddress = RelativeBindingName> {
     snapshot: Option<Arc<ExpressionReport<B>>>,
     snapshot_error: Option<MissingEvidence>,
     schema_kind: crate::schema::SchemaKind,
+    slot_kind: AuthoredSlotKind,
     conditions: ConditionSnapshot,
 }
 
@@ -1181,9 +1214,24 @@ impl<B: BindingAddress> std::fmt::Debug for JudgedSlot<B> {
 }
 
 impl JudgedSlot {
+    #[cfg(test)]
     fn from_expression(
         expression: super::ExprValue,
         schema_kind: crate::schema::SchemaKind,
+        instance: ExpansionInstanceId,
+    ) -> Self {
+        Self::from_classified_expression(
+            expression,
+            schema_kind,
+            AuthoredSlotKind::Attribute,
+            instance,
+        )
+    }
+
+    fn from_classified_expression(
+        expression: super::ExprValue,
+        schema_kind: crate::schema::SchemaKind,
+        slot_kind: AuthoredSlotKind,
         instance: ExpansionInstanceId,
     ) -> Self {
         Self {
@@ -1195,12 +1243,25 @@ impl JudgedSlot {
             snapshot: None,
             snapshot_error: None,
             schema_kind,
+            slot_kind,
             conditions: ConditionSnapshot::default(),
         }
     }
 }
 
 impl<B: BindingAddress> JudgedSlot<B> {
+    pub(crate) fn attribute_row_key(
+        &self,
+        name: &crate::parser::AttributeKey,
+    ) -> Option<AttributeRowKey> {
+        match self.slot_kind {
+            AuthoredSlotKind::Attribute => {
+                Some(AttributeRowKey(name.transport_identity().to_owned()))
+            }
+            AuthoredSlotKind::Directives => None,
+        }
+    }
+
     pub(crate) fn secrecy_conditions(&self) -> ConditionSnapshot {
         self.conditions.clone()
     }
@@ -1809,6 +1870,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
                             snapshot: None,
                             snapshot_error: None,
                             schema_kind: slot.schema_kind,
+                            slot_kind: slot.slot_kind,
                             conditions: slot.conditions,
                         },
                     )
@@ -1859,10 +1921,12 @@ impl AuthoredSlots {
         name: impl Into<crate::parser::AttributeKey>,
         expression: super::ExprValue,
         kind: crate::schema::SchemaKind,
+        slot_kind: AuthoredSlotKind,
         instance: ExpansionInstanceId,
         conditions: ConditionSnapshot,
     ) {
-        let mut slot = JudgedSlot::from_expression(expression, kind, instance);
+        let mut slot =
+            JudgedSlot::from_classified_expression(expression, kind, slot_kind, instance);
         slot.conditions = conditions;
         self.slots.insert(name, slot);
     }

@@ -1,0 +1,3 @@
+Error: ./main.crn at line 1
+Error: unknown attribute `directives` on `b`
+Error: ./main.crn:1:61: Attribute 'name': ?? alternatives mix secret and public values; all alternatives must be secret or all public.

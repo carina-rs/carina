@@ -1,0 +1,1 @@
+mock.test.resource { name = 'y' directives { force_delete = secret(true) ?? false } }

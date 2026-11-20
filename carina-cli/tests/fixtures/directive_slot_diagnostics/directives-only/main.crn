@@ -1,0 +1,2 @@
+
+mock.test.resource { name = 'y' directives { depends_on = [x as mock.actions.OidcSubject.ClaimKey] } }

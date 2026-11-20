@@ -1,0 +1,1 @@
+let b = mock.test.resource { name = 'b' comment = secret('s') ?? b.directives directives { prevent_destroy = true } }

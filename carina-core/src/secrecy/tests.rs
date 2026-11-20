@@ -59,6 +59,107 @@ fn with_parser_stack(test: impl FnOnce() + Send + 'static) {
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
+const SECRET_TOKEN_SOURCE: &str = "let token = secret('canary')\n";
+const DIRECTIVES_SOURCE: &str = r#"
+let protected = mock.test.Resource {
+  name = "protected"
+  comment = token
+  directives { prevent_destroy = true }
+}
+"#;
+const PLAIN_RESOURCE_SOURCE: &str =
+    "let plain = mock.test.Resource { name = 'plain' comment = 'visible' }\n";
+
+fn assert_directives_secrecy(report: &SecrecyReport) {
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(!report.is_pending(), "{report:?}");
+    let graph = report
+        .admitted()
+        .expect("complete resource secrecy evidence");
+    assert_eq!(report.rows.len(), 2);
+    assert_eq!(
+        attribute(report, "protected", "comment"),
+        Evidence::Leaf(Secrecy::Secret)
+    );
+    assert_eq!(
+        attribute(report, "plain", "comment"),
+        Evidence::Leaf(Secrecy::Public)
+    );
+    for (id, row) in report.rows.iter() {
+        assert_eq!(
+            row.attributes
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["name", "comment"]
+        );
+        assert_eq!(row.attributes["name"], Evidence::Leaf(Secrecy::Public));
+        assert_eq!(graph.attributes(id), Some(&*row.attributes));
+    }
+}
+
+#[test]
+fn resource_directives_do_not_make_file_secrecy_pending() {
+    assert_directives_secrecy(&report(&format!(
+        "{SECRET_TOKEN_SOURCE}{DIRECTIVES_SOURCE}{PLAIN_RESOURCE_SOURCE}"
+    )));
+}
+
+#[test]
+fn resource_directives_do_not_make_directory_secrecy_pending() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("main.crn"), DIRECTIVES_SOURCE).unwrap();
+    std::fs::write(
+        directory.path().join("providers.crn"),
+        format!("provider mock {{}}\n{SECRET_TOKEN_SOURCE}{PLAIN_RESOURCE_SOURCE}"),
+    )
+    .unwrap();
+    let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let parsed = crate::config_loader::parse_directory(&path, &context())
+        .unwrap()
+        .parsed()
+        .clone();
+    assert_directives_secrecy(&secrecy_report(&parsed, &schemas()));
+}
+
+#[test]
+fn resource_directives_named_attribute_keeps_its_secrecy_slot() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        Schema::new("test.Custom")
+            .attribute(Attribute::optional("directives", Type::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let file = parsed("let custom = mock.test.Custom { directives = secret('canary') }");
+    let report = secrecy_report(&file, &schemas);
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(!report.is_pending(), "{report:?}");
+    assert!(report.admitted().is_some());
+    assert_eq!(
+        attribute(&report, "custom", "directives"),
+        Evidence::Leaf(Secrecy::Secret)
+    );
+}
+
+#[test]
+fn resource_attribute_count_mismatch_keeps_secrecy_pending() {
+    let mut file = parsed("let plain = mock.test.Resource { name = 'plain' }");
+    assert!(secrecy_report(&file, &schemas()).admitted().is_some());
+    file.resources[0].attributes.insert(
+        "comment".into(),
+        Value::Concrete(ConcreteValue::String("no-authored-slot".into())),
+    );
+    let report = secrecy_report(&file, &schemas());
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert_eq!(report.rows.len(), 1);
+    assert_eq!(report.rows.values().next().unwrap().attributes.len(), 1);
+    assert_eq!(file.resources[0].attributes.len(), 2);
+    assert!(report.is_pending(), "{report:?}");
+    assert!(report.admitted().is_none());
+}
+
 #[test]
 fn references_operands_interpolation_and_selected_paths_retain_secrecy() {
     let report = report(
@@ -2283,4 +2384,276 @@ let sink = mock.test.Resource { name = "sink" comment = g(seed) }
         .filter_map(|row| row.attributes.get("comment"))
         .collect::<Vec<_>>();
     assert_eq!(comments, vec![&Evidence::Leaf(Secrecy::Secret)]);
+}
+
+fn assert_directive_expression_admitted(case: &str, report: &SecrecyReport) {
+    assert!(report.findings().is_empty(), "{case}: {report:?}");
+    assert!(report.admitted().is_some(), "{case}: {report:?}");
+    assert!(
+        report
+            .rows
+            .values()
+            .all(|row| !row.attributes.contains_key("directives")),
+        "metadata must not enter attribute rows: {case}: {report:?}"
+    );
+}
+
+#[test]
+fn resource_directives_ignore_changes_local_map_is_metadata() {
+    let report = report(
+        "let tags = { Name = 'outside' }\nlet sink = mock.test.Resource { name = 'sink' tags = {} directives { ignore_changes = [tags.Name] } }\n",
+    );
+    assert_directive_expression_admitted("ignore_changes local map", &report);
+}
+
+#[test]
+fn resource_directives_with_failed_expression_stays_pending() {
+    let report = report(
+        "let b = mock.test.Resource { name = 'b' }\nlet sink = mock.test.Resource { name = 'sink' directives { ignore_changes = [b.x] } }\n",
+    );
+    let file = parsed(
+        "let b = mock.test.Resource { name = 'b' }\nlet sink = mock.test.Resource { name = 'sink' directives { ignore_changes = [b.x] } }\n",
+    );
+    let syntax = crate::parser::retained::judge_expressions(&file, &schemas(), &context());
+    assert!(syntax.has_failed_expressions());
+    assert_eq!(report.rows.len(), 2);
+    assert!(report.rows.values().all(|row| row.attributes.len() == 1));
+    assert!(
+        report
+            .traversals
+            .iter()
+            .any(|walk| walk.attribute == "directives")
+    );
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(
+        report.is_pending(),
+        "the judge failure remains out of scope: {report:?}"
+    );
+    assert!(report.admitted().is_none());
+}
+
+fn assert_directive_dependency_keeps_base_pending(case: &str, report: &SecrecyReport) {
+    assert!(report.findings().is_empty(), "{case}: {report:?}");
+    assert!(
+        report.is_pending(),
+        "base cannot derive this dependency: {case}: {report:?}"
+    );
+    assert!(report.admitted().is_none());
+    assert_eq!(report.rows.len(), 2);
+    assert!(
+        report
+            .rows
+            .values()
+            .all(|row| row.attributes.len() == 1 && row.attributes.contains_key("name")),
+        "the count check passes: {report:?}"
+    );
+    assert!(
+        report
+            .traversals
+            .iter()
+            .any(|walk| walk.attribute == "directives")
+    );
+}
+
+#[test]
+fn resource_directives_depends_on_if_binding_is_metadata() {
+    let prefix = "let selected = if true { mock.test.Resource { name = 'selected' } } else { mock.test.Resource { name = 'unused' } }\n";
+    let control = report(&format!(
+        "{prefix}let sink = mock.test.Resource {{ name = 'sink' }}\n"
+    ));
+    assert_directive_expression_admitted("if binding control", &control);
+    let observed = report(&format!(
+        "{prefix}let sink = mock.test.Resource {{ name = 'sink' directives {{ depends_on = [selected] }} }}\n"
+    ));
+    assert_directive_dependency_keeps_base_pending("depends_on if binding", &observed);
+}
+
+#[test]
+fn resource_directives_depends_on_for_binding_is_metadata() {
+    let prefix = "let items = for name in ['one'] { mock.test.Resource { name = name } }\n";
+    let control = report(&format!(
+        "{prefix}let sink = mock.test.Resource {{ name = 'sink' }}\n"
+    ));
+    assert_directive_expression_admitted("for binding control", &control);
+    let observed = report(&format!(
+        "{prefix}let sink = mock.test.Resource {{ name = 'sink' directives {{ depends_on = [items] }} }}\n"
+    ));
+    assert_directive_dependency_keeps_base_pending("depends_on for binding", &observed);
+}
+
+fn directive_module_report(root: &str, body: &str) -> SecrecyReport {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("child")).unwrap();
+    std::fs::write(directory.path().join("child/main.crn"), body).unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        format!("let child = use {{ source = './child' }}\n{root}"),
+    )
+    .unwrap();
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let context = context();
+    let schemas = schemas();
+    let file = crate::config_loader::load_configuration_with_config(&base, &context, &schemas)
+        .unwrap()
+        .parsed;
+    let expanded = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        crate::module_resolver::resolve_modules_with_providerless_config(
+            file, &base, session, &schemas,
+        )
+        .unwrap()
+    });
+    for resource in &expanded.resources {
+        assert!(resource.authored_slots.get("directives").is_ok());
+        let slots = resource
+            .authored_slots
+            .iter()
+            .filter_map(|(name, slot)| {
+                slot.attribute_row_key(name)
+                    .map(|_| name.transport_identity().to_owned())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let attributes = resource
+            .attributes
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(slots, attributes, "module-expanded resource slots");
+    }
+    crate::config_loader::load_buffer_configuration(&expanded, &schemas, &context)
+        .judged()
+        .secrecy()
+        .clone()
+}
+
+#[test]
+fn resource_directives_module_argument_is_metadata() {
+    let body = "arguments { flag: Bool }\nmock.test.Resource { name = 'child' directives { prevent_destroy = flag } }\n";
+    let report = directive_module_report("let instance = child { flag = true }\n", body);
+    assert_directive_expression_admitted("module argument", &report);
+}
+
+#[test]
+fn resource_directives_keep_ordinary_discarded_attribute_findings() {
+    let report = report(
+        "if false { mock.test.Resource { name = 'discarded' comment = secret('canary') ?? 'public' directives { prevent_destroy = true } } } else { mock.test.Resource { name = 'selected' } }\n",
+    );
+    assert!(
+        report
+            .findings()
+            .iter()
+            .any(|finding| matches!(finding.cause(), DerivationError::MixedAlternatives(_))),
+        "{report:?}"
+    );
+    assert!(report.admitted().is_none());
+}
+
+#[test]
+fn resource_directives_keep_underivable_attribute_count_pending() {
+    let file = parsed(
+        "let role = mock.test.Resource { name = 'role' tags = {} }\nlet local = role.tags\nlet consumer = mock.test.Resource { name = 'consumer' comment = local.absent directives { prevent_destroy = true } }\n",
+    );
+    let consumer = file
+        .resources
+        .iter()
+        .find(|resource| resource.id.identity_str() == Some("consumer"))
+        .unwrap();
+    assert_eq!(consumer.attributes.len(), 2);
+    assert_eq!(
+        consumer
+            .authored_slots
+            .iter()
+            .filter(|(name, slot)| slot.attribute_row_key(name).is_some())
+            .count(),
+        2
+    );
+    assert_eq!(consumer.authored_slots.iter().count(), 3);
+    let report = secrecy_report(&file, &schemas());
+    assert!(report.findings().is_empty(), "{report:?}");
+    let row = report.rows.get(&consumer.id).expect("consumer evidence");
+    assert_eq!(row.attributes.len(), 1);
+    assert_eq!(row.attributes["name"], Evidence::Leaf(Secrecy::Public));
+    assert!(!row.attributes.contains_key("comment"));
+    assert!(report.is_pending(), "{report:?}");
+    assert!(report.admitted().is_none());
+}
+
+#[test]
+fn resource_directives_mixed_alternatives_keep_findings_and_attribute_count() {
+    let file = parsed(
+        "mock.test.Resource { name = 'sink' comment = secret('canary') directives { prevent_destroy = true ?? secret(true) } }\n",
+    );
+    let observed = secrecy_report(&file, &schemas());
+    assert!(
+        observed
+            .findings()
+            .iter()
+            .any(|finding| matches!(finding.cause(), DerivationError::MixedAlternatives(_))),
+        "{observed:?}"
+    );
+    assert!(
+        observed
+            .findings()
+            .iter()
+            .any(|finding| finding.message().starts_with("Attribute 'directives':")),
+        "{observed:?}"
+    );
+    let row = observed
+        .rows
+        .values()
+        .next()
+        .expect("ordinary resource evidence");
+    assert_eq!(file.resources[0].attributes.len(), 2);
+    assert_eq!(
+        row.attributes.len(),
+        file.resources[0].attributes.len(),
+        "the count comparison passes"
+    );
+    assert_eq!(row.attributes["name"], Evidence::Leaf(Secrecy::Public));
+    assert_eq!(row.attributes["comment"], Evidence::Leaf(Secrecy::Secret));
+    assert!(!row.attributes.contains_key("directives"));
+    assert!(
+        observed.admitted().is_none(),
+        "findings prevent file admission"
+    );
+}
+
+#[test]
+fn resource_directives_assignment_and_block_keep_base_attribute_in_both_orders() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        Schema::new("test.Custom")
+            .attribute(Attribute::optional("name", Type::string()).build())
+            .attribute(Attribute::optional("directives", Type::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    for body in [
+        "directives = x directives { prevent_destroy = true }",
+        "directives { prevent_destroy = true } directives = x",
+        "directives = x directives {}",
+        "directives {} directives = x",
+    ] {
+        let file = parsed(&format!(
+            "let x = secret('canary')\nlet sink = mock.test.Custom {{ name = 'sink' {body} }}\n"
+        ));
+        let observed = secrecy_report(&file, &schemas);
+        assert!(observed.findings().is_empty(), "{body}: {observed:?}");
+        let row = observed.rows.values().next().unwrap();
+        assert_eq!(
+            row.attributes.len(),
+            file.resources[0].attributes.len(),
+            "{body}: {observed:?}"
+        );
+        assert_eq!(
+            row.attributes["directives"],
+            Evidence::Leaf(Secrecy::Secret)
+        );
+        assert!(
+            observed.is_pending(),
+            "the base judge remains pending: {body}: {observed:?}"
+        );
+        assert!(observed.admitted().is_none(), "{body}: {observed:?}");
+    }
 }

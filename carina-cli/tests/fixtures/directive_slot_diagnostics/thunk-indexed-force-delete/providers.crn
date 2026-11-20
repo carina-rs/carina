@@ -1,0 +1,2 @@
+provider mock {}
+let b = mock.test.resource { name = 'b' directives { force_delete = true } }

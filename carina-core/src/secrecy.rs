@@ -8,7 +8,9 @@ use std::sync::{Arc, OnceLock};
 
 use indexmap::{IndexMap, IndexSet};
 
-use crate::parser::retained::{ExprKind, ExprValue, ExpressionInstance, ExpressionReport, NodeId};
+use crate::parser::retained::{
+    ExprKind, ExprValue, ExpressionInstance, ExpressionReport, NodeId, RowAttributes,
+};
 use crate::parser::{DeclarationLocation, File, ResourceRef};
 use crate::resource::{
     BindingAddress, ConcreteValue, DeferredValue, FunctionArgument, InterpolationPart,
@@ -313,7 +315,7 @@ pub struct SecrecyReport {
 struct Row {
     declaration: crate::parser::retained::SlotDeclarationId,
     instance: Option<crate::parser::retained::ExpansionInstanceId>,
-    attributes: IndexMap<String, Evidence>,
+    attributes: RowAttributes<Evidence>,
 }
 
 impl SecrecyReport {
@@ -404,7 +406,7 @@ pub struct ValidatedSecrecyGraph {
 }
 impl ValidatedSecrecyGraph {
     pub fn attributes(&self, resource: &ResourceId) -> Option<&IndexMap<String, Evidence>> {
-        self.rows.get(resource).map(|row| &row.attributes)
+        self.rows.get(resource).map(|row| &*row.attributes)
     }
 }
 
@@ -1335,7 +1337,7 @@ where
             Arc::make_mut(&mut report.rows).shift_remove(resource.id());
             continue;
         }
-        let mut attributes = IndexMap::new();
+        let mut attributes = RowAttributes::default();
         for (name, slot) in slots.iter() {
             let Some(source) = syntax.secrecy_root(resource.id(), slot.secrecy_node()) else {
                 report.pending = true;
@@ -1354,7 +1356,9 @@ where
                 report.inspect_source(&owner, name.to_string(), location, source, environment);
             match evidence {
                 Some(evidence) => {
-                    attributes.insert(name.transport_identity().to_string(), evidence);
+                    if let Some(key) = slot.attribute_row_key(name) {
+                        attributes.insert(key, evidence);
+                    }
                 }
                 None => report.pending = true,
             }
