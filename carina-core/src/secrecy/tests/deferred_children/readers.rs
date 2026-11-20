@@ -239,6 +239,22 @@ fn assert_reader_protected(
                     "export 'output' cannot hold a secret value",
                     "{label}"
                 );
+                let error =
+                    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                        crate::validation::check_export_values_pre_apply(
+                            &file.export_params,
+                            &bindings,
+                            session,
+                            crate::parser::retained::ProjectedPhase::plan_context(
+                                &crate::resource::knowledge::KnowledgeContext::plan(&bindings),
+                            ),
+                        )
+                    })
+                    .expect_err("list child export must be rejected by the plan export check");
+                assert_eq!(
+                    error, "export 'output' cannot hold a secret value",
+                    "{label}"
+                );
             }
         }
     }

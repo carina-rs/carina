@@ -9327,6 +9327,14 @@ impl<S, P: ValueKind, B: BindingAddress, D> Resource<S, P, B, D> {
     /// Authored metadata is in-memory only (`#[serde(skip)]`), so decoding a
     /// resource directly instead reads `ChildSecrecyRead::NotLoopChild`.
     /// The shape of the unavailable case is provisional until carina#4442.
+    ///
+    /// Known gap: the hand-over lives in public, clonable `authored_slots`.
+    /// Rust code can copy a child's `authored_slots` and `loop_provenance` onto
+    /// another resource of the same provider and type, or clone a child and
+    /// replace only its attributes, and still read `ChildSecrecyRead::Row`:
+    /// attributes are not part of the match. No `.crn` input reaches this, and
+    /// no production code reads the row yet. carina#4442 decides where the
+    /// judgement is kept together with the consumer (see also carina#4563).
     pub fn child_secrecy(&self) -> crate::secrecy::ChildSecrecyRead<'_> {
         use crate::secrecy::{ChildSecrecy, ChildSecrecyRead};
         match self.authored_slots.child_secrecy() {

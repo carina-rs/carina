@@ -744,6 +744,21 @@ fn assert_foreign_template_rejected(entry_point: &str) {
         }
         _ => unreachable!(),
     }
+    let template = &file_b.deferred_for_expressions()[0];
+    let error = graph(&file_b).template_evidence(template).unwrap_err();
+    assert_eq!(
+        error,
+        TemplateAdmissionError::ForeignTemplateEvidence {
+            resource: template.template_resource_id().clone(),
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "deferred-for template `{}` carries secrecy evidence this configuration did not admit",
+            template.template_resource_id()
+        )
+    );
     let before = file_b.clone();
     // Unresolved loop-slot values deliberately compare unequal. Compare the
     // structural representation and check the retained capability separately.
@@ -855,8 +870,18 @@ fn issue_4516_foreign_template_evidence_cannot_replace_derived_evidence() {
     };
     // Equal slots and equal evidence are insufficient: admission owns the Arc.
     template.attach_template_evidence(std::sync::Arc::new(evidence.as_ref().clone()));
-    assert!(matches!(
-        graph(&file).template_evidence(&template),
-        Err(TemplateAdmissionError::MissingTemplateEvidence { .. })
-    ));
+    let error = graph(&file).template_evidence(&template).unwrap_err();
+    assert_eq!(
+        error,
+        TemplateAdmissionError::ForeignTemplateEvidence {
+            resource: template.template_resource_id().clone(),
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "deferred-for template `{}` carries secrecy evidence this configuration did not admit",
+            template.template_resource_id()
+        )
+    );
 }

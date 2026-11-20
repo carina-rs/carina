@@ -419,11 +419,19 @@ pub enum ChildSecrecy {
 /// The deferred-for hand-over checked against the resource carrying it.
 /// Every outcome must be handled explicitly, including an attached row that no
 /// longer matches. The unavailable shape is provisional until carina#4442.
+///
+/// Known gap: the hand-over lives in public, clonable `authored_slots`.
+/// Rust code can copy a child's `authored_slots` and `loop_provenance` onto
+/// another resource of the same provider and type, or clone a child and
+/// replace only its attributes, and still read `Row`: attributes are not part
+/// of the match. No `.crn` input reaches this, and no production code reads the
+/// row yet. carina#4442 decides where the judgement is kept together with the
+/// consumer (see also carina#4563).
 #[derive(Debug)]
 pub enum ChildSecrecyRead<'a> {
     /// No deferred-for hand-over is attached to this resource.
     NotLoopChild,
-    /// The checked row still belongs to this resource and loop element.
+    /// The attached row matches the checked metadata and loop element.
     Row(&'a ChildRow),
     /// Expansion could not obtain admitted template evidence.
     Unavailable(TemplateEvidenceUnavailable),
@@ -449,6 +457,10 @@ pub enum TemplateEvidenceMismatch {
 pub enum TemplateAdmissionError {
     #[error("admitted secrecy graph has no evidence for deferred-for template `{resource}`")]
     MissingTemplateEvidence { resource: ResourceId },
+    #[error(
+        "deferred-for template `{resource}` carries secrecy evidence this configuration did not admit"
+    )]
+    ForeignTemplateEvidence { resource: ResourceId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -657,7 +669,14 @@ impl ValidatedSecrecyGraph {
     ) -> Result<Arc<TemplateEvidence>, TemplateAdmissionError> {
         let slots = &template.template_resource().as_resource().authored_slots;
         let evidence = match template.secrecy() {
-            TemplateSecrecy::Derived(evidence) => self.owns_template(evidence).then_some(evidence),
+            TemplateSecrecy::Derived(evidence) => {
+                if !self.owns_template(evidence) {
+                    return Err(TemplateAdmissionError::ForeignTemplateEvidence {
+                        resource: template.template_resource_id().clone(),
+                    });
+                }
+                Some(evidence)
+            }
             TemplateSecrecy::Unavailable(_) => self.templates.get(template.template_resource_id()),
         };
         evidence
