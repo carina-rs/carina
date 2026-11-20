@@ -515,7 +515,7 @@ fn rejection<B: BindingAddress>(
             | ExprKind::Parameter(_)
             | ExprKind::LoopSlot(_)
             | ExprKind::UntypedParameter
-            | ExprKind::Binding(_)
+            | ExprKind::Binding { .. }
             | ExprKind::Reference { .. }
             | ExprKind::List
             | ExprKind::Map(_)
@@ -911,7 +911,7 @@ pub(crate) fn check<K: AssignmentKind, P: crate::resource::PlaceholderKind, B: B
         | ExprKind::Parameter(_)
         | ExprKind::LoopSlot(_)
         | ExprKind::UntypedParameter
-        | ExprKind::Binding(_)
+        | ExprKind::Binding { .. }
         | ExprKind::Reference { .. }
         | ExprKind::List
         | ExprKind::Map(_)

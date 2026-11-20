@@ -1,0 +1,106 @@
+{
+  "m4_bad_argument_type": {
+    ".": {
+      "text": "Validating...\nError: main.crn at line 2\nError: module call 'c (anonymous call)': argument 'prefix': expected String, got int (1)\n",
+      "json": {
+        "status": "error",
+        "resource_count": 0,
+        "resources": [],
+        "errors": [
+          {
+            "message": "module call 'c (anonymous call)': argument 'prefix': expected String, got int (1)",
+            "severity": "error",
+            "code": null,
+            "location": {
+              "file": "main.crn",
+              "range": {
+                "start": {
+                  "line": 2,
+                  "column": 14
+                },
+                "end": {
+                  "line": 2,
+                  "column": 15
+                }
+              }
+            }
+          }
+        ]
+      },
+      "text_exit": 1,
+      "json_exit": 1
+    }
+  },
+  "m4_missing_argument": {
+    ".": {
+      "text": "Validating...\nError: main.crn at line 2\nError: Missing required argument 'prefix' for module 'c'\n",
+      "json": {
+        "status": "error",
+        "resource_count": 0,
+        "resources": [],
+        "errors": [
+          {
+            "message": "Missing required argument 'prefix' for module 'c'",
+            "severity": "error",
+            "code": null,
+            "location": {
+              "file": "main.crn",
+              "range": {
+                "start": {
+                  "line": 2,
+                  "column": 1
+                },
+                "end": {
+                  "line": 2,
+                  "column": 5
+                }
+              }
+            }
+          }
+        ]
+      },
+      "text_exit": 1,
+      "json_exit": 1
+    }
+  },
+  "m4_standalone_with_provider": {
+    "child": {
+      "text": "Validating...\nError: arguments blocks are only valid inside module definitions, not in root configurations.\n",
+      "json": {
+        "status": "error",
+        "resource_count": 0,
+        "resources": [],
+        "errors": [
+          {
+            "message": "arguments blocks are only valid inside module definitions, not in root configurations.",
+            "severity": "error",
+            "code": null,
+            "location": null
+          }
+        ]
+      },
+      "text_exit": 1,
+      "json_exit": 1
+    }
+  },
+  "m4_standalone_with_backend": {
+    "child": {
+      "text": "Validating...\nError: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\n",
+      "json": {
+        "status": "error",
+        "resource_count": 0,
+        "resources": [],
+        "errors": [
+          {
+            "message": "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
+            "severity": "error",
+            "code": null,
+            "location": null
+          }
+        ]
+      },
+      "text_exit": 1,
+      "json_exit": 1
+    }
+  }
+}

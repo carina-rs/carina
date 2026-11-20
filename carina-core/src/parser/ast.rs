@@ -4163,6 +4163,12 @@ impl SourceFileId {
     pub fn path(&self) -> &Path {
         &self.0
     }
+
+    /// Source label for publication, reducing real-directory parent components
+    /// without replacing an authored symlink spelling by its target.
+    pub fn diagnostic_path(&self) -> PathBuf {
+        crate::paths::DisplayPath::for_diagnostics(self.path()).into_source_path()
+    }
 }
 
 /// Parser-owned identity of one lexical binding scope.
@@ -6669,6 +6675,11 @@ pub trait DeferredForPhaseTraversal<
         P: 'a,
         T: 'a;
 
+    fn deferred_binding<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a ForBinding
+    where
+        P: 'a,
+        T: 'a;
+
     fn deferred_header<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a str
     where
         P: 'a,
@@ -6783,6 +6794,10 @@ impl<P: ValueKind, B: BindingAddress> DeferredForPhaseTraversal<P, P, B>
         &deferred.iterable
     }
 
+    fn deferred_binding<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a ForBinding {
+        &deferred.binding
+    }
+
     fn deferred_header<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a str {
         &deferred.header
     }
@@ -6881,6 +6896,14 @@ impl<P: ValueKind, T: ValueKind, B: BindingAddress> DeferredForPhaseTraversal<P,
         T: 'a,
     {
         &deferred.iterable
+    }
+
+    fn deferred_binding<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a ForBinding
+    where
+        P: 'a,
+        T: 'a,
+    {
+        &deferred.binding
     }
 
     fn deferred_header<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a str

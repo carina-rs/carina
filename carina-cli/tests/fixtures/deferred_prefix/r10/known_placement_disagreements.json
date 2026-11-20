@@ -1,0 +1,160 @@
+{
+  "m4_standalone_with_provider": {
+    "validate": {
+      "text": "Validating...\nError: arguments blocks are only valid inside module definitions, not in root configurations.\n",
+      "text_exit": 1,
+      "json": {
+        "status": "error",
+        "resource_count": 0,
+        "resources": [],
+        "errors": [
+          {
+            "message": "arguments blocks are only valid inside module definitions, not in root configurations.",
+            "severity": "error",
+            "code": null,
+            "location": null
+          }
+        ]
+      },
+      "json_exit": 1,
+      "json_stderr": ""
+    },
+    "lsp": {
+      "child/arguments.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 0
+            },
+            "start": {
+              "character": 0,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "arguments blocks are only valid inside module definitions, not in root configurations."
+        }
+      ],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ],
+      "child/providers.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 13,
+              "line": 0
+            },
+            "start": {
+              "character": 0,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "provider blocks are not allowed inside modules. Define providers at the root configuration level."
+        }
+      ]
+    }
+  },
+  "m4_standalone_with_backend": {
+    "validate": {
+      "text": "Validating...\nError: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\n",
+      "text_exit": 1,
+      "json": {
+        "status": "error",
+        "resource_count": 0,
+        "resources": [],
+        "errors": [
+          {
+            "message": "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
+            "severity": "error",
+            "code": null,
+            "location": null
+          }
+        ]
+      },
+      "json_exit": 1,
+      "json_stderr": ""
+    },
+    "lsp": {
+      "child/arguments.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 0
+            },
+            "start": {
+              "character": 0,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "arguments blocks are only valid inside module definitions, not in root configurations."
+        }
+      ],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ],
+      "child/providers.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 13,
+              "line": 0
+            },
+            "start": {
+              "character": 0,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "provider blocks are not allowed inside modules. Define providers at the root configuration level."
+        }
+      ],
+      "child/backend.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 7,
+              "line": 0
+            },
+            "start": {
+              "character": 0,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "backend blocks are not allowed inside modules. Define the backend at the root configuration level."
+        }
+      ]
+    }
+  }
+}

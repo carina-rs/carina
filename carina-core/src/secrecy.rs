@@ -1163,8 +1163,16 @@ impl<B: BindingAddress> Owner<'_, B> {
                         ));
                 }
             }
-            if let ExprKind::Binding(binding) | ExprKind::Reference { binding, .. } =
-                source.secrecy_kind()
+            if let ExprKind::Binding {
+                binding,
+                authored_binding: _,
+            }
+            | ExprKind::Reference {
+                binding,
+                authored_binding: _,
+                attribute: _,
+                segments: _,
+            } = source.secrecy_kind()
                 && let Some(definition) = self.syntax.secrecy_definition(binding)
             {
                 pending.push((definition.clone(), owner.clone()));
@@ -1382,16 +1390,14 @@ impl<B: BindingAddress> Owner<'_, B> {
                 continue;
             }
             let independent = match source.secrecy_kind() {
-                ExprKind::Binding(binding) => {
+                ExprKind::Binding { binding, authored_binding: _ } => {
                     !self.resources.contains_key(binding)
                         && self.syntax.secrecy_definition(binding).is_none()
                         && self.syntax.secrecy_argument(binding).is_none()
                         && !self.upstream.contains(binding)
                         && self.syntax.secrecy_literal(source)
                 }
-                ExprKind::Reference {
-                    binding, attribute, ..
-                } => {
+                ExprKind::Reference { binding, attribute, authored_binding: _, segments: _ } => {
                     !self.resources.contains_key(binding)
                         && self.syntax.secrecy_definition(binding).is_none()
                         && self.syntax.secrecy_argument(binding).is_none()
@@ -1735,9 +1741,13 @@ where
     for condition in syntax.secrecy_conditions() {
         let mut nodes = vec![&condition];
         while let Some(node) = nodes.pop() {
-            if let ExprKind::Binding(binding)
+            if let ExprKind::Binding {
+                binding,
+                authored_binding: _,
+            }
             | ExprKind::Reference {
                 binding,
+                authored_binding: _,
                 attribute: _,
                 segments: _,
             } = node.secrecy_kind()
@@ -2586,7 +2596,10 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         })
                 };
                 match expression.secrecy_kind() {
-                    ExprKind::Binding(binding) => {
+                    ExprKind::Binding {
+                        binding,
+                        authored_binding: _,
+                    } => {
                         if self.local_literal(binding, &expression) {
                             values.push(Some(Evidence::Leaf(Secrecy::Public)));
                         } else {
@@ -2597,6 +2610,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         binding,
                         attribute,
                         segments,
+                        authored_binding: _,
                     } => {
                         if self.local_literal(binding, &expression)
                             && self
@@ -3005,7 +3019,11 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                     ) && expression.secrecy_children().len() == 1
                     {
                         thunk.source = Source::Syntax(expression.secrecy_children()[0].clone());
-                    } else if let ExprKind::Binding(binding) = expression.secrecy_kind() {
+                    } else if let ExprKind::Binding {
+                        binding,
+                        authored_binding: _,
+                    } = expression.secrecy_kind()
+                    {
                         thunk.source =
                             Source::Syntax(self.owner.syntax.secrecy_definition(binding)?.clone());
                     } else if matches!(expression.secrecy_kind(), ExprKind::List) {
@@ -3153,7 +3171,10 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                                 ExprKind::Parameter(_) | ExprKind::UntypedParameter => {
                                     ArgumentOrigin::UnboundParameter
                                 }
-                                ExprKind::Binding(binding) => self.argument_reference_origin(
+                                ExprKind::Binding {
+                                    binding,
+                                    authored_binding: _,
+                                } => self.argument_reference_origin(
                                     binding,
                                     Vec::new(),
                                     &thunk.environment,
@@ -3163,6 +3184,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                                     binding,
                                     attribute,
                                     segments,
+                                    authored_binding: _,
                                 } => self.argument_reference_origin(
                                     binding,
                                     std::iter::once(PathSegment::Field {

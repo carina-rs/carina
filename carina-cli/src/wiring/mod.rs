@@ -3820,10 +3820,10 @@ pub(crate) fn resolve_file_names_with_ctx<
     );
     errors.extend(
         canonical
-            .prefix_errors()
+            .rejections()
             .iter()
             .cloned()
-            .map(|error| AppError::AttributePrefix(Box::new(error))),
+            .map(|error| AppError::AttributePrefix(Box::new(error.into()))),
     );
     if errors.is_empty() {
         Ok(canonical)
@@ -3844,7 +3844,7 @@ fn resolve_config_names_with_ctx<'s, E>(
         .map_err(|errors| {
             errors
                 .into_iter()
-                .map(|error| AppError::AttributePrefix(Box::new(error)))
+                .map(|error| AppError::AttributePrefix(Box::new(error.into())))
                 .collect()
         })
 }
@@ -3869,13 +3869,18 @@ pub fn resolve_config_block_names_for_test<E>(
 }
 
 pub fn resolve_attr_prefixes_with_ctx<
+    X,
     P: carina_core::resource::PlaceholderKind,
+    T: carina_core::resource::PlaceholderKind,
+    D: carina_core::parser::DeferredForPhaseTraversal<P, T, B>,
     B: BindingAddress,
 >(
     ctx: &WiringContext,
-    resources: &mut [Resource<ModuleSource, P, B>],
+    file: &mut carina_core::parser::File<X, P, T, D, B>,
 ) -> Vec<AppError> {
-    identifier::resolve_attr_prefix_findings(resources, ctx.schemas())
+    let findings = identifier::resolve_attr_prefix_findings(file, ctx.schemas());
+    findings
+        .into_live_findings()
         .into_iter()
         .map(|error| AppError::AttributePrefix(Box::new(error)))
         .collect()
@@ -11133,7 +11138,11 @@ pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
 pub fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), AppError> {
     let ctx =
         WiringContext::new_for_test(&crate::test_support::TestCommandRuntime::new(), vec![], &[]);
-    errors_to_legacy_result(resolve_attr_prefixes_with_ctx(&ctx, resources))
+    let mut file = carina_core::parser::ExpandedParsedFile::default();
+    file.resources = resources.to_vec();
+    let result = errors_to_legacy_result(resolve_attr_prefixes_with_ctx(&ctx, &mut file));
+    resources.clone_from_slice(&file.resources);
+    result
 }
 
 #[cfg(test)]

@@ -1001,7 +1001,8 @@ where
                         &mut coverage,
                     );
                     assert!(outcome.classification_diagnostics.0.is_empty());
-                    outcome.values
+                    let (values, _prefixes_for_test) = outcome.values.into_parts();
+                    values
                 };
                 (findings, coverage.len())
             })
@@ -2236,7 +2237,8 @@ fn review_seam_prepared_inputs_reject_other_instances_and_stale_generations() {
                     &mut Default::default(),
                 );
                 assert!(outcome.classification_diagnostics.0.is_empty());
-                outcome.values
+                let (values, _prefixes_for_test) = outcome.values.into_parts();
+                values
             };
             assert!(
                 findings.errors().any(|error| error

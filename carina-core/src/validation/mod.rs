@@ -5408,7 +5408,8 @@ impl ResourceAdmissionFinding {
             .join("\n");
         self
     }
-    fn prefix(error: &crate::identifier::AttributePrefixError) -> Self {
+    fn prefix(error: impl Into<crate::identifier::AttributePrefixFinding>) -> Self {
+        let error = error.into();
         let mut finding = Self::schema(
             error.resource_id(),
             &crate::schema::SchemaDiagnostic::unlocated(TypeError::AttributePrefix(Box::new(
@@ -5576,7 +5577,7 @@ type ResourceAdmissionValues = HashMap<
         crate::resource::ResourceId,
         crate::parser::DeclarationLocation,
     ),
-    crate::schema::ResourceValueValidation,
+    crate::identifier::PrefixAdmitted<crate::schema::ResourceValueValidation>,
 >;
 
 struct ResourceValidationContext<'a, B: BindingAddress> {
@@ -5667,6 +5668,7 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                 checked = outcome.values;
                 &checked
             };
+            let (values, _prefixes_reported_by_file) = values.as_parts();
             for (diagnostic, symbolic) in values.diagnostic_errors() {
                 if diagnostic
                     .coverage_path()
@@ -5772,8 +5774,10 @@ pub fn validate_resources<
     let report = canonical.validation_report(provider_context);
     let mut run: ConversionValidation = ConversionValidation::new(&report);
     let mut findings = canonical
-        .prefix_errors()
-        .iter()
+        .prefix_findings()
+        .clone()
+        .into_live_findings()
+        .into_iter()
         .map(ResourceAdmissionFinding::prefix)
         .collect::<Vec<_>>();
     match canonical.schema_validation_resources() {
@@ -5967,7 +5971,7 @@ pub fn resource_reference_findings_in<
         &subject,
         presentation::AdmissionBoundary::Live,
     )?;
-    run.ordinary(report.findings.0, subject);
+    run.ordinary(report.into_live_findings(), subject);
     Ok(())
 }
 
@@ -6000,7 +6004,10 @@ pub fn resource_reference_preflight_findings_in<F: ValidationClientError>(
         &subject,
         presentation::AdmissionBoundary::Preflight,
     )?;
-    run.ordinary(report.findings.0, subject);
+    run.ordinary(
+        PreflightResourceAdmissionReport(report).defer_prefix_findings_to_live_expansion(),
+        subject,
+    );
     Ok(())
 }
 
@@ -6054,17 +6061,18 @@ pub fn resource_admission_findings_in<
         run,
         &subject,
     )?;
-    run.ordinary(report.findings.0, subject);
+    run.ordinary(report.into_live_findings(), subject);
     Ok(())
 }
 
 fn complete_resource_admission_report<
+    'a,
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     F: ValidationClientError,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    judged: &crate::identifier::PrefixCanonicalized<
+    judged: &'a crate::identifier::PrefixCanonicalized<
         '_,
         crate::parser::retained::JudgedFile<'_, E, D, B>,
     >,
@@ -6073,7 +6081,7 @@ fn complete_resource_admission_report<
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
     run: &mut ConversionValidation<F>,
     subject: &FindingSubject,
-) -> Result<ResourceAdmissionReport, crate::parser::AnalysisTreeError> {
+) -> Result<ResourceAdmissionReport<'a>, crate::parser::AnalysisTreeError> {
     let mut report = resource_admission_report(
         judged,
         bindings,
@@ -6109,27 +6117,58 @@ fn publish_admission_diagnostics<T>(
     result.publish(sink)
 }
 
-struct ResourceAdmissionReport {
+struct ResourceAdmissionReport<'a> {
     attributes: ResourceAdmissionValues,
-    // Required prefix rejections and reference findings have one consuming exit.
+    prefixes: &'a crate::identifier::PrefixFindings,
     findings: ResourceAdmissionFindings,
 }
-impl ResourceAdmissionReport {
-    fn new<F>(
-        file: &crate::identifier::PrefixCanonicalized<'_, F>,
-        attributes: ResourceAdmissionValues,
-        mut references: ResourceAdmissionFindings,
-    ) -> Self {
-        let mut findings = file
-            .prefix_errors()
+
+/// Preflight borrows the template's complete prefix authority without consuming
+/// its argument obligations. Module expansion binds the owning template's
+/// values; only Live admission converts any remaining formals into findings.
+struct PreflightResourceAdmissionReport<'a>(ResourceAdmissionReport<'a>);
+impl PreflightResourceAdmissionReport<'_> {
+    fn defer_prefix_findings_to_live_expansion(self) -> Vec<ResourceAdmissionFinding> {
+        let ResourceAdmissionReport {
+            attributes,
+            prefixes,
+            findings,
+        } = self.0;
+        drop(attributes);
+        prefixes
+            .rejections()
             .iter()
             .map(ResourceAdmissionFinding::prefix)
-            .collect::<Vec<_>>();
-        findings.append(&mut references.0);
+            .chain(findings.0)
+            .collect()
+    }
+}
+impl<'a> ResourceAdmissionReport<'a> {
+    fn new<F>(
+        file: &'a crate::identifier::PrefixCanonicalized<'_, F>,
+        attributes: ResourceAdmissionValues,
+        references: ResourceAdmissionFindings,
+    ) -> Self {
         Self {
             attributes,
-            findings: ResourceAdmissionFindings(findings),
+            prefixes: file.prefix_findings(),
+            findings: references,
         }
+    }
+    fn into_live_findings(self) -> Vec<ResourceAdmissionFinding> {
+        let Self {
+            attributes,
+            prefixes,
+            findings,
+        } = self;
+        drop(attributes);
+        prefixes
+            .clone()
+            .into_live_findings()
+            .into_iter()
+            .map(ResourceAdmissionFinding::prefix)
+            .chain(findings.0)
+            .collect()
     }
 }
 /// Recover the lexical type of a bare value that became an entire reference
@@ -6186,12 +6225,13 @@ where
 }
 
 fn resource_admission_report<
+    'a,
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     F: ValidationClientError,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    judged: &crate::identifier::PrefixCanonicalized<
+    judged: &'a crate::identifier::PrefixCanonicalized<
         '_,
         crate::parser::retained::JudgedFile<'_, E, D, B>,
     >,
@@ -6200,7 +6240,7 @@ fn resource_admission_report<
     conversion_validation: &mut ConversionValidation<F>,
     subject: &FindingSubject,
     boundary: presentation::AdmissionBoundary,
-) -> Result<ResourceAdmissionReport, crate::parser::AnalysisTreeError> {
+) -> Result<ResourceAdmissionReport<'a>, crate::parser::AnalysisTreeError> {
     let parsed = judged.parsed();
     let mut all_errors = ResourceAdmissionFindings::default();
     let mut attributes = HashMap::new();
@@ -6240,7 +6280,8 @@ fn resource_admission_report<
                     };
                     let attrs = resource.attributes();
                     let location = resource.diagnostic_label();
-                    for (attribute, path, diagnostic) in values.symbolic_errors() {
+                    let (value_report, _prefixes_reported_by_file) = values.as_parts();
+                    for (attribute, path, diagnostic) in value_report.symbolic_errors() {
                         let located = match resource
                             .locate_schema_diagnostic(diagnostic, |_ordinary| {
                                 resource.attribute_key_location(attribute).clone()
@@ -11552,5 +11593,138 @@ mod review15_error_tests {
         assert!(
             matches!(finding.kind, ReferenceFindingKind::SchemaUnavailable(SecretDiagnosticError::Public(error)) if matches!(*error, crate::parser::CustomTypeValidationError::ProvidersNotLoaded))
         );
+    }
+}
+
+#[cfg(test)]
+mod prefix_obligation_tests {
+    use super::*;
+
+    #[test]
+    fn r7b_live_formal_prefix_obligations_become_located_findings() {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            crate::schema::ResourceSchema::new("Sink")
+                .attribute(
+                    crate::schema::AttributeSchema::required(
+                        "name",
+                        crate::schema::AttributeType::string(),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for (arguments, definitions, expression, dependency) in [
+            ("prefix: String", "", "prefix", "'prefix'"),
+            (
+                "prefix: String",
+                "let p = prefix\n",
+                "p",
+                "'prefix' (through 'p')",
+            ),
+            ("prefix: String", "", "\"${prefix}-x\"", "'prefix'"),
+            ("prefix: String", "", "secret(prefix)", "'(secret)'"),
+            (
+                "first: String second: String",
+                "",
+                "\"${first}-${second}\"",
+                "'first' and 'second'",
+            ),
+        ] {
+            let source = format!(
+                "arguments {{ {arguments} }}\n{definitions}mock.Sink {{ name_prefix = {expression} }}\n"
+            );
+            let parsed = crate::parser::parse_and_resolve(&source).unwrap();
+            let canonical = crate::identifier::canonicalize_file_prefixes(
+                parsed,
+                &schemas,
+                crate::identifier::SuffixSource::Preview,
+            )
+            .judge(&context);
+            let authored = canonical.parsed().resources[0]
+                .declaration
+                .attribute_key_finding_location("name_prefix");
+            let report = ResourceAdmissionReport::new(
+                &canonical,
+                HashMap::new(),
+                ResourceAdmissionFindings::default(),
+            );
+            let findings = report.into_live_findings();
+            assert_eq!(
+                findings.len(),
+                1,
+                "Live must publish the obligation for {expression}"
+            );
+            assert_eq!(findings[0].location, authored);
+            assert_eq!(
+                findings[0].to_string(),
+                format!(
+                    "mock.Sink.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on {dependency}, which is not resolved when names are generated"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_schema_inputs_keep_the_suppression_finding_in_preflight_report() {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            crate::schema::ResourceSchema::new("Sink")
+                .attribute(
+                    crate::schema::AttributeSchema::required(
+                        "name",
+                        crate::schema::AttributeType::string(),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    crate::schema::AttributeSchema::provider_populated(
+                        "identifier",
+                        crate::schema::AttributeType::string(),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_and_resolve(
+            "let src = mock.Sink { name = 'source' }\nmock.Sink { name_prefix = src.identifier }",
+        )
+        .unwrap();
+        let canonical = crate::identifier::canonicalize_file_prefixes(
+            parsed,
+            &schemas,
+            crate::identifier::SuffixSource::Preview,
+        )
+        .judge(&context);
+        let report = ResourceAdmissionReport::new(
+            &canonical,
+            HashMap::new(),
+            ResourceAdmissionFindings::default(),
+        );
+        assert!(
+            !report.prefixes.is_empty(),
+            "preflight must retain the finding until its explicit suppress-only boundary"
+        );
+        assert_eq!(
+            report.prefixes.deferred_findings(),
+            canonical.deferred_findings()
+        );
+        assert!(
+            PreflightResourceAdmissionReport(report)
+                .defer_prefix_findings_to_live_expansion()
+                .is_empty()
+        );
+        let live = ResourceAdmissionReport::new(
+            &canonical,
+            HashMap::new(),
+            ResourceAdmissionFindings::default(),
+        );
+        assert_eq!(live.into_live_findings().len(), 1);
     }
 }

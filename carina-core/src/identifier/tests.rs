@@ -2831,8 +2831,12 @@ fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
     );
 
     let schemas = registry_with_s3_bucket();
-    let mut resources = vec![resource];
-    resolve_attr_prefixes(&mut resources, &schemas).unwrap();
+    let mut file = crate::parser::ExpandedParsedFile {
+        resources: vec![resource],
+        ..Default::default()
+    };
+    resolve_attr_prefixes(&mut file, &schemas).unwrap();
+    let resources = file.resources;
 
     // bucket_name_prefix should be removed
     assert!(!resources[0].attributes.contains_key("bucket_name_prefix"));
@@ -2861,8 +2865,12 @@ fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
     );
 
     let schemas = registry_with_s3_bucket();
-    let mut resources = vec![resource];
-    resolve_attr_prefixes(&mut resources, &schemas).unwrap();
+    let mut file = crate::parser::ExpandedParsedFile {
+        resources: vec![resource],
+        ..Default::default()
+    };
+    resolve_attr_prefixes(&mut file, &schemas).unwrap();
+    let resources = file.resources;
 
     // nonexistent_attr_prefix should remain untouched
     assert!(
@@ -2886,8 +2894,11 @@ fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
     );
 
     let schemas = registry_with_s3_bucket();
-    let mut resources = vec![resource];
-    let result = resolve_attr_prefixes(&mut resources, &schemas);
+    let mut file = crate::parser::ExpandedParsedFile {
+        resources: vec![resource],
+        ..Default::default()
+    };
+    let result = resolve_attr_prefixes(&mut file, &schemas);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("cannot specify both"));
 }
@@ -2901,8 +2912,11 @@ fn test_resolve_attr_prefixes_errors_on_empty_prefix() {
     );
 
     let schemas = registry_with_s3_bucket();
-    let mut resources = vec![resource];
-    let result = resolve_attr_prefixes(&mut resources, &schemas);
+    let mut file = crate::parser::ExpandedParsedFile {
+        resources: vec![resource],
+        ..Default::default()
+    };
+    let result = resolve_attr_prefixes(&mut file, &schemas);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("cannot be empty"));
 }

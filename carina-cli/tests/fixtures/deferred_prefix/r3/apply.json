@@ -1,0 +1,86 @@
+{
+  "json": {
+    "errors": [
+      {
+        "code": null,
+        "location": {
+          "file": "child/main.crn",
+          "range": {
+            "end": {
+              "column": 21,
+              "line": 2
+            },
+            "start": {
+              "column": 3,
+              "line": 2
+            }
+          }
+        },
+        "message": "Required attribute 'name' is missing",
+        "severity": "error"
+      },
+      {
+        "code": null,
+        "location": {
+          "file": "child/main.crn",
+          "range": {
+            "end": {
+              "column": 20,
+              "line": 3
+            },
+            "start": {
+              "column": 5,
+              "line": 3
+            }
+          }
+        },
+        "message": "Unknown attribute 'name_prefix'",
+        "severity": "error"
+      }
+    ],
+    "resource_count": 0,
+    "resources": [],
+    "status": "error"
+  },
+  "json_exit": 1,
+  "json_stderr": "",
+  "lsp": {
+    "backend.crn": [],
+    "child/arguments.crn": [],
+    "child/main.crn": [
+      {
+        "message": "Required attribute 'name' is missing",
+        "range": {
+          "end": {
+            "character": 20,
+            "line": 1
+          },
+          "start": {
+            "character": 2,
+            "line": 1
+          }
+        },
+        "severity": 1
+      },
+      {
+        "message": "Unknown attribute 'name_prefix'",
+        "range": {
+          "end": {
+            "character": 19,
+            "line": 2
+          },
+          "start": {
+            "character": 4,
+            "line": 2
+          }
+        },
+        "severity": 1
+      }
+    ],
+    "lets.crn": [],
+    "main.crn": [],
+    "providers.crn": []
+  },
+  "text": "Validating...\nError: mock.test.resource.<pending>: Required attribute 'name' is missing\nError: mock.test.resource.<pending>: Unknown attribute 'name_prefix'\n",
+  "text_exit": 1
+}

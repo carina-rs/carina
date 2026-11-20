@@ -389,7 +389,87 @@ enum ParseOwnership {
     Covered,
     Ordinary,
 }
+/// Source dependency occurrences, before alias substitution and redaction.
+/// Identity and diagnostic spelling remain separate across module expansion.
+pub(crate) enum AuthoredDependency<B: BindingAddress> {
+    Binding {
+        binding: B,
+        authored_binding: RelativeBindingName,
+        scope: DiagnosticScope,
+    },
+    Reference {
+        identity: crate::resource::AccessPath<B>,
+        authored: crate::resource::AccessPath<RelativeBindingName>,
+        scope: DiagnosticScope,
+    },
+}
+
 impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
+    fn dependency_reference(
+        &self,
+    ) -> Option<(
+        crate::resource::AccessPath<B>,
+        crate::resource::AccessPath<RelativeBindingName>,
+    )> {
+        match &self.kind {
+            ExprKind::Reference {
+                binding,
+                authored_binding,
+                attribute,
+                segments,
+            } => Some((
+                crate::resource::AccessPath::from_binding(
+                    binding.clone(),
+                    attribute.clone(),
+                    segments.clone(),
+                ),
+                crate::resource::AccessPath::from_binding(
+                    authored_binding.clone(),
+                    attribute.clone(),
+                    segments.clone(),
+                ),
+            )),
+            ExprKind::Access(step) => {
+                let (identity, authored) =
+                    self.children.first()?.authored.dependency_reference()?;
+                Some((
+                    identity.with_appended_segment(step.clone()),
+                    authored.with_appended_segment(step.clone()),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn dependency_uses(&self, scope: DiagnosticScope, output: &mut Vec<AuthoredDependency<B>>) {
+        let scope = if matches!(self.kind, ExprKind::Secret) {
+            DiagnosticScope::Secret
+        } else {
+            scope
+        };
+        if let Some((identity, authored)) = self.dependency_reference() {
+            output.push(AuthoredDependency::Reference {
+                identity,
+                authored,
+                scope,
+            });
+        } else if let ExprKind::Binding {
+            binding,
+            authored_binding,
+        } = &self.kind
+        {
+            output.push(AuthoredDependency::Binding {
+                binding: binding.clone(),
+                authored_binding: authored_binding.clone(),
+                scope,
+            });
+        } else {
+            for child in &self.children {
+                child.authored.dependency_uses(scope, output);
+            }
+        }
+    }
+
     fn conversion_role(&self) -> conversion::flow::PlacementRole {
         match self.roles {
             AuthoredChildRoles::Computed => conversion::flow::PlacementRole::Computed,
@@ -440,7 +520,7 @@ impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
     }
     fn is_bare_source(&self) -> bool {
         match &self.kind {
-            ExprKind::Binding(_) => true,
+            ExprKind::Binding { .. } => true,
             ExprKind::Alias | ExprKind::Parens | ExprKind::Definition => {
                 match self.children.as_slice() {
                     [child] => child.authored.is_bare_source(),
@@ -545,9 +625,13 @@ pub(crate) enum ExprKind<B: BindingAddress> {
     Parameter(TypeExpr),
     LoopSlot(TypeExpr),
     UntypedParameter,
-    Binding(B),
+    Binding {
+        binding: B,
+        authored_binding: RelativeBindingName,
+    },
     Reference {
         binding: B,
+        authored_binding: RelativeBindingName,
         attribute: String,
         segments: Vec<PathSegment>,
     },
@@ -688,13 +772,21 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
         let mut authored = Arc::unwrap_or_clone(self.authored);
         let kind = match std::mem::replace(&mut authored.kind, ExprKind::Declaration) {
             ExprKind::Convert { target, parsing } => ExprKind::Convert { target, parsing },
-            ExprKind::Binding(binding) => ExprKind::Binding(map(binding)),
+            ExprKind::Binding {
+                binding,
+                authored_binding,
+            } => ExprKind::Binding {
+                binding: map(binding),
+                authored_binding,
+            },
             ExprKind::Reference {
                 binding,
+                authored_binding,
                 attribute,
                 segments,
             } => ExprKind::Reference {
                 binding: map(binding),
+                authored_binding,
                 attribute,
                 segments,
             },
@@ -921,6 +1013,7 @@ pub(in crate::parser) fn resource_slots(
 pub struct Expressions<B: BindingAddress = RelativeBindingName> {
     roots: Vec<ExprValue<ParserPlaceholder, B>>,
     definitions: IndexMap<B, ExprValue<ParserPlaceholder, B>>,
+    binding_names: IndexMap<B, RelativeBindingName>,
     report: Arc<ExpressionReport<B>>,
     arguments: IndexMap<B, TypeExpr>,
     secrecy_arguments: IndexMap<B, Value<ParserPlaceholder, B>>,
@@ -940,6 +1033,7 @@ impl<B: BindingAddress> PartialEq for Expressions<B> {
         let Self {
             roots,
             definitions,
+            binding_names,
             report,
             arguments,
             secrecy_arguments,
@@ -953,6 +1047,7 @@ impl<B: BindingAddress> PartialEq for Expressions<B> {
         } = self;
         roots == &other.roots
             && definitions == &other.definitions
+            && binding_names == &other.binding_names
             && report == &other.report
             && arguments == &other.arguments
             && secrecy_arguments == &other.secrecy_arguments
@@ -979,6 +1074,7 @@ impl<B: BindingAddress> Default for Expressions<B> {
         Self {
             roots: Vec::new(),
             definitions: IndexMap::new(),
+            binding_names: IndexMap::new(),
             report: Arc::new(ExpressionReport::empty()),
             arguments: IndexMap::new(),
             secrecy_arguments: IndexMap::new(),
@@ -1027,7 +1123,10 @@ fn builtin_closure<B: BindingAddress>(
             ExprKind::Alias | ExprKind::Parens | ExprKind::Definition => {
                 definition = definition.secrecy_children().last()?;
             }
-            ExprKind::Binding(binding) => definition = definitions.get(binding)?,
+            ExprKind::Binding {
+                binding,
+                authored_binding: _,
+            } => definition = definitions.get(binding)?,
             ExprKind::Call(name) => {
                 captures.push(definition.secrecy_children());
                 if let Some(builtin) = crate::builtins::Builtin::from_name(name) {
@@ -1062,9 +1161,102 @@ impl<B: BindingAddress> Expressions<B> {
         &self.roots
     }
 
+    pub(crate) fn authored_binding_name(&self, binding: &B) -> Option<&RelativeBindingName> {
+        self.binding_names.get(binding)
+    }
+
+    pub(crate) fn dependency_uses(&self, binding: &B) -> Vec<AuthoredDependency<B>> {
+        let mut uses = Vec::new();
+        if let Some(definition) = self.definitions.get(binding) {
+            definition
+                .authored
+                .dependency_uses(DiagnosticScope::Public, &mut uses);
+        }
+        uses
+    }
+
+    /// Read the authored loop at its use; resolved values must not decide
+    /// whether an iterable came from a formal argument.
+    pub(crate) fn argument_iterable_at(
+        &self,
+        declaration: &DeclarationLocation,
+        scope: &crate::resource::ModuleInstanceScope,
+    ) -> bool {
+        let instance = ExpressionInstance::for_scope(scope);
+        let target = declaration.span();
+        let mut pending = self
+            .roots
+            .iter()
+            .map(|root| root.authored.as_ref())
+            .collect::<Vec<_>>();
+        let mut innermost = None;
+        while let Some(node) = pending.pop() {
+            let location = &node.location.authored;
+            let span = location.span();
+            if node.location.instance != instance
+                || location.file() != declaration.file()
+                || (span.start_line(), span.start_column())
+                    > (target.start_line(), target.start_column())
+                || (span.end_line(), span.end_column()) < (target.end_line(), target.end_column())
+            {
+                continue;
+            }
+            if matches!(node.kind, ExprKind::For { .. }) {
+                // The kind's iterable is redacted text, not a syntax node.
+                // Main's constructor and admission walk use [iterable, body].
+                innermost = node.children.first().map(|child| child.authored.as_ref());
+            }
+            pending.extend(node.children.iter().map(|child| child.authored.as_ref()));
+        }
+        let Some(iterable) = innermost else {
+            return false;
+        };
+        let mut uses = Vec::new();
+        iterable.dependency_uses(DiagnosticScope::Public, &mut uses);
+        let mut seen = Vec::new();
+        while let Some(usage) = uses.pop() {
+            let binding = match usage {
+                AuthoredDependency::Binding {
+                    binding,
+                    authored_binding: _,
+                    scope: _,
+                } => binding,
+                AuthoredDependency::Reference {
+                    identity,
+                    authored: _,
+                    scope: _,
+                } => identity.binding_address().clone(),
+            };
+            if self.is_module_argument(&binding) {
+                return true;
+            }
+            if !seen.contains(&binding) {
+                uses.extend(self.dependency_uses(&binding));
+                seen.push(binding);
+            }
+        }
+        false
+    }
+
+    pub(crate) fn is_module_argument(&self, binding: &B) -> bool {
+        self.arguments.contains_key(binding)
+    }
+
+    /// Provisional alias payload for diagnostic provenance, never admission evidence.
+    pub(crate) fn binding_projection(&self, binding: &B) -> Option<&Value<ParserPlaceholder, B>> {
+        self.definitions
+            .get(binding)
+            .and_then(|definition| match &definition.payload {
+                Projection::Value(value) => Some(value),
+                Projection::Pending => None,
+            })
+            .or_else(|| self.secrecy_arguments.get(binding))
+    }
+
     pub(super) fn extend(&mut self, other: Self) {
         self.roots.extend(other.roots);
         self.definitions.extend(other.definitions);
+        self.binding_names.extend(other.binding_names);
         self.arguments.extend(other.arguments);
         self.secrecy_arguments.extend(other.secrecy_arguments);
         self.secrecy_argument_modules
@@ -1114,6 +1306,11 @@ impl<B: BindingAddress> Expressions<B> {
                 .roots
                 .into_iter()
                 .map(|root| root.map_bindings(map, &mut memo))
+                .collect(),
+            binding_names: self
+                .binding_names
+                .into_iter()
+                .map(|(binding, name)| (map(binding), name))
                 .collect(),
             definitions: self
                 .definitions
@@ -1549,6 +1746,10 @@ impl Expressions {
                     if name != "_" {
                         out.definitions
                             .insert(RelativeBindingName::new(name), expression.clone());
+                        out.binding_names.insert(
+                            RelativeBindingName::new(name),
+                            RelativeBindingName::new(name),
+                        );
                     }
                     out.roots.push(if name == "_" {
                         node(&pair, ExprKind::Definition, vec![expression], file, source)
@@ -1692,7 +1893,7 @@ fn node_at_with_roles(
         | ExprKind::Parameter(_)
         | ExprKind::LoopSlot(_)
         | ExprKind::UntypedParameter
-        | ExprKind::Binding(_)
+        | ExprKind::Binding { .. }
         | ExprKind::Reference { .. }
         | ExprKind::List
         | ExprKind::Map(_)
@@ -2430,6 +2631,7 @@ fn compile_remaining_form(
                     &pair,
                     ExprKind::Reference {
                         binding: RelativeBindingName::new(name.as_str()),
+                        authored_binding: RelativeBindingName::new(name.as_str()),
                         attribute,
                         segments: Vec::new(),
                     },
@@ -2462,7 +2664,10 @@ fn compile_remaining_form(
                 ),
                 None => node(
                     &name,
-                    ExprKind::Binding(RelativeBindingName::new(name.as_str())),
+                    ExprKind::Binding {
+                        binding: RelativeBindingName::new(name.as_str()),
+                        authored_binding: RelativeBindingName::new(name.as_str()),
+                    },
                     vec![],
                     file,
                     source,
@@ -2509,6 +2714,7 @@ fn compile_remaining_form(
             node(
                 &pair,
                 ExprKind::Reference {
+                    authored_binding: binding.clone(),
                     binding,
                     attribute,
                     segments,
@@ -2793,7 +2999,10 @@ fn compile_remaining_form(
             let target = scope.get(target.as_str()).cloned().unwrap_or_else(|| {
                 node(
                     &target,
-                    ExprKind::Binding(RelativeBindingName::new(target.as_str())),
+                    ExprKind::Binding {
+                        binding: RelativeBindingName::new(target.as_str()),
+                        authored_binding: RelativeBindingName::new(target.as_str()),
+                    },
                     vec![],
                     file,
                     source,
@@ -5809,7 +6018,7 @@ mod judgement {
                 | ExprKind::Parameter(_)
                 | ExprKind::LoopSlot(_)
                 | ExprKind::UntypedParameter
-                | ExprKind::Binding(_)
+                | ExprKind::Binding { .. }
                 | ExprKind::Reference { .. }
                 | ExprKind::List
                 | ExprKind::Map(_)
@@ -5898,7 +6107,7 @@ mod judgement {
                 if item.node.children.is_empty()
                     && !matches!(
                         item.node.kind,
-                        ExprKind::Binding(_) | ExprKind::Reference { .. }
+                        ExprKind::Binding { .. } | ExprKind::Reference { .. }
                     )
                 {
                     self.scope = item.scope;
@@ -5940,6 +6149,7 @@ mod judgement {
                 if let ExprKind::Reference {
                     binding,
                     attribute,
+                    authored_binding: _,
                     segments: _,
                 } = &item.node.kind
                     && let Some(output) = self
@@ -5958,10 +6168,14 @@ mod judgement {
                 }
                 if let ExprKind::Reference {
                     binding,
+                    authored_binding: _,
                     attribute: _,
                     segments: _,
                 }
-                | ExprKind::Binding(binding) = &item.node.kind
+                | ExprKind::Binding {
+                    binding,
+                    authored_binding: _,
+                } = &item.node.kind
                     && self.parameter_type(binding).is_none()
                     && let Some(definition) = self.expressions.definitions.get(binding)
                 {
@@ -6102,8 +6316,16 @@ mod judgement {
                     owner: FailureOwner::Boundary,
                 };
             }
-            let reference = if let ExprKind::Reference { binding, .. }
-            | ExprKind::Binding(binding) = &root.kind
+            let reference = if let ExprKind::Reference {
+                binding,
+                authored_binding: _,
+                attribute: _,
+                segments: _,
+            }
+            | ExprKind::Binding {
+                binding,
+                authored_binding: _,
+            } = &root.kind
             {
                 if self.parameter_type(binding).is_some() {
                     None
@@ -6154,13 +6376,19 @@ mod judgement {
                     E::NonCrossed(N::FunctionParameter)
                 }
                 ExprKind::Parameter(_) => E::NonCrossed(N::FunctionParameter),
-                ExprKind::Binding(binding) if self.parameter_type(binding).is_some() => {
-                    E::NonCrossed(N::ModuleArgument)
-                }
-                ExprKind::Binding(_) if reference.is_none() => {
+                ExprKind::Binding {
+                    binding,
+                    authored_binding: _,
+                } if self.parameter_type(binding).is_some() => E::NonCrossed(N::ModuleArgument),
+                ExprKind::Binding { .. } if reference.is_none() => {
                     E::MissingReference(conversion::flow::MissingReferenceEdge::UndefinedBinding)
                 }
-                ExprKind::Reference { binding, .. } if reference.is_none() => {
+                ExprKind::Reference {
+                    binding,
+                    authored_binding: _,
+                    attribute: _,
+                    segments: _,
+                } if reference.is_none() => {
                     let cut = match self.bindings.get(binding.as_str()) {
                         Some(InferenceBinding::Argument { .. }) => N::ModuleArgument,
                         Some(InferenceBinding::UpstreamState) => N::UpstreamStateReference,
@@ -6181,7 +6409,7 @@ mod judgement {
                     }
                 }
                 ExprKind::Scalar(_)
-                | ExprKind::Binding(_)
+                | ExprKind::Binding { .. }
                 | ExprKind::LoopSlot(_)
                 | ExprKind::Reference { .. }
                 | ExprKind::List
@@ -6583,7 +6811,10 @@ mod judgement {
                     .with_kind(|_| InferredKind::LoopSlot)
                     .owned_by_bindings(),
                 ExprKind::UntypedParameter => value_dependent("unannotated function parameter"),
-                ExprKind::Binding(name) => {
+                ExprKind::Binding {
+                    binding: name,
+                    authored_binding: _,
+                } => {
                     if let Some(ty) = self.parameter_type(name) {
                         ordinary(Ok(ty.clone()), false).owned_by_bindings()
                     } else if let Some(definition) = self.expressions.definitions.get(name) {
@@ -6596,6 +6827,7 @@ mod judgement {
                     binding,
                     attribute,
                     segments,
+                    authored_binding: _,
                 } => {
                     let steps = std::iter::once(PathSegment::Field {
                         name: attribute.clone(),
@@ -6928,9 +7160,16 @@ mod judgement {
                         expression: &ExprValue<ParserPlaceholder, B>,
                     ) -> Option<&B> {
                         match &expression.authored.kind {
-                            ExprKind::Binding(binding) | ExprKind::Reference { binding, .. } => {
-                                Some(binding)
+                            ExprKind::Binding {
+                                binding,
+                                authored_binding: _,
                             }
+                            | ExprKind::Reference {
+                                binding,
+                                authored_binding: _,
+                                attribute: _,
+                                segments: _,
+                            } => Some(binding),
                             ExprKind::Alias
                             | ExprKind::Parens
                             | ExprKind::Definition

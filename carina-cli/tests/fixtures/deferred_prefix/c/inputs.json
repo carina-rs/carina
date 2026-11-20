@@ -1,0 +1,65 @@
+{
+  "b1_three_modules": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "let src = mock.test.resource { name = 'source' }\n",
+    "main.crn": "let a = use { source = './mod_a' }\nlet c = use { source = './mod_c' }\nlet one = a { p = src.identifier }\nlet two = c { cfg = { x = src.identifier } }\n",
+    "mod_a/arguments.crn": "arguments { p: String }\n",
+    "mod_a/main.crn": "let b = use { source = '../mod_b' }\nmock.test.resource {\n  name_prefix = p\n}\nlet inner = b { prefix = p }\n",
+    "mod_b/arguments.crn": "arguments { prefix: String }\n",
+    "mod_b/main.crn": "mock.test.resource {\n  name_prefix = prefix\n}\n",
+    "mod_c/arguments.crn": "arguments { cfg: map(String) }\n",
+    "mod_c/main.crn": "let b = use { source = '../mod_b' }\nlet inner = b { prefix = cfg.x }\n"
+  },
+  "b2_hop_deferred": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "let src = mock.test.resource { name = 'source' }\n",
+    "main.crn": "let c = use { source = './child' }\nlet instance = c { prefix = src.identifier }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "let r = mock.test.resource {\n  name = prefix\n}\nmock.test.resource {\n  name_prefix = r.name\n}\n"
+  },
+  "b2_hop_literal": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "let src = mock.test.resource { name = 'source' }\n",
+    "main.crn": "let c = use { source = './child' }\nlet instance = c { prefix = 'x' }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "let r = mock.test.resource {\n  name = prefix\n}\nmock.test.resource {\n  name_prefix = r.name\n}\n"
+  },
+  "b3_direct": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "let src = mock.test.resource { name = 'source' }\n",
+    "main.crn": "let c = use { source = './child' }\nlet instance = c { prefix = src.identifier }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource {\n  name_prefix = prefix\n}\n"
+  },
+  "b3_interpolation": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "let src = mock.test.resource { name = 'source' }\n",
+    "main.crn": "let c = use { source = './child' }\nlet instance = c { prefix = src.identifier }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource {\n  name_prefix = \"${prefix}-x\"\n}\n"
+  },
+  "b3_alias": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "let src = mock.test.resource { name = 'source' }\n",
+    "main.crn": "let c = use { source = './child' }\nlet instance = c { prefix = src.identifier }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource {\n  name_prefix = p\n}\n",
+    "child/lets.crn": "let p = prefix\n"
+  },
+  "b3_nested": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "let src = mock.test.resource { name = 'source' }\n",
+    "main.crn": "let a = use { source = './mod_a' }\nlet instance = a { prefix = src.identifier }\n",
+    "mod_a/arguments.crn": "arguments { prefix: String }\n",
+    "mod_a/main.crn": "let b = use { source = '../mod_b' }\nlet inner = b { prefix = prefix }\n",
+    "mod_b/arguments.crn": "arguments { prefix: String }\n",
+    "mod_b/main.crn": "mock.test.resource {\n  name_prefix = prefix\n}\n"
+  }
+}

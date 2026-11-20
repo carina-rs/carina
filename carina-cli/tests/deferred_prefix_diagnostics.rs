@@ -1,0 +1,1554 @@
+//! carina#4461: one core finding across directory validate, plan, and the editor.
+
+use std::path::Path;
+use std::process::{Command, Output};
+use std::sync::Arc;
+
+use carina_core::{EnvironmentSnapshot, UserDirs, parser::ProviderContext};
+use carina_lsp::backend::{
+    FactoryBuilder, ProviderStates, analyze_document, reload_provider_states,
+};
+use carina_lsp::document::Document;
+use carina_lsp::factories::{build_factories, install_prober};
+use serde_json::json;
+use tower_lsp::lsp_types::{Position, Range};
+
+const SOURCE: &str = "let src = mock.test.resource { name = 'source' }\n";
+
+struct Fixture {
+    directory: tempfile::TempDir,
+    files: Vec<String>,
+    subject: String,
+}
+
+impl Fixture {
+    fn new(main: &str, lets: &str, child: bool) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for (name, text) in [
+            ("providers.crn", "provider mock {}\n"),
+            (
+                "backend.crn",
+                "backend local { path = 'carina.state.json' }\n",
+            ),
+            ("lets.crn", lets),
+            ("main.crn", main),
+        ]
+        .into_iter()
+        .chain(
+            child
+                .then_some([
+                    ("child/arguments.crn", "arguments {\n  prefix: String\n}\n"),
+                    (
+                        "child/main.crn",
+                        "mock.test.resource {\n  name_prefix = prefix\n}\n",
+                    ),
+                ])
+                .into_iter()
+                .flatten(),
+        ) {
+            let path = directory.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+            files.push(name.to_owned());
+        }
+        Self {
+            directory,
+            files,
+            subject: "mock.test.resource.<pending>".into(),
+        }
+    }
+
+    fn with_file(mut self, name: &str, text: &str) -> Self {
+        let path = self.root().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+        if !self.files.iter().any(|file| file == name) {
+            self.files.push(name.into());
+        }
+        self
+    }
+
+    async fn observation(&self) -> serde_json::Value {
+        let sources = self
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.clone(),
+                    json!(std::fs::read_to_string(self.root().join(file)).unwrap()),
+                )
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+        let validate = self.cli(&["validate", "."]);
+        let json_output = self.cli(&["validate", ".", "--json"]);
+        let observation = json!({
+            "text":text(&validate), "text_exit":validate.status.code(),
+            "json":serde_json::from_slice::<serde_json::Value>(&json_output.stdout).unwrap(),
+            "json_exit":json_output.status.code(), "json_stderr":String::from_utf8_lossy(&json_output.stderr),
+            "lsp":self.editor_inventory().await
+        });
+        println!(
+            "C4461_INPUTS={} {}",
+            std::thread::current().name().unwrap_or("unnamed"),
+            json!(sources)
+        );
+        println!(
+            "C4461_OBSERVATION={} {observation}",
+            std::thread::current().name().unwrap_or("unnamed")
+        );
+        observation
+    }
+
+    fn root(&self) -> &Path {
+        self.directory.path()
+    }
+
+    fn cli(&self, arguments: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_carina"))
+            .args(arguments)
+            .current_dir(self.root())
+            .env("NO_COLOR", "1")
+            .env("CLICOLOR", "0")
+            .env("TERM", "dumb")
+            .env_remove("CLICOLOR_FORCE")
+            .env_remove("RUST_LOG")
+            .output()
+            .unwrap()
+    }
+
+    async fn assert_editor(&self, message: Option<&str>, authored: &str, range: Range) {
+        let inventory = self.editor_inventory().await;
+        for file in &self.files {
+            let expected_range = if file == authored { Some(range) } else { None };
+            let before = match (message, expected_range) {
+                (Some(message), Some(range)) => {
+                    json!([{"message":message, "range":range, "severity":1}])
+                }
+                _ => json!([]),
+            };
+            let expected = if file == authored
+                && Path::new(file)
+                    .parent()
+                    .is_some_and(|directory| !directory.as_os_str().is_empty())
+            {
+                self.standalone_editor_findings(file)
+            } else {
+                before.clone()
+            };
+            if before != expected {
+                println!(
+                    "C4461_EXPECTATION_CHANGE={} {}",
+                    std::thread::current().name().unwrap_or("unnamed"),
+                    json!({"file":file,"before":before,"after":expected})
+                );
+            }
+            assert_eq!(inventory[file], expected, "{file}");
+        }
+    }
+
+    fn standalone_editor_findings(&self, file: &str) -> serde_json::Value {
+        let directory = Path::new(file).parent().unwrap().to_str().unwrap();
+        let output = self.cli(&["validate", directory, "--json"]);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        r10::cli_file_inventory(self, &report, file)
+    }
+
+    async fn editor_inventory(&self) -> serde_json::Value {
+        self.editor_inventory_for_files(&self.files).await
+    }
+
+    async fn editor_inventory_for_files(&self, files: &[String]) -> serde_json::Value {
+        let home = tempfile::tempdir().unwrap();
+        let dirs = UserDirs::under(home.path());
+        let builder: FactoryBuilder =
+            Arc::new(move |configs| build_factories(Ok(&dirs), configs, &Default::default()));
+        let states = tokio::sync::RwLock::new(ProviderStates::new(EnvironmentSnapshot::empty()));
+        let reload =
+            reload_provider_states(self.root(), &builder, Some(&install_prober()), &states).await;
+        assert!(reload.warnings.is_empty(), "{:?}", reload.warnings);
+        assert!(reload.schemas > 0);
+        let states = states.into_inner();
+        let mut inventory = serde_json::Map::new();
+        for file in files {
+            let path = self.root().join(file);
+            let document = Document::new_with_path(
+                std::fs::read_to_string(&path).unwrap(),
+                path.clone(),
+                Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
+            );
+            let diagnostics = analyze_document(&states, &document, Some(&path));
+            inventory.insert(file.clone(), json!(diagnostics.into_iter().map(|diagnostic| {
+                json!({"message": diagnostic.message, "range": diagnostic.range, "severity": diagnostic.severity})
+            }).collect::<Vec<_>>()));
+        }
+        serde_json::Value::Object(inventory)
+    }
+}
+
+fn text(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+async fn assert_rejected(fixture: Fixture, dependency: &str, authored: &str, range: Range) {
+    let message = format!(
+        "'name_prefix' must be known at plan time to generate 'name', but it depends on {dependency}, which is known only after apply"
+    );
+    let human = format!("Error: {}: {message}\n", fixture.subject);
+    let output = fixture.cli(&["validate", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output), format!("Validating...\n{human}"));
+
+    let output = fixture.cli(&["validate", ".", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let actual: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        actual,
+        json!({
+            "status": "error", "resource_count": 0, "resources": [],
+            "errors": [{
+                "message": message, "severity": "error", "code": null,
+                "location": {"file": authored, "range": {
+                    "start": {"line": range.start.line + 1, "column": range.start.character + 1},
+                    "end": {"line": range.end.line + 1, "column": range.end.character + 1}
+                }}
+            }]
+        })
+    );
+
+    let output = fixture.cli(&["plan", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output), human);
+    fixture.assert_editor(Some(&message), authored, range).await;
+}
+
+fn assignment(end: u32) -> Range {
+    Range::new(Position::new(1, 2), Position::new(1, end))
+}
+
+#[tokio::test]
+async fn deferred_prefix_a_direct_directory() {
+    assert_rejected(
+        Fixture::new(
+            "mock.test.resource {\n  name_prefix = src.identifier\n}\n",
+            SOURCE,
+            false,
+        ),
+        "'src.identifier'",
+        "main.crn",
+        assignment(30),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn deferred_prefix_b_known_directory_control() {
+    let fixture = Fixture::new(
+        "mock.test.resource {\n  name_prefix = src.name\n}\n",
+        SOURCE,
+        false,
+    );
+    let output = fixture.cli(&["validate", ".", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["resource_count"], 2);
+    assert!(result.get("errors").is_none(), "{result:#}");
+    let resources = result["resources"].as_array().unwrap();
+    let expected = format!(
+        "Validating...\n✓ 2 resources validated successfully.\n  • {}\n  • {}\n",
+        resources[0].as_str().unwrap(),
+        resources[1].as_str().unwrap()
+    );
+    let output = fixture.cli(&["validate", "."]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(text(&output), expected);
+    fixture
+        .assert_editor(None, "main.crn", assignment(24))
+        .await;
+    let output = fixture.cli(&["init", "."]);
+    assert!(output.status.success(), "{output:?}");
+    let output = fixture.cli(&["plan", "."]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(text(&output).contains("2 to add"), "{}", text(&output));
+}
+
+#[tokio::test]
+async fn deferred_prefix_c1_interpolation_directory() {
+    assert_rejected(
+        Fixture::new(
+            "mock.test.resource {\n  name_prefix = \"${src.identifier}-x\"\n}\n",
+            SOURCE,
+            false,
+        ),
+        "'src.identifier'",
+        "main.crn",
+        assignment(37),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn deferred_prefix_c2_alias_directory() {
+    assert_rejected(
+        Fixture::new(
+            "mock.test.resource {\n  name_prefix = p\n}\n",
+            &format!("{SOURCE}let p = src.identifier\n"),
+            false,
+        ),
+        "'src.identifier' (through 'p')",
+        "main.crn",
+        assignment(17),
+    )
+    .await;
+}
+
+async fn assert_module_declaration_findings(
+    fixture: Fixture,
+    dependencies: &[&str],
+    ranges: &[Range],
+) {
+    let human = dependencies.iter().map(|dependency| format!(
+        "Error: {}: 'name_prefix' must be known at plan time to generate 'name', but it depends on {dependency}, which is known only after apply\n", fixture.subject
+    )).collect::<String>();
+    let plan = fixture.cli(&["plan", "."]);
+    assert_eq!(plan.status.code(), Some(1));
+    assert_eq!(text(&plan), human);
+    let findings = ranges
+        .iter()
+        .zip(dependencies)
+        .map(|(range, dependency)| ("child/main.crn", *range, *dependency))
+        .collect::<Vec<_>>();
+    assert_forwarded_findings(fixture, &findings).await;
+}
+
+#[tokio::test]
+async fn deferred_prefix_d_caller_and_module_use_their_own_analysis() {
+    assert_module_declaration_findings(
+        Fixture::new("let sink_module = use { source = './child' }\n\nlet sink = sink_module {\n  prefix = src.identifier\n}\n", SOURCE, true),
+        &["'src.identifier'"],
+        &[assignment(22)],
+    ).await;
+}
+
+#[tokio::test]
+async fn deferred_prefix_d_two_calls_share_one_declaration_finding() {
+    assert_module_declaration_findings(
+        Fixture::new("let sink_module = use { source = './child' }\n\nlet first = sink_module {\n  prefix = src.identifier\n}\n\nlet second = sink_module {\n  prefix = src.identifier\n}\n", SOURCE, true),
+        &["'src.identifier'"],
+        &[assignment(22)],
+    ).await;
+}
+
+#[tokio::test]
+async fn deferred_prefix_d_caller_alias_keeps_expanded_validate_dependency() {
+    assert_module_declaration_findings(
+        Fixture::new("let sink_module = use { source = './child' }\n\nlet sink = sink_module {\n  prefix = p\n}\n", &format!("{SOURCE}let p = src.identifier\n"), true),
+        &["'src.identifier'"],
+        &[assignment(22)],
+    ).await;
+}
+
+#[tokio::test]
+async fn deferred_prefix_multiline_value_uses_key_range() {
+    assert_rejected(
+        Fixture::new(
+            "mock.test.resource {\n  name_prefix = \"${src.identifier\n  }-x\"\n}\n",
+            SOURCE,
+            false,
+        ),
+        "'src.identifier'",
+        "main.crn",
+        assignment(13),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn deferred_prefix_several_references_join_with_and() {
+    assert_rejected(Fixture::new("mock.test.resource {\n  name_prefix = \"${a.identifier}-${b.identifier}\"\n}\n", "let a = mock.test.resource { name = 'a' }\nlet b = mock.test.resource { name = 'b' }\n", false), "'a.identifier' and 'b.identifier'", "main.crn", assignment(49)).await;
+}
+
+#[tokio::test]
+async fn deferred_prefix_known_alias_does_not_claim_direct_dependency() {
+    let main = "mock.test.resource {\n  name_prefix = \"${p}-${src.identifier}\"\n}\n";
+    let range = assignment(main.lines().nth(1).unwrap().len() as u32);
+    assert_rejected(
+        Fixture::new(main, &format!("{SOURCE}let p = 'known'\n"), false),
+        "'src.identifier'",
+        "main.crn",
+        range,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn deferred_prefix_in_deferred_for_body_is_recognized() {
+    let mut fixture = Fixture::new(
+        "let children = for _ in src.domain_validation_options {\n  mock.test.resource {\n    name_prefix = src.identifier\n  }\n}\n",
+        SOURCE,
+        false,
+    );
+    fixture.subject = "mock.test.resource.children[?]".into();
+    assert_rejected(
+        fixture,
+        "'src.identifier'",
+        "main.crn",
+        Range::new(Position::new(2, 4), Position::new(2, 32)),
+    )
+    .await;
+}
+
+fn nested_fixture(main: &str, argument: &str) -> Fixture {
+    Fixture::new(main, SOURCE, false)
+        .with_file("mod_a/arguments.crn", "arguments { prefix: String }\n")
+        .with_file("mod_a/main.crn", &format!("let mod_b = use {{ source = './mod_b' }}\n\nlet b = mod_b {{\n  prefix = {argument}\n}}\n"))
+        .with_file("mod_a/mod_b/arguments.crn", "arguments { prefix: String }\n")
+        .with_file("mod_a/mod_b/main.crn", "mock.test.resource {\n  name_prefix = prefix\n}\n")
+}
+
+async fn assert_forwarded_findings(fixture: Fixture, findings: &[(&str, Range, &str)]) {
+    let mut errors = Vec::new();
+    let mut human = String::new();
+    let mut lsp = fixture
+        .files
+        .iter()
+        .map(|file| (file.clone(), json!([])))
+        .collect::<serde_json::Map<_, _>>();
+    for (file, range, dependency) in findings {
+        let message = format!(
+            "'name_prefix' must be known at plan time to generate 'name', but it depends on {dependency}, which is known only after apply"
+        );
+        human.push_str(&format!("Error: {}: {message}\n", fixture.subject));
+        errors.push(json!({"message":message,"severity":"error","code":null,"location":{"file":file,"range":{
+            "start":{"line":range.start.line+1,"column":range.start.character+1},
+            "end":{"line":range.end.line+1,"column":range.end.character+1}
+        }}}));
+        lsp.get_mut(*file)
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"message":message,"range":range,"severity":1}));
+    }
+    for file in findings
+        .iter()
+        .map(|(file, _, _)| *file)
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if Path::new(file)
+            .parent()
+            .is_some_and(|directory| !directory.as_os_str().is_empty())
+        {
+            let before = lsp[file].clone();
+            let after = fixture.standalone_editor_findings(file);
+            if before != after {
+                println!(
+                    "C4461_EXPECTATION_CHANGE={} {}",
+                    std::thread::current().name().unwrap_or("unnamed"),
+                    json!({"file":file,"before":before,"after":after})
+                );
+            }
+            lsp.insert(file.into(), after);
+        }
+    }
+    let actual = fixture.observation().await;
+    assert_eq!(
+        actual,
+        json!({"text":format!("Validating...\n{human}"),"text_exit":1,
+        "json":{"status":"error","resource_count":0,"resources":[],"errors":errors},
+        "json_exit":1,"json_stderr":"","lsp":lsp}),
+        "all interfaces for forwarded arguments"
+    );
+}
+
+#[tokio::test]
+async fn r1_nested_forwarding_keeps_caller_and_standalone_dependencies() {
+    let fixture = nested_fixture(
+        "let mod_a = use { source = './mod_a' }\n\nlet a = mod_a {\n  prefix = src.identifier\n}\n",
+        "prefix",
+    );
+    assert_forwarded_findings(
+        fixture,
+        &[("mod_a/mod_b/main.crn", assignment(22), "'src.identifier'")],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_nested_local_reference_keeps_caller_and_standalone_dependencies() {
+    let fixture = nested_fixture(
+        "let mod_a = use { source = './mod_a' }\n\nlet a = mod_a {\n  prefix = src.identifier\n}\n",
+        "local.identifier",
+    )
+    .with_file(
+        "mod_a/lets.crn",
+        "let local = mock.test.resource { name = 'local' }\n",
+    );
+    assert_forwarded_findings(
+        fixture,
+        &[(
+            "mod_a/mod_b/main.crn",
+            assignment(22),
+            "'a.local.identifier'",
+        )],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_nested_forwarding_shares_the_declaration_between_root_instances() {
+    let fixture = nested_fixture(
+        "let mod_a = use { source = './mod_a' }\n\nlet first = mod_a {\n  prefix = src.identifier\n}\n\nlet second = mod_a {\n  prefix = src.identifier\n}\n",
+        "prefix",
+    );
+    assert_forwarded_findings(
+        fixture,
+        &[("mod_a/mod_b/main.crn", assignment(22), "'src.identifier'")],
+    )
+    .await;
+}
+
+async fn assert_named_dependency(fixture: Fixture, dependency: &str, range: Range) {
+    assert_named_dependency_reason(fixture, dependency, range, "known only after apply").await;
+}
+
+async fn assert_named_dependency_reason(
+    fixture: Fixture,
+    dependency: &str,
+    range: Range,
+    reason: &str,
+) {
+    let message = format!(
+        "'name_prefix' must be known at plan time to generate 'name', but it depends on {dependency}, which is {reason}"
+    );
+    let mut lsp = fixture
+        .files
+        .iter()
+        .map(|file| (file.clone(), json!([])))
+        .collect::<serde_json::Map<_, _>>();
+    lsp.insert(
+        "main.crn".into(),
+        json!([{"message":message,"range":range,"severity":1}]),
+    );
+    let actual = fixture.observation().await;
+    assert_eq!(
+        actual,
+        json!({
+            "text":format!("Validating...\nError: {}: {message}\n",fixture.subject),"text_exit":1,
+            "json":{"status":"error","resource_count":0,"resources":[],"errors":[{"message":message,"severity":"error","code":null,"location":{"file":"main.crn","range":{
+                "start":{"line":range.start.line+1,"column":range.start.character+1},
+                "end":{"line":range.end.line+1,"column":range.end.character+1}
+            }}}]},"json_exit":1,"json_stderr":"","lsp":lsp
+        }),
+        "all interfaces for named dependencies"
+    );
+}
+
+#[tokio::test]
+async fn r1_loop_variable_dependency_is_named() {
+    let mut fixture = Fixture::new(
+        "let children = for x in src.domain_validation_options {\n  mock.test.resource {\n    name_prefix = x\n  }\n}\n",
+        SOURCE,
+        false,
+    );
+    fixture.subject = "mock.test.resource.children[?]".into();
+    assert_named_dependency_reason(
+        fixture,
+        "'x'",
+        Range::new(Position::new(2, 4), Position::new(2, 19)),
+        "not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r3_root_loop_does_not_inherit_unrelated_call_arguments() {
+    let mut fixture = Fixture::new(
+        "let children = for x in src.domain_validation_options {\n  mock.test.resource {\n    name_prefix = x\n  }\n}\nlet c = use { source = './child' }\nlet other = c { names = src.domain_validation_options }\n",
+        SOURCE,
+        true,
+    ).with_file("child/arguments.crn", "arguments { names: list(String) }\n")
+        .with_file("child/main.crn", "for n in names { mock.test.resource { name = n } }\n");
+    fixture.subject = "mock.test.resource.children[?]".into();
+    assert_named_dependency_reason(
+        fixture,
+        "'x'",
+        Range::new(Position::new(2, 4), Position::new(2, 19)),
+        "not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_user_function_dependency_names_reference() {
+    let main = "mock.test.resource {\n  name_prefix = render(src.identifier)\n}\n";
+    let fixture = Fixture::new(
+        main,
+        &format!("{SOURCE}fn render(value: String): String {{ value }}\n"),
+        false,
+    );
+    assert_named_dependency(fixture, "'src.identifier'", assignment(38)).await;
+}
+
+#[tokio::test]
+async fn r1_dependency_keeps_direct_and_alias_occurrences() {
+    let main = "mock.test.resource {\n  name_prefix = \"${p}-${src.identifier}\"\n}\n";
+    let fixture = Fixture::new(main, &format!("{SOURCE}let p = src.identifier\n"), false);
+    assert_named_dependency(
+        fixture,
+        "'src.identifier' (through 'p') and 'src.identifier'",
+        assignment(40),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_secret_dependencies_do_not_share_alias_origins() {
+    let main =
+        "mock.test.resource {\n  name_prefix = \"${secret(p)}-${secret(b.identifier)}\"\n}\n";
+    let fixture = Fixture::new(
+        main,
+        "let a = mock.test.resource { name = 'a' }\nlet b = mock.test.resource { name = 'b' }\nlet p = a.identifier\n",
+        false,
+    );
+    assert_named_dependency(
+        fixture,
+        "'(secret)' (through '(secret)') and '(secret)'",
+        assignment(54),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_callee_alias_keeps_caller_and_standalone_provenance() {
+    let fixture=Fixture::new("let sink_module = use { source = './child' }\n\nlet sink = sink_module {\n  prefix = src.identifier\n}\n",SOURCE,true)
+        .with_file("child/lets.crn","let forwarded = prefix\n")
+        .with_file("child/main.crn","mock.test.resource {\n  name_prefix = forwarded\n}\n");
+    assert_module_declaration_findings(
+        fixture,
+        &["'src.identifier' (through 'forwarded')"],
+        &[assignment(25)],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_secret_literal_keeps_main_behavior() {
+    let fixture = Fixture::new(
+        "mock.test.resource {\n  name_prefix = secret('app')\n}\n",
+        "",
+        false,
+    );
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/main_secret_literal.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        fixture.observation().await,
+        expected,
+        "captured main checkout text, JSON and LSP"
+    );
+}
+
+#[tokio::test]
+async fn r1_known_builtin_keeps_main_behavior() {
+    let fixture = Fixture::new(
+        "mock.test.resource {\n  name_prefix = upper('app')\n}\n",
+        "",
+        false,
+    );
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/main_known_builtin.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        fixture.observation().await,
+        expected,
+        "captured main checkout text, JSON and LSP"
+    );
+}
+
+async fn assert_awaiting_prefix_keeps_sibling(
+    sibling: &str,
+    message: &str,
+    end: u32,
+    severity: u32,
+) {
+    let fixture = Fixture::new(
+        "let child = use { source = './child' }\nlet sink = child { prefix = src.identifier }\n",
+        SOURCE,
+        true,
+    )
+    .with_file(
+        "child/main.crn",
+        &format!("mock.test.resource {{\n  name_prefix = prefix\n  {sibling}\n}}\n"),
+    );
+    let prefix_message = "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply";
+    let standalone_message = "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated";
+
+    let mut lsp = fixture
+        .files
+        .iter()
+        .map(|file| (file.clone(), json!([])))
+        .collect::<serde_json::Map<_, _>>();
+    lsp.insert("main.crn".into(),json!([{"message":format!("mock.test.resource.<pending>: {message}"),"severity":1,"range":Range::new(Position::new(1,11),Position::new(1,44))}]));
+    lsp.insert("child/main.crn".into(),json!([{"message":standalone_message,"severity":1,"range":assignment(22)},{"message":message,"severity":severity,"range":Range::new(Position::new(2,2),Position::new(2,end))}]));
+    let actual = fixture.observation().await;
+    assert_eq!(
+        actual,
+        json!({"text":format!("Validating...\nError: mock.test.resource.<pending>: {prefix_message}\nError: mock.test.resource.<pending>: {message}\n"),"text_exit":1,
+            "json":{"status":"error","resource_count":0,"resources":[],"errors":[{"message":prefix_message,"code":null,"severity":"error","location":{"file":"child/main.crn","range":{"start":{"line":2,"column":3},"end":{"line":2,"column":23}}}},{"message":message,"code":null,"severity":"error","location":{"file":"child/main.crn","range":{
+                "start":{"line":3,"column":3},"end":{"line":3,"column":end+1}
+            }}}]},"json_exit":1,"json_stderr":"","lsp":lsp
+        }),
+        "only the companion judgement awaits arguments; sibling diagnostics remain"
+    );
+}
+
+#[tokio::test]
+async fn r1_awaiting_prefix_keeps_unknown_sibling() {
+    assert_awaiting_prefix_keeps_sibling("bogus = 1", "Unknown attribute 'bogus'", 11, 1).await;
+}
+
+#[tokio::test]
+async fn r1_awaiting_prefix_keeps_typed_sibling() {
+    assert_awaiting_prefix_keeps_sibling(
+        "comment = 1",
+        "Type mismatch: expected String, got Int",
+        9,
+        2,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r1_awaiting_prefix_keeps_both_siblings() {
+    let fixture = Fixture::new(
+        "let child = use { source = './child' }\nlet sink = child { prefix = src.identifier }\n",
+        SOURCE,
+        true,
+    )
+    .with_file(
+        "child/main.crn",
+        "mock.test.resource {\n  name_prefix = prefix\n  bogus = 1\n  comment = 1\n}\n",
+    );
+    let messages = [
+        "Unknown attribute 'bogus'",
+        "Type mismatch: expected String, got Int",
+    ];
+    let prefix_message = "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply";
+    let standalone_message = "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated";
+
+    let mut lsp = fixture
+        .files
+        .iter()
+        .map(|file| (file.clone(), json!([])))
+        .collect::<serde_json::Map<_, _>>();
+    lsp.insert("main.crn".into(),json!(messages.iter().map(|message|json!({"message":format!("mock.test.resource.<pending>: {message}"),"severity":1,"range":Range::new(Position::new(1,11),Position::new(1,44))})).collect::<Vec<_>>()));
+    lsp.insert("child/main.crn".into(),json!([
+        {"message":standalone_message,"severity":1,"range":assignment(22)},
+        {"message":messages[0],"severity":1,"range":Range::new(Position::new(2,2),Position::new(2,11))},
+        {"message":messages[1],"severity":2,"range":Range::new(Position::new(3,2),Position::new(3,9))}
+    ]));
+    let mut actual = fixture.observation().await;
+    // Diagnostic order between independent fields is not a publication policy.
+    actual["lsp"]["child/main.crn"]
+        .as_array_mut()
+        .unwrap()
+        .sort_by_key(|finding| {
+            (
+                finding["range"]["start"]["line"].as_u64().unwrap(),
+                finding["range"]["start"]["character"].as_u64().unwrap(),
+            )
+        });
+    assert_eq!(
+        actual,
+        json!({
+            "text":format!("Validating...\nError: mock.test.resource.<pending>: {prefix_message}\nError: mock.test.resource.<pending>: {}\nError: mock.test.resource.<pending>: {}\n",messages[0],messages[1]),"text_exit":1,
+            "json":{"status":"error","resource_count":0,"resources":[],"errors":[
+                {"message":prefix_message,"code":null,"severity":"error","location":{"file":"child/main.crn","range":{"start":{"line":2,"column":3},"end":{"line":2,"column":23}}}},
+                {"message":messages[0],"severity":"error","code":null,"location":{"file":"child/main.crn","range":{"start":{"line":3,"column":3},"end":{"line":3,"column":12}}}},
+                {"message":messages[1],"severity":"error","code":null,"location":{"file":"child/main.crn","range":{"start":{"line":4,"column":3},"end":{"line":4,"column":10}}}}
+            ]},"json_exit":1,"json_stderr":"","lsp":lsp
+        }),
+        "each sibling remains a separate finding"
+    );
+}
+
+fn r2_fixture(case: &str) -> Fixture {
+    let call = "let c = use { source = './child' }\nlet s = c { prefix = src.identifier }\n";
+    match case {
+        "b1_literal_siblings" | "b1_deferred_siblings" => {
+            let argument = if case == "b1_literal_siblings" { "'app'" } else { "src.identifier" };
+            Fixture::new(&format!("let c = use {{ source = './child' }}\nlet s = c {{ prefix = {argument} }}\nmock.test.resource {{ name = 'r' nope = 1 }}\n"), if case == "b1_literal_siblings" { "" } else { SOURCE }, true)
+                .with_file("child/main.crn", "mock.test.resource {\n  name_prefix = prefix\n  bogus = 1\n}\n")
+        }
+        "b1_local_module_siblings" => Fixture::new("let c = use { source = './child' }\nlet s = c { prefix = 'app' }\nmock.test.resource { name = 'r' nope = 1 }\n","",true)
+            .with_file("child/lets.crn","let local = mock.test.resource { name = 'local' }\n")
+            .with_file("child/main.crn","mock.test.resource {\n  name_prefix = local.identifier\n  bogus = 1\n}\n"),
+        "s1_root_siblings" => Fixture::new("let child = use { source = './child' }\nlet net = child {}\nmock.test.resource { name_prefix = net.first bogus = 'one' }\nmock.test.resource { name_prefix = net.second bogus = 'two' }\n", "", false)
+            .with_file("child/main.crn", "attributes { first: String = 'first' second: String = 'second' }\n"),
+        "s4_one_call_two_resources" => Fixture::new(call,SOURCE,true)
+            .with_file("child/main.crn","let first = mock.test.resource { name_prefix = prefix }\nlet second = mock.test.resource { name_prefix = prefix }\nattributes { first_id: String = first.identifier second_id: String = second.identifier }\n"),
+        "n1_mixed_deferred" | "n1_mixed_literal" | "n2_middle_alias" => {
+            let arg=if case == "n1_mixed_literal" { "'app'" } else { "src.identifier" };
+            let expr=if case == "n2_middle_alias" { "p" } else { "\"${prefix}-${local.identifier}\"" };
+            let f=Fixture::new(&format!("let a = use {{ source = './mod_a' }}\nlet root = a {{ prefix = {arg} }}\n"),if case == "n1_mixed_literal" { "" } else { SOURCE },false)
+                .with_file("mod_a/arguments.crn","arguments { prefix: String }\n")
+                .with_file("mod_a/lets.crn","let local = mock.test.resource { name = 'local' }\nlet p = local.identifier\n")
+                .with_file("mod_a/main.crn",&format!("let b = use {{ source = './mod_b' }}\nlet inner = b {{ prefix = {expr} }}\n"))
+                .with_file("mod_a/mod_b/arguments.crn","arguments { prefix: String }\n")
+                .with_file("mod_a/mod_b/main.crn","mock.test.resource {\n  name_prefix = prefix\n}\n");
+            if case == "n2_middle_alias" { f } else { f.with_file("mod_a/lets.crn","let local = mock.test.resource { name = 'local' }\n") }
+        }
+        "n4_undefined_binding" => Fixture::new("mock.test.resource {\n  name_prefix = missing\n}\n","",false),
+        _ => panic!("unknown r2 case: {case}")
+    }
+}
+
+#[tokio::test]
+async fn r2_b1_literal_siblings() {
+    let fixture = r2_fixture("b1_literal_siblings");
+    let actual = fixture.observation().await;
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/r2/b1_literal_siblings.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        actual, expected,
+        "complete validate text, JSON, and per-file LSP inventory"
+    );
+}
+
+#[tokio::test]
+async fn r2_b1_deferred_siblings() {
+    let fixture = r2_fixture("b1_deferred_siblings");
+    let actual = fixture.observation().await;
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/r2/b1_deferred_siblings.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        actual, expected,
+        "complete validate text, JSON, and per-file LSP inventory"
+    );
+}
+
+#[tokio::test]
+async fn r2_s1_root_siblings() {
+    let fixture = r2_fixture("s1_root_siblings");
+    let actual = fixture.observation().await;
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/r2/s1_root_siblings.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        actual, expected,
+        "complete validate text, JSON, and per-file LSP inventory"
+    );
+}
+
+#[tokio::test]
+async fn r2_s4_one_call_two_resources() {
+    let fixture = r2_fixture("s4_one_call_two_resources");
+    let actual = fixture.observation().await;
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/r2/s4_one_call_two_resources.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        actual, expected,
+        "complete validate text, JSON, and per-file LSP inventory"
+    );
+}
+
+#[tokio::test]
+async fn r2_n1_mixed_deferred() {
+    let fixture = r2_fixture("n1_mixed_deferred");
+    let actual = fixture.observation().await;
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/r2/n1_mixed_deferred.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        actual, expected,
+        "complete validate text, JSON, and per-file LSP inventory"
+    );
+}
+
+#[tokio::test]
+async fn r2_n1_mixed_literal() {
+    let fixture = r2_fixture("n1_mixed_literal");
+    let actual = fixture.observation().await;
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/r2/n1_mixed_literal.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        actual, expected,
+        "complete validate text, JSON, and per-file LSP inventory"
+    );
+}
+
+#[tokio::test]
+async fn r2_n2_middle_alias() {
+    let fixture = r2_fixture("n2_middle_alias");
+    let actual = fixture.observation().await;
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/r2/n2_middle_alias.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        actual, expected,
+        "complete validate text, JSON, and per-file LSP inventory"
+    );
+}
+
+#[tokio::test]
+async fn r2_n4_undefined_binding() {
+    let fixture = r2_fixture("n4_undefined_binding");
+    let actual = fixture.observation().await;
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/r2/n4_undefined_binding.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        actual, expected,
+        "complete validate text, JSON, and per-file LSP inventory"
+    );
+}
+
+#[tokio::test]
+async fn r2_b1_local_module_siblings() {
+    let fixture = r2_fixture("b1_local_module_siblings");
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/r2/b1_local_module_siblings.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        fixture.observation().await,
+        expected,
+        "a local deferred companion must not stop module import or root sibling admission"
+    );
+}
+
+fn r3_fixture(case: &str) -> Fixture {
+    let argument = if case == "literal" {
+        "['app']"
+    } else {
+        "src.domain_validation_options"
+    };
+    let child = if case == "concat_unknown" {
+        "for x in concat(items, nope.list) { mock.test.resource { name = x } }\n"
+    } else {
+        "for n in names {\n  mock.test.resource {\n    name_prefix = n\n  }\n}\n"
+    };
+    let argname = if case == "concat_unknown" {
+        "items"
+    } else {
+        "names"
+    };
+    Fixture::new(
+        &format!("let c = use {{ source = './child' }}\nlet s = c {{ {argname} = {argument} }}\n"),
+        if case == "literal" { "" } else { SOURCE },
+        true,
+    )
+    .with_file(
+        "child/arguments.crn",
+        &format!("arguments {{ {argname}: list(String) }}\n"),
+    )
+    .with_file("child/main.crn", child)
+}
+#[tokio::test]
+async fn r3_module_argument_iterable_matches_main() {
+    for (case, expected) in [
+        (
+            "literal",
+            include_str!("fixtures/deferred_prefix/r3/literal.json"),
+        ),
+        (
+            "apply",
+            include_str!("fixtures/deferred_prefix/r3/apply.json"),
+        ),
+    ] {
+        let expected: serde_json::Value = serde_json::from_str(expected).unwrap();
+        assert_eq!(
+            r3_fixture(case).observation().await,
+            expected,
+            "main-captured {case}: complete text, JSON, and every file's LSP inventory"
+        );
+    }
+}
+#[tokio::test]
+async fn r3_module_argument_concat_unknown_matches_main() {
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/r3/concat_unknown.json"
+    ))
+    .unwrap();
+    assert_eq!(r3_fixture("concat_unknown").observation().await, expected);
+}
+
+fn w_fixture(case: &str) -> Fixture {
+    if case == "caller_module" {
+        return Fixture::new(
+            "let sink = child { prefix = net.first }\n",
+            "let origin = use { source = './origin' }\nlet net = origin {}\nlet child = use { source = './child' }\n",
+            true,
+        ).with_file("origin/main.crn", "attributes { first: String = 'first' }\n");
+    }
+    let (expression, lets) = match case {
+        "provider" => ("src.identifier", SOURCE.to_owned()),
+        "module" | "module_pair" | "loop_module" => (
+            if case == "module_pair" {
+                "\"${net.first}-${net.second}\""
+            } else {
+                "net.first"
+            },
+            "let child = use { source = './child' }\nlet net = child {}\n".into(),
+        ),
+        "module_alias" => (
+            "p",
+            "let child = use { source = './child' }\nlet net = child {}\nlet p = net.first\n"
+                .into(),
+        ),
+        "module_secret" => (
+            "secret(net.first)",
+            "let child = use { source = './child' }\nlet net = child {}\n".into(),
+        ),
+        "upstream" | "loop_upstream" => (
+            "net.first",
+            "let net = upstream_state { source = './upstream' }\n".into(),
+        ),
+        "mixed" => (
+            "\"${src.identifier}-${net.first}\"",
+            format!("{SOURCE}let child = use {{ source = './child' }}\nlet net = child {{}}\n"),
+        ),
+        _ => panic!("unknown wording fixture: {case}"),
+    };
+    let main = if case.starts_with("loop_") {
+        "let children = for x in net.names {\n  mock.test.resource {\n    name_prefix = x\n  }\n}\n"
+            .into()
+    } else {
+        format!("mock.test.resource {{\n  name_prefix = {expression}\n}}\n")
+    };
+    let mut fixture = Fixture::new(&main, &lets, false);
+    if matches!(
+        case,
+        "module" | "module_pair" | "module_alias" | "module_secret" | "mixed" | "loop_module"
+    ) {
+        fixture = fixture.with_file("child/main.crn", "attributes { first: String = 'first' second: String = 'second' names: list(String) = ['app'] }\n");
+    }
+    if matches!(case, "upstream" | "loop_upstream") {
+        fixture = fixture
+            .with_file(
+                "upstream/backend.crn",
+                "backend local { path = 'carina.state.json' }\n",
+            )
+            .with_file(
+                "upstream/exports.crn",
+                "exports { first: String = 'first' names: list(String) = ['app'] }\n",
+            );
+        let mut state = serde_json::to_value(carina_state::StateFile::new()).unwrap();
+        state["exports"] = json!({"first": "first", "names": ["app"]});
+        std::fs::write(
+            fixture.root().join("upstream/carina.state.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+    }
+    if case.starts_with("loop_") {
+        fixture.subject = "mock.test.resource.children[?]".into();
+    }
+    fixture
+}
+
+async fn w_assert(case: &str, dependencies: &str) {
+    let fixture = w_fixture(case);
+    assert_wording_fixture(fixture, case, dependencies).await;
+}
+
+async fn assert_wording_fixture(fixture: Fixture, case: &str, dependencies: &str) {
+    let authored = if case.starts_with("caller_") {
+        "child/main.crn"
+    } else {
+        "main.crn"
+    };
+    let source = std::fs::read_to_string(fixture.root().join(authored)).unwrap();
+    let (line, assignment) = source
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("name_prefix ="))
+        .unwrap();
+    let range = Range::new(
+        Position::new(line as u32, assignment.find("name_prefix").unwrap() as u32),
+        Position::new(line as u32, assignment.len() as u32),
+    );
+    let subject = fixture.subject.clone();
+    let message = format!(
+        "'name_prefix' must be known at plan time to generate 'name', but it depends on {dependencies}"
+    );
+    let mut inventory = serde_json::Map::new();
+    for file in &fixture.files {
+        inventory.insert(
+            file.clone(),
+            if file == authored {
+                json!([{"message":message,"range":range,"severity":1}])
+            } else {
+                json!([])
+            },
+        );
+    }
+    if authored != "main.crn" {
+        let before = inventory[authored].clone();
+        let after = fixture.standalone_editor_findings(authored);
+        if before != after {
+            println!(
+                "C4461_EXPECTATION_CHANGE={} {}",
+                std::thread::current().name().unwrap_or("unnamed"),
+                json!({"file":authored,"before":before,"after":after})
+            );
+        }
+        inventory.insert(authored.into(), after);
+    }
+    if matches!(case, "loop_coalesce" | "loop_coalesce_reversed") {
+        // Main's existing style hint also appears on the map type constructor.
+        // Keep the entire per-file inventory while changing only the prefix finding.
+        inventory.insert(
+            "child/main.crn".into(),
+            json!([{
+                "message":"Consider using pipe form for 'map': data |> map(...)",
+                "range":Range::new(Position::new(0,25),Position::new(0,28)),"severity":3
+            }]),
+        );
+    }
+    let expected = json!({
+        "text": format!("Validating...\nError: {subject}: {message}\n"),
+        "text_exit":1,"json_exit":1,"json_stderr":"",
+        "json":{"status":"error","resource_count":0,"resources":[],"errors":[{
+            "message":message,"severity":"error","code":null,
+            "location":{"file":authored,"range":{
+                "start":{"line":range.start.line+1,"column":range.start.character+1},
+                "end":{"line":range.end.line+1,"column":range.end.character+1}
+            }}
+        }]},
+        "lsp":inventory
+    });
+    println!("C4461_W_CASE={case}");
+    assert_eq!(
+        fixture.observation().await,
+        expected,
+        "exact validate text, JSON, and every file's LSP inventory: {case}"
+    );
+}
+
+#[tokio::test]
+async fn w_provider_attribute_keeps_apply_clause() {
+    w_assert(
+        "provider",
+        "'src.identifier', which is known only after apply",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_module_output_uses_name_generation_clause() {
+    w_assert(
+        "module",
+        "'net.first', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_upstream_export_uses_name_generation_clause() {
+    w_assert(
+        "upstream",
+        "'net.first', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_mixed_kinds_keep_each_clause() {
+    w_assert("mixed", "'src.identifier', which is known only after apply, and 'net.first', which is not resolved when names are generated").await;
+}
+
+#[tokio::test]
+async fn w_module_alias_keeps_kind_and_authored_name() {
+    w_assert(
+        "module_alias",
+        "'net.first' (through 'p'), which is not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_same_kind_uses_one_clause() {
+    w_assert(
+        "module_pair",
+        "'net.first' and 'net.second', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_loop_over_module_output_inherits_kind() {
+    w_assert(
+        "loop_module",
+        "'x', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_loop_over_upstream_export_inherits_kind() {
+    w_assert(
+        "loop_upstream",
+        "'x', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_module_argument_separates_caller_kind_from_standalone_formal() {
+    w_assert(
+        "caller_module",
+        "'net.first', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_secret_module_output_keeps_kind_without_rendered_identity() {
+    w_assert(
+        "module_secret",
+        "'(secret)', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+fn r4_fixture(case: &str) -> Fixture {
+    let call = "let c = use { source = './child' }\n";
+    match case {
+        "field_deferred" | "field_literal" | "alias_field_argument" => {
+            let value = if case == "field_literal" { "'app'" } else { "src.identifier" };
+            let mut fixture = Fixture::new(&format!("{call}let instance = c {{ cfg = {{ prefix = {value} }} }}\n"), if case == "field_literal" { "" } else { SOURCE }, false)
+                .with_file("child/arguments.crn", "arguments { cfg: map(String) }\n")
+                .with_file("child/main.crn", if case == "alias_field_argument" { "mock.test.resource {\n  name_prefix = p\n}\n" } else { "mock.test.resource {\n  name_prefix = cfg.prefix\n}\n" });
+            if case == "alias_field_argument" { fixture = fixture.with_file("child/lets.crn", "let p = cfg.prefix\n"); }
+            fixture
+        }
+        "index_argument" => Fixture::new(&format!("{call}let instance = c {{ names = [src.identifier] }}\n"), SOURCE, false)
+            .with_file("child/arguments.crn", "arguments { names: list(String) }\n")
+            .with_file("child/main.crn", "mock.test.resource {\n  name_prefix = names[0]\n}\n"),
+        "builtin_argument" | "user_function_argument" => {
+            let expression = if case == "builtin_argument" { "upper(prefix)" } else { "render(prefix)" };
+            let mut fixture = Fixture::new(&format!("{call}let instance = c {{ prefix = src.identifier }}\n"), SOURCE, false)
+                .with_file("child/arguments.crn", "arguments { prefix: String }\n")
+                .with_file("child/main.crn", &format!("mock.test.resource {{\n  name_prefix = {expression}\n}}\n"));
+            if case == "user_function_argument" { fixture = fixture.with_file("child/functions.crn", "fn render(s: String): String { s }\n"); }
+            fixture
+        }
+        "forwarded_field" => Fixture::new("let a = use { source = './mod_a' }\nlet instance = a { cfg = { prefix = src.identifier } }\n", SOURCE, false)
+            .with_file("mod_a/arguments.crn", "arguments { cfg: map(String) }\n")
+            .with_file("mod_a/main.crn", "let b = use { source = './mod_b' }\nlet inner = b { prefix = cfg.prefix }\n")
+            .with_file("mod_a/mod_b/arguments.crn", "arguments { prefix: String }\n")
+            .with_file("mod_a/mod_b/main.crn", "mock.test.resource {\n  name_prefix = prefix\n}\n"),
+        "loop_argument_literal" | "loop_argument_deferred" => r3_fixture(if case == "loop_argument_literal" { "literal" } else { "apply" }),
+        "caller_literal_attr" => Fixture::new(
+            "let sink = child { prefix = src.name }\n",
+            &format!("{SOURCE}let child = use {{ source = './child' }}\n"), true),
+        "provider_attr" => w_fixture("provider"),
+        "literal_attr" => Fixture::new("mock.test.resource {\n  name_prefix = src.name\n}\n", SOURCE, false),
+        "forward_literal_attr" => Fixture::new("mock.test.resource {\n  name_prefix = src.name\n}\nlet src = mock.test.resource { name = 'source' }\n", "", false),
+        "expression_attr" => Fixture::new("mock.test.resource {\n  name_prefix = src.name\n}\n", "let origin = mock.test.resource { name = 'origin' }\nlet src = mock.test.resource { name = origin.identifier }\n", false),
+        "optional_attr" => Fixture::new("mock.test.resource {\n  name_prefix = src.comment\n}\n", SOURCE, false),
+        "loop_literal_attr" => Fixture::new("mock.test.resource {\n  name_prefix = sources[0].name\n}\n", "let src = mock.test.resource { name = 'source' }\nlet sources = for x in src.domain_validation_options { mock.test.resource { name = 'literal' } }\n", false),
+        "module_output" => w_fixture("module"),
+        "upstream_export" => w_fixture("upstream"),
+        "mixed" => w_fixture("mixed"),
+        "module_upstream" => w_fixture("upstream")
+            .with_file("lets.crn", "let c = use { source = './child' }\nlet net = c {}\nlet up = upstream_state { source = './upstream' }\n")
+            .with_file("child/main.crn", "attributes { first: String = 'first' }\n")
+            .with_file("main.crn", "mock.test.resource {\n  name_prefix = \"${net.first}-${up.first}\"\n}\n"),
+        "loop_concat" | "loop_coalesce" | "loop_coalesce_reversed" => {
+            let iterable = match case { "loop_concat" => "concat(src.generated_rules, net.names)", "loop_coalesce" => "net.names ?? src.generated_rules", _ => "src.generated_rules ?? net.names" };
+            Fixture::new(&format!("let items = {iterable}\nlet children = for (_, x) in items {{\n  mock.test.resource {{\n    name_prefix = x.action\n  }}\n}}\n"), "let src = mock.test.deferred_source { name = 'source' }\nlet c = use { source = './child' }\nlet net = c {}\n", false)
+                .with_file("child/main.crn", "attributes { names: list(map(String)) = [{ action = 'app' }] }\n")
+        }
+        "distinct_sets" => Fixture::new(&format!("{call}let instance = c {{ first = src.identifier second = other.identifier }}\n"), &format!("{SOURCE}let other = mock.test.resource {{ name = 'other' }}\n"), false)
+            .with_file("child/arguments.crn", "arguments { first: String second: String }\n")
+            .with_file("child/main.crn", "mock.test.resource { name_prefix = first }\nmock.test.resource { name_prefix = second }\n"),
+        "data_source_names" | "data_source_input" | "data_source_deferred" => {
+            let deferred = case == "data_source_deferred";
+            let attr = if case == "data_source_input" { "name_regex" } else { "names[0]" };
+            let regex = if deferred { "src.identifier" } else { "'pattern'" };
+            let fixture = Fixture::new(&format!("mock.test.resource {{\n  name_prefix = ds.{attr}\n}}\n"), &format!("{}let ds = read mock.iam.Roles {{ name_regex = {regex} }}\n", if deferred { SOURCE } else { "" }), false);
+            std::fs::write(fixture.root().join("mock-provider-state.json"), r#"{"version":2,"states":{"iam.Roles.ds":{"name_regex":"pattern","names":["resolved-role"]}}}"#).unwrap();
+            fixture
+        }
+        _ => panic!("unknown round-4 fixture: {case}"),
+    }
+}
+
+#[tokio::test]
+async fn r4_resource_input_uses_name_generation_clause() {
+    assert_wording_fixture(
+        r4_fixture("optional_attr"),
+        "optional_attr",
+        "'src.comment', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r4_module_and_upstream_share_one_clause() {
+    assert_wording_fixture(
+        r4_fixture("module_upstream"),
+        "module_upstream",
+        "'net.first' and 'up.first', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+macro_rules! r4_captured_case {
+    ($test:ident, $case:literal) => {
+        #[tokio::test]
+        async fn $test() {
+            let expected: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                "fixtures/deferred_prefix/r4/",
+                $case,
+                ".json"
+            )))
+            .unwrap();
+            assert_eq!(
+                r4_fixture($case).observation().await,
+                expected,
+                "captured validate text, JSON locations/counts and each standalone/caller LSP inventory"
+            );
+        }
+    };
+}
+r4_captured_case!(
+    r4_field_deferred_uses_standalone_module_analysis,
+    "field_deferred"
+);
+r4_captured_case!(
+    r4_field_literal_uses_standalone_module_analysis,
+    "field_literal"
+);
+r4_captured_case!(
+    r4_index_argument_uses_standalone_module_analysis,
+    "index_argument"
+);
+r4_captured_case!(
+    r4_builtin_argument_uses_standalone_module_analysis,
+    "builtin_argument"
+);
+r4_captured_case!(
+    r4_user_function_argument_uses_standalone_module_analysis,
+    "user_function_argument"
+);
+r4_captured_case!(
+    r4_alias_field_argument_uses_standalone_module_analysis,
+    "alias_field_argument"
+);
+r4_captured_case!(
+    r4_forwarded_field_uses_standalone_module_analysis,
+    "forwarded_field"
+);
+r4_captured_case!(
+    r4_loop_argument_literal_matches_main,
+    "loop_argument_literal"
+);
+r4_captured_case!(
+    r4_loop_argument_deferred_matches_main,
+    "loop_argument_deferred"
+);
+
+#[tokio::test]
+async fn r4_loop_kind_considers_every_iterable_reference() {
+    for case in ["loop_coalesce", "loop_coalesce_reversed"] {
+        let mut fixture = r4_fixture(case);
+        fixture.subject = "mock.test.resource.children[?]".into();
+        assert_wording_fixture(fixture, case, "'x', which is known only after apply").await;
+    }
+}
+
+#[tokio::test]
+async fn r4_authored_resource_expression_uses_name_generation_clause() {
+    assert_wording_fixture(
+        r4_fixture("expression_attr"),
+        "expression_attr",
+        "'src.name', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+r4_captured_case!(r4_known_resource_literal_matches_main, "literal_attr");
+
+#[tokio::test]
+async fn r4_distinct_dependency_sets_at_one_call_stay_distinct() {
+    let fixture = r4_fixture("distinct_sets");
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/c/distinct_sets.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture.observation().await, expected);
+}
+
+#[tokio::test]
+async fn r4_caller_literal_input_uses_name_generation_clause() {
+    assert_wording_fixture(
+        r4_fixture("caller_literal_attr"),
+        "caller_literal_attr",
+        "'src.name', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+r4_captured_case!(
+    r4_known_forward_literal_matches_main,
+    "forward_literal_attr"
+);
+
+async fn assert_data_source_capture(case: &str, captured: &str) {
+    let expected: serde_json::Value = serde_json::from_str(captured).unwrap();
+    assert_eq!(r4_fixture(case).observation().await, expected, "{case}");
+}
+
+#[tokio::test]
+async fn r4_data_source_names_use_name_generation_clause() {
+    assert_data_source_capture(
+        "data_source_names",
+        include_str!("fixtures/deferred_prefix/r4/data_source_names.json"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r4_data_source_deferred_uses_name_generation_clause() {
+    assert_data_source_capture(
+        "data_source_deferred",
+        include_str!("fixtures/deferred_prefix/r4/data_source_deferred.json"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r4_data_source_literal_input_stays_known() {
+    assert_data_source_capture(
+        "data_source_input",
+        include_str!("fixtures/deferred_prefix/r4/data_source_input.json"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r4b_data_source_iterable_uses_name_generation_clause() {
+    let mut fixture = r4_fixture("data_source_names").with_file(
+        "main.crn",
+        "let children = for x in ds.names {\n  mock.test.resource {\n    name_prefix = x\n  }\n}\n",
+    );
+    fixture.subject = "mock.test.resource.children[?]".into();
+    assert_named_dependency_reason(
+        fixture,
+        "'x'",
+        Range::new(Position::new(2, 4), Position::new(2, 19)),
+        "not resolved when names are generated",
+    )
+    .await;
+}
+
+fn option_c_fixture(case: &str) -> Fixture {
+    let sources: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/deferred_prefix/c/inputs.json")).unwrap();
+    let source = &sources[case];
+    let mut fixture = Fixture::new(
+        source["main.crn"].as_str().unwrap(),
+        source["lets.crn"].as_str().unwrap(),
+        false,
+    );
+    for (file, text) in source.as_object().unwrap() {
+        fixture = fixture.with_file(file, text.as_str().unwrap());
+    }
+    fixture
+}
+
+macro_rules! option_c_case {
+    ($name:ident, $case:literal) => {
+        #[tokio::test]
+        async fn $name() {
+            let expected: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                "fixtures/deferred_prefix/c/",
+                $case,
+                ".json"
+            )))
+            .unwrap();
+            assert_eq!(
+                option_c_fixture($case).observation().await,
+                expected,
+                "exact validate text/JSON and every opened file's LSP inventory"
+            );
+        }
+    };
+}
+option_c_case!(option_c_bare_direct_is_declaration_owned, "b3_direct");
+option_c_case!(
+    option_c_interpolation_is_declaration_owned,
+    "b3_interpolation"
+);
+option_c_case!(option_c_let_alias_is_declaration_owned, "b3_alias");
+option_c_case!(option_c_nested_forwarding_is_declaration_owned, "b3_nested");
+option_c_case!(
+    option_c_three_modules_keep_caller_and_standalone_findings,
+    "b1_three_modules"
+);
+option_c_case!(
+    option_c_resource_hop_deferred_uses_standalone_module_analysis,
+    "b2_hop_deferred"
+);
+option_c_case!(
+    option_c_resource_hop_literal_uses_standalone_module_analysis,
+    "b2_hop_literal"
+);
+
+#[tokio::test]
+async fn option_c_field_access_is_declaration_owned() {
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/c/field_deferred.json"
+    ))
+    .unwrap();
+    assert_eq!(r4_fixture("field_deferred").observation().await, expected);
+}
+
+#[tokio::test]
+async fn option_c_parenthesized_argument_is_declaration_owned() {
+    assert_rejected(
+        Fixture::new(
+            "let c = use { source = './child' }\nlet instance = c { prefix = src.identifier }\n",
+            SOURCE,
+            true,
+        )
+        .with_file(
+            "child/main.crn",
+            "mock.test.resource {\n  name_prefix = (prefix)\n}\n",
+        ),
+        "'src.identifier'",
+        "child/main.crn",
+        assignment(24),
+    )
+    .await;
+}
+
+#[path = "deferred_prefix_diagnostics/r7b.rs"]
+mod r7b;
+
+#[path = "deferred_prefix_diagnostics/r10.rs"]
+mod r10;

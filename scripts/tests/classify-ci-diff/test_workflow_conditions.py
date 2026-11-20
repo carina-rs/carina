@@ -24,8 +24,8 @@ TEST_JOBS = {"test-partition", "test-isolation"} | AUX_CACHE_JOBS
 CACHE_JOBS = MAIN_CACHE_JOBS | AUX_CACHE_JOBS
 SCRIPT_JOBS = {
     "provider-boundaries", "binding-addresses", "error-source-display", "no-wall-clock-test-assertions",
-    "docs-spellings", "check-resources-access", "check-cli-hints",
-    "check-no-home-env-reads", "check-crates-not-publishable",
+    "docs-spellings", "check-doctest-module-tree", "check-resources-access",
+    "check-cli-hints", "check-no-home-env-reads", "check-crates-not-publishable",
     "check-wit-bindgen-workspace", "check-plan-fixtures",
     "check-rust-cache-via-local-action", "check-pinned-toolchain", "check-vendored-patches-used",
 }

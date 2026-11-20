@@ -463,12 +463,7 @@ fn locate_unknown_key(
             .unwrap_or(declaration),
         SchemaDiagnosticKey::Attribute { name } => {
             let root = authored_root(name)?;
-            let assignment = root.assignment_location();
-            if assignment.span().start_line() == assignment.span().end_line() {
-                assignment
-            } else {
-                root.location()
-            }
+            root.finding_location()
         }
         SchemaDiagnosticKey::Value {
             root: name,
@@ -484,6 +479,14 @@ fn locate_unknown_key(
 }
 
 impl DeclarationProvenance {
+    pub(crate) fn attribute_key_finding_location(&self, name: &str) -> Option<DeclarationLocation> {
+        self.elements()
+            .diagnostic_index()
+            .attribute(name)
+            .and_then(|node| node.root_key(self.elements()))
+            .map(|key| key.finding_location().clone())
+    }
+
     /// Locate a schema finding while its declaration is still in hand. Unauthored
     /// programmatic resources have no source span; an authored missing root is an invariant.
     pub(crate) fn schema_diagnostic_location(
@@ -1599,6 +1602,32 @@ where
             ResourceRef::DataSource(source) => source.module_source.as_ref(),
             ResourceRef::Deferred { resource, .. } => resource.as_resource().module_source.as_ref(),
             ResourceRef::LiveComposition(_) => None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn prefix_declaration(&self) -> Option<&'a super::DeclarationProvenance> {
+        match self.resource {
+            ResourceRef::Resource(resource) => Some(&resource.declaration),
+            ResourceRef::DataSource(resource) => Some(&resource.declaration),
+            ResourceRef::Deferred { resource, .. } => Some(&resource.as_resource().declaration),
+            ResourceRef::LiveComposition(_) => None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn loop_iterable(&self) -> Option<&'a Value<P, B>> {
+        match self.resource {
+            ResourceRef::Deferred { deferred, .. } => Some(D::deferred_iterable(deferred)),
+            _ => None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn loop_binding(&self) -> Option<&'a super::ForBinding> {
+        match self.resource {
+            ResourceRef::Deferred { deferred, .. } => Some(D::deferred_binding(deferred)),
+            _ => None,
         }
     }
 

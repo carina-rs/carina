@@ -136,7 +136,7 @@ impl ProviderState {
             diagnostic_engine.with_provider_errors(provider_errors.into_iter().collect());
         if let Some((directory, _)) = configs.first() {
             diagnostic_engine = diagnostic_engine.with_directory_providers(
-                PathIdentity::new(directory),
+                directory.clone(),
                 configs
                     .iter()
                     .map(|(_, config)| config.factory_config().clone())
@@ -1149,6 +1149,10 @@ fn should_reload_for_event(event: &FileEvent) -> bool {
 }
 
 #[cfg(test)]
+#[path = "backend/tests/prefix_publication.rs"]
+mod prefix_publication_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use carina_core::provider::{BoxFuture, ProviderResult};
@@ -1352,6 +1356,103 @@ mod tests {
             vec![],
             carina_core::EnvironmentSnapshot::empty(),
         )
+    }
+
+    #[test]
+    fn deferred_prefix_publication_uses_the_open_directory_context() {
+        let sources: serde_json::Value = serde_json::from_str(include_str!(
+            "../../carina-cli/tests/fixtures/deferred_prefix/c/inputs.json"
+        ))
+        .unwrap();
+        let callers: serde_json::Value = serde_json::from_str(include_str!(
+            "../../carina-cli/tests/fixtures/deferred_prefix/c/caller_prefix_publications.json"
+        ))
+        .unwrap();
+        let standalone: serde_json::Value = serde_json::from_str(include_str!(
+            "../../carina-cli/tests/fixtures/deferred_prefix/c/standalone_prefix_publications.json"
+        ))
+        .unwrap();
+        for case in [
+            "b3_direct",
+            "b3_interpolation",
+            "b3_alias",
+            "b3_nested",
+            "b1_three_modules",
+            "b2_hop_deferred",
+            "b2_hop_literal",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let files = sources[case].as_object().unwrap();
+            for (file, text) in files {
+                let path = directory.path().join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, text.as_str().unwrap()).unwrap();
+            }
+            let state = builtin_mock_provider_state(directory.path());
+            let prefix_inventory = |inventory: &serde_json::Value| {
+                inventory
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|(file, findings)| {
+                        let prefixes = findings
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter(|finding| {
+                                finding["message"]
+                                    .as_str()
+                                    .unwrap()
+                                    .starts_with("'name_prefix' must be known")
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        (!prefixes.is_empty())
+                            .then(|| (file.clone(), serde_json::Value::Array(prefixes)))
+                    })
+                    .collect::<serde_json::Map<_, _>>()
+            };
+            for (file, text) in files {
+                let path = directory.path().join(file);
+                let document = Document::new_with_path(
+                    text.as_str().unwrap().into(),
+                    path.clone(),
+                    Arc::new(ProviderContext::new(
+                        carina_core::EnvironmentSnapshot::empty(),
+                    )),
+                );
+                let result =
+                    state
+                        .diagnostic_engine
+                        .analyze_document_snapshot(&document, Some(&path), &[]);
+                let inventory = result.documents.into_iter().map(|(path, findings)| {
+                    let file = path.strip_prefix(directory.path()).unwrap().to_string_lossy().into_owned();
+                    let findings = findings.into_iter().map(|finding| {
+                        let diagnostic = finding.diagnostic;
+                        assert!(!diagnostic.message.contains("Required attribute 'name' is missing")
+                            && !diagnostic.message.contains("Unknown attribute 'name_prefix'"), "{case}/{file}: {diagnostic:?}");
+                        serde_json::json!({"message":diagnostic.message,"range":diagnostic.range,"severity":diagnostic.severity})
+                    }).collect::<Vec<_>>();
+                    (file, serde_json::json!(findings))
+                }).collect::<serde_json::Map<_, _>>();
+                assert_eq!(
+                    prefix_inventory(&serde_json::Value::Object(inventory)),
+                    standalone[case]
+                        .get(
+                            std::path::Path::new(file)
+                                .parent()
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                        )
+                        .unwrap_or(&callers[case])
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    "{case}, only {file} open: own standalone module or unchanged caller context"
+                );
+            }
+        }
     }
 
     fn builtin_mock_provider_state(directory: &std::path::Path) -> ProviderState {

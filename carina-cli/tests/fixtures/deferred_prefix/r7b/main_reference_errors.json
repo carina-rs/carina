@@ -1,0 +1,670 @@
+{
+  "direct": {
+    "errors": [
+      {
+        "message": "mock.test.resource.<pending>: unknown attribute 'id' on 'src' in reference src.id",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 22
+            },
+            "end": {
+              "line": 1,
+              "column": 33
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: mock.test.resource.<pending>.name_prefix: mock.test.resource.<pending>: unknown attribute 'id' on 'src' in reference src.id"
+    ]
+  },
+  "interpolation": {
+    "errors": [
+      {
+        "message": "unknown attribute `id` on `src`",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 36
+            },
+            "end": {
+              "line": 1,
+              "column": 51
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: ./main.crn at line 1",
+      "Error: unknown attribute `id` on `src`"
+    ]
+  },
+  "parenthesized": {
+    "errors": [
+      {
+        "message": "mock.test.resource.<pending>: unknown attribute 'id' on 'src' in reference src.id",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 22
+            },
+            "end": {
+              "line": 1,
+              "column": 33
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: mock.test.resource.<pending>.name_prefix: mock.test.resource.<pending>: unknown attribute 'id' on 'src' in reference src.id"
+    ]
+  },
+  "builtin": {
+    "errors": [
+      {
+        "message": "unknown attribute `id` on `src`",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 36
+            },
+            "end": {
+              "line": 1,
+              "column": 49
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: ./main.crn at line 1",
+      "Error: unknown attribute `id` on `src`"
+    ]
+  },
+  "pipe": {
+    "errors": [
+      {
+        "message": "unknown attribute `id` on `src`",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 46
+            },
+            "end": {
+              "line": 1,
+              "column": 53
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: ./main.crn at line 1",
+      "Error: unknown attribute `id` on `src`"
+    ]
+  },
+  "coalesce": {
+    "errors": [
+      {
+        "message": "unknown attribute `id` on `src`",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 46
+            },
+            "end": {
+              "line": 1,
+              "column": 56
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: ./main.crn at line 1",
+      "Error: unknown attribute `id` on `src`"
+    ]
+  },
+  "conditional": {
+    "errors": [
+      {
+        "message": "unknown attribute `id` on `src`",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 36
+            },
+            "end": {
+              "line": 1,
+              "column": 71
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: ./main.crn at line 1",
+      "Error: unknown attribute `id` on `src`"
+    ]
+  },
+  "nested_field": {
+    "errors": [
+      {
+        "message": "mock.test.resource.<pending>: unknown field 'missing' on struct 'Rule' in reference src.rules[0].missing; known fields: action, conditions.",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 22
+            },
+            "end": {
+              "line": 1,
+              "column": 33
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: mock.test.resource.<pending>.name_prefix: mock.test.resource.<pending>: unknown field 'missing' on struct 'Rule' in reference src.rules[0].missing; known fields: action, conditions."
+    ]
+  },
+  "nested_index": {
+    "errors": [
+      {
+        "message": "mock.test.resource.<pending>: unknown attribute 'missing' on 'src' in reference src.missing",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 22
+            },
+            "end": {
+              "line": 1,
+              "column": 33
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: mock.test.resource.<pending>.name_prefix: mock.test.resource.<pending>: unknown attribute 'missing' on 'src' in reference src.missing"
+    ]
+  },
+  "dynamic_index": {
+    "errors": [
+      {
+        "message": "mock.test.resource.<pending>: unknown attribute 'id' on 'src' in reference src.id",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 22
+            },
+            "end": {
+              "line": 1,
+              "column": 33
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: mock.test.resource.<pending>.name_prefix: mock.test.resource.<pending>: unknown attribute 'id' on 'src' in reference src.id"
+    ]
+  },
+  "conversion": {
+    "errors": [
+      {
+        "message": "mock.test.resource.<pending>: unknown attribute 'id' on 'src' in reference src.id",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 22
+            },
+            "end": {
+              "line": 1,
+              "column": 33
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: mock.test.resource.<pending>.name_prefix: mock.test.resource.<pending>: unknown attribute 'id' on 'src' in reference src.id"
+    ]
+  },
+  "integer": {
+    "errors": [
+      {
+        "message": "unknown attribute `id` on `src`",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 36
+            },
+            "end": {
+              "line": 1,
+              "column": 46
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: ./main.crn at line 1",
+      "Error: unknown attribute `id` on `src`"
+    ]
+  },
+  "list_argument": {
+    "errors": [
+      {
+        "message": "unknown attribute `id` on `src`",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 36
+            },
+            "end": {
+              "line": 1,
+              "column": 55
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: ./main.crn at line 1",
+      "Error: unknown attribute `id` on `src`"
+    ]
+  },
+  "secret": {
+    "errors": [
+      {
+        "message": "mock.test.resource.<pending>: attribute 'name_prefix': unknown attribute: invalid value inside secret(...)",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 22
+            },
+            "end": {
+              "line": 1,
+              "column": 33
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: mock.test.resource.<pending>.name_prefix: mock.test.resource.<pending>: attribute 'name_prefix': unknown attribute: invalid value inside secret(...)"
+    ]
+  },
+  "alias": {
+    "errors": [
+      {
+        "message": "mock.test.resource.<pending>: unknown attribute 'id' on 'src' in reference src.id",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 22
+            },
+            "end": {
+              "line": 1,
+              "column": 33
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: mock.test.resource.<pending>.name_prefix: mock.test.resource.<pending>: unknown attribute 'id' on 'src' in reference src.id"
+    ]
+  },
+  "user_function": {
+    "errors": [
+      {
+        "message": "mock.test.resource.<pending>: unknown attribute 'id' on 'src' in reference src.id",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 22
+            },
+            "end": {
+              "line": 1,
+              "column": 33
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: mock.test.resource.<pending>.name_prefix: mock.test.resource.<pending>: unknown attribute 'id' on 'src' in reference src.id"
+    ]
+  },
+  "map_argument": {
+    "errors": [
+      {
+        "message": "mock.test.resource.<pending>: unknown attribute 'id' on 'src' in reference src.id",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 22
+            },
+            "end": {
+              "line": 1,
+              "column": 33
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: mock.test.resource.<pending>.name_prefix: mock.test.resource.<pending>: unknown attribute 'id' on 'src' in reference src.id"
+    ]
+  },
+  "module_argument": {
+    "errors": [
+      {
+        "message": "module call 'c (anonymous call)': unknown attribute 'id' on 'src' in reference src.id",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 2,
+              "column": 14
+            },
+            "end": {
+              "line": 2,
+              "column": 20
+            }
+          }
+        }
+      },
+      {
+        "message": "Invalid argument type for 'prefix' in module 'c': expected String, got resource reference",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 2,
+              "column": 1
+            },
+            "end": {
+              "line": 2,
+              "column": 2
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: main.crn at line 2",
+      "Error: module call 'c (anonymous call)': unknown attribute 'id' on 'src' in reference src.id",
+      "Error: Module resolution error: Invalid argument type for 'prefix' in module 'c': expected String, got resource reference"
+    ]
+  },
+  "module_field": {
+    "errors": [
+      {
+        "message": "module call 'c (anonymous call)': unknown attribute 'id' on 'src' in reference src.id",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 2,
+              "column": 11
+            },
+            "end": {
+              "line": 2,
+              "column": 29
+            }
+          }
+        }
+      },
+      {
+        "message": "Invalid argument type for 'cfg' in module 'c': at map key 'value': expected String, got resource reference",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 2,
+              "column": 1
+            },
+            "end": {
+              "line": 2,
+              "column": 2
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: main.crn at line 2",
+      "Error: module call 'c (anonymous call)': unknown attribute 'id' on 'src' in reference src.id",
+      "Error: Module resolution error: Invalid argument type for 'cfg' in module 'c': at map key 'value': expected String, got resource reference"
+    ]
+  },
+  "module_index": {
+    "errors": [
+      {
+        "message": "module call 'c (anonymous call)': unknown attribute 'id' on 'src' in reference src.id",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 2,
+              "column": 13
+            },
+            "end": {
+              "line": 2,
+              "column": 21
+            }
+          }
+        }
+      },
+      {
+        "message": "Invalid argument type for 'names' in module 'c': at list element 0: expected String, got resource reference",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 2,
+              "column": 1
+            },
+            "end": {
+              "line": 2,
+              "column": 2
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: main.crn at line 2",
+      "Error: module call 'c (anonymous call)': unknown attribute 'id' on 'src' in reference src.id",
+      "Error: Module resolution error: Invalid argument type for 'names' in module 'c': at list element 0: expected String, got resource reference"
+    ]
+  },
+  "module_output": {
+    "errors": [
+      {
+        "message": "mock.test.resource.<pending>: unknown attribute 'missing' on 'net' in reference net.missing",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 22
+            },
+            "end": {
+              "line": 1,
+              "column": 33
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: mock.test.resource.<pending>.name_prefix: mock.test.resource.<pending>: unknown attribute 'missing' on 'net' in reference net.missing"
+    ]
+  },
+  "upstream_export": {
+    "errors": [
+      {
+        "message": "mock.test.resource.<pending>: upstream_state `net` does not export `missing`.",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 22
+            },
+            "end": {
+              "line": 1,
+              "column": 33
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: mock.test.resource.<pending>.name_prefix: mock.test.resource.<pending>: upstream_state `net` does not export `missing`."
+    ]
+  },
+  "data_source": {
+    "errors": [
+      {
+        "message": "mock.test.resource.<pending>: unknown attribute 'missing' on 'ds' in reference ds.missing",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 22
+            },
+            "end": {
+              "line": 1,
+              "column": 33
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: mock.test.resource.<pending>.name_prefix: mock.test.resource.<pending>: unknown attribute 'missing' on 'ds' in reference ds.missing"
+    ]
+  },
+  "root_loop_variable": {
+    "errors": [
+      {
+        "message": "unknown attribute `id` on `src`",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 1,
+              "column": 89
+            },
+            "end": {
+              "line": 1,
+              "column": 105
+            }
+          }
+        }
+      }
+    ],
+    "text_lines": [
+      "Error: ./main.crn at line 1",
+      "Error: unknown attribute `id` on `src`"
+    ]
+  }
+}

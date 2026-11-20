@@ -1,0 +1,74 @@
+{
+  "json": {
+    "errors": [
+      {
+        "code": null,
+        "location": {
+          "file": "child/main.crn",
+          "range": null
+        },
+        "message": "for iterable function call 'concat' depends on a runtime value; all arguments must be statically known at parse time",
+        "severity": "error"
+      }
+    ],
+    "resource_count": 0,
+    "resources": [],
+    "status": "error"
+  },
+  "json_exit": 1,
+  "json_stderr": "",
+  "lsp": {
+    "backend.crn": [],
+    "child/arguments.crn": [],
+    "child/main.crn": [
+      {
+        "message": "for iterable function call 'concat' depends on a runtime value; all arguments must be statically known at parse time",
+        "range": {
+          "end": {
+            "character": 100,
+            "line": 0
+          },
+          "start": {
+            "character": 0,
+            "line": 0
+          }
+        },
+        "severity": 1
+      },
+      {
+        "message": "Consider using pipe form for 'concat': data |> concat(...)",
+        "range": {
+          "end": {
+            "character": 15,
+            "line": 0
+          },
+          "start": {
+            "character": 9,
+            "line": 0
+          }
+        },
+        "severity": 3
+      }
+    ],
+    "lets.crn": [],
+    "main.crn": [
+      {
+        "message": "Parse error in child/main.crn: Invalid expression at line 0: for iterable function call 'concat' depends on a runtime value; all arguments must be statically known at parse time",
+        "range": {
+          "end": {
+            "character": 9,
+            "line": 1
+          },
+          "start": {
+            "character": 8,
+            "line": 1
+          }
+        },
+        "severity": 1
+      }
+    ],
+    "providers.crn": []
+  },
+  "text": "Validating...\nError: Module resolution error: Parse error in child/main.crn: Invalid expression at line 0: for iterable function call 'concat' depends on a runtime value; all arguments must be statically known at parse time\n",
+  "text_exit": 1
+}

@@ -74,6 +74,7 @@ where
 ///
 /// Admission consumes this product and classifies its stored projections.
 pub struct ResourceAttributeInputs<B: BindingAddress> {
+    awaiting: crate::identifier::PrefixObligations,
     owner: ResourceId,
     pub(super) declaration: Option<DeclarationIdentity>,
     precheck: Option<crate::parser::ResourcePrecheckIdentity>,
@@ -154,11 +155,14 @@ impl<B: BindingAddress> StoredInput<B> {
 }
 
 impl<B: BindingAddress> ResourceAttributeInputs<B> {
+    pub(super) fn awaiting_prefixes(&self) -> &crate::identifier::PrefixObligations {
+        &self.awaiting
+    }
     pub fn new<X, D>(owner: &CanonicalResource<'_, X, D, B>) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        let mut result = Self::new_raw(owner);
+        let mut result = Self::new_raw(owner, owner.awaiting_prefixes());
         result.declaration = Some(super::declaration_identity(owner.resource_schema()));
         result
     }
@@ -169,7 +173,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        let mut result = Self::for_resource_raw(owner, report)?;
+        let mut result = Self::for_resource_raw(owner, report, owner.awaiting_prefixes())?;
         result.declaration = Some(super::declaration_identity(owner.resource_schema()));
         Ok(result)
     }
@@ -181,7 +185,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        let mut result = Self::from_resolved_raw(owner, values, report)?;
+        let mut result = Self::from_resolved_raw(owner, values, report, &values.awaiting)?;
         result.declaration = Some(values.declaration.clone());
         Ok(result)
     }
@@ -193,7 +197,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        let mut result = Self::from_report_raw(owner, values, report);
+        let mut result = Self::from_report_raw(owner, values, report, &values.awaiting);
         result.declaration = Some(values.declaration.clone());
         result
     }
@@ -206,7 +210,8 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        let mut result = Self::from_report_with_evidence_raw(owner, values, report, unchecked);
+        let mut result =
+            Self::from_report_with_evidence_raw(owner, values, report, unchecked, &values.awaiting);
         result.declaration = Some(values.declaration.clone());
         result
     }
@@ -224,7 +229,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        Self::new_raw(resource)
+        Self::new_raw(resource, &Default::default())
     }
 
     #[cfg(test)]
@@ -241,7 +246,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        Self::for_resource_raw(resource, report)
+        Self::for_resource_raw(resource, report, &Default::default())
     }
 
     #[cfg(test)]
@@ -259,7 +264,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        Self::from_report_raw(resource, values, report)
+        Self::from_report_raw(resource, values, report, &Default::default())
     }
 
     #[cfg(test)]
@@ -277,7 +282,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        Self::from_resolved_raw(resource, values, report)
+        Self::from_resolved_raw(resource, values, report, &Default::default())
     }
 
     fn new_raw<D>(
@@ -288,11 +293,12 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             D,
             B,
         >,
+        awaiting: &crate::identifier::PrefixObligations,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        Self::prepare(resource, resource.attributes().iter(), false)
+        Self::prepare(resource, resource.attributes().iter(), false, awaiting)
     }
 
     /// Require the resource report used by main's CLI/expanded admission path.
@@ -306,12 +312,13 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             B,
         >,
         report: &crate::parser::retained::ExpressionReport<B>,
+        awaiting: &crate::identifier::PrefixObligations,
     ) -> Result<Self, MissingEvidence>
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
         let report = report.for_resource(resource.id())?;
-        let mut inputs = Self::new_raw(resource);
+        let mut inputs = Self::new_raw(resource, awaiting);
         inputs.report = Some(Arc::new(report.clone()));
         Ok(inputs)
     }
@@ -328,6 +335,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         >,
         values: &IndexMap<String, Value<ParserPlaceholder, B>>,
         report: &crate::parser::retained::ExpressionReport<B>,
+        awaiting: &crate::identifier::PrefixObligations,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -337,6 +345,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             values,
             report,
             crate::parser::retained::NoAuthoredEvidence::for_resource(resource),
+            awaiting,
         )
     }
 
@@ -353,6 +362,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         values: &IndexMap<String, Value<ParserPlaceholder, B>>,
         report: &crate::parser::retained::ExpressionReport<B>,
         unchecked: crate::parser::retained::NoAuthoredEvidence,
+        awaiting: &crate::identifier::PrefixObligations,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -360,6 +370,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         let mut prepared = Self {
             owner: resource.id().clone(),
             declaration: None,
+            awaiting: awaiting.clone(),
             precheck: unchecked.precheck_identity(),
             scope: crate::schema::value_validation::AssignmentScope::Full,
             evidence: ResourceEvidence::NoAuthoredEvidence(Arc::new(unchecked)),
@@ -408,12 +419,18 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         >,
         values: &IndexMap<String, Value<ParserPlaceholder, B>>,
         report: &crate::parser::retained::ExpressionReport<B>,
+        awaiting: &crate::identifier::PrefixObligations,
     ) -> Result<Self, MissingEvidence>
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
         let report = report.for_resource(resource.id())?;
-        let mut inputs = Self::prepare(resource, in_resource_order(resource, values), true);
+        let mut inputs = Self::prepare(
+            resource,
+            in_resource_order(resource, values),
+            true,
+            awaiting,
+        );
         inputs.report = Some(Arc::new(report.clone()));
         Ok(inputs)
     }
@@ -428,6 +445,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         >,
         values: impl Iterator<Item = (&'v String, &'v Value<ParserPlaceholder, B>)>,
         materialize: bool,
+        awaiting: &crate::identifier::PrefixObligations,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -503,6 +521,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         let mut prepared = Self {
             owner: resource.id().clone(),
             declaration: None,
+            awaiting: awaiting.clone(),
             precheck: resource.precheck_identity(),
             scope: crate::schema::value_validation::AssignmentScope::Full,
             report: None,
@@ -654,6 +673,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         Self {
             owner: self.owner.clone(),
             declaration: self.declaration.clone(),
+            awaiting: self.awaiting.clone(),
             precheck: self.precheck.clone(),
             scope: self.scope,
             report: self.report.clone(),
@@ -1067,7 +1087,7 @@ pub struct ClassificationDiagnostics<B: BindingAddress>(pub Vec<(String, Knowled
 /// Owned findings and classification failures from the consumed product.
 #[derive(Debug)]
 pub struct ResourceAdmissionOutcome<B: BindingAddress> {
-    pub values: crate::schema::ResourceValueValidation,
+    pub values: crate::identifier::PrefixAdmitted<crate::schema::ResourceValueValidation>,
     pub classification_diagnostics: ClassificationDiagnostics<B>,
 }
 

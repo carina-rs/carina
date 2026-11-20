@@ -16,6 +16,45 @@ fn test_github_source(value: &str) -> carina_core::provider_source::GithubSource
 
 use super::*;
 
+#[test]
+fn prefix_pair_resolution_cannot_drop_a_deferred_finding() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        carina_core::schema::ResourceSchema::new("Sink")
+            .attribute(
+                carina_core::schema::AttributeSchema::required(
+                    "name",
+                    carina_core::schema::AttributeType::string(),
+                )
+                .build(),
+            )
+            .attribute(
+                carina_core::schema::AttributeSchema::provider_populated(
+                    "identifier",
+                    carina_core::schema::AttributeType::string(),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let context =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let parsed = carina_core::parser::parse_file_and_resolve(
+        "let src = mock.Sink { name = 'source' }\nmock.Sink { name_prefix = src.identifier }",
+        std::path::Path::new("test.crn"),
+        &context,
+    )
+    .unwrap();
+    let pair = CanonicalResourcePair::for_test(resolve_file_for_test(parsed), Vec::new());
+    let error = pair.resolve_attr_prefixes(&schemas).expect_err(
+        "a pair with a deferred companion must return its finding, never silent success",
+    );
+    assert_eq!(error.lines().count(), 1);
+    assert!(error.contains("'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"));
+}
+
 #[tokio::test]
 async fn issue_4304_3a_review2_read_only_validation_preserves_authored_defaults() {
     let project = tempfile::tempdir().unwrap();
@@ -10901,7 +10940,8 @@ fn dependency_chain_wrappers_return_vec_app_error() {
     let mut resources: Vec<Resource> = Vec::new();
     let providers: Vec<carina_core::parser::ExpandedProviderConfig> = Vec::new();
 
-    let errors = resolve_attr_prefixes_with_ctx(&ctx, &mut resources);
+    let mut file = carina_core::parser::ExpandedParsedFile::default();
+    let errors = resolve_attr_prefixes_with_ctx(&ctx, &mut file);
     assert!(errors.is_empty(), "resolve_attr_prefixes: got {errors:?}");
 
     let canonical_resources =

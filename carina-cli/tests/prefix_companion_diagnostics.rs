@@ -388,7 +388,7 @@ async fn prefix_companion_data_source_stays_unknown() {
 }
 
 #[tokio::test]
-async fn prefix_companion_deferred_reference_stays_unknown() {
+async fn prefix_companion_deferred_reference_rejected_at_plan_time() {
     for attribute in ["identifier", "id"] {
         let main = format!("mock.test.resource {{ name_prefix = src.{attribute} }}\n");
         let fixture = PrefixDirectory::new(&[
@@ -402,17 +402,26 @@ async fn prefix_companion_deferred_reference_stays_unknown() {
         let lsp = fixture.lsp(false).await;
         let messages = error_messages(&lsp);
         assert_eq!(cli["status"], "error", "{cli:#}");
+        let reason = if attribute == "identifier" {
+            "known only after apply"
+        } else {
+            "not resolved when names are generated"
+        };
+        let expected = format!(
+            "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.{attribute}', which is {reason}"
+        );
+        assert!(messages.contains(&expected.as_str()), "{lsp:#?}");
         assert!(
-            messages.contains(&"Unknown attribute 'name_prefix'"),
+            !messages.contains(&"Unknown attribute 'name_prefix'"),
             "{lsp:#?}"
         );
         assert!(
-            messages.contains(&"Required attribute 'name' is missing"),
+            !messages.contains(&"Required attribute 'name' is missing"),
             "{lsp:#?}"
         );
         if attribute == "identifier" {
-            assert_eq!(messages.len(), 2, "{lsp:#?}");
-            assert_eq!(cli["errors"].as_array().unwrap().len(), 2, "{cli:#}");
+            assert_eq!(messages.len(), 1, "{lsp:#?}");
+            assert_eq!(cli["errors"].as_array().unwrap().len(), 1, "{cli:#}");
         } else {
             assert!(
                 lsp.iter()
@@ -628,12 +637,16 @@ async fn prefix_companion_module_outputs_on_unnamed_roots_keep_deferred_companio
         .iter()
         .map(|error| error["message"].as_str().unwrap())
         .collect::<Vec<_>>();
-    let per_owner = [
-        "Required attribute 'name' is missing",
-        "Unknown attribute 'name_prefix'",
+    let expected = ["first", "second"].map(|attribute| format!(
+        "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.{attribute}', which is not resolved when names are generated"
+    ));
+    let expected = vec![
+        expected[0].as_str(),
+        expected[1].as_str(),
+        "Unknown attribute 'bogus'",
         "Unknown attribute 'bogus'",
     ];
-    assert_eq!(cli_messages, per_owner.repeat(2), "{cli:#}");
+    assert_eq!(cli_messages, expected, "{cli:#}");
     assert_eq!(error_messages(&lsp), cli_messages, "{lsp:#?}");
 }
 

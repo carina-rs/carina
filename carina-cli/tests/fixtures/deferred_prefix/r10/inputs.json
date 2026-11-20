@@ -1,0 +1,212 @@
+{
+  "m1a_empty": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "let c = use { source = './child' }\nc { prefix = '' }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n"
+  },
+  "m1a2_conflict": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "let c = use { source = './child' }\nc { prefix = 'p-' }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name = 'x'  name_prefix = prefix }\n"
+  },
+  "m1b_secret": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "let c = use { source = './child' }\nc { prefix = secret('x') }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n"
+  },
+  "m1c_parse": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "let = \n",
+    "main.crn": "let c = use { source = './child' }\nc { prefix = src.identifier }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n",
+    "source.crn": "let src = mock.test.resource { name = 'source' }\n"
+  },
+  "m1c_upstream_missing_state": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "let src = mock.test.resource { name = 'source' }\nlet net = upstream_state { source = './upstream' }\n",
+    "main.crn": "let c = use { source = './child' }\nc { prefix = src.identifier }\nmock.test.resource { name = net.first }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n",
+    "upstream/backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "upstream/exports.crn": "exports { first: String = 'first' }\n"
+  },
+  "m1c_upstream_missing_source": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "let src = mock.test.resource { name = 'source' }\nlet net = upstream_state { source = './upstream' }\n",
+    "main.crn": "let c = use { source = './child' }\nc { prefix = src.identifier }\nmock.test.resource { name = net.first }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n"
+  },
+  "m1c_upstream_missing_export": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "let src = mock.test.resource { name = 'source' }\nlet net = upstream_state { source = './upstream' }\n",
+    "main.crn": "let c = use { source = './child' }\nc { prefix = src.identifier }\nmock.test.resource { name = net.missing }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n",
+    "upstream/backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "upstream/exports.crn": "exports { first: String = 'first' }\n",
+    "upstream/carina.state.json": "{\n  \"version\": 5,\n  \"serial\": 0,\n  \"lineage\": \"r6-upstream\",\n  \"carina_version\": \"0.1.0\",\n  \"resources\": [],\n  \"exports\": {\n    \"first\": \"first\"\n  }\n}\n"
+  },
+  "m2_two_roots": {
+    "modules/app/arguments.crn": "arguments { prefix: String }\n",
+    "modules/app/main.crn": "mock.test.resource { name_prefix = prefix }\n",
+    "envs/a/providers.crn": "provider mock {}\n",
+    "envs/a/backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "envs/a/lets.crn": "",
+    "envs/a/main.crn": "let c = use { source = '../../modules/app' }\nc { prefix = 'a-' }\n",
+    "envs/b/providers.crn": "provider mock {}\n",
+    "envs/b/backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "envs/b/lets.crn": "let src = mock.test.resource { name = 'source' }\n",
+    "envs/b/main.crn": "let c = use { source = '../../modules/app' }\nc { prefix = src.identifier }\n"
+  },
+  "m2_ancestor_provider": {
+    "modules/app/arguments.crn": "arguments { prefix: String }\n",
+    "modules/app/main.crn": "mock.test.resource { name_prefix = prefix }\n",
+    "envs/a/providers.crn": "provider mock {}\n",
+    "envs/a/backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "envs/a/lets.crn": "",
+    "envs/a/main.crn": "let c = use { source = '../../modules/app' }\nc { prefix = 'a-' }\n",
+    "envs/b/providers.crn": "provider mock {}\n",
+    "envs/b/backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "envs/b/lets.crn": "let src = mock.test.resource { name = 'source' }\n",
+    "envs/b/main.crn": "let c = use { source = '../../modules/app' }\nc { prefix = src.identifier }\n",
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "main.crn": ""
+  },
+  "m3_invalid_attribute": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "let src = mock.test.resource { name = 'source' }\n",
+    "main.crn": "mock.test.resource { name_prefix = src.id }\n"
+  },
+  "m3_undefined_binding": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "mock.test.resource { name_prefix = nosuch.identifier }\n"
+  },
+  "m4_unimported_child": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n"
+  },
+  "m4_standalone_with_provider": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "main.crn": "",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n",
+    "child/providers.crn": "provider mock {}\n"
+  },
+  "m4_bad_argument_type": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "let c = use { source = './child' }\nc { prefix = 1 }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n"
+  },
+  "m4_missing_argument": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "let c = use { source = './child' }\nc {}\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n"
+  },
+  "m4_standalone_with_backend": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "main.crn": "",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n",
+    "child/providers.crn": "provider mock {}\n",
+    "child/backend.crn": "backend local { path = 'carina.state.json' }\n"
+  },
+  "m1c_upstream_prefix_missing_export": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "let net = upstream_state { source = './upstream' }\n",
+    "main.crn": "let c = use { source = './child' }\nc { prefix = net.missing }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n",
+    "upstream/backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "upstream/exports.crn": "exports { first: String = 'first' }\n",
+    "upstream/carina.state.json": "{\n  \"version\": 5,\n  \"serial\": 0,\n  \"lineage\": \"r6-upstream\",\n  \"carina_version\": \"0.1.0\",\n  \"resources\": [],\n  \"exports\": {\n    \"first\": \"first\"\n  }\n}\n"
+  },
+  "m1c_upstream_prefix_missing_source": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "let net = upstream_state { source = './upstream' }\n",
+    "main.crn": "let c = use { source = './child' }\nc { prefix = net.first }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n"
+  },
+  "r7b_formal_bare": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n"
+  },
+  "r7b_formal_alias": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = p }\n",
+    "child/lets.crn": "let p = prefix\n"
+  },
+  "r7b_formal_interpolation": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = \"${prefix}-x\" }\n"
+  },
+  "r7b_formal_secret": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = secret(prefix) }\n"
+  },
+  "r7b_formal_several": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "",
+    "child/arguments.crn": "arguments { first: String second: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = \"${first}-${second}\" }\n"
+  },
+  "r9_literal_only": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "let c = use { source = './child' }\nc { prefix = 'x' }\n",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n"
+  }
+}

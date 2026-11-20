@@ -1182,7 +1182,7 @@ pub enum AppError {
     ),
 
     #[error("{0}")]
-    AttributePrefix(Box<carina_core::identifier::AttributePrefixError>),
+    AttributePrefix(Box<carina_core::identifier::AttributePrefixFinding>),
 
     #[error("{0}")]
     ProviderConfiguration(

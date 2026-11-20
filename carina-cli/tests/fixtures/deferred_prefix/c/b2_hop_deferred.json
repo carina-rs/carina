@@ -1,0 +1,54 @@
+{
+  "text": "Validating...\nError: mock.test.resource.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'r.name', which is not resolved when names are generated\n",
+  "text_exit": 1,
+  "json": {
+    "status": "error",
+    "resource_count": 0,
+    "resources": [],
+    "errors": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'r.name', which is not resolved when names are generated",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "child/main.crn",
+          "range": {
+            "start": {
+              "line": 5,
+              "column": 3
+            },
+            "end": {
+              "line": 5,
+              "column": 23
+            }
+          }
+        }
+      }
+    ]
+  },
+  "json_exit": 1,
+  "json_stderr": "",
+  "lsp": {
+    "backend.crn": [],
+    "child/arguments.crn": [],
+    "child/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'r.name', which is not resolved when names are generated",
+        "range": {
+          "start": {
+            "line": 4,
+            "character": 2
+          },
+          "end": {
+            "line": 4,
+            "character": 22
+          }
+        },
+        "severity": 1
+      }
+    ],
+    "lets.crn": [],
+    "main.crn": [],
+    "providers.crn": []
+  }
+}

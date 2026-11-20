@@ -1,0 +1,112 @@
+{
+  "b3_nested": {
+    "mod_a": {
+      "mod_b/main.crn": [
+        {
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated",
+          "severity": 1,
+          "range": {
+            "start": {
+              "line": 1,
+              "character": 2
+            },
+            "end": {
+              "line": 1,
+              "character": 22
+            }
+          }
+        }
+      ]
+    },
+    "mod_b": {
+      "mod_b/main.crn": [
+        {
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated",
+          "severity": 1,
+          "range": {
+            "start": {
+              "line": 1,
+              "character": 2
+            },
+            "end": {
+              "line": 1,
+              "character": 22
+            }
+          }
+        }
+      ]
+    }
+  },
+  "b1_three_modules": {
+    "mod_a": {
+      "mod_a/main.crn": [
+        {
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'p', which is not resolved when names are generated",
+          "severity": 1,
+          "range": {
+            "start": {
+              "line": 2,
+              "character": 2
+            },
+            "end": {
+              "line": 2,
+              "character": 17
+            }
+          }
+        }
+      ],
+      "mod_b/main.crn": [
+        {
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'p', which is not resolved when names are generated",
+          "severity": 1,
+          "range": {
+            "start": {
+              "line": 1,
+              "character": 2
+            },
+            "end": {
+              "line": 1,
+              "character": 22
+            }
+          }
+        }
+      ]
+    },
+    "mod_b": {
+      "mod_b/main.crn": [
+        {
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated",
+          "severity": 1,
+          "range": {
+            "start": {
+              "line": 1,
+              "character": 2
+            },
+            "end": {
+              "line": 1,
+              "character": 22
+            }
+          }
+        }
+      ]
+    },
+    "mod_c": {
+      "mod_b/main.crn": [
+        {
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'cfg', which is not resolved when names are generated",
+          "severity": 1,
+          "range": {
+            "start": {
+              "line": 1,
+              "character": 2
+            },
+            "end": {
+              "line": 1,
+              "character": 22
+            }
+          }
+        }
+      ]
+    }
+  }
+}
