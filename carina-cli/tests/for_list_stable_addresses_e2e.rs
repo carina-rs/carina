@@ -654,6 +654,29 @@ fn assert_module_expression_expands(
     );
 }
 
+fn assert_module_iterable_runtime_error(output: &Output, function: &str) {
+    assert!(
+        !output.status.success(),
+        "validate must reject runtime calls"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim_end(),
+        format!(
+            "Error: Module resolution error: Parse error in mod/main.crn: Invalid expression at line 0: for iterable function call '{function}' depends on a runtime value; all arguments must be statically known at parse time"
+        ),
+    );
+}
+
+fn assert_module_expression_rejected(
+    arguments: &str,
+    iterable: &str,
+    supplied: &str,
+    function: &str,
+) {
+    let scenario = expression_argument_module(arguments, iterable, supplied);
+    assert_module_iterable_runtime_error(&scenario.carina(&["validate", "."]), function);
+}
+
 #[test]
 fn for_value_keys_module_expression_interpolation() {
     assert_module_expression_expands(
@@ -666,42 +689,60 @@ fn for_value_keys_module_expression_interpolation() {
 
 #[test]
 fn for_value_keys_module_expression_concat() {
-    assert_module_expression_expands(
+    assert_module_expression_rejected(
         "arguments { names: list(String) }",
         "concat(names, ['z'])",
         "names = ['a']",
-        &["inst.inner.a", "inst.inner.z"],
+        "concat",
     );
 }
 
 #[test]
 fn for_value_keys_module_expression_member_function() {
-    assert_module_expression_expands(
+    assert_module_expression_rejected(
         "arguments { item: String }",
         "[upper(item), 'z']",
         "item = 'a'",
-        &["inst.inner.A", "inst.inner.z"],
+        "upper",
     );
 }
 
 #[test]
 fn for_value_keys_module_expression_split() {
-    assert_module_expression_expands(
+    assert_module_expression_rejected(
         "arguments { csv: String }",
         "split(',', csv)",
         "csv = 'a,z'",
-        &["inst.inner.a", "inst.inner.z"],
+        "split",
     );
 }
 
 #[test]
 fn for_value_keys_module_expression_keys() {
-    assert_module_expression_expands(
+    assert_module_expression_rejected(
         "arguments { m: map(String) }",
         "keys(m)",
         "m = { a = 'first', z = 'last' }",
-        &["inst.inner.a", "inst.inner.z"],
+        "keys",
     );
+}
+
+#[test]
+fn for_value_keys_module_runtime_concat_rejected_for_all_loop_forms() {
+    for header in ["let o = for y", "for y", "let o = for (i, y)"] {
+        let scenario = expression_argument_module(
+            "arguments { names: list(String) }",
+            "concat(names, ['z'])",
+            "names = ['a']",
+        );
+        scenario.write(
+            "mod/main.crn",
+            &format!(
+                "arguments {{ names: list(String) }}\n{header} in concat(names, ['z']) {{ mock.test.resource {{ name = y }} }}\n"
+            ),
+        );
+        assert_module_iterable_runtime_error(&scenario.carina(&["validate", "."]), "concat");
+    }
 }
 
 #[test]
@@ -728,7 +769,7 @@ fn for_value_keys_module_expression_without_argument() {
 fn for_value_keys_module_expression_provider_iterable_stays_deferred() {
     let scenario = expression_argument_module(
         "arguments { names: list(String) }",
-        "concat(names, ['z'])",
+        "names",
         "names = seed.generated_strings",
     );
     scenario.write(

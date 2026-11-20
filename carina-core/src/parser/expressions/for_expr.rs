@@ -921,8 +921,7 @@ pub(crate) fn parse_for_binding(
 ///
 /// When the iterable is a function call with all statically-known arguments,
 /// the function is eagerly evaluated at parse time. If any argument depends on
-/// a runtime value (e.g. ResourceRef), a clear error is returned. Module
-/// arguments remain substitution inputs until the module call is resolved.
+/// a runtime value (e.g. ResourceRef), a clear error is returned.
 struct ParsedForIterable {
     value: Value,
     bare_unbound_identifier: Option<String>,
@@ -968,13 +967,8 @@ fn parse_for_iterable(
         .into_value()
         .map_err(|error| ParseError::from_eval_value(error, line))?;
     let value = crate::parser::functions::try_evaluate_fn_value(value, ctx, line)?;
-    let value = if crate::parser::functions::contains_module_argument(&value) {
-        value
-    } else {
-        evaluate_static_value(value, ctx.config)?
-    };
     Ok(ParsedForIterable {
-        value,
+        value: evaluate_static_value(value, ctx.config)?,
         bare_unbound_identifier,
         structural_for_binding,
         provisional_binding,
