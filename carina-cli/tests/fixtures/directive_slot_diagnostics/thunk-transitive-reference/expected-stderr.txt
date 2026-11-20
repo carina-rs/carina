@@ -1,0 +1,3 @@
+Error: mock.test.resource.c: unknown attribute 'directives' on 'b' in reference b.directives
+Error: mock.test.resource.<pending>: unknown attribute 'directives' on 'b' in reference b.directives
+Error: ./main.crn:2:39: Attribute 'name': ?? alternatives mix secret and public values; all alternatives must be secret or all public.

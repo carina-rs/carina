@@ -22575,3 +22575,135 @@ fn for_value_keys_bare_handle_hint() {
         assert!(error.to_string().contains(example), "{error}");
     }
 }
+
+#[test]
+fn resource_slot_inventory_keeps_ready_pending_and_grouped_attributes() {
+    use std::collections::BTreeSet;
+
+    for (case, declaration, read) in [
+        ("named", "let consumer = mock.test.Consumer", false),
+        ("anonymous", "mock.test.Consumer", false),
+        ("read", "let consumer = read mock.test.Consumer", true),
+    ] {
+        let source = format!(
+            "let structural = mock.test.Source {{ name = 'source' }}\n\
+             {declaration} {{\n\
+               name = 'consumer'\n\
+               settings {{ value = 'nested' }}\n\
+               item {{ value = structural }}\n\
+               item {{ value = 'ready' }}\n\
+               comment = structural\n\
+               directives {{ prevent_destroy = true }}\n\
+             }}\n"
+        );
+        let parsed = parse(
+            &source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        let (actual, mut expected) = if read {
+            let resource = parsed
+                .data_sources
+                .iter()
+                .find(|resource| resource.id.resource_type == "test.Consumer")
+                .expect("read consumer");
+            assert!(resource.authored_slots.get("directives").is_ok(), "{case}");
+            assert!(resource.attributes.get("comment").is_none(), "{case}");
+            assert!(resource.attributes.get("item").is_none(), "{case}");
+            (
+                resource
+                    .authored_slots
+                    .iter()
+                    .filter_map(|(name, slot)| {
+                        slot.attribute_row_key(name)
+                            .map(|_| name.transport_identity().to_owned())
+                    })
+                    .collect::<BTreeSet<_>>(),
+                resource.attributes.keys().cloned().collect::<BTreeSet<_>>(),
+            )
+        } else {
+            let resource = parsed
+                .resources
+                .iter()
+                .find(|resource| resource.id.resource_type == "test.Consumer")
+                .expect("consumer");
+            assert!(resource.authored_slots.get("directives").is_ok(), "{case}");
+            assert!(resource.attributes.get("comment").is_none(), "{case}");
+            assert!(resource.attributes.get("item").is_none(), "{case}");
+            (
+                resource
+                    .authored_slots
+                    .iter()
+                    .filter_map(|(name, slot)| {
+                        slot.attribute_row_key(name)
+                            .map(|_| name.transport_identity().to_owned())
+                    })
+                    .collect::<BTreeSet<_>>(),
+                resource.attributes.keys().cloned().collect::<BTreeSet<_>>(),
+            )
+        };
+        expected.extend(["comment".to_owned(), "item".to_owned()]);
+        assert_eq!(
+            actual, expected,
+            "{case}: slots must cover materialized and pending attributes"
+        );
+        assert_eq!(
+            actual,
+            ["name", "settings", "item", "comment"]
+                .map(str::to_owned)
+                .into_iter()
+                .collect(),
+            "{case}"
+        );
+        assert!(!actual.contains("directives"), "{case}");
+    }
+}
+
+#[test]
+fn resource_directives_keep_their_admission_slot() {
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = parse(
+        "let kept = mock.test.Resource { name = 'kept' directives { prevent_destroy = true } }",
+        &context,
+    )
+    .unwrap();
+    let slots = &parsed.resources[0].authored_slots;
+    assert!(
+        slots.get("directives").is_ok(),
+        "metadata remains a conversion/admission input"
+    );
+    assert_eq!(slots.iter().count(), 2);
+    assert_eq!(
+        slots
+            .iter()
+            .filter_map(|(name, slot)| {
+                slot.attribute_row_key(name)
+                    .map(|_| name.transport_identity())
+            })
+            .collect::<Vec<_>>(),
+        ["name"]
+    );
+    let schemas = crate::schema::SchemaRegistry::new();
+    let syntax = crate::parser::retained::judge_expressions(&parsed, &schemas, &context);
+    assert!(
+        slots
+            .get("directives")
+            .unwrap()
+            .source_judgement_in(&syntax)
+            .is_ok(),
+        "the directive judgement remains available"
+    );
+    let resource = syntax.secrecy_resources().next().unwrap();
+    assert_eq!(
+        resource
+            .secrecy_children()
+            .iter()
+            .filter_map(|child| match child.secrecy_kind() {
+                retained::ExprKind::Sink { name } => Some(name.transport_identity()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        ["name", "directives"],
+        "base authored-child inspection still includes directives",
+    );
+}

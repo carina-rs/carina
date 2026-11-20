@@ -5,6 +5,7 @@
 //! evidence. A projection is useful for identities and expansion, but cannot
 //! be turned back into an authored expression.
 
+use super::resource_body::{AuthoredSlotKind, resource_child_kind};
 use super::{DeclarationLocation, Located, PreprocessedFile, Rule, TypeExpr};
 use crate::resource::DiagnosticScope;
 use crate::resource::InsideSecret;
@@ -77,8 +78,8 @@ pub use cursor::{
     SlotDeclarationId, UnreachedSlot, UseId,
 };
 pub(crate) use cursor::{
-    AuthoredForm, AuthoredNavigation, CursorKind, ProjectionAuthority, SourceReference,
-    SyntheticSource, ValidationProjection,
+    AuthoredForm, AuthoredNavigation, CursorKind, ProjectionAuthority, RowAttributes,
+    SourceReference, SyntheticSource, ValidationProjection,
 };
 
 /// The existing authored walk owns source diagnostics for expressions that
@@ -949,6 +950,26 @@ pub(in crate::parser) fn resource_slots(
         // Standalone expression parser helpers have no configuration inventory.
         return Ok(AuthoredSlots::default());
     };
+    // Keep the parser's child classification only until constructing the slots.
+    // Captured names also preserve rejected keys and grouped block identities.
+    // Repeated blocks share a kind by name, and a surviving scalar sink is always an attribute.
+    let mut slot_kinds = HashMap::new();
+    for child in pair
+        .clone()
+        .into_inner()
+        .filter(|child| child.as_rule() == Rule::block_content)
+        .flat_map(Pair::into_inner)
+        .filter(|child| matches!(child.as_rule(), Rule::attribute | Rule::nested_block))
+    {
+        let source = captures
+            .get(&ParseNodeKey::of(&child))
+            .ok_or_else(|| MissingEvidence::new("classified resource child"))?;
+        let name = match &source.authored.kind {
+            ExprKind::Sink { name } | ExprKind::NestedBlock { name, .. } => name,
+            _ => return Err(MissingEvidence::new("resource child sink identity").into()),
+        };
+        slot_kinds.insert(name.clone(), resource_child_kind(&child));
+    }
     let instance = ExpansionInstanceId::fresh();
     let mut slots = AuthoredSlots::default();
     slots.set_instance(instance);
@@ -969,6 +990,7 @@ pub(in crate::parser) fn resource_slots(
                 name.clone(),
                 sink.expression.clone(),
                 kind,
+                AuthoredSlotKind::Attribute,
                 instance,
                 conditions,
             );
@@ -987,6 +1009,9 @@ pub(in crate::parser) fn resource_slots(
                 name.clone(),
                 expression,
                 kind,
+                *slot_kinds
+                    .get(name)
+                    .ok_or_else(|| MissingEvidence::new("resource slot kind"))?,
                 instance,
                 captures.condition_snapshot(),
             );
