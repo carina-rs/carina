@@ -149,6 +149,15 @@ jobs:
       - uses: actions/checkout@v4
       - run: scripts/verify.sh docs-spellings
 
+  check-doctest-module-tree:
+    name: Check Doctest Module Tree
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/verify.sh doctest-module-tree
+
   check-resources-access:
     name: Check Direct parsed.resources Access
     if: github.event_name != 'push'

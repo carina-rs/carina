@@ -9,7 +9,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 default_kinds=(
     fmt provider-boundaries error-source-display no-wall-clock-test-assertions
-    docs-spellings resources-access cli-hints no-home-env-reads
+    docs-spellings doctest-module-tree resources-access cli-hints no-home-env-reads
     crates-not-publishable wit-bindgen-workspace plan-fixtures rust-cache pinned-toolchain
     vendored-patches check feature-isolation clippy validate-crn example-warnings
     wasm-fixtures nextest isolation provider-cause doctests
@@ -31,7 +31,7 @@ running checks (isolation-with-archive means isolation <archive>).
 
 Kinds:
   fmt provider-boundaries error-source-display no-wall-clock-test-assertions
-  docs-spellings resources-access cli-hints no-home-env-reads
+  docs-spellings doctest-module-tree resources-access cli-hints no-home-env-reads
   crates-not-publishable wit-bindgen-workspace plan-fixtures rust-cache pinned-toolchain
   vendored-patches check feature-isolation clippy validate-crn example-warnings
   wasm-fixtures nextest isolation provider-cause doctests
@@ -148,6 +148,7 @@ run_kind() {
             bash scripts/test-check-docs-spellings.sh
             bash scripts/check-docs-use-new-spellings.sh
             ;;
+        doctest-module-tree) bash scripts/check-doctest-module-tree.sh ;;
         resources-access) bash scripts/check-no-direct-resources-access.sh ;;
         cli-hints) bash scripts/check-cli-hints-use-project-command.sh ;;
         no-home-env-reads) bash scripts/check-no-home-env-reads.sh ;;
