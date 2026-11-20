@@ -3070,6 +3070,7 @@ pub(crate) struct AuthoredForIterable<'a> {
     pub location: &'a DeclarationLocation,
     pub expression: String,
     pub judged: Result<&'a JudgedExpr, MissingEvidence>,
+    pub key_judged: Result<&'a JudgedExpr, MissingEvidence>,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -5258,12 +5259,13 @@ mod judgement {
                 Ok(instances)
             }
         }
-        pub(crate) fn authored_for_iterables(
-            &self,
-        ) -> impl Iterator<Item = AuthoredForIterable<'_>> {
+        pub(crate) fn authored_for_iterables<'a>(
+            &'a self,
+            key_report: &'a Self,
+        ) -> impl Iterator<Item = AuthoredForIterable<'a>> {
             self.syntax_nodes
                 .iter()
-                .filter_map(|((instance, _), syntax)| {
+                .filter_map(move |((instance, _), syntax)| {
                     let ExprKind::For {
                         binding,
                         bound,
@@ -5282,14 +5284,18 @@ mod judgement {
                         .get(&(instance.clone(), operand.node_id()))
                         .map(crate::value::format_value)
                         .unwrap_or_else(|| iterable.as_str().trim().to_string());
+                    let judgement = |report: &'a Self| {
+                        report.node(instance, operand.node_id()).ok_or_else(|| {
+                            MissingEvidence::new(format!("for iterable at {location:?}"))
+                        })
+                    };
                     Some(AuthoredForIterable {
                         binding,
                         bound: *bound,
                         location,
                         expression,
-                        judged: self.node(instance, operand.node_id()).ok_or_else(|| {
-                            MissingEvidence::new(format!("for iterable at {location:?}"))
-                        }),
+                        judged: judgement(self),
+                        key_judged: judgement(key_report),
                     })
                 })
         }

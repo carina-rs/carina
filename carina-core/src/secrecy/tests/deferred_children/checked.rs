@@ -161,6 +161,56 @@ fn issue_4516_deferred_for_child_rows_keep_element_identity() {
 }
 
 #[test]
+fn for_value_keys_deferred_for_child_rows_keep_element_identity() {
+    let (_directory, file, schemas, context) = directory(ROOT_LOOP);
+    let file = resolved(file, &schemas, &context);
+    let children = children(
+        &file.deferred_for_expressions()[0],
+        list(&["a", "b"]),
+        &context,
+    );
+    assert_eq!(children.len(), 2);
+    let mut graph = graph(&file).clone();
+    for (address, other_address) in [("children.a", "children.b"), ("children.b", "children.a")] {
+        let child = children
+            .iter()
+            .find(|child| child.id.identity_str() == Some(address))
+            .unwrap();
+        let other = children
+            .iter()
+            .find(|child| child.id.identity_str() == Some(other_address))
+            .unwrap();
+        let row = match child.child_secrecy() {
+            ChildSecrecyRead::Row(row) => row,
+            unexpected @ (ChildSecrecyRead::NotLoopChild
+            | ChildSecrecyRead::Unavailable(_)
+            | ChildSecrecyRead::RowMismatch) => {
+                panic!("expected admitted child's row, got {unexpected:?}")
+            }
+        };
+        assert_eq!(row.attributes()["comment"], Evidence::Leaf(Secrecy::Secret));
+        assert_eq!(row.attributes()["name"], Evidence::Leaf(Secrecy::Public));
+        assert!(row.matches_resource(child));
+        assert!(!row.matches_resource(other));
+        graph.insert_child(child).unwrap();
+        assert_eq!(graph.attributes(&child.id), Some(row.attributes()));
+
+        let mut wrong_element = child.clone();
+        wrong_element.id.set_identity(other_address.into());
+        wrong_element.binding = other.binding.clone();
+        assert!(!row.matches_resource(&wrong_element));
+        assert!(matches!(
+            wrong_element.child_secrecy(),
+            ChildSecrecyRead::RowMismatch
+        ));
+        assert_eq!(
+            graph.insert_child(&wrong_element),
+            Err(ChildEvidenceInsertError::ChildDeclaration)
+        );
+    }
+}
+
+#[test]
 fn issue_4516_deferred_for_pending_directory_carries_unavailable() {
     // The missing NoSchema schema is the pending cause.
     let (_directory, file, schemas, context) = directory(&format!(

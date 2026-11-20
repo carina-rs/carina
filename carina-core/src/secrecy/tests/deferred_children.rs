@@ -331,6 +331,40 @@ fn issue_4516_deferred_for_module_children_join_the_directory_graph() {
 }
 
 #[test]
+fn for_value_keys_literal_module_children_join_the_directory_graph() {
+    let (_directory, file, schemas, context) = fixture(
+        "let child = use { source = './child' }\nlet instance = child { items = ['a', 'b'] }\n",
+        Some(
+            "arguments { items: list(String) }\nlet children = for item in items { mock.test.Resource { comment = secret('canary') name = item } }\n",
+        ),
+    );
+    assert!(file.deferred_for_expressions().is_empty());
+    let report = report(&file, &schemas, &context);
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(!report.is_pending(), "{report:?}");
+    let graph = report
+        .admitted()
+        .expect("literal module children are admitted");
+    for binding in ["instance.children.a", "instance.children.b"] {
+        let child = file
+            .resources
+            .iter()
+            .find(|child| child.id.identity_str() == Some(binding))
+            .unwrap();
+        assert!(matches!(
+            child.child_secrecy(),
+            ChildSecrecyRead::NotLoopChild
+        ));
+        let attributes = graph.attributes(&child.id).unwrap();
+        assert_eq!(attributes["comment"], Evidence::Leaf(Secrecy::Secret));
+        assert_eq!(attributes["name"], Evidence::Leaf(Secrecy::Public));
+        assert!(!format!("{attributes:?}").contains("canary"));
+    }
+    assert!(!format!("{report:?}").contains("canary"));
+    assert!(!format!("{graph:?}").contains("canary"));
+}
+
+#[test]
 fn issue_4516_deferred_for_map_rows_follow_keys_after_removal() {
     let (_directory, file, schemas, context) = directory(
         "let children = for key, item in upstream.items { mock.test.Resource { comment = secret('canary') name = item } }\n",
@@ -387,6 +421,50 @@ fn issue_4516_deferred_for_list_rows_follow_indices_after_removal() {
     expand(&mut only_b, list(&["b"]), &context);
     assert_child_row(&only_b, "children[0]");
     assert!(graph(&only_b).attributes(&old_index_id).is_none());
+}
+
+#[test]
+fn for_value_keys_deferred_for_list_rows_follow_values_after_removal() {
+    let (_directory, file, schemas, context) = directory(ROOT_LOOP);
+    let report = report(&file, &schemas, &context);
+    assert!(!report.is_pending(), "{report:?}");
+    assert!(report.admitted().is_some());
+    let file = resolved(file, &schemas, &context);
+    let mut both = file.clone();
+    expand(&mut both, list(&["a", "b"]), &context);
+    assert_child_row(&both, "children.a");
+    assert_child_row(&both, "children.b");
+    let removed_id = both
+        .resources
+        .iter()
+        .find(|child| child.id.identity_str() == Some("children.a"))
+        .unwrap()
+        .id
+        .clone();
+    let retained_id = both
+        .resources
+        .iter()
+        .find(|child| child.id.identity_str() == Some("children.b"))
+        .unwrap()
+        .id
+        .clone();
+    let retained_attributes = graph(&both).attributes(&retained_id).unwrap().clone();
+    let mut only_b = file;
+    expand(&mut only_b, list(&["b"]), &context);
+    assert_child_row(&only_b, "children.b");
+    let retained = only_b
+        .resources
+        .iter()
+        .find(|child| child.id.identity_str() == Some("children.b"))
+        .unwrap();
+    assert_eq!(retained.id, retained_id);
+    assert_eq!(
+        graph(&only_b).attributes(&retained_id),
+        Some(&retained_attributes)
+    );
+    assert!(graph(&only_b).attributes(&removed_id).is_none());
+    assert!(only_b.resources.iter().all(|child| child.id != removed_id));
+    assert_eq!(only_b.resources.len(), 2, "one child and unrelated");
 }
 
 #[test]

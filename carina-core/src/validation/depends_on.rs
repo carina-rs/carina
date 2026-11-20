@@ -704,14 +704,34 @@ let other = wait cert { until = cert.status == "ISSUED" }
     fn expanded_loop_group_takes_precedence_over_value_argument_in_depends_on() {
         let mut parsed = parse_and_resolve(
             r#"
-                arguments { records: String }
-                let member = aws.s3.Bucket { bucket_name = "one" }
+                let records = for (_, name) in ["one"] {
+                    aws.s3.Bucket { bucket_name = name }
+                }
                 let consumer = aws.s3.Bucket { bucket_name = "consumer" directives { depends_on = [missing] } }
             "#,
         )
         .unwrap();
-        // Model an expanded group without a retained parser loop handle.
-        parsed.resources[0].binding = Some("records[0]".into());
+        assert!(
+            AnalysisTree::try_from_file(&parsed)
+                .unwrap()
+                .is_loop_group("records")
+        );
+        assert_eq!(
+            parsed.resources[0].binding.as_ref().unwrap().as_str(),
+            "records[0]"
+        );
+        // Model the same-named value argument at the validator boundary;
+        // authored duplicate declarations are rejected before this pass.
+        let argument_types = ResolvedArgumentTypes {
+            types: [(
+                "records".to_string(),
+                DependencyArgumentResolution::Resolved(ResolvedDependencyArgumentType::Value(
+                    "String".to_string(),
+                )),
+            )]
+            .into_iter()
+            .collect(),
+        };
         *parsed.resources[1]
             .dependencies
             .depends_on
@@ -720,7 +740,10 @@ let other = wait cert { until = cert.status == "ISSUED" }
             .expect("authored operand") =
             UnexpandedDependencyOperand::BareBinding("records".into());
 
-        let diagnostics = check(&parsed).unwrap();
+        let diagnostics = validate_depends_on(
+            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &argument_types,
+        );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 

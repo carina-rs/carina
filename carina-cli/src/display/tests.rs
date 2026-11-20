@@ -1279,7 +1279,7 @@ fn test_deferred_replace_renders_top_level() {
     Execution Plan:
 
       -/+ aws.route53.Record validation_records[*] (N records after cert resolves)
-          <- for opt in cert.domain_validation_options
+          <- for (_, opt) in cert.domain_validation_options
           name: (known after cert resolves)
 
     Plan: 0 to add, 0 to change, 0 to destroy.
@@ -1330,7 +1330,7 @@ fn test_deferred_replace_renders_dependent_children() {
     Execution Plan:
 
       +/- aws.route53.Record validation_records[*] (N records after cert resolves)
-          <- for opt in cert.domain_validation_options
+          <- for (_, opt) in cert.domain_validation_options
           name: (known after cert resolves)
             │
             └─ + acm.CertificateValidation cert-validation
@@ -1371,7 +1371,7 @@ fn test_deferred_replace_keeps_unrelated_same_type_delete() {
 
       + acm.Certificate cert
             ├─ -/+ aws.route53.Record validation_records[*] (N records after cert applies)
-            │     <- for opt in cert.domain_validation_options
+            │     <- for (_, opt) in cert.domain_validation_options
             │     name: (known after cert applies)
             │
             └─ - route53.Record old_record

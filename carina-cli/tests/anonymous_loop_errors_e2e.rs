@@ -138,8 +138,16 @@ fn anonymous_loop_sibling_conflicts_report_every_loop_in_validate_and_plan() {
             stderr.contains("at b.crn:1"),
             "missing b.crn error: {stderr}"
         );
-        assert!(stderr.contains("let thing = for name"), "{stderr}");
-        assert!(stderr.contains("let thing_2 = for name"), "{stderr}");
+        assert!(stderr.contains("let thing = for (_, name)"), "{stderr}");
+        assert!(stderr.contains("let thing_2 = for (_, name)"), "{stderr}");
+        assert!(
+            stderr.contains("to = mock.test.Thing 'thing[0]'"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("to = mock.test.Thing 'thing_2[0]'"),
+            "{stderr}"
+        );
     }
 }
 
@@ -177,10 +185,14 @@ fn anonymous_plain_and_single_loop_conflict_reach_validate_and_plan() {
             args[0],
         );
         assert!(stderr.contains("at main.crn:5"), "{stderr}");
-        assert!(stderr.contains("let thing = for name"), "{stderr}");
+        assert!(stderr.contains("let thing = for (_, name)"), "{stderr}");
         assert!(
             stderr.contains("from = mock.test.Thing '_for0[0]'"),
             "{stderr}",
+        );
+        assert!(
+            stderr.contains("to = mock.test.Thing 'thing[0]'"),
+            "{stderr}"
         );
     }
 }

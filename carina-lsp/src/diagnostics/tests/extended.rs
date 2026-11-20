@@ -2048,12 +2048,12 @@ fn default_control_values_only_taint_dependent_directives_in_lsp() {
     for (arguments, body, error_expected) in [
         (
             "flags: list(Bool) = [false]",
-            "for flag in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = false } } }",
+            "for (_, flag) in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = false } } }",
             false,
         ),
         (
             "flags: list(Bool) = [false]",
-            "for flag in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = flag } } }",
+            "for (_, flag) in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = flag } } }",
             true,
         ),
         (

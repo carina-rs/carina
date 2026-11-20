@@ -6439,10 +6439,12 @@ pub fn validate_for_iterable_types<D, B: BindingAddress, E>(
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    validate_authored_for_iterable_types(tree.file().expression_report(), provider_context)
+    let report = tree.file().expression_report();
+    validate_authored_for_iterable_types(report, report, provider_context)
 }
 
-/// Supply declared upstream exports to the same authored-node iterable walk.
+/// Supply upstream element types to the authored-node walk. Upstream iterable
+/// shape diagnostics retain their occurrence-aware upstream owner.
 pub fn validate_for_iterable_types_with_upstream<D, B: BindingAddress, E>(
     tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     provider_context: &ProviderContext,
@@ -6458,22 +6460,23 @@ where
         provider_context,
         Some(upstream),
     );
-    validate_authored_for_iterable_types(&report, provider_context)
+    validate_authored_for_iterable_types(tree.file().expression_report(), &report, provider_context)
 }
 
 fn validate_authored_for_iterable_types<B: BindingAddress>(
     report: &crate::parser::retained::ExpressionReport<B>,
+    key_report: &crate::parser::retained::ExpressionReport<B>,
     provider_context: &ProviderContext,
 ) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>> {
     let mut diagnostics = Vec::new();
-    for authored in report.authored_for_iterables() {
+    for authored in report.authored_for_iterables(key_report) {
         let expected = match authored.binding {
             ForBinding::Simple(_) | ForBinding::Indexed(_, _) => DeferredIterableKind::List,
             ForBinding::Map(_, _) => DeferredIterableKind::Map,
         };
-        let judged = match authored.judged {
-            Ok(judged) => judged,
-            Err(error) => {
+        let (judged, key_judged) = match (authored.judged, authored.key_judged) {
+            (Ok(judged), Ok(key_judged)) => (judged, key_judged),
+            (Err(error), _) | (_, Err(error)) => {
                 diagnostics.push(crate::parser::Located::new(
                     authored.location.clone(),
                     DeferredForIterableTypeDiagnostic::Iterable {
@@ -6489,6 +6492,7 @@ fn validate_authored_for_iterable_types<B: BindingAddress>(
                 expected,
                 value_keys: matches!(authored.binding, ForBinding::Simple(_)) && authored.bound,
                 judged,
+                key_judged,
                 provider_context,
                 location: authored.location,
                 expression: &authored.expression,
@@ -6575,6 +6579,7 @@ struct ForIterableValidationContext<'a> {
     value_keys: bool,
     provider_context: &'a ProviderContext,
     judged: &'a crate::parser::retained::JudgedExpr,
+    key_judged: &'a crate::parser::retained::JudgedExpr,
     location: &'a crate::parser::DeclarationLocation,
     expression: &'a str,
 }
@@ -6594,9 +6599,14 @@ fn validate_for_iterable_operand(
     if let Some(operands) = context.judged.coalesce_operands() {
         let mut findings: Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>> =
             Vec::new();
-        for operand in operands {
+        let key_operands = context
+            .key_judged
+            .coalesce_operands()
+            .expect("paired reports judge the same authored coalesce");
+        for (operand, key_operand) in operands.iter().zip(key_operands) {
             let mut operand_context = context;
             operand_context.judged = operand;
+            operand_context.key_judged = key_operand;
             let mut operand_findings = Vec::new();
             validate_for_iterable_operand(operand_context, &mut operand_findings);
             for finding in operand_findings {
@@ -6617,11 +6627,12 @@ fn validate_for_iterable_operand(
         DeferredIterableKind::Map => TypeExpr::Map(Box::new(TypeExpr::String)),
     };
     let judged = context.judged.for_sink(&sink, context.provider_context);
+    let key_judged = context.key_judged.for_sink(&sink, context.provider_context);
     if context.value_keys
-        && (judged.collection_kind() == Some(crate::parser::retained::CollectionKind::List)
-            || context.judged.has_list_elements())
+        && (key_judged.collection_kind() == Some(crate::parser::retained::CollectionKind::List)
+            || context.key_judged.has_list_elements())
     {
-        for member in context.judged.elements() {
+        for member in context.key_judged.elements() {
             if let Ok(element) = member.static_type()
                 && let Err(error) = crate::resource::classify_for_key_type(element)
             {
@@ -6629,6 +6640,14 @@ fn validate_for_iterable_operand(
                 return;
             }
         }
+    }
+    if context.value_keys
+        && let Ok(DeferredIterableShape::List(Some(element))) =
+            deferred_iterable_shape_for_phase(&key_judged)
+        && let Err(error) = crate::resource::classify_for_key_type(&element)
+    {
+        diagnostics.push(deferred_for_key_diagnostic(context, error));
+        return;
     }
     let inferred = match deferred_iterable_shape_for_phase(&judged) {
         Ok(inferred) => Some(inferred),
@@ -6670,14 +6689,7 @@ fn validate_for_iterable_operand(
         return;
     };
     match (context.expected, inferred) {
-        (DeferredIterableKind::List, DeferredIterableShape::List(element)) => {
-            if context.value_keys
-                && let Some(element) = element
-                && let Err(error) = crate::resource::classify_for_key_type(&element)
-            {
-                diagnostics.push(deferred_for_key_diagnostic(context, error));
-            }
-        }
+        (DeferredIterableKind::List, DeferredIterableShape::List(_)) => {}
         (DeferredIterableKind::Map, DeferredIterableShape::Map) => {}
         (DeferredIterableKind::List, DeferredIterableShape::Map) => {
             diagnostics.push(deferred_iterable_diagnostic(

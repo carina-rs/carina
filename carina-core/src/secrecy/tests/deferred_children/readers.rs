@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::module_resolver::ModuleError;
+use crate::resource::knowledge::{Classification, KnowledgeContext};
 use crate::validation::ParameterValueFinding;
 
 #[derive(Debug)]
@@ -75,8 +76,42 @@ fn assert_reader_protected(
     annotated: bool,
     expected: Expectation,
 ) {
-    let header = if map { "key, item" } else { "(i, item)" };
-    // The colliding map key selects `name`, so make that attribute secret too.
+    assert_reader_protected_for_iterable(
+        label,
+        selector,
+        if map {
+            ReaderIterable::Map
+        } else {
+            ReaderIterable::IndexedList
+        },
+        module,
+        export,
+        annotated,
+        expected,
+    );
+}
+
+enum ReaderIterable {
+    IndexedList,
+    ValueKeyedList,
+    Map,
+}
+
+fn assert_reader_protected_for_iterable(
+    label: &str,
+    selector: &str,
+    iterable: ReaderIterable,
+    module: bool,
+    export: bool,
+    annotated: bool,
+    expected: Expectation,
+) {
+    let (header, iterable_type) = match iterable {
+        ReaderIterable::IndexedList => ("(i, item)", "list"),
+        ReaderIterable::ValueKeyedList => ("item", "list"),
+        ReaderIterable::Map => ("key, item", "map"),
+    };
+    // The colliding key selects `name`, so make that attribute secret too.
     let name = if selector == "children.comment.name" {
         "secret('name canary')"
     } else {
@@ -92,10 +127,7 @@ fn assert_reader_protected(
             format!("let other = mock.test.Resource {{ comment = {selector} }}")
         },
     );
-    let module_source = format!(
-        "arguments {{ items: {}(String) }}\n{body}",
-        if map { "map" } else { "list" }
-    );
+    let module_source = format!("arguments {{ items: {iterable_type}(String) }}\n{body}");
     let main = if module {
         format!(
             "let child = use {{ source = './child' }}\nlet instance = child {{ items = upstream.items }}\n{}",
@@ -285,6 +317,280 @@ reader_test!(
     false,
     Pending
 );
+
+#[test]
+fn for_value_keys_reader_list() {
+    assert_reader_protected_for_iterable(
+        "value-keyed list reader",
+        "children.a.comment",
+        ReaderIterable::ValueKeyedList,
+        false,
+        false,
+        true,
+        Pending,
+    );
+}
+
+#[test]
+#[ignore = "value-key reader stays pending; maintainer decision pending, PR #4574"]
+fn for_value_keys_reader_list_attribute_key() {
+    assert_reader_protected_for_iterable(
+        "value-keyed list attribute-name collision",
+        "children.comment.name",
+        ReaderIterable::ValueKeyedList,
+        false,
+        false,
+        true,
+        Pending,
+    );
+    let (_directory, file, schemas, context) = reader_fixture(
+        "let children = for item in ['comment'] { mock.test.Resource { comment = secret('canary') name = secret('name canary') } }\nlet other = mock.test.Resource { comment = children.comment.name }\n",
+        None,
+    );
+    let file = file.expect("literal value-keyed reader should load");
+    assert!(file.deferred_for_expressions().is_empty());
+    let report = report(&file, &schemas, &context);
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(!report.is_pending(), "{report:?}");
+    assert!(report.admitted().is_some());
+    assert_eq!(
+        super::super::attribute(&report, "other", "comment"),
+        Evidence::Leaf(Secrecy::Secret)
+    );
+    assert!(!format!("{report:?}").contains("canary"));
+}
+
+fn assert_literal_reader_admitted(header: &str, iterable: &str, selector: &str) {
+    let source = format!(
+        "let children = for {header} in {iterable} {{ mock.test.Resource {{ comment = secret('canary') name = secret('name canary') }} }}\nlet other = mock.test.Resource {{ comment = {selector} }}\n",
+    );
+    let (_directory, file, schemas, context) = reader_fixture(&source, None);
+    let file = file.expect("literal reader should load");
+    assert!(file.deferred_for_expressions().is_empty());
+    let report = report(&file, &schemas, &context);
+    let evidence = report
+        .rows
+        .iter()
+        .find(|(id, _)| id.identity_str() == Some("other"))
+        .and_then(|(_, row)| row.attributes.get("comment"));
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(
+        !report.is_pending(),
+        "{selector}: pending={}, other.comment={evidence:?}; {report:?}",
+        report.is_pending(),
+    );
+    assert_eq!(evidence, Some(&Evidence::Leaf(Secrecy::Secret)));
+    assert!(report.admitted().is_some());
+    assert!(!format!("{report:?}").contains("canary"));
+    let resolved = resolve_owner(file, &schemas, &context);
+    assert!(resolved.validated_secrecy().is_ok());
+}
+
+#[test]
+#[ignore = "value-key reader stays pending; maintainer decision pending, PR #4574"]
+fn for_value_keys_reader_literal_list_dot() {
+    assert_literal_reader_admitted("item", "['a']", "children.a.comment");
+}
+
+#[test]
+#[ignore = "value-key reader stays pending; maintainer decision pending, PR #4574"]
+fn for_value_keys_reader_literal_list_subscript() {
+    assert_literal_reader_admitted("item", "['a']", "children['a'].comment");
+}
+
+#[test]
+#[ignore = "value-key reader stays pending; maintainer decision pending, PR #4574"]
+fn for_value_keys_reader_literal_indexed_list() {
+    assert_literal_reader_admitted("(i, item)", "['comment']", "children[0].name");
+}
+
+#[test]
+#[ignore = "value-key reader stays pending; maintainer decision pending, PR #4574"]
+fn for_value_keys_reader_literal_map_attribute_key() {
+    assert_literal_reader_admitted("k, v", "({ comment = 'x' })", "children.comment.name");
+}
+
+#[test]
+fn for_value_keys_reader_pending_keeps_runtime_redaction() {
+    for selector in ["children.comment.name", "children['comment'].name"] {
+        let source = format!(
+            "let children = for item in ['comment'] {{ mock.test.Resource {{ comment = secret('canary') name = secret('name canary') }} }}\nlet other = mock.test.Resource {{ comment = {selector} }}\n",
+        );
+        let (_directory, file, schemas, context) = reader_fixture(&source, None);
+        let file = file.unwrap();
+        let report = report(&file, &schemas, &context);
+        assert!(report.is_pending());
+        assert!(report.findings().is_empty());
+        assert!(report.admitted().is_none());
+        assert!(report.rows.iter().any(|(id, row)| {
+            id.identity_str() == Some("other") && !row.attributes.contains_key("comment")
+        }));
+        let group = file
+            .parser_binding_metadata
+            .structural_handles()
+            .keys()
+            .find(|binding| binding.as_str() == "children")
+            .expect("authored loop group");
+        assert!(file.expression_report().secrecy_definition(group).is_some());
+        assert!(file.resources.iter().all(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .is_none_or(|binding| binding.as_str() != "children")
+        }));
+        let resolved = resolve_owner(file, &schemas, &context);
+        assert!(resolved.validated_secrecy().is_err());
+        let other = resolved
+            .as_file()
+            .resources
+            .iter()
+            .find(|resource| resource.id.identity_str() == Some("other"))
+            .unwrap();
+        let bindings = crate::binding_index::ResolvedBindings::pre_apply_live(
+            crate::binding_index::LivePreApplyInputs {
+                managed: &resolved.as_file().resources,
+                compositions: &[],
+                managed_current: &HashMap::new(),
+                data_source_values: &crate::data_source_value::DataSourceValues::empty(),
+                remote_bindings: &Default::default(),
+                wait_aliases: &[],
+            },
+        );
+        let value = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            crate::resolver::resolve_ref_value_with_config(
+                &other.attributes["comment"],
+                &bindings,
+                session,
+            )
+        })
+        .unwrap();
+        if selector == "children.comment.name" {
+            assert!(
+                matches!(
+                    value
+                        .knowledge(&KnowledgeContext::plan(&bindings))
+                        .unwrap()
+                        .into_classification(),
+                    Classification::Pending(_)
+                ),
+                "{selector}"
+            );
+        } else {
+            assert!(crate::value::contains_secret(&value), "{selector}");
+            assert!(!crate::value::format_value(&value).contains("canary"));
+        }
+        let child = resolved
+            .as_file()
+            .resources
+            .iter()
+            .find(|resource| resource.id.identity_str() == Some("children.comment"))
+            .unwrap();
+        let provider_values = BTreeMap::from([
+            (
+                "comment".to_string(),
+                Value::Concrete(ConcreteValue::String("canary".into())),
+            ),
+            (
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("name canary".into())),
+            ),
+        ]);
+        let protected = crate::binding_index::SecretPreservingAttributes::from_provider_values(
+            &child.attributes,
+            &provider_values,
+        );
+        let state = crate::resource::State {
+            id: child.id.clone(),
+            identifier: None,
+            exists: true,
+            attributes: provider_values,
+            dependency_bindings: Default::default(),
+            partial_read: None,
+        };
+        let mut applied = crate::binding_index::ResolvedBindings::default();
+        applied.record_applied(
+            child.binding.as_ref().map(|binding| binding.as_str()),
+            &protected,
+            &state,
+            crate::binding_index::BindingCompleteness::Complete,
+        );
+        let value = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            crate::resolver::resolve_ref_value_with_config(
+                &other.attributes["comment"],
+                &applied,
+                session,
+            )
+        })
+        .unwrap();
+        if selector == "children.comment.name" {
+            assert!(matches!(
+                value
+                    .knowledge(&KnowledgeContext::apply(&applied))
+                    .unwrap()
+                    .into_classification(),
+                Classification::Pending(_)
+            ));
+            assert!(!crate::value::format_value(&value).contains("canary"));
+        } else {
+            assert!(crate::value::contains_secret(&value));
+            assert!(!crate::value::format_value(&value).contains("canary"));
+            let snapshot = crate::value::redact_secrets_in_value(&value).unwrap();
+            assert!(!serde_json::to_string(&snapshot).unwrap().contains("canary"));
+        }
+    }
+}
+
+#[test]
+fn for_value_keys_reader_pending_mixed_alternatives_characterization() {
+    let (_directory, file, _schemas, _context) = reader_fixture(
+        "let children = for item in ['comment'] { mock.test.Resource { name = secret('name canary') } }\nlet other = mock.test.Resource { comment = children.comment.name ?? 'public' }\n",
+        None,
+    );
+    let error = file.unwrap_err().to_string();
+    assert!(
+        error.contains("cannot apply access .comment to list(mock.test.Resource)"),
+        "{error}"
+    );
+    assert!(!error.contains("canary"));
+
+    let loop_source = "let children = for item in ['comment'] { mock.test.Resource { comment = secret('canary') name = secret('name canary') } }\nlet other = mock.test.Resource { comment = children.comment.name }\n";
+    let (_directory, file, schemas, context) = reader_fixture(loop_source, None);
+    let file = file.unwrap();
+    let pending = report(&file, &schemas, &context);
+    assert!(pending.is_pending());
+    assert!(pending.findings().is_empty());
+    assert!(
+        resolve_owner(file, &schemas, &context)
+            .validated_secrecy()
+            .is_err()
+    );
+
+    for source in [
+        "let child = mock.test.Resource { name = secret('name canary') }\nlet other = mock.test.Resource { comment = child.name ?? 'public' }\n".to_string(),
+        format!("{loop_source}let independent = mock.test.Resource {{ comment = secret('independent canary') ?? 'public' }}\n"),
+    ] {
+        let (_directory, file, schemas, context) = reader_fixture(&source, None);
+        let file = file.unwrap();
+        let report = report(&file, &schemas, &context);
+        assert_eq!(report.findings().len(), 1, "{report:?}");
+        assert!(matches!(
+            report.findings()[0].cause(),
+            crate::secrecy::DerivationError::MixedAlternatives(_)
+        ));
+        let error = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            crate::validation::resolve_bare_binding_uses_in_session(
+                file,
+                &schemas,
+                session,
+                &crate::module_resolver::ResolvedModuleSignatures::default(),
+            )
+        })
+        .unwrap_err();
+        assert!(matches!(error, crate::validation::ResolveFileError::Secrecy(_)));
+        assert!(!format!("{report:?}").contains("canary"));
+    }
+}
+
 reader_test!(
     issue_4516_reader_map_dot,
     "children.a.comment",
@@ -325,6 +631,20 @@ reader_test!(
     true,
     Admitted
 );
+
+#[test]
+fn for_value_keys_reader_export_list() {
+    assert_reader_protected_for_iterable(
+        "value-keyed list export",
+        "children.a.comment",
+        ReaderIterable::ValueKeyedList,
+        false,
+        true,
+        true,
+        Pending,
+    );
+}
+
 reader_test!(
     issue_4516_reader_export_map,
     "children.a.comment",
