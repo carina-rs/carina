@@ -20,12 +20,13 @@ fn carina(args: &[&str]) -> std::process::Output {
         .expect("failed to execute carina")
 }
 
-/// Write a minimal v8 state file with a single ec2.Vpc resource bound
+/// Write a minimal v21 state file with a single ec2.Vpc resource bound
 /// to `vpc` and return its path.
 fn write_minimal_state(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("carina.state.json");
     let state = json!({
-        "version": 8,
+        "version": 21,
+        "exports_version": 1,
         "serial": 1,
         "lineage": "test-state-url-e2e",
         "carina_version": "0.1.0",
@@ -35,10 +36,14 @@ fn write_minimal_state(dir: &std::path::Path) -> std::path::PathBuf {
                 "identity": "my-vpc",
                 "binding": "vpc",
                 "provider": "awscc",
-                "identifier": "vpc-deadbeef",
-                "attributes": {
-                    "vpc_id": "vpc-deadbeef",
-                    "cidr_block": "10.0.0.0/16"
+                "current": {
+                    "kind": "applied",
+                    "identifier": "vpc-deadbeef",
+                    "attributes": {
+                        "vpc_id": "vpc-deadbeef",
+                        "cidr_block": "10.0.0.0/16"
+                    },
+                    "nested_write_only": {}
                 },
                 "protected": false,
                 "directives": {},
@@ -57,7 +62,8 @@ fn write_secret_display_state(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("carina.state.json");
     let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
     let state = json!({
-        "version": 14,
+        "version": 21,
+        "exports_version": 1,
         "serial": 1,
         "lineage": "secret-display-e2e",
         "carina_version": "0.4.0",
@@ -66,10 +72,14 @@ fn write_secret_display_state(dir: &std::path::Path) -> std::path::PathBuf {
             "identity": "display",
             "binding": "display",
             "provider": "mock",
-            "identifier": "display-id",
-            "attributes": {
-                "stored_secret": {"$secret": digest},
-                "user_secret_map": {"$$secret": "user-visible"}
+            "current": {
+                "kind": "applied",
+                "identifier": "display-id",
+                "attributes": {
+                    "stored_secret": {"$secret": digest},
+                    "user_secret_map": {"$$secret": "user-visible"}
+                },
+                "nested_write_only": {}
             },
             "protected": false,
             "directives": {},

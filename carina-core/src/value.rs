@@ -1131,45 +1131,6 @@ fn escape_persisted_map_key(key: &str) -> Cow<'_, str> {
     }
 }
 
-/// Upgrade one value tree written by state format v12 or earlier.
-///
-/// The legacy enum recognition deliberately matches the old decoder: an
-/// outer object containing only `Enum`, with all required typed identity and
-/// `api_value` fields, is treated as the enum it used to decode into. Its
-/// payload is re-emitted canonically. Every other object is user data, so `$`
-/// keys are escaped recursively.
-pub fn migrate_legacy_persisted_json(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Array(values) => {
-            for value in values {
-                migrate_legacy_persisted_json(value);
-            }
-        }
-        serde_json::Value::Object(values) => {
-            if values.len() == 1
-                && let Some(serde_json::Value::Object(payload)) = values.get(LEGACY_ENUM_KEY)
-                && let Some(canonical) = canonical_enum_from_payload(payload, false)
-            {
-                *value = canonical_enum_to_json(&canonical, PERSISTED_ENUM_KEY);
-                return;
-            }
-
-            let old = std::mem::take(values);
-            *values = old
-                .into_iter()
-                .map(|(key, mut value)| {
-                    migrate_legacy_persisted_json(&mut value);
-                    (escape_persisted_map_key(&key).into_owned(), value)
-                })
-                .collect();
-        }
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => {}
-    }
-}
-
 /// Convert `serde_json::Value` to DSL `Value`.
 ///
 /// Returns `None` for JSON null, since null represents a missing/unset value
@@ -1182,8 +1143,7 @@ pub fn json_to_dsl_value(json: &serde_json::Value) -> Result<Option<Value>, Json
 }
 
 /// Convert persisted state JSON to a DSL value, lifting structural `$secret`
-/// tags into their opaque typed representation. Versioned state migrations
-/// rewrite legacy string encodings before this conversion runs.
+/// tags into their opaque typed representation. Ordinary strings remain literal.
 fn persisted_json_to_dsl_value(
     json: &serde_json::Value,
     purpose: PersistedPurpose,
@@ -1381,20 +1341,19 @@ fn json_to_canonical_enum(
         return None;
     }
 
-    canonical_enum_from_payload(payload, true)
+    canonical_enum_from_payload(payload)
 }
 
 fn canonical_enum_from_payload(
     payload: &serde_json::Map<String, serde_json::Value>,
-    require_canonical_shape: bool,
 ) -> Option<CanonicalEnumValue> {
-    if require_canonical_shape && payload.len() != 2 {
+    if payload.len() != 2 {
         return None;
     }
     let serde_json::Value::Object(identity) = payload.get("identity")? else {
         return None;
     };
-    if require_canonical_shape && identity.len() != 3 {
+    if identity.len() != 3 {
         return None;
     }
     let provider = match identity.get("provider")? {
@@ -8487,7 +8446,7 @@ mod tests {
     }
 
     #[test]
-    fn state_row_load_upgrades_raw_legacy_marker_to_structural_secret_tag() {
+    fn structural_legacy_secret_tag_decodes_while_raw_marker_stays_literal() {
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let marker = format!("_secret:argon2:{hash}");
         let mut json = serde_json::json!({ "nested": [marker.clone()] });
@@ -8505,20 +8464,16 @@ mod tests {
             "a raw legacy marker is not a context-free persisted encoding",
         );
 
-        json = crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
-            json,
-            "test.resource",
-            "old",
-            "tags",
-        )
-        .expect("migrate legacy test state document");
+        json = serde_json::json!({"nested": [{"$secret": format!(
+            "argon2-legacy:{}:{hash}", hex::encode(b"carina:test.resource:old:tags")
+        )}]});
         assert!(
             json["nested"][0][PERSISTED_SECRET_KEY]
                 .as_str()
                 .is_some_and(|digest| digest.starts_with("argon2-legacy:")),
         );
         let persisted = PersistedValue::from_serialized_json(json)
-            .expect("migrated persisted JSON")
+            .expect("structural persisted JSON")
             .decode()
             .expect("persisted JSON value");
         let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(map)) = persisted
@@ -8542,7 +8497,7 @@ mod tests {
         let digest = format!("argon2:{}", "ab".repeat(32));
         assert!(
             RedactedSecretHash::from_encoded_digest(&digest).is_none(),
-            "a raw legacy digest must first be upgraded by its state-file row",
+            "a legacy digest must carry an explicit salt",
         );
     }
 
@@ -8550,20 +8505,11 @@ mod tests {
     fn redacted_secret_hash_deserialize_accepts_only_its_serialized_encoding() {
         let bare_hash = "ab".repeat(32);
         let marker = format!("_secret:argon2:{bare_hash}");
-        let migrated =
-            crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
-                serde_json::json!(marker),
-                "test.resource",
-                "old",
-                "comment",
-            )
-            .expect("migrate legacy test state document");
-        let digest = RedactedSecretHash::from_encoded_digest(
-            migrated[PERSISTED_SECRET_KEY]
-                .as_str()
-                .expect("migrated digest"),
-        )
-        .expect("state load must upgrade a raw legacy marker");
+        let digest = RedactedSecretHash::from_encoded_digest(&format!(
+            "argon2-legacy:{}:{bare_hash}",
+            hex::encode(b"carina:test.resource:old:comment")
+        ))
+        .expect("valid explicit legacy digest");
         let encoded = serde_json::to_value(&digest).expect("serialize typed digest");
 
         let decoded_hash: RedactedSecretHash =

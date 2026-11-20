@@ -10,6 +10,9 @@ use crate::resource::{ResolvedResourceError, ResourceId};
 #[cfg(test)]
 use crate::schema::SchemaRegistry;
 
+#[cfg(test)]
+mod secrecy_tests;
+
 #[derive(Clone, Copy)]
 pub(super) struct DeferredIdentityInputs<'a> {
     pub(super) provider_configs: &'a [crate::parser::ProviderConfig<
@@ -294,6 +297,8 @@ impl std::error::Error for DeferredCreateFailure {
 
 /// Materialize `Effect::Create` children for a deferred-for template using the
 /// runtime values published under every binding referenced by the iterable.
+/// Each create resource retains its `child_secrecy()` hand-over through
+/// anonymous identity computation and dependency materialization.
 pub(super) fn materialize_deferred_create<
     S: Clone + crate::resource::AnonymousIdentityModuleSource,
 >(
@@ -477,6 +482,8 @@ pub(super) fn materialize_deferred_create<
                 error: error.into(),
             },
             error @ (DeferredForExpansionError::UnavailableSecret(_)
+            | DeferredForExpansionError::TemplateSecrecy(_)
+            | DeferredForExpansionError::ChildSecrecy(_)
             | DeferredForExpansionError::ValueAccess { .. }
             | DeferredForExpansionError::Resolution { .. }
             | DeferredForExpansionError::Knowledge { .. }

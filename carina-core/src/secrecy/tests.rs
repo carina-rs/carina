@@ -5,6 +5,7 @@ use crate::schema::{
     PatternResourceSchema as Schema,
 };
 
+mod deferred_children;
 fn context() -> ProviderContext {
     ProviderContext::new(crate::EnvironmentSnapshot::empty())
 }

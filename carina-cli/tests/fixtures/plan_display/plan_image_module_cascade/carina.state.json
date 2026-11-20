@@ -1,168 +1,301 @@
 {
-  "version": 7,
-  "serial": 9,
-  "lineage": "test-plan-image-module-cascade",
   "carina_version": "0.6.0",
+  "exports_version": 1,
+  "lineage": "test-plan-image-module-cascade",
   "resources": [
     {
-      "resource_type": "test.Widget",
-      "identity": "source",
-      "provider": "test",
-      "identifier": "source-live",
-      "attributes": {
-        "external_name": "source-old",
-        "output_id": "stable-output"
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "source",
+      "current": {
+        "attributes": {
+          "external_name": "source-old",
+          "output_id": "stable-output"
+        },
+        "identifier": "source-live",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
-          "external_name": { "kind": "leaf" }
-        }
-      }
+          "external_name": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "source",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "test",
+      "resource_type": "test.Widget"
     },
     {
-      "resource_type": "test.Widget",
-      "identity": "connector",
-      "provider": "test",
-      "identifier": "connector-live",
-      "attributes": {
-        "external_name": "connector",
-        "metric_name": "bridge"
-      },
-      "protected": false,
-      "directives": {
-        "depends_on": ["source"]
-      },
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "connector",
-      "dependency_bindings": ["source"],
-      "explicit": {
-        "kind": "struct",
-        "children": {
-          "external_name": { "kind": "leaf" },
-          "metric_name": { "kind": "leaf" }
-        }
-      }
-    },
-    {
-      "resource_type": "test.Widget",
-      "identity": "sink",
-      "provider": "test",
-      "identifier": "sink-live",
-      "attributes": {
-        "external_name": "sink",
-        "description": "old sink description"
+      "current": {
+        "attributes": {
+          "external_name": "connector",
+          "metric_name": "bridge"
+        },
+        "identifier": "connector-live",
+        "kind": "applied",
+        "nested_write_only": {}
       },
-      "protected": false,
+      "dependency_bindings": [
+        {
+          "identity": "source",
+          "provider": "test",
+          "resource_type": "test.Widget"
+        }
+      ],
       "directives": {
-        "depends_on": ["connector"]
+        "depends_on": [
+          {
+            "identity": "source",
+            "provider": "test",
+            "resource_type": "test.Widget"
+          }
+        ],
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
       },
-      "prefixes": {},
+      "explicit": {
+        "children": {
+          "external_name": {
+            "kind": "leaf"
+          },
+          "metric_name": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "connector",
       "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "test",
+      "resource_type": "test.Widget"
+    },
+    {
       "binding": "sink",
-      "dependency_bindings": ["connector"],
-      "explicit": {
-        "kind": "struct",
-        "children": {
-          "external_name": { "kind": "leaf" },
-          "description": { "kind": "leaf" }
+      "current": {
+        "attributes": {
+          "description": "old sink description",
+          "external_name": "sink"
+        },
+        "identifier": "sink-live",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
+      "dependency_bindings": [
+        {
+          "identity": "connector",
+          "provider": "test",
+          "resource_type": "test.Widget"
         }
-      }
+      ],
+      "directives": {
+        "depends_on": [
+          {
+            "identity": "connector",
+            "provider": "test",
+            "resource_type": "test.Widget"
+          }
+        ],
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
+      "explicit": {
+        "children": {
+          "description": {
+            "kind": "leaf"
+          },
+          "external_name": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "sink",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "test",
+      "resource_type": "test.Widget"
     },
     {
-      "resource_type": "test.Widget",
-      "identity": "cascade",
-      "provider": "test",
-      "identifier": "cascade-live",
-      "attributes": {
-        "external_name": "stable-output",
-        "description": "cascade consumer"
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "cascade",
-      "dependency_bindings": ["source"],
-      "explicit": {
-        "kind": "struct",
-        "children": {
-          "external_name": { "kind": "leaf" },
-          "description": { "kind": "leaf" }
+      "current": {
+        "attributes": {
+          "description": "cascade consumer",
+          "external_name": "stable-output"
+        },
+        "identifier": "cascade-live",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
+      "dependency_bindings": [
+        {
+          "identity": "source",
+          "provider": "test",
+          "resource_type": "test.Widget"
         }
-      }
+      ],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
+      "explicit": {
+        "children": {
+          "description": {
+            "kind": "leaf"
+          },
+          "external_name": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "cascade",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "test",
+      "resource_type": "test.Widget"
     },
     {
-      "resource_type": "test.Widget",
-      "identity": "review.module_node",
-      "provider": "test",
-      "identifier": "module-live",
-      "attributes": {
-        "external_name": "module-widget",
-        "description": "old module description"
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "review.module_node",
+      "current": {
+        "attributes": {
+          "description": "old module description",
+          "external_name": "module-widget"
+        },
+        "identifier": "module-live",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
-          "external_name": { "kind": "leaf" },
-          "description": { "kind": "leaf" }
-        }
-      }
+          "description": {
+            "kind": "leaf"
+          },
+          "external_name": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "review.module_node",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "test",
+      "resource_type": "test.Widget"
     },
     {
-      "resource_type": "test.Widget",
-      "identity": "obsolete",
-      "provider": "test",
-      "identifier": "obsolete-live",
-      "attributes": {
-        "external_name": "obsolete"
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "obsolete",
-      "dependency_bindings": ["source"],
-      "explicit": {
-        "kind": "struct",
-        "children": {
-          "external_name": { "kind": "leaf" }
+      "current": {
+        "attributes": {
+          "external_name": "obsolete"
+        },
+        "identifier": "obsolete-live",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
+      "dependency_bindings": [
+        {
+          "identity": "source",
+          "provider": "test",
+          "resource_type": "test.Widget"
         }
-      }
+      ],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
+      "explicit": {
+        "children": {
+          "external_name": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "obsolete",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "test",
+      "resource_type": "test.Widget"
     },
     {
-      "resource_type": "test.Widget",
-      "identity": "obsolete_child",
-      "provider": "test",
-      "identifier": "obsolete-child-live",
-      "attributes": {
-        "external_name": "obsolete-child"
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "obsolete_child",
-      "dependency_bindings": ["obsolete"],
-      "explicit": {
-        "kind": "struct",
-        "children": {
-          "external_name": { "kind": "leaf" }
+      "current": {
+        "attributes": {
+          "external_name": "obsolete-child"
+        },
+        "identifier": "obsolete-child-live",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
+      "dependency_bindings": [
+        {
+          "identity": "obsolete",
+          "provider": "test",
+          "resource_type": "test.Widget"
         }
-      }
+      ],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
+      "explicit": {
+        "children": {
+          "external_name": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "obsolete_child",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "test",
+      "resource_type": "test.Widget"
     }
-  ]
+  ],
+  "serial": 9,
+  "version": 21
 }

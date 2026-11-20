@@ -103,61 +103,6 @@ fn resource_by_identity<'a>(state: &'a Value, identity: &str) -> &'a Value {
     &resource["current"]
 }
 
-fn downgrade_state_to_v13(state: &mut Value) {
-    state["version"] = Value::from(13);
-    state
-        .as_object_mut()
-        .expect("state object")
-        .remove("exports_version");
-    for row in state["resources"].as_array_mut().expect("state resources") {
-        let row_object = row.as_object_mut().expect("state resource row");
-        let directives = row_object["directives"]
-            .as_object_mut()
-            .expect("state directives");
-        assert_eq!(
-            directives.get("prevent_destroy"),
-            Some(&serde_json::json!({"kind": "unspecified"})),
-            "legacy-secret fixtures start with unspecified destruction protection"
-        );
-        directives.insert("prevent_destroy".to_string(), Value::Bool(false));
-        let current = row_object
-            .remove("current")
-            .expect("v15 row has a current instance");
-        let mut current = current
-            .as_object()
-            .expect("current instance object")
-            .clone();
-        assert_eq!(
-            current.remove("kind"),
-            Some(Value::String("applied".to_string())),
-            "legacy-secret fixtures start from applied rows"
-        );
-        row_object.insert(
-            "identifier".to_string(),
-            current.remove("identifier").expect("applied identifier"),
-        );
-        row_object.insert(
-            "attributes".to_string(),
-            current.remove("attributes").expect("applied attributes"),
-        );
-        if let Some(value) = current.remove("write_only_attributes") {
-            row_object.insert("write_only_attributes".to_string(), value);
-        }
-        if let Some(value) = current.remove("partial_read") {
-            row_object.insert("partial_read".to_string(), value);
-        }
-        assert_eq!(
-            current.remove("nested_write_only"),
-            Some(serde_json::json!({})),
-            "legacy-secret fixtures must not carry nested write-only provenance"
-        );
-        assert!(
-            current.is_empty(),
-            "unexpected v15 current fields: {current:?}"
-        );
-    }
-}
-
 fn comment_digest(state: &Value, identity: &str) -> String {
     secret_digest(&resource_by_identity(state, identity)["attributes"]["comment"]).to_string()
 }
@@ -186,12 +131,12 @@ fn assert_digest_verifies(encoded_digest: &str, plaintext: &str) {
     );
 }
 
-fn legacy_marker(
+fn structural_legacy_secret(
     plaintext: &Value,
     display_type: &str,
     identity: &str,
     top_level_attribute_key: &str,
-) -> String {
+) -> Value {
     let material = serde_json::to_vec(plaintext).expect("serialize legacy secret material");
     let salt = format!("carina:{display_type}:{identity}:{top_level_attribute_key}");
     let mut output = [0_u8; 32];
@@ -202,7 +147,12 @@ fn legacy_marker(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    format!("_secret:argon2:{hash}")
+    let salt_hex = salt
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    serde_json::json!({"$secret": format!("argon2-legacy:{salt_hex}:{hash}")})
 }
 
 #[test]
@@ -311,13 +261,12 @@ let old = mock.test.resource {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let mut state = scenario.state_json();
-    downgrade_state_to_v13(&mut state);
-    state["resources"][0]["attributes"]["comment"] = Value::String(legacy_marker(
+    state["resources"][0]["current"]["attributes"]["comment"] = structural_legacy_secret(
         &Value::String("MOVED_LEGACY_PLAIN".to_string()),
         "mock.test.resource",
         "old",
         "comment",
-    ));
+    );
     scenario.write_state_json(&state);
     scenario.write_main(
         r#"backend local { path = "carina.state.json" }
@@ -409,13 +358,12 @@ let old = mock.test.resource {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let mut state = scenario.state_json();
-    downgrade_state_to_v13(&mut state);
-    state["resources"][0]["attributes"]["comment"] = Value::String(legacy_marker(
+    state["resources"][0]["current"]["attributes"]["comment"] = structural_legacy_secret(
         &Value::String("ORPHAN_REKEY_LEGACY_PLAIN".to_string()),
         "mock.test.resource",
         "old",
         "comment",
-    ));
+    );
     scenario.write_state_json(&state);
     scenario.write_main(
         r#"backend local { path = "carina.state.json" }
@@ -474,13 +422,12 @@ let old = mock.test.resource {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let mut state = scenario.state_json();
-    downgrade_state_to_v13(&mut state);
-    state["resources"][0]["attributes"]["comment"] = Value::String(legacy_marker(
+    state["resources"][0]["current"]["attributes"]["comment"] = structural_legacy_secret(
         &Value::String("ROUND_TWO_SAME_PLAIN".to_string()),
         "mock.test.resource",
         "old",
         "comment",
-    ));
+    );
     scenario.write_state_json(&state);
     scenario.write_main(
         r#"backend local { path = "carina.state.json" }
@@ -552,7 +499,6 @@ mock.example.consumer {
     );
 
     let mut state = scenario.state_json();
-    downgrade_state_to_v13(&mut state);
     let old_identity = state["resources"][0]["identity"]
         .as_str()
         .expect("anonymous state identity")
@@ -563,15 +509,17 @@ mock.example.consumer {
         .to_string();
     state["resources"][0]["identity"] = Value::String(stored_identity.clone());
     let provider: Value = serde_json::from_slice(&fs::read(&scenario.mock_state).unwrap()).unwrap();
-    let identifier = state["resources"][0]["identifier"].as_str().unwrap();
+    let identifier = state["resources"][0]["current"]["identifier"]
+        .as_str()
+        .unwrap();
     assert!(provider["states"][identifier].is_object());
     assert_eq!(provider["states"].as_object().unwrap().len(), 1);
-    state["resources"][0]["attributes"]["plain"] = Value::String(legacy_marker(
+    state["resources"][0]["current"]["attributes"]["plain"] = structural_legacy_secret(
         &Value::String("ANONYMOUS_LEGACY_RECONCILE_PLAIN".to_string()),
         "mock.example.consumer",
         &stored_identity,
         "plain",
-    ));
+    );
     scenario.write_state_json(&state);
 
     assert_plan_counts(
@@ -656,25 +604,24 @@ let legacy = mock.test.resource {
     );
 
     let mut state = scenario.state_json();
-    downgrade_state_to_v13(&mut state);
     let resource = state["resources"]
         .as_array_mut()
         .expect("state resources")
         .iter_mut()
         .find(|resource| resource["identity"] == "legacy")
         .expect("legacy state row");
-    resource["attributes"]["comment"] = Value::String(legacy_marker(
+    resource["current"]["attributes"]["comment"] = structural_legacy_secret(
         &Value::String("LEGACY_TOP_PLAIN".to_string()),
         "mock.test.resource",
         "legacy",
         "comment",
-    ));
-    resource["attributes"]["tags"]["nested"] = Value::String(legacy_marker(
+    );
+    resource["current"]["attributes"]["tags"]["nested"] = structural_legacy_secret(
         &Value::String("LEGACY_NESTED_PLAIN".to_string()),
         "mock.test.resource",
         "legacy",
         "tags",
-    ));
+    );
     fs::write(
         scenario.project.join("carina.state.json"),
         serde_json::to_vec_pretty(&state).expect("encode legacy state"),
@@ -734,19 +681,18 @@ let legacy_plan = mock.test.resource {
     );
 
     let mut state = scenario.state_json();
-    downgrade_state_to_v13(&mut state);
     let resource = state["resources"]
         .as_array_mut()
         .expect("state resources")
         .iter_mut()
         .find(|resource| resource["identity"] == "legacy_plan")
         .expect("legacy_plan state row");
-    resource["attributes"]["comment"] = Value::String(legacy_marker(
+    resource["current"]["attributes"]["comment"] = structural_legacy_secret(
         &Value::String("LEGACY_SAVED_PLAN_PLAIN".to_string()),
         "mock.test.resource",
         "legacy_plan",
         "comment",
-    ));
+    );
     fs::write(
         scenario.project.join("carina.state.json"),
         serde_json::to_vec_pretty(&state).expect("encode legacy state"),
@@ -801,19 +747,18 @@ let legacy_changed = mock.test.resource {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let mut state = scenario.state_json();
-    downgrade_state_to_v13(&mut state);
     let resource = state["resources"]
         .as_array_mut()
         .expect("state resources")
         .iter_mut()
         .find(|resource| resource["identity"] == "legacy_changed")
         .expect("legacy_changed state row");
-    resource["attributes"]["comment"] = Value::String(legacy_marker(
+    resource["current"]["attributes"]["comment"] = structural_legacy_secret(
         &Value::String("LEGACY_BEFORE".to_string()),
         "mock.test.resource",
         "legacy_changed",
         "comment",
-    ));
+    );
     fs::write(
         scenario.project.join("carina.state.json"),
         serde_json::to_vec_pretty(&state).expect("encode changed legacy state"),
@@ -850,19 +795,18 @@ let legacy_role = mock.iam.Role {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let mut state = scenario.state_json();
-    downgrade_state_to_v13(&mut state);
     let resource = state["resources"]
         .as_array_mut()
         .expect("state resources")
         .iter_mut()
         .find(|resource| resource["identity"] == "legacy_role")
         .expect("legacy_role state row");
-    resource["attributes"]["path"] = Value::String(legacy_marker(
+    resource["current"]["attributes"]["path"] = structural_legacy_secret(
         &Value::String("/legacy-path/".to_string()),
         "mock.iam.Role",
         "legacy_role",
         "path",
-    ));
+    );
     fs::write(
         scenario.project.join("carina.state.json"),
         serde_json::to_vec_pretty(&state).expect("encode create-only legacy state"),

@@ -416,33 +416,6 @@ fn for_value_keys_other_commands_same_error() {
         fs::read(scenario.project.join("carina.state.json")).unwrap(),
         before
     );
-    let state = scenario.json("carina.state.json");
-    let row = &state["resources"][0];
-    let copied = serde_json::to_vec_pretty(&serde_json::json!({
-        "version": 20, "exports_version": 1, "serial": 11,
-        "lineage": "for-value-keys-copied-state", "carina_version": "legacy",
-        "exports": {}, "resources": [{ "provider": "mock", "resource_type": "test.deferred_source", "identity": "producer", "binding": "producer", "current": row["current"] }]
-    })).unwrap();
-    fs::write(scenario.project.join("copied-v20.json"), &copied).unwrap();
-    assert_rejected(
-        &scenario.carina(&[
-            "state",
-            "migrate",
-            "--check",
-            ".",
-            "--state-url",
-            "copied-v20.json",
-        ]),
-        message,
-    );
-    assert_eq!(
-        fs::read(scenario.project.join("copied-v20.json")).unwrap(),
-        copied
-    );
-    assert_eq!(
-        fs::read(scenario.project.join("carina.state.json")).unwrap(),
-        before
-    );
 }
 
 #[test]

@@ -18,7 +18,7 @@ use carina_core::resource::{
     AbsoluteBindingAddress, ConcreteValue, Directives, LoopSlot, NoPlaceholder,
     RelativeBindingName, ResolvedResource, Resource, ResourceId, State, Value,
 };
-use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile, check_and_migrate};
+use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile, load_state};
 use tempfile::TempDir;
 
 fn resolved(resource: Resource) -> ResolvedResource {
@@ -374,7 +374,6 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             })
             .collect(),
         sorted_explicit_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
-        legacy_dependency_classification: None,
         unresolved_resources: sorted_resources
             .into_iter()
             .map(Resource::into_value_snapshot)
@@ -404,9 +403,7 @@ fn apply_saved_plan_deferred_replace_persists_new_child_and_siblings() {
     let output = scenario.apply_plan(&plan_path);
     assert_success("carina apply plan", &output);
 
-    let saved = check_and_migrate(&fs::read_to_string(&scenario.state_path).unwrap())
-        .unwrap()
-        .into_state();
+    let saved = load_state(&fs::read_to_string(&scenario.state_path).unwrap()).unwrap();
     let validation = saved
         .find_resource("mock", "test.resource", "validation_records[0]")
         .expect("new validation record state must be persisted");
@@ -509,7 +506,6 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         sorted_resources: vec![],
         sorted_value_destroy_dependencies: vec![],
         sorted_explicit_destroy_dependencies: vec![],
-        legacy_dependency_classification: None,
         unresolved_resources: vec![],
         compositions: vec![],
         data_sources: vec![],

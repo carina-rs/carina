@@ -1,17 +1,11 @@
 {
-  "version": 18,
-  "exports_version": 1,
-  "serial": 1,
-  "lineage": "test-nested-write-only-plan-display",
   "carina_version": "0.6.0",
+  "exports_version": 1,
+  "lineage": "test-nested-write-only-plan-display",
   "resources": [
     {
-      "resource_type": "elasticloadbalancingv2.Listener",
-      "identity": "unrelated",
-      "provider": "awscc",
+      "binding": "unrelated",
       "current": {
-        "kind": "applied",
-        "identifier": "listener-unrelated",
         "attributes": {
           "default_actions": [
             {
@@ -22,13 +16,24 @@
           ],
           "ssl_policy": "ELBSecurityPolicy-2016-08"
         },
+        "identifier": "listener-unrelated",
+        "kind": "applied",
         "nested_write_only": {
           "default_actions": [
             [
               [
-                { "kind": "list_index", "value": 0 },
-                { "kind": "struct_field", "value": "authenticate_oidc_config" },
-                { "kind": "struct_field", "value": "client_secret" }
+                {
+                  "kind": "list_index",
+                  "value": 0
+                },
+                {
+                  "kind": "struct_field",
+                  "value": "authenticate_oidc_config"
+                },
+                {
+                  "kind": "struct_field",
+                  "value": "client_secret"
+                }
               ],
               {
                 "$secret": "$argon2id$v=19$m=19456,t=2,p=1$2yYtuifhQajhavSi7wSNBA$FICk1979G03jsA3wcTlRPOOpBprbM8HTXPs3SDHunfE"
@@ -37,27 +42,35 @@
           ]
         }
       },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
-      "explicit": {
-        "kind": "struct",
-        "children": {
-          "default_actions": { "kind": "leaf" },
-          "ssl_policy": { "kind": "leaf" }
-        }
+      "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
       },
-      "binding": "unrelated",
-      "dependency_bindings": []
+      "explicit": {
+        "children": {
+          "default_actions": {
+            "kind": "leaf"
+          },
+          "ssl_policy": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "unrelated",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "elasticloadbalancingv2.Listener"
     },
     {
-      "resource_type": "elasticloadbalancingv2.Listener",
-      "identity": "rotated",
-      "provider": "awscc",
+      "binding": "rotated",
       "current": {
-        "kind": "applied",
-        "identifier": "listener-rotated",
         "attributes": {
           "default_actions": [
             {
@@ -68,13 +81,24 @@
           ],
           "ssl_policy": "ELBSecurityPolicy-TLS13-1-2-2021-06"
         },
+        "identifier": "listener-rotated",
+        "kind": "applied",
         "nested_write_only": {
           "default_actions": [
             [
               [
-                { "kind": "list_index", "value": 0 },
-                { "kind": "struct_field", "value": "authenticate_oidc_config" },
-                { "kind": "struct_field", "value": "client_secret" }
+                {
+                  "kind": "list_index",
+                  "value": 0
+                },
+                {
+                  "kind": "struct_field",
+                  "value": "authenticate_oidc_config"
+                },
+                {
+                  "kind": "struct_field",
+                  "value": "client_secret"
+                }
               ],
               {
                 "$secret": "$argon2id$v=19$m=19456,t=2,p=1$dM5BtxnCfP2o5yV9QP4Pqg$TY/GUWDMR1DzU/2QLl8MAqFb4ZdnIvFdABk5RzbYk/8"
@@ -83,75 +107,35 @@
           ]
         }
       },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
-      "explicit": {
-        "kind": "struct",
-        "children": {
-          "default_actions": { "kind": "leaf" },
-          "ssl_policy": { "kind": "leaf" }
-        }
+      "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
       },
-      "binding": "rotated",
-      "dependency_bindings": []
+      "explicit": {
+        "children": {
+          "default_actions": {
+            "kind": "leaf"
+          },
+          "ssl_policy": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "rotated",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "elasticloadbalancingv2.Listener"
     },
     {
-      "resource_type": "elasticloadbalancingv2.Listener",
-      "identity": "replacement",
-      "provider": "awscc",
-      "current": {
-        "kind": "applied",
-        "identifier": "listener-replacement",
-        "attributes": {
-          "default_actions": [
-            {
-              "authenticate_oidc_config": {
-                "issuer": "https://issuer.example.com"
-              }
-            }
-          ],
-          "ssl_policy": "ELBSecurityPolicy-TLS13-1-2-2021-06",
-          "port": 443
-        },
-        "nested_write_only": {
-          "default_actions": [
-            [
-              [
-                { "kind": "list_index", "value": 0 },
-                { "kind": "struct_field", "value": "authenticate_oidc_config" },
-                { "kind": "struct_field", "value": "client_secret" }
-              ],
-              {
-                "$secret": "$argon2id$v=19$m=19456,t=2,p=1$dM5BtxnCfP2o5yV9QP4Pqg$TY/GUWDMR1DzU/2QLl8MAqFb4ZdnIvFdABk5RzbYk/8"
-              }
-            ]
-          ]
-        }
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
-      "explicit": {
-        "kind": "struct",
-        "children": {
-          "default_actions": { "kind": "leaf" },
-          "ssl_policy": { "kind": "leaf" },
-          "port": { "kind": "leaf" }
-        }
-      },
       "binding": "replacement",
-      "dependency_bindings": []
-    },
-    {
-      "resource_type": "elasticloadbalancingv2.Listener",
-      "identity": "replacement_same_secret",
-      "provider": "awscc",
       "current": {
-        "kind": "applied",
-        "identifier": "listener-replacement-same-secret",
         "attributes": {
           "default_actions": [
             {
@@ -160,16 +144,96 @@
               }
             }
           ],
-          "ssl_policy": "ELBSecurityPolicy-TLS13-1-2-2021-06",
-          "port": 443
+          "port": 443,
+          "ssl_policy": "ELBSecurityPolicy-TLS13-1-2-2021-06"
         },
+        "identifier": "listener-replacement",
+        "kind": "applied",
         "nested_write_only": {
           "default_actions": [
             [
               [
-                { "kind": "list_index", "value": 0 },
-                { "kind": "struct_field", "value": "authenticate_oidc_config" },
-                { "kind": "struct_field", "value": "client_secret" }
+                {
+                  "kind": "list_index",
+                  "value": 0
+                },
+                {
+                  "kind": "struct_field",
+                  "value": "authenticate_oidc_config"
+                },
+                {
+                  "kind": "struct_field",
+                  "value": "client_secret"
+                }
+              ],
+              {
+                "$secret": "$argon2id$v=19$m=19456,t=2,p=1$dM5BtxnCfP2o5yV9QP4Pqg$TY/GUWDMR1DzU/2QLl8MAqFb4ZdnIvFdABk5RzbYk/8"
+              }
+            ]
+          ]
+        }
+      },
+      "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
+      "explicit": {
+        "children": {
+          "default_actions": {
+            "kind": "leaf"
+          },
+          "port": {
+            "kind": "leaf"
+          },
+          "ssl_policy": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "replacement",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "elasticloadbalancingv2.Listener"
+    },
+    {
+      "binding": "replacement_same_secret",
+      "current": {
+        "attributes": {
+          "default_actions": [
+            {
+              "authenticate_oidc_config": {
+                "issuer": "https://issuer.example.com"
+              }
+            }
+          ],
+          "port": 443,
+          "ssl_policy": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+        },
+        "identifier": "listener-replacement-same-secret",
+        "kind": "applied",
+        "nested_write_only": {
+          "default_actions": [
+            [
+              [
+                {
+                  "kind": "list_index",
+                  "value": 0
+                },
+                {
+                  "kind": "struct_field",
+                  "value": "authenticate_oidc_config"
+                },
+                {
+                  "kind": "struct_field",
+                  "value": "client_secret"
+                }
               ],
               {
                 "$secret": "$argon2id$v=19$m=19456,t=2,p=1$2yYtuifhQajhavSi7wSNBA$FICk1979G03jsA3wcTlRPOOpBprbM8HTXPs3SDHunfE"
@@ -178,21 +242,36 @@
           ]
         }
       },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
-      "explicit": {
-        "kind": "struct",
-        "children": {
-          "default_actions": { "kind": "leaf" },
-          "ssl_policy": { "kind": "leaf" },
-          "port": { "kind": "leaf" }
-        }
+      "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
       },
-      "binding": "replacement_same_secret",
-      "dependency_bindings": []
+      "explicit": {
+        "children": {
+          "default_actions": {
+            "kind": "leaf"
+          },
+          "port": {
+            "kind": "leaf"
+          },
+          "ssl_policy": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "replacement_same_secret",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "elasticloadbalancingv2.Listener"
     }
   ],
-  "exports": {}
+  "serial": 1,
+  "version": 21
 }

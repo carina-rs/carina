@@ -1100,29 +1100,6 @@ fn snapshot_delete_orphan() {
 }
 
 #[test]
-fn snapshot_legacy_orphan_unknown_destroy_ordering() {
-    let color_mode = crate::output_style::ColorMode::Plain;
-    // Legacy dependency warnings are emitted to stderr during state migration,
-    // before the plan renderer consumes the migrated, typed dependencies.
-    let (plan, current_states, schemas, _moved) =
-        build_plan_and_states_from_fixture(color_mode, "legacy_orphan_unknown_destroy_ordering");
-    let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
-    let output = strip_ansi(&format_plan(
-        color_mode,
-        &plan,
-        DetailLevel::Full,
-        &delete_attributes,
-        Some(&schemas),
-        &HashMap::new(),
-        &[],
-        &[],
-        None,
-        None,
-    ));
-    insta::assert_snapshot!(output);
-}
-
-#[test]
 fn snapshot_deposed_delete() {
     let runtime = crate::test_support::TestCommandRuntime::new();
     let color_mode = crate::output_style::ColorMode::Plain;

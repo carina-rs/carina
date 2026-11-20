@@ -432,15 +432,12 @@ impl Orphan {
         &self.directives
     }
 
-    /// Refresh graph-classified destroy metadata after a legacy state file
-    /// crosses the configuration-aware migration seam.
-    pub fn set_destroy_metadata(
+    /// Refresh dependency bindings from the current persisted row.
+    pub fn set_dependency_bindings(
         &mut self,
         dependencies: crate::resource::PersistedDestroyDependencies,
-        directives: PersistedDirectives,
     ) {
         self.current.set_dependency_bindings(dependencies);
-        self.directives = directives;
     }
 
     /// Project this persisted-only resource into the minimal desired-resource

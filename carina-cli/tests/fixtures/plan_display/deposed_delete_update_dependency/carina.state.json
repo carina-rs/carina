@@ -1,111 +1,136 @@
 {
-  "version": 9,
-  "serial": 1,
-  "lineage": "test-lineage-deposed-delete-update-dependency",
   "carina_version": "0.4.0",
+  "exports_version": 1,
+  "lineage": "test-lineage-deposed-delete-update-dependency",
   "resources": [
     {
-      "resource_type": "ec2.Vpc",
-      "identity": "main",
-      "provider": "awscc",
-      "identifier": "vpc-new",
-      "attributes": {
-        "cidr_block": "10.221.0.0/16",
-        "vpc_id": "vpc-new",
-        "tags": {
-          "Name": "main",
-          "Environment": "old"
-        }
+      "binding": "main",
+      "current": {
+        "attributes": {
+          "cidr_block": "10.221.0.0/16",
+          "tags": {
+            "Environment": "old",
+            "Name": "main"
+          },
+          "vpc_id": "vpc-new"
+        },
+        "identifier": "vpc-new",
+        "kind": "applied",
+        "nested_write_only": {}
       },
+      "dependency_bindings": [],
       "deposed": [
         {
-          "key": "deposed001",
-          "identifier": "vpc-old",
           "attributes": {
             "cidr_block": "10.220.0.0/16",
-            "vpc_id": "vpc-old",
             "tags": {
-              "Name": "main-old",
-              "Environment": "old"
-            }
+              "Environment": "old",
+              "Name": "main-old"
+            },
+            "vpc_id": "vpc-old"
           },
-          "dependency_bindings": []
+          "dependency_bindings": [],
+          "identifier": "vpc-old",
+          "key": "deposed001"
         }
       ],
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
-      "binding": "main",
-      "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "cidr_block": {
             "kind": "leaf"
           },
           "tags": {
-            "kind": "struct",
             "children": {
-              "Name": {
-                "kind": "leaf"
-              },
               "Environment": {
                 "kind": "leaf"
+              },
+              "Name": {
+                "kind": "leaf"
               }
-            }
+            },
+            "kind": "struct"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "main",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Vpc"
     },
     {
-      "resource_type": "ec2.Subnet",
-      "identity": "subnet",
-      "provider": "awscc",
-      "identifier": "subnet-new",
-      "attributes": {
-        "subnet_id": "subnet-new",
-        "vpc_id": "vpc-new",
-        "cidr_block": "10.221.1.0/24",
-        "availability_zone": "ap-northeast-1a",
-        "tags": {
-          "Name": "subnet",
-          "Environment": "old"
-        }
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "subnet",
+      "current": {
+        "attributes": {
+          "availability_zone": "ap-northeast-1a",
+          "cidr_block": "10.221.1.0/24",
+          "subnet_id": "subnet-new",
+          "tags": {
+            "Environment": "old",
+            "Name": "subnet"
+          },
+          "vpc_id": "vpc-new"
+        },
+        "identifier": "subnet-new",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [
-        "main"
+        {
+          "identity": "main",
+          "provider": "awscc",
+          "resource_type": "ec2.Vpc"
+        }
       ],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
-          "vpc_id": {
-            "kind": "leaf"
-          },
-          "cidr_block": {
-            "kind": "leaf"
-          },
           "availability_zone": {
             "kind": "leaf"
           },
+          "cidr_block": {
+            "kind": "leaf"
+          },
           "tags": {
-            "kind": "struct",
             "children": {
-              "Name": {
-                "kind": "leaf"
-              },
               "Environment": {
                 "kind": "leaf"
+              },
+              "Name": {
+                "kind": "leaf"
               }
-            }
+            },
+            "kind": "struct"
+          },
+          "vpc_id": {
+            "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "subnet",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Subnet"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

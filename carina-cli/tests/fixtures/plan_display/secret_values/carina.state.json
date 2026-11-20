@@ -1,30 +1,34 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-lineage-secret",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-lineage-secret",
   "resources": [
     {
-      "resource_type": "ec2.Vpc",
-      "identity": "awscc_ec2_vpc_0bc2a2bb",
-      "provider": "awscc",
-      "identifier": "vpc-0123456789abcdef0",
-      "attributes": {
-        "cidr_block": "10.0.0.0/16",
-        "vpc_id": "vpc-0123456789abcdef0",
-        "tags": {
-          "Name": "secret-test",
-          "Password": "_secret:argon2:0000000000000000000000000000000000000000000000000000000000000000"
-        }
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": null,
+      "current": {
+        "attributes": {
+          "cidr_block": "10.0.0.0/16",
+          "tags": {
+            "Name": "secret-test",
+            "Password": {
+              "$secret": "argon2-legacy:636172696e613a61777363632e6563322e5670633a61777363635f6563325f7670635f30626332613262623a74616773:0000000000000000000000000000000000000000000000000000000000000000"
+            }
+          },
+          "vpc_id": "vpc-0123456789abcdef0"
+        },
+        "identifier": "vpc-0123456789abcdef0",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "cidr_block": {
             "kind": "leaf"
@@ -32,43 +36,64 @@
           "tags": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "awscc_ec2_vpc_0bc2a2bb",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Vpc"
     },
     {
-      "resource_type": "ec2.Subnet",
-      "identity": "orphan_subnet",
-      "provider": "awscc",
-      "identifier": "subnet-0123456789abcdef0",
-      "attributes": {
-        "vpc_id": "vpc-0123456789abcdef0",
-        "cidr_block": "10.0.1.0/24",
-        "subnet_id": "subnet-0123456789abcdef0",
-        "tags": {
-          "Name": "orphan-subnet",
-          "ApiKey": "_secret:argon2:1111111111111111111111111111111111111111111111111111111111111111"
-        }
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": null,
-      "dependency_bindings": [],
-      "explicit": {
-        "kind": "struct",
-        "children": {
-          "vpc_id": {
-            "kind": "leaf"
+      "current": {
+        "attributes": {
+          "cidr_block": "10.0.1.0/24",
+          "subnet_id": "subnet-0123456789abcdef0",
+          "tags": {
+            "ApiKey": {
+              "$secret": "argon2-legacy:636172696e613a61777363632e6563322e5375626e65743a6f727068616e5f7375626e65743a74616773:1111111111111111111111111111111111111111111111111111111111111111"
+            },
+            "Name": "orphan-subnet"
           },
+          "vpc_id": "vpc-0123456789abcdef0"
+        },
+        "identifier": "subnet-0123456789abcdef0",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
+      "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
+      "explicit": {
+        "children": {
           "cidr_block": {
             "kind": "leaf"
           },
           "tags": {
             "kind": "leaf"
+          },
+          "vpc_id": {
+            "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "orphan_subnet",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Subnet"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

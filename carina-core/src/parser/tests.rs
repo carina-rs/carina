@@ -22266,7 +22266,7 @@ mod for_value_keys_addresses {
     #[test]
     fn for_value_keys_partial_list_is_deferred() {
         let parsed = parse("let producer = mock.test.resource { name = 'p' }\nlet rs = for x in [producer.identifier, 'lit'] { mock.test.resource { name = x } }", &ProviderContext::new(crate::EnvironmentSnapshot::empty())).unwrap();
-        assert_eq!(parsed.resources.len(), 1);
+        assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
         assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     }
 }

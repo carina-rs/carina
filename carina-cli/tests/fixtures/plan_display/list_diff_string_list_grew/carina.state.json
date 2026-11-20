@@ -1,46 +1,48 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-lineage-list-diff-string-list-grew",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-lineage-list-diff-string-list-grew",
   "resources": [
     {
-      "resource_type": "iam.RolePolicy",
-      "identity": "policy",
-      "provider": "awscc",
-      "identifier": "test-role|test-inline",
-      "attributes": {
-        "policy_name": "test-inline",
-        "role_name": "test-role",
-        "statement": [
-          {
-            "sid": "AllowRoute53Read",
-            "effect": "Allow",
-            "action": [
-              "route53:CreateHostedZone",
-              "route53:DeleteHostedZone",
-              "route53:GetHostedZone",
-              "route53:ListHostedZones",
-              "route53:ListHostedZonesByName",
-              "route53:UpdateHostedZoneComment",
-              "route53:ChangeTagsForResource",
-              "route53:ListTagsForResource",
-              "route53:ChangeResourceRecordSets",
-              "route53:ListResourceRecordSets",
-              "route53:GetChange"
-            ],
-            "resource": "*"
-          }
-        ]
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "policy",
+      "current": {
+        "attributes": {
+          "policy_name": "test-inline",
+          "role_name": "test-role",
+          "statement": [
+            {
+              "action": [
+                "route53:CreateHostedZone",
+                "route53:DeleteHostedZone",
+                "route53:GetHostedZone",
+                "route53:ListHostedZones",
+                "route53:ListHostedZonesByName",
+                "route53:UpdateHostedZoneComment",
+                "route53:ChangeTagsForResource",
+                "route53:ListTagsForResource",
+                "route53:ChangeResourceRecordSets",
+                "route53:ListResourceRecordSets",
+                "route53:GetChange"
+              ],
+              "effect": "Allow",
+              "resource": "*",
+              "sid": "AllowRoute53Read"
+            }
+          ]
+        },
+        "identifier": "test-role|test-inline",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "policy_name": {
             "kind": "leaf"
@@ -51,8 +53,17 @@
           "statement": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "policy",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "iam.RolePolicy"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

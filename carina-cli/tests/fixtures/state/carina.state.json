@@ -1,79 +1,141 @@
 {
-  "version": 3,
-  "serial": 2,
-  "lineage": "test-lineage-state",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-lineage-state",
   "resources": [
     {
-      "resource_type": "ec2.Vpc",
-      "identity": "my-vpc",
-      "provider": "awscc",
-      "identifier": "vpc-0123456789abcdef0",
-      "attributes": {
-        "cidr_block": "10.0.0.0/16",
-        "enable_dns_support": true,
-        "vpc_id": "vpc-0123456789abcdef0"
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
-      "desired_keys": [
-        "cidr_block",
-        "enable_dns_support"
-      ],
       "binding": "vpc",
-      "dependency_bindings": []
+      "current": {
+        "attributes": {
+          "cidr_block": "10.0.0.0/16",
+          "enable_dns_support": true,
+          "vpc_id": "vpc-0123456789abcdef0"
+        },
+        "identifier": "vpc-0123456789abcdef0",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
+      "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
+      "identity": "my-vpc",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Vpc",
+      "explicit": {
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          },
+          "enable_dns_support": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      }
     },
     {
-      "resource_type": "ec2.Subnet",
-      "identity": "my-subnet",
-      "provider": "awscc",
-      "identifier": "subnet-0123456789abcdef0",
-      "attributes": {
-        "vpc_id": "vpc-0123456789abcdef0",
-        "cidr_block": "10.0.1.0/24",
-        "availability_zone": "ap-northeast-1a",
-        "subnet_id": "subnet-0123456789abcdef0",
-        "tags": {
-          "Name": "test-subnet"
-        }
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
-      "desired_keys": [
-        "vpc_id",
-        "cidr_block",
-        "availability_zone",
-        "tags"
-      ],
       "binding": "subnet",
+      "current": {
+        "attributes": {
+          "availability_zone": "ap-northeast-1a",
+          "cidr_block": "10.0.1.0/24",
+          "subnet_id": "subnet-0123456789abcdef0",
+          "tags": {
+            "Name": "test-subnet"
+          },
+          "vpc_id": "vpc-0123456789abcdef0"
+        },
+        "identifier": "subnet-0123456789abcdef0",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [
-        "vpc"
-      ]
+        {
+          "identity": "my-vpc",
+          "provider": "awscc",
+          "resource_type": "ec2.Vpc"
+        }
+      ],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
+      "identity": "my-subnet",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Subnet",
+      "explicit": {
+        "children": {
+          "availability_zone": {
+            "kind": "leaf"
+          },
+          "cidr_block": {
+            "kind": "leaf"
+          },
+          "tags": {
+            "kind": "leaf"
+          },
+          "vpc_id": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      }
     },
     {
-      "resource_type": "ec2.RouteTable",
-      "identity": "main-rt",
-      "provider": "awscc",
-      "identifier": "rtb-0123456789abcdef0",
-      "attributes": {
-        "vpc_id": "vpc-0123456789abcdef0",
-        "route_table_id": "rtb-0123456789abcdef0"
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
-      "desired_keys": [
-        "vpc_id"
-      ],
       "binding": null,
+      "current": {
+        "attributes": {
+          "route_table_id": "rtb-0123456789abcdef0",
+          "vpc_id": "vpc-0123456789abcdef0"
+        },
+        "identifier": "rtb-0123456789abcdef0",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [
-        "vpc"
-      ]
+        {
+          "identity": "my-vpc",
+          "provider": "awscc",
+          "resource_type": "ec2.Vpc"
+        }
+      ],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
+      "identity": "main-rt",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.RouteTable",
+      "explicit": {
+        "children": {
+          "vpc_id": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      }
     }
-  ]
+  ],
+  "serial": 2,
+  "version": 21
 }

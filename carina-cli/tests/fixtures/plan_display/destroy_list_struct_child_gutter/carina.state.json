@@ -1,69 +1,85 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-lineage-destroy-list-struct-child-gutter",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-lineage-destroy-list-struct-child-gutter",
   "resources": [
     {
-      "resource_type": "iam.Role",
-      "identity": "role",
-      "provider": "awscc",
-      "identifier": "test-role",
-      "attributes": {
-        "role_name": "test-role",
-        "assume_role_policy_document": "{}"
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "role",
+      "current": {
+        "attributes": {
+          "assume_role_policy_document": "{}",
+          "role_name": "test-role"
+        },
+        "identifier": "test-role",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
-          "role_name": {
-            "kind": "leaf"
-          },
           "assume_role_policy_document": {
             "kind": "leaf"
+          },
+          "role_name": {
+            "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "role",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "iam.Role"
     },
     {
-      "resource_type": "iam.RolePolicy",
-      "identity": "policy",
-      "provider": "awscc",
-      "identifier": "test-role|test-inline",
-      "attributes": {
-        "policy_name": "test-inline",
-        "role_name": "test-role",
-        "statement": [
-          {
-            "sid": "AllowS3Read",
-            "effect": "Allow",
-            "action": "s3:GetObject",
-            "resource": "arn:aws:s3:::example/*"
-          },
-          {
-            "sid": "DenyS3Write",
-            "effect": "Deny",
-            "action": "s3:PutObject",
-            "resource": "arn:aws:s3:::example/*"
-          }
-        ]
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "policy",
+      "current": {
+        "attributes": {
+          "policy_name": "test-inline",
+          "role_name": "test-role",
+          "statement": [
+            {
+              "action": "s3:GetObject",
+              "effect": "Allow",
+              "resource": "arn:aws:s3:::example/*",
+              "sid": "AllowS3Read"
+            },
+            {
+              "action": "s3:PutObject",
+              "effect": "Deny",
+              "resource": "arn:aws:s3:::example/*",
+              "sid": "DenyS3Write"
+            }
+          ]
+        },
+        "identifier": "test-role|test-inline",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [
-        "role"
+        {
+          "identity": "role",
+          "provider": "awscc",
+          "resource_type": "iam.Role"
+        }
       ],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "policy_name": {
             "kind": "leaf"
@@ -74,33 +90,56 @@
           "statement": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "policy",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "iam.RolePolicy"
     },
     {
-      "resource_type": "s3.Bucket",
-      "identity": "zzz_bucket",
-      "provider": "awscc",
-      "identifier": "zzz-trailing-sibling",
-      "attributes": {
-        "bucket_name": "zzz-trailing-sibling"
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "zzz_bucket",
+      "current": {
+        "attributes": {
+          "bucket_name": "zzz-trailing-sibling"
+        },
+        "identifier": "zzz-trailing-sibling",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [
-        "role"
+        {
+          "identity": "role",
+          "provider": "awscc",
+          "resource_type": "iam.Role"
+        }
       ],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "bucket_name": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "zzz_bucket",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "s3.Bucket"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

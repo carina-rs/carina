@@ -201,9 +201,9 @@ pub(crate) enum ForAddressAdmission<P: super::PlaceholderKind, B: BindingAddress
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ForAdmissionFailure<B: BindingAddress> {
-    #[error("{0}")]
+    #[error(transparent)]
     Shape(#[from] crate::parser::ShapeMismatch),
-    #[error("{0}")]
+    #[error(transparent)]
     Knowledge(#[from] super::knowledge::KnowledgeError<B>),
 }
 
@@ -503,7 +503,7 @@ pub fn decompose_binding_address(spelling: &str) -> Option<CheckedBindingAddress
         .iter()
         .position(|b| matches!(b, b'.' | b'['))
         .unwrap_or(bytes.len());
-    if root_end == 0 {
+    if root_end == 0 || spelling[..root_end].ends_with(']') {
         return None;
     }
     // A closing quote may itself be key content. Keep only closures whose

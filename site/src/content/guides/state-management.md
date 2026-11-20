@@ -15,46 +15,22 @@ By default, state is stored locally as `carina.state.json`. Use `backend local {
 
 ### State format upgrades
 
-State format v20 records a token-less `create_outcome_unknown` row when an
-initial create fails after a request may have reached the cloud but before the
-provider returns an identifier or continuation. It also makes
-`prevent_destroy` tri-state, preserving the difference between an omitted
-directive and an explicit `false` so provider-schema defaults can protect an
-unspecified resource. Carina does not refresh, destroy, or re-create a
-token-less unknown address automatically. If the resource exists, add the
-import block shown by `carina plan`. If it does not exist, remove only that
-recovery row with `carina state forget <TYPE> <IDENTITY>` and then plan again.
+Carina's full-state commands read and write state format v21 only. State at v20 or older must be
+rewritten once with carina v0.15.0: run `carina apply` or `carina state refresh`
+with that release, then retry with the current binary. The state body version
+is checked before exports-version validation and resource-row decoding.
+`carina state migrate` has been removed. Saved plans from earlier builds must be regenerated with
+`carina plan --out`.
 
-State format v21 stores current and deposed dependency metadata as complete,
-typed resource IDs instead of binding-name strings. When Carina reads a v20
-file, it classifies every legacy dependency against state rows and the current
-expanded resource graph. A missing or ambiguous name on a configured row is a
-migration error. An orphan or deposed row retains every known edge and prints
-a warning for each unknown name before rewrite; unknown names are displayed,
-never silently dropped or persisted in v21.
-
-You can test this migration against a copy without changing either the copy or
-the configured backend:
-
-```bash
-cp carina.state.json /tmp/carina-state-migration-check.json
-carina state migrate \
-  --check /absolute/path/to/infra \
-  --state-url /tmp/carina-state-migration-check.json
-```
-
-`state migrate --check` performs the same graph-aware classification as
-plan/apply without credentials, provider initialization, CRUD or data-source
-calls, upstream-state reads, backend access, locks, network access, cache
-writes, or state writes. It loads schema metadata only from exact installed
-provider artifacts. Repeat `--provider-schema KIND=/absolute/provider.wasm`
-to select explicit artifacts. The check requires providers built for the
-current protocol (28), including on this metadata-only path. Older artifacts,
-including released protocol-v12 providers, are rejected with a protocol-version
-error because their schemas do not declare pattern match modes. Rebuild them
-against the current SDK before checking the migration. A successful run reports
-configured rows plus orphan/deposed warnings and confirms that no state was
-written.
+Current and deposed dependency metadata and persisted `depends_on` directives
+store complete managed resource IDs. Current instances distinguish applied
+resources, resumable creates, missing identifiers, deposed-only rows, and
+`create_outcome_unknown` recovery rows. A token-less unknown create may have
+reached the cloud; Carina does not refresh, destroy, or re-create it automatically.
+If the resource exists, add the import block shown by `carina plan`. If it does
+not exist, use `carina state forget <TYPE> <IDENTITY>` and plan again.
+`prevent_destroy` distinguishes an unspecified directive from explicit `false`,
+so provider-schema defaults can protect an unspecified resource.
 
 State format v17 adds a top-level `exports_version` that versions the exports
 encoding separately from the rest of the state file. Readers that only need
@@ -64,41 +40,31 @@ downstream project that runs an older Carina, as long as that Carina supports
 the exports encoding. `exports_version` changes only when the encoding of
 exported values changes.
 
-This protection starts with v17 itself. A Carina that predates v17 reads
-exports through the full state format check, so it rejects a v17 state with
-"State file version 17 is newer than supported version 16". Upgrade the projects that read an
-upstream state before applying the upstream project with v17.
+Whenever `exports_version` is present, exports-only reads do not inspect the
+state body version or decode resource rows. This keeps v17 and later state,
+including future state body versions, readable when their exports encoding is
+supported. Exports-only reads always require `exports_version`, regardless of
+the state body version.
 
 `carina state lookup` reads resources only. To read exports from another
 project's state, use `carina export --state-url <URL>`.
 
-State format v14 stores a redacted secret structurally as a single-key object:
+Redacted secrets are stored structurally as single-key objects:
 
 ```json
 {"$secret":"$argon2id$..."}
 ```
 
-Ordinary strings are always strings, even when their text starts with
-`_secret:` and otherwise looks like an older secret marker. User map keys such
-as `$secret` are stored as `$$secret` so they cannot be confused with the
-host-owned tag. Loading v13 or older state migrates legacy secret markers only
-inside current and deposed resource attributes; exported strings retain their
-literal value.
+Ordinary strings remain strings even when their text starts with `_secret:`.
+Host-owned values use a reserved `$` namespace: canonical enums use `$enum`,
+and user map keys beginning with `$` are escaped with one additional `$`.
+For example, a user `$secret` key is stored as `$$secret`.
 
-State format v13 gives host-owned values a reserved `$` namespace. Canonical
-enums are stored under `$enum`; user map keys that begin with `$` are escaped
-with one additional `$` and restored when state is read. Loading an older state
-file migrates legacy enum objects and `$`-prefixed user keys automatically.
-
-The v14 loader also preserves the v12 migration for old raw secret markers.
-An `_secret:argon2:<hash>` value from an earlier state version is bound to the
-provider, resource type, stored identity, and top-level attribute key from its
-own row, then stored as a `$secret` object carrying an
-`argon2-legacy:<row-salt-hex>:<hash-hex>` digest. This load-time upgrade does
-not require the plaintext and does not create a resource change. The next state
-write that has the matching plaintext replaces the legacy digest with a
-standard `$argon2id$...` PHC digest containing a fresh random salt and explicit
-Argon2 parameters.
+Self-contained `argon2-legacy:<salt-hex>:<hash-hex>` digests remain valid in
+v21 `$secret` objects. Verification needs no original resource address. A state
+write with matching plaintext replaces this digest with a standard
+`$argon2id$...` PHC digest containing a fresh random salt and explicit Argon2
+parameters.
 
 ## Configuring the S3 backend
 
@@ -210,8 +176,7 @@ carina export --state-url 'github://owner/infra-state/states/prod/carina.state.j
 The first URL uses the block's `carina-state` branch. The second shows
 percent-encoding for a different branch named `states/prod`.
 The `branch` query parameter is required. Percent-encode `/` in branch names
-as `%2F`. These URLs never acquire a lock or modify state. Offline
-`state migrate --check` accepts only a local copy, not a GitHub URL.
+as `%2F`. These URLs never acquire a lock or modify state.
 
 Use one branch per independently applied state. State and lease writes
 use the Contents API with the observed blob SHA; mutations of different paths
@@ -503,7 +468,7 @@ Use the original element values to pair old indices with new keys. When the list
 
 When the iterable is still unknown at plan time, the loop's existing children are replaced. To preserve the old addresses, keep `for (i, x) in list`. Materialize and inspect the collection, then switch to value keys and author moves when the list is known at plan time.
 
-Regenerate saved plans. Already-expanded effects in an old saved plan still apply under their stored index addresses; the next concrete plan exposes the address change and possible-move hint. An old deferred simple-list template expands using value keys or fails visibly under the new checks. State and saved-plan format numbers do not change.
+Regenerate saved plans after upgrading. The current saved-plan format is 47; plans from earlier formats, including 46, are rejected. Recreate them with `carina plan --out`. State remains at version 21.
 
 ## Removing resources from state
 

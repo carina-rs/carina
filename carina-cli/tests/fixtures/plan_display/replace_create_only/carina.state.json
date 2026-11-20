@@ -1,60 +1,75 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-replace-create-only",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-replace-create-only",
   "resources": [
     {
-      "resource_type": "test.Widget",
-      "identity": "alpha",
-      "provider": "test",
-      "identifier": "widget-alpha-live",
-      "attributes": {
-        "external_name": "old"
-      },
-      "protected": false,
-      "directives": {
-        "force_delete": false,
-        "create_before_destroy": false
-      },
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "alpha",
+      "current": {
+        "attributes": {
+          "external_name": "old"
+        },
+        "identifier": "widget-alpha-live",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "create_before_destroy": false,
+        "force_delete": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "external_name": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "alpha",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "test",
+      "resource_type": "test.Widget"
     },
     {
-      "resource_type": "test.Widget",
-      "identity": "beta",
-      "provider": "test",
-      "identifier": "widget-beta-live",
-      "attributes": {
-        "legacy_token": "tok"
-      },
-      "protected": false,
-      "directives": {
-        "force_delete": false,
-        "create_before_destroy": false
-      },
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "beta",
+      "current": {
+        "attributes": {
+          "legacy_token": "tok"
+        },
+        "identifier": "widget-beta-live",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "create_before_destroy": false,
+        "force_delete": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "legacy_token": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "beta",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "test",
+      "resource_type": "test.Widget"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

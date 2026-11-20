@@ -249,6 +249,15 @@ async fn run_init_with_provider_resolver(
 
 #[cfg(test)]
 mod tests {
+    fn test_github_source(value: &str) -> carina_core::provider_source::GithubSource {
+        use carina_core::provider_source::{ProviderSource, RemoteSource};
+        let ProviderSource::Remote(RemoteSource::GithubDirect(source)) = value.parse().unwrap()
+        else {
+            panic!("expected github source: {value}");
+        };
+        source
+    }
+
     use super::*;
     use carina_core::UserDirs;
     use carina_core::provider_source::{ProviderSource, RemoteSource};
@@ -397,7 +406,6 @@ mod tests {
         let installed = carina_provider_resolver::find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project).unwrap(),
             config,
-            &mut |notice| eprintln!("{notice}"),
         )
         .unwrap();
         let grants = TrustedLocalGrants::parse(&[], None).unwrap();
@@ -453,8 +461,8 @@ mod tests {
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: test_github_source(source),
                 version: version.parse().unwrap(),
                 tag: serde_json::from_str::<ReleaseTag>(&format!("\"v{version}\"")).unwrap(),
                 asset_id: serde_json::from_str::<AssetId>("42").unwrap(),

@@ -12,7 +12,7 @@ pub use analysis::{
 mod ast;
 #[cfg(test)]
 pub(crate) use ast::expand_deferred_children_for_test;
-pub(crate) use ast::{ForChildMembers, expand_deferred_children_with_members};
+pub(crate) use ast::{ExpandedForChild, ForChildMembers, expand_deferred_children_with_members};
 mod authored_text;
 mod failed_file;
 pub use failed_file::{

@@ -1,26 +1,41 @@
 {
-  "version": 14,
-  "serial": 1,
-  "lineage": "removed-missing-identifier-ordering",
   "carina_version": "0.4.0",
+  "exports_version": 1,
+  "lineage": "removed-missing-identifier-ordering",
   "resources": [
     {
-      "resource_type": "test.resource",
-      "identity": "legacy",
-      "provider": "mock",
-      "identifier": null,
-      "attributes": {
-        "name": "legacy"
+      "binding": "legacy",
+      "current": {
+        "attributes": {
+          "name": "legacy"
+        },
+        "kind": "missing_identifier",
+        "nested_write_only": {}
       },
       "deposed": [
         {
-          "key": "broken-generation",
-          "identifier": "",
           "attributes": {},
-          "dependency_bindings": []
+          "dependency_bindings": [],
+          "identifier": "",
+          "key": "broken-generation"
         }
       ],
-      "binding": "legacy"
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
+      "identity": "legacy",
+      "provider": "mock",
+      "resource_type": "test.resource",
+      "dependency_bindings": [],
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

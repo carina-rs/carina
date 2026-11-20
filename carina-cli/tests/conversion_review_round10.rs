@@ -634,9 +634,8 @@ fn r10_state_refresh_cannot_dispatch_an_unjudged_data_source_argument() {
     // Keep the provider's query result, but remove its managed state row so
     // the only iam.Roles read below is the configured data-source call.
     let state_path = fixture.path().join("carina.state.json");
-    let mut saved = carina_state::check_and_migrate(&std::fs::read_to_string(&state_path).unwrap())
-        .unwrap()
-        .into_state();
+    let mut saved =
+        carina_state::load_state(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
     assert!(
         saved
             .remove_resource("mock", "iam.Roles", "query")

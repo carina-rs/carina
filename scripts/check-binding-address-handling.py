@@ -16,7 +16,7 @@ SPELLING_OWNERS = {
     "carina-core/src/identifier/mod.rs": "identity feature paths",
     "carina-core/src/differ/comparison.rs": "attribute comparison paths",
     "carina-core/src/resource/snapshot.rs": "secret attribute paths",
-    "carina-core/src/protocol_convert.rs": "schema field and rule paths",
+    "carina-core/src/protocol_convert/mod.rs": "schema field and rule paths",
     "carina-core/src/schema/mod.rs": "schema field and rule paths",
     "carina-sigstore-tlog/src/lib.rs": "transparency-log JSON paths",
     "carina-state/src/backend.rs": "state-document row diagnostics",

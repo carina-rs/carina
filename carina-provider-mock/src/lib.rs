@@ -2377,9 +2377,8 @@ mod tests {
         let mut document =
             serde_json::to_value(carina_state::StateFile::new()).expect("fixture state serializes");
         document["resources"] = serde_json::json!([row]);
-        let loaded = carina_state::state::check_and_migrate(&document.to_string())
-            .expect("v15 fixture passes the public state loader")
-            .into_state();
+        let loaded = carina_state::state::load_state(&document.to_string())
+            .expect("current fixture passes the public state loader");
         match loaded.build_state_for_resource(id) {
             carina_core::resource::Current::CreateInFlight(pending) => pending,
             carina_core::resource::Current::Absent(state) => {

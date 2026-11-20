@@ -1027,40 +1027,36 @@ fn local_trust_and_unwritable_cache_notices_belong_to_the_report() {
 }
 
 #[test]
-fn legacy_lock_migration_notices_belong_to_the_report() {
-    for remote in [false, true] {
-        let fixture = tempfile::tempdir().unwrap();
-        std::fs::write(
-            fixture.path().join("main.crn"),
-            if remote {
-                "provider broken { source = 'github.com/example/carina-provider-broken' }\n"
-            } else {
-                "provider mock {}\n"
-            },
-        )
-        .unwrap();
+fn validate_reports_unsupported_lock_versions_in_human_and_json() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let init = carina_core::hint::ProjectCommand::new("init", fixture.path()).to_string();
+    for version in 1..carina_provider_resolver::LockFile::CURRENT_VERSION {
         std::fs::write(
             fixture.path().join("carina-providers.lock"),
-            "version = 1\nprovider = []\n",
+            format!("version = {version}\n"),
         )
         .unwrap();
         let human = validate(fixture.path(), false);
-        let text = String::from_utf8(human.stderr).unwrap();
-        assert_eq!(
-            text.matches("Provider lock format migration:").count(),
-            if remote { 2 } else { 1 },
-            "{text}"
-        );
-        let output = validate(fixture.path(), true);
-        assert_eq!(output.status, human.status);
+        assert_eq!(human.status.code(), Some(1), "{human:?}");
+        let stderr = String::from_utf8(human.stderr).unwrap();
+        let json = report(&validate(fixture.path(), true), 1, 0);
+        let message = json["errors"][0]["message"].as_str().unwrap();
+        for expected in [
+            format!("uses format version {version}"),
+            "reads only version 5".into(),
+            "Carina v0.15.0".into(),
+            format!("run `{init}` with v0.15.0"),
+            "`providers repin-discovery` or `providers repin-identity`".into(),
+            format!("then `{init}` again"),
+        ] {
+            assert!(stderr.contains(&expected), "{stderr}");
+            assert!(message.contains(&expected), "{json}");
+        }
         assert!(
-            output.stderr.is_empty(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            stderr.contains(message),
+            "human and JSON must retain the same UnsupportedVersion diagnostic: {stderr}\n{json}"
         );
-        let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(json["status"], if remote { "error" } else { "ok" });
-        assert!(!json.to_string().contains("Provider lock format migration"));
     }
 }
 
