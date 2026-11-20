@@ -332,7 +332,7 @@ fn for_value_keys_reader_list() {
 }
 
 #[test]
-#[ignore = "value-key reader stays pending; maintainer decision pending, PR #4574"]
+#[ignore = "reader of a parse-time-expanded loop child stays pending: carina#4579"]
 fn for_value_keys_reader_list_attribute_key() {
     assert_reader_protected_for_iterable(
         "value-keyed list attribute-name collision",
@@ -387,29 +387,30 @@ fn assert_literal_reader_admitted(header: &str, iterable: &str, selector: &str) 
 }
 
 #[test]
-#[ignore = "value-key reader stays pending; maintainer decision pending, PR #4574"]
+#[ignore = "reader of a parse-time-expanded loop child stays pending: carina#4579"]
 fn for_value_keys_reader_literal_list_dot() {
     assert_literal_reader_admitted("item", "['a']", "children.a.comment");
 }
 
 #[test]
-#[ignore = "value-key reader stays pending; maintainer decision pending, PR #4574"]
+#[ignore = "reader of a parse-time-expanded loop child stays pending: carina#4579"]
 fn for_value_keys_reader_literal_list_subscript() {
     assert_literal_reader_admitted("item", "['a']", "children['a'].comment");
 }
 
 #[test]
-#[ignore = "value-key reader stays pending; maintainer decision pending, PR #4574"]
+#[ignore = "reader of a parse-time-expanded loop child stays pending: carina#4579"]
 fn for_value_keys_reader_literal_indexed_list() {
     assert_literal_reader_admitted("(i, item)", "['comment']", "children[0].name");
 }
 
 #[test]
-#[ignore = "value-key reader stays pending; maintainer decision pending, PR #4574"]
+#[ignore = "reader of a parse-time-expanded loop child stays pending: carina#4579"]
 fn for_value_keys_reader_literal_map_attribute_key() {
     assert_literal_reader_admitted("k, v", "({ comment = 'x' })", "children.comment.name");
 }
 
+// Assert the current pending state; invert these expectations when carina#4579 is fixed.
 #[test]
 fn for_value_keys_reader_pending_keeps_runtime_redaction() {
     for selector in ["children.comment.name", "children['comment'].name"] {
@@ -540,8 +541,10 @@ fn for_value_keys_reader_pending_keeps_runtime_redaction() {
     }
 }
 
+// Assert the current pending state; invert these expectations when carina#4579 is fixed.
 #[test]
 fn for_value_keys_reader_pending_mixed_alternatives_characterization() {
+    // The rejection of the read under `??` is carina#4580; invert it when fixed.
     let (_directory, file, _schemas, _context) = reader_fixture(
         "let children = for item in ['comment'] { mock.test.Resource { name = secret('name canary') } }\nlet other = mock.test.Resource { comment = children.comment.name ?? 'public' }\n",
         None,
