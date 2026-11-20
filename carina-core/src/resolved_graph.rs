@@ -1067,30 +1067,59 @@ pub fn wait_scheduler_id(binding: &AbsoluteBindingAddress) -> ResolvedResourceId
     ResolvedResourceId::with_identity(format!("{SYNTHETIC_TYPE_PREFIX}wait"), identity)
 }
 
-pub fn loop_group_bindings<B: BindingAddress>(binding: &B) -> Vec<B> {
-    let mut groups = Vec::new();
-    let mut in_string = false;
-    let mut escaped = false;
-    for (index, character) in binding.as_str().char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match character {
-            '"' => in_string = true,
-            '[' if index > 0 => groups.push(crate::resource::binding_address::binding_collection(
-                binding, index,
-            )),
-            _ => {}
-        }
-    }
-    groups
+/// Return only authored loop groups that own this existing binding.
+pub fn loop_group_bindings<E, P, T, D, B>(
+    parsed: &crate::parser::File<E, P, T, D, B>,
+    binding: &B,
+) -> Vec<B>
+where
+    P: crate::resource::ValueKind,
+    T: crate::resource::ValueKind,
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+{
+    loop_group_bindings_in(&declared_loop_groups(parsed), binding)
+}
+
+fn declared_loop_groups<E, P, T, D, B>(
+    parsed: &crate::parser::File<E, P, T, D, B>,
+) -> std::collections::BTreeSet<B>
+where
+    P: crate::resource::ValueKind,
+    T: crate::resource::ValueKind,
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+{
+    parsed
+        .parser_binding_metadata
+        .structural_handles()
+        .iter()
+        .filter(|(_, handle)| handle.is_for_binding())
+        .map(|(binding, _)| binding.clone())
+        .chain(
+            parsed
+                .deferred_for_sites()
+                .filter_map(|site| site.target.bound_binding_address().cloned()),
+        )
+        .collect()
+}
+
+fn loop_group_bindings_in<B: BindingAddress>(
+    actual_groups: &std::collections::BTreeSet<B>,
+    binding: &B,
+) -> Vec<B> {
+    let Some(address) = crate::resource::decompose_binding_address(binding.as_str()) else {
+        return Vec::new();
+    };
+    address
+        .candidate_ancestors()
+        .filter_map(|ancestor| {
+            actual_groups
+                .iter()
+                .find(|group| group.as_str() == ancestor)
+                .cloned()
+        })
+        .collect()
 }
 
 fn resolve_pending_output(
@@ -1350,7 +1379,10 @@ impl<E, D> From<File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>>
 /// ```
 pub fn resolve_expanded_graph<E, D>(
     configuration: ConfiguredGraphInput<E, D>,
-) -> Result<ResolvedExpandedGraph<E, D>, ExpandedGraphResolutionError> {
+) -> Result<ResolvedExpandedGraph<E, D>, ExpandedGraphResolutionError>
+where
+    D: crate::parser::DeferredForPhaseTraversal<NoPlaceholder, LoopSlot, AbsoluteBindingAddress>,
+{
     let ConfiguredGraphInput {
         configuration: mut parsed,
         prior_orphans,
@@ -1361,12 +1393,10 @@ pub fn resolve_expanded_graph<E, D>(
         .map(|upstream| upstream.binding.clone())
         .collect::<HashSet<_>>();
     let mut targets = ExpandedTargets::default();
-    let mut managed_groups = parsed
-        .parser_binding_metadata
-        .structural_handles()
+    let loop_groups = declared_loop_groups(&parsed);
+    let mut managed_groups = loop_groups
         .iter()
-        .filter(|(_binding, handle)| handle.is_for_binding())
-        .map(|(binding, _handle)| (binding.clone(), ResolvedDependencies::default()))
+        .map(|binding| (binding.clone(), ResolvedDependencies::default()))
         .collect::<HashMap<_, _>>();
     let mut managed_ids = HashSet::new();
     for resource in &parsed.resources {
@@ -1381,8 +1411,10 @@ pub fn resolve_expanded_graph<E, D>(
         };
         if let Some(binding) = &resource.binding {
             targets.insert_binding(binding.clone(), target.clone())?;
-            for group in loop_group_bindings(binding) {
-                managed_groups.entry(group).or_default().insert(id.clone());
+            for group in loop_group_bindings_in(&loop_groups, binding) {
+                if let Some(members) = managed_groups.get_mut(&group) {
+                    members.insert(id.clone());
+                }
             }
         }
         targets.insert_identity(id.binding_address(), target)?;
@@ -2042,5 +2074,91 @@ mod tests {
             .compile_deferred_for(template)
             .expect("upstream loop compiles");
         assert!(template.dependencies().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod for_value_keys_membership_tests {
+    use super::*;
+    use crate::resource::RelativeBindingName;
+
+    #[test]
+    fn for_value_keys_membership_boundaries() {
+        for (binding, expected) in [
+            ("rs.a", vec!["rs"]),
+            ("rs['a.b']", vec!["rs"]),
+            ("rs['a[b].c']", vec!["rs"]),
+            ("rs[0].child", vec!["rs", "rs[0]"]),
+            ("module.rs.a", vec!["module", "module.rs"]),
+            ("rs_extra.a", vec!["rs_extra"]),
+        ] {
+            let address = crate::resource::decompose_binding_address(binding).unwrap();
+            assert_eq!(address.candidate_ancestors().collect::<Vec<_>>(), expected);
+        }
+    }
+
+    #[test]
+    fn for_value_keys_membership_resolves_actual_loop_handles() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("child")).unwrap();
+        for (file, source) in [
+            ("providers.crn", "provider mock {}\n"),
+            (
+                "calls.crn",
+                "let child = use { source = './child' }\nlet ordinary = child {}\n",
+            ),
+            (
+                "resources.crn",
+                "let rs = for x in ['a'] { mock.test.resource { name = x } }\n",
+            ),
+            (
+                "child/main.crn",
+                "arguments { name: String = 'ordinary' }\nlet resource = mock.test.resource { name = name }\nlet nested = for x in ['b'] { mock.test.resource { name = x } }\n",
+            ),
+        ] {
+            std::fs::write(directory.path().join(file), source).unwrap();
+        }
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let loaded = crate::config_loader::load_configuration_with_config(
+            &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+            &context,
+            &SchemaRegistry::new(),
+        )
+        .unwrap();
+        let resolved =
+            crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                crate::module_resolver::resolve_modules_with_providerless_config(
+                    loaded.parsed,
+                    &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+                    session,
+                    &SchemaRegistry::new(),
+                )
+                .map_err(Box::new)
+            })
+            .unwrap();
+        let tree = crate::parser::AnalysisTree::try_from(&resolved).unwrap();
+        assert!(tree.is_loop_group("rs"));
+        assert!(tree.is_loop_group("ordinary.nested"));
+        assert!(!tree.is_loop_group("ordinary"));
+        assert!(!tree.is_loop_group("ordinary.resource"));
+    }
+
+    #[test]
+    fn for_value_keys_deferred_old_index_rows() {
+        let target = crate::parser::DeferredForTarget::Bound(
+            crate::parser::BoundDeferredTarget::new(RelativeBindingName::new("rs")).unwrap(),
+        );
+        for binding in ["rs[0]", "rs.a", "rs['a.b']"] {
+            assert!(crate::differ::binding_matches_deferred_template(
+                &RelativeBindingName::new(binding),
+                &target
+            ));
+        }
+        for binding in ["rs_extra[0]", "rs.a.child", "rs['a.b'].child", "rs[0][1]"] {
+            assert!(!crate::differ::binding_matches_deferred_template(
+                &RelativeBindingName::new(binding),
+                &target
+            ));
+        }
     }
 }

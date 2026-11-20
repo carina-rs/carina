@@ -422,7 +422,7 @@ the expanded element address:
 ```crn
 moved {
   from = awscc.ec2.Vpc 'vpc'
-  to   = awscc.ec2.Vpc 'vpcs[0]'
+  to   = awscc.ec2.Vpc "vpcs['10.0.0.0/16']"
 }
 
 let vpcs = for cidr in ['10.0.0.0/16'] {
@@ -432,7 +432,7 @@ let vpcs = for cidr in ['10.0.0.0/16'] {
 }
 ```
 
-A map loop uses `'vpcs.key'` for an identifier-safe key, or
+A simple String-list loop and a map loop use `'vpcs.key'` for an identifier-safe key, or
 `"vpcs['key with space']"` when the key needs quoting. Elements from unbound
 `for` and `if` expressions are anonymous: Carina derives their stable identity
 from the resource schema instead of their position. Legacy `_forN[i]` state
@@ -443,6 +443,32 @@ To move an existing resource into an unbound loop, use the anonymous address
 shown by `carina plan` as the `to` address. To give loop elements explicit
 names instead, bind the loop with `let` and target the expanded bound address,
 as in the example above.
+
+### Migrating index-addressed list loops
+
+Simple `let`-bound list loops now use each element's String value as identity. This breaks their old index addresses: `rs[0]` becomes `rs.a` for the original value `'a'`. There is no automatic move or legacy expansion mode. Anonymous loops are unaffected. To preserve positional addresses, opt into `for (i, x) in list` before planning.
+
+To adopt value keys, inspect the original iterable and state, then author one `moved` block for each retained child:
+
+```crn
+moved {
+  from = awscc.ec2.Vpc 'vpcs[0]'
+  to   = awscc.ec2.Vpc 'vpcs.dev'
+}
+
+let vpcs = for env in ['dev'] {
+  awscc.ec2.Vpc {
+    cidr_block = '10.0.0.0/16'
+    tags = { Name = env }
+  }
+}
+```
+
+Use the original element values to pair old indices with new keys. When the list is known at plan time, a `moved` block from `rs[0]` to `rs.<key>` carries the existing state row over to the new address. Check `carina plan`, then apply the moves before removing the blocks. Without moves, concrete children appear as destroy/create, with the existing possible-move hint where matching attributes allow it. Update references from `vpcs[0].vpc_id` to `vpcs['dev'].vpc_id`. Non-String or repeated elements require an indexed loop or a rewritten String list; protected values cannot supply keys. Strings that cannot round-trip through state address canonicalization and decomposition also require `(i, x)` until [carina#4552](https://github.com/carina-rs/carina/issues/4552) fixes key escaping. Map-loop keys are unchanged.
+
+When the iterable is still unknown at plan time, the loop's existing children are replaced. To preserve the old addresses, keep `for (i, x) in list`. Materialize and inspect the collection, then switch to value keys and author moves when the list is known at plan time.
+
+Regenerate saved plans after upgrading. The current saved-plan format is 47; plans from earlier formats, including 46, are rejected. Recreate them with `carina plan --out`. State remains at version 21.
 
 ## Removing resources from state
 

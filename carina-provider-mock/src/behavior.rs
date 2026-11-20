@@ -122,6 +122,8 @@ pub struct ServerListMutation {
 pub struct MockBehavior {
     /// Supplied JSON is decoded when references are resolved, preserving lazy errors.
     pub reference_table: Option<String>,
+    /// Provider-populated String-list output, decoded before creating an object.
+    pub generated_strings: Option<String>,
     pub reference_echo_alias: bool,
     pub create_mode: CreateMode,
     pub resume_mode: ResumeMode,
@@ -191,6 +193,7 @@ pub fn decode_controls(environment: &carina_core::EnvironmentSnapshot) -> Decode
         state_file: path("STATE_FILE"),
         behavior: MockBehavior {
             reference_table: text("REFERENCE_TABLE"),
+            generated_strings: text("GENERATED_STRINGS"),
             reference_echo_alias: text("REFERENCE_ECHO_ALIAS").as_deref() == Some("true"),
             create_mode: match text("CREATE_MODE").as_deref() {
                 Some("not_created") => CreateMode::NotCreated,
@@ -358,6 +361,7 @@ mod tests {
                 reference_table: Some(
                     "{\"alias/example\":{\"Ok\":{\"Resolved\":\"key/example\"}}}".to_owned()
                 ),
+                generated_strings: None,
                 reference_echo_alias: true,
                 create_mode: CreateMode::IdentifierReported,
                 resume_mode: ResumeMode::Resend,

@@ -1998,7 +1998,7 @@ impl DiagnosticRun<'_> {
                 exports,
                 resolve_errors,
             ));
-            diagnostics.extend(self.check_for_iterable_bindings(doc, merged));
+            diagnostics.extend(self.check_for_iterable_bindings(doc, merged, exports));
         }
 
         // carina#2191 Phase 5: surface `check_provider_instance_routing`

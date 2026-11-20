@@ -1103,7 +1103,7 @@ impl OwnerPosition {
                     .into()
             }
             Self::KnownIterableRead => format!(
-                "let results = for n in [7] {{ read mock.Query {{ attr = {} }} }}\n",
+                "let results = for (_, n) in [7] {{ read mock.Query {{ attr = {} }} }}\n",
                 cast("n")
             ),
             Self::DeferredManaged => format!(

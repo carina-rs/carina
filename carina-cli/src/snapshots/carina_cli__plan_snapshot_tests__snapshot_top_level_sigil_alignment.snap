@@ -9,7 +9,7 @@ Execution Plan:
   ▾ module "cluster" (./modules/cluster)
      └─ + aws.eks.Cluster cluster/inner
   + aws.route53.RecordSet (N records after cert.domain_validation_options resolves)
-      <- for option in cert.domain_validation_options
+      <- for (_, option) in cert.domain_validation_options
       name: option.name
 
 Plan: 1 to read, 2 to add, 0 to change, 0 to destroy.

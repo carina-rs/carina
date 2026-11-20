@@ -275,7 +275,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
     let template = DeferredForExpression::new(
         Some("main.crn".to_string()),
         1,
-        "for opt in cert.domain_validation_options".to_string(),
+        "for (_, opt) in cert.domain_validation_options".to_string(),
         carina_core::parser::DeferredForTarget::bound(
             carina_core::resource::absolute_binding_address_for_test("validation_records"),
         )
@@ -286,7 +286,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             Vec::new(),
         )
         .resolve_root_for_test(),
-        ForBinding::Simple("opt".to_string()),
+        ForBinding::Indexed("_".into(), "opt".to_string()),
         template_resource,
     );
 

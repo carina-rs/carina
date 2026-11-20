@@ -38,7 +38,7 @@ fn updating_changed_iterable_defers_missing_element_output() {
     let mut parsed = parse(
         r#"
         let x = mock.test.Source {}
-        let children = for r in x.rules {
+        let children = for (_, r) in x.rules {
             mock.test.Target { name = r.id }
         }
         "#,

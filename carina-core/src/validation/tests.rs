@@ -993,7 +993,7 @@ fn deferred_iterable_shape_classifies_concrete_list_without_placeholder_type() {
     let sink = TypeExpr::List(Box::new(TypeExpr::String));
     let shape = deferred_iterable_shape_for_phase(&expression.for_sink(&sink, &context))
         .expect("authored iterable shape");
-    assert_eq!(shape, DeferredIterableShape::List);
+    assert_eq!(shape, DeferredIterableShape::List(None));
 }
 
 #[test]
@@ -2746,6 +2746,14 @@ import {
 }
 
 #[test]
+fn for_value_keys_children_are_not_unused_bindings() {
+    let view = authored_binding_view(
+        "let rs = for x in ['a', 'b c'] { mock.test.resource { name = x } }\nlet unused = mock.test.resource { name = 'unused' }\n",
+    );
+    assert_eq!(check_unused_bindings(&view), vec!["unused"]);
+}
+
+#[test]
 fn dotted_string_literal_does_not_count_as_binding_use() {
     let mut parsed = empty_parsed();
 
@@ -3752,7 +3760,7 @@ fn postfix_and_path_access_report_the_same_unknown_struct_field() {
 fn parenthesized_for_address_reports_the_same_unknown_field_as_direct_path() {
     let parsed = crate::parser::parse(
         r#"
-            let roles = for n in [0] {
+            let roles = for (_, n) in [0] {
                 mock.test.Thing { name = "role" }
             }
             mock.test.Consumer {

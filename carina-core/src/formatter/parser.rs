@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn issue_1175_for_expression() {
         // for expressions should parse
-        let input = r#"let subnets = for subnet in subnets {
+        let input = r#"let subnets = for (_, subnet) in subnets {
   awscc.ec2.Subnet {
     vpc_id = vpc.vpc_id
     cidr_block = subnet.cidr

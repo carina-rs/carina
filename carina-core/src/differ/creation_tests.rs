@@ -297,13 +297,13 @@ fn deferred_payload() -> DeferredCreatePayload {
     let template: crate::parser::DeferredForExpression = crate::parser::DeferredForExpression::new(
         None,
         1,
-        "for item in parent.items".into(),
+        "for (_, item) in parent.items".into(),
         crate::parser::DeferredForTarget::bound(
             crate::resource::absolute_binding_address_for_test("children"),
         )
         .unwrap(),
         Value::root_resource_ref("parent", "items", vec![]),
-        crate::parser::ForBinding::Simple("item".into()),
+        crate::parser::ForBinding::Indexed("_".into(), "item".into()),
         Resource::with_provider("mock", "Bucket", "children", None).with_attribute(
             "name",
             // The loop's item has no known element type.

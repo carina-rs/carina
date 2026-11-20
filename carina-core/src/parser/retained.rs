@@ -470,7 +470,7 @@ impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
             | ExprKind::Resource { .. }
             | ExprKind::Sink { .. }
             | ExprKind::If
-            | ExprKind::For
+            | ExprKind::For { .. }
             | ExprKind::Wait
             | ExprKind::Compose
             | ExprKind::DynamicAccess
@@ -588,7 +588,11 @@ pub(crate) enum ExprKind<B: BindingAddress> {
         name: super::AttributeKey,
     },
     If,
-    For,
+    For {
+        binding: super::ForBinding,
+        bound: bool,
+        iterable: super::AuthoredExpressionText,
+    },
     Wait,
     Compose,
     DynamicAccess,
@@ -729,7 +733,15 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             },
             ExprKind::Sink { name } => ExprKind::Sink { name },
             ExprKind::If => ExprKind::If,
-            ExprKind::For => ExprKind::For,
+            ExprKind::For {
+                binding,
+                bound,
+                iterable,
+            } => ExprKind::For {
+                binding,
+                bound,
+                iterable,
+            },
             ExprKind::Wait => ExprKind::Wait,
             ExprKind::Compose => ExprKind::Compose,
             ExprKind::DynamicAccess => ExprKind::DynamicAccess,
@@ -1501,6 +1513,29 @@ impl Expressions {
             inventory: true,
             ..Default::default()
         };
+        let mut authored = pairs.clone().collect::<Vec<_>>();
+        while let Some(pair) = authored.pop() {
+            if matches!(
+                pair.as_rule(),
+                Rule::let_binding
+                    | Rule::local_binding
+                    | Rule::fn_local_let
+                    | Rule::for_local_binding
+                    | Rule::if_local_binding
+            ) && let Some(rhs) = pair
+                .clone()
+                .into_inner()
+                .find(|child| child.as_rule() == Rule::expression)
+                && let Some(descent) = super::util::descend_expression(rhs, false)
+                && let Some(expression) = descent.primary().into_inner().next()
+                && expression.as_rule() == Rule::for_expr
+            {
+                captures
+                    .bound_for_sites
+                    .insert(ParseNodeKey::of(&expression));
+            }
+            authored.extend(pair.into_inner());
+        }
         for statement in pairs
             .flat_map(|pair| pair.into_inner())
             .filter(|pair| pair.as_rule() == Rule::statement)
@@ -1669,7 +1704,7 @@ fn node_at_with_roles(
         | ExprKind::Iterable
         | ExprKind::Resource { .. }
         | ExprKind::If
-        | ExprKind::For
+        | ExprKind::For { .. }
         | ExprKind::Wait
         | ExprKind::Compose
         | ExprKind::ModuleCall
@@ -1788,6 +1823,7 @@ impl ParseNodeKey {
 pub(in crate::parser) struct CapturedNodes {
     inventory: bool,
     nodes: HashMap<ParseNodeKey, ExprValue>,
+    bound_for_sites: HashSet<ParseNodeKey>,
     resource_declarations: HashMap<NodeId, SlotDeclarationId>,
     values: std::sync::RwLock<IndexMap<NodeId, Value<ParserPlaceholder, RelativeBindingName>>>,
     conditions: ConditionRecorder,
@@ -2637,13 +2673,12 @@ fn compile_remaining_form(
         Rule::for_expr => {
             let mut parts = pair.clone().into_inner();
             let binding = parts.next().expect("loop binding");
-            let iterable = compile(
-                parts.next().expect("loop iterable"),
-                file,
-                source,
-                scope,
-                captures,
-            );
+            let binding_form = super::expressions::for_expr::parse_for_binding(binding.clone())
+                .expect("retained loop binding follows the grammar");
+            let iterable_pair = parts.next().expect("loop iterable");
+            let iterable_text =
+                super::AuthoredExpressionText::redact(iterable_pair.clone(), Some(file));
+            let iterable = compile(iterable_pair, file, source, scope, captures);
             let mut scope = scope.clone();
             let pattern = binding.into_inner().next().expect("loop pattern");
             let names = pattern.clone().into_inner().collect::<Vec<_>>();
@@ -2668,7 +2703,17 @@ fn compile_remaining_form(
                 &scope,
                 captures,
             );
-            node(&pair, ExprKind::For, vec![iterable, body], file, source)
+            node(
+                &pair,
+                ExprKind::For {
+                    binding: binding_form,
+                    bound: captures.bound_for_sites.contains(&ParseNodeKey::of(&pair)),
+                    iterable: iterable_text,
+                },
+                vec![iterable, body],
+                file,
+                source,
+            )
         }
         Rule::function_call | Rule::validate_function_call => {
             let mut parts = pair.clone().into_inner();
@@ -3010,7 +3055,6 @@ fn access_step(pair: Pair<'_, Rule>) -> Option<PathSegment> {
 }
 
 use judgement::ConversionEvidence;
-pub(crate) use judgement::judge_expressions;
 pub(in crate::parser) use judgement::unjudged as missing_judgement;
 pub(crate) use judgement::{AdmissionContext, admit_ordinary_with_context, admit_with_context};
 pub use judgement::{
@@ -3018,6 +3062,17 @@ pub use judgement::{
     JudgedExprData, NoConversion, NoTypeProjection, OrdinaryJudgedExpr,
     ProviderAuthorityUnavailable, SinkJudgedExpr, TypeProjection, admit_expression,
 };
+pub(crate) use judgement::{judge_expressions, judge_expressions_with_upstream};
+/// One authored loop's iterable evidence, independent of expansion timing.
+pub(crate) struct AuthoredForIterable<'a> {
+    pub binding: &'a super::ForBinding,
+    pub bound: bool,
+    pub location: &'a DeclarationLocation,
+    pub expression: String,
+    pub judged: Result<&'a JudgedExpr, MissingEvidence>,
+    pub key_judged: Result<&'a JudgedExpr, MissingEvidence>,
+}
+
 #[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn value_dependent_judgement_for_test() -> JudgedExpr {
     judgement::constraint_fixture()
@@ -3812,6 +3867,9 @@ mod judgement {
         }
         pub fn static_type(&self) -> Result<&TypeExpr, InferenceIssue> {
             self.judgement.static_type()
+        }
+        pub(crate) fn has_list_elements(&self) -> bool {
+            !self.elements.is_empty()
         }
         pub(crate) fn elements(&self) -> impl Iterator<Item = &JudgedExpr> {
             self.elements
@@ -5182,6 +5240,7 @@ mod judgement {
         ) -> Result<&JudgedExpr, MissingEvidence> {
             self.expression_in(&self.instance, location)
         }
+        #[cfg(test)]
         pub(crate) fn instances_at(
             &self,
             location: &DeclarationLocation,
@@ -5199,6 +5258,46 @@ mod judgement {
             } else {
                 Ok(instances)
             }
+        }
+        pub(crate) fn authored_for_iterables<'a>(
+            &'a self,
+            key_report: &'a Self,
+        ) -> impl Iterator<Item = AuthoredForIterable<'a>> {
+            self.syntax_nodes
+                .iter()
+                .filter_map(move |((instance, _), syntax)| {
+                    let ExprKind::For {
+                        binding,
+                        bound,
+                        iterable,
+                    } = &syntax.kind
+                    else {
+                        return None;
+                    };
+                    let operand = syntax
+                        .children
+                        .first()
+                        .expect("authored for has an iterable");
+                    let location = operand.location();
+                    let expression = self
+                        .projections
+                        .get(&(instance.clone(), operand.node_id()))
+                        .map(crate::value::format_value)
+                        .unwrap_or_else(|| iterable.as_str().trim().to_string());
+                    let judgement = |report: &'a Self| {
+                        report.node(instance, operand.node_id()).ok_or_else(|| {
+                            MissingEvidence::new(format!("for iterable at {location:?}"))
+                        })
+                    };
+                    Some(AuthoredForIterable {
+                        binding,
+                        bound: *bound,
+                        location,
+                        expression,
+                        judged: judgement(self),
+                        key_judged: judgement(key_report),
+                    })
+                })
         }
         pub(crate) fn expression_in(
             &self,
@@ -5411,6 +5510,24 @@ mod judgement {
     where
         D: super::super::DeferredForPhaseTraversal<P, T, B>,
     {
+        judge_expressions_with_upstream(file, schemas, config, None)
+    }
+
+    pub fn judge_expressions_with_upstream<
+        E,
+        P: crate::resource::PlaceholderKind,
+        T: crate::resource::PlaceholderKind,
+        D,
+        B: BindingAddress,
+    >(
+        file: &super::super::File<E, P, T, D, B>,
+        schemas: &crate::schema::SchemaRegistry,
+        config: &super::super::ProviderContext,
+        upstream: Option<&crate::upstream_exports::UpstreamExports<B>>,
+    ) -> ExpressionReport<B>
+    where
+        D: super::super::DeferredForPhaseTraversal<P, T, B>,
+    {
         let expressions = file.parser_binding_metadata.syntax().expressions();
         let mut bindings = inference::bindings_from_parsed(file);
         for wait in &file.wait_bindings {
@@ -5485,6 +5602,7 @@ mod judgement {
             function_errors: Vec::new(),
             operands: HashMap::new(),
             module_attributes: Some(&expressions.report.module_attributes),
+            upstream,
         };
         let mut judged_bindings = IndexMap::new();
         for (name, expression) in &expressions.definitions {
@@ -5665,6 +5783,7 @@ mod judgement {
         function_errors: Vec<Located<InferenceError>>,
         operands: HashMap<ExpressionLocation, [JudgedExpr; 2]>,
         module_attributes: Option<&'a IndexMap<(B, String), JudgedExpr>>,
+        upstream: Option<&'a crate::upstream_exports::UpstreamExports<B>>,
     }
 
     impl<B: BindingAddress> Judge<'_, B> {
@@ -5709,7 +5828,7 @@ mod judgement {
                 | ExprKind::Resource { .. }
                 | ExprKind::Sink { .. }
                 | ExprKind::If
-                | ExprKind::For
+                | ExprKind::For { .. }
                 | ExprKind::Wait
                 | ExprKind::Compose
                 | ExprKind::DynamicAccess
@@ -6082,7 +6201,7 @@ mod judgement {
                 | ExprKind::Iterable
                 | ExprKind::Sink { .. }
                 | ExprKind::If
-                | ExprKind::For
+                | ExprKind::For { .. }
                 | ExprKind::Wait
                 | ExprKind::Compose
                 | ExprKind::DynamicAccess
@@ -6099,7 +6218,10 @@ mod judgement {
             let mut result = JudgedExpr::build(result.data, edges);
             if matches!(
                 root.kind,
-                ExprKind::Resource { .. } | ExprKind::For | ExprKind::Wait | ExprKind::ModuleCall
+                ExprKind::Resource { .. }
+                    | ExprKind::For { .. }
+                    | ExprKind::Wait
+                    | ExprKind::ModuleCall
             ) {
                 result.data_mut().structural_source = true;
             }
@@ -6493,6 +6615,18 @@ mod judgement {
                         let attribute = self.refresh_module_output(attribute);
                         return self.access_path(
                             InferredExpr::from(&attribute),
+                            segments,
+                            binding.as_str(),
+                        );
+                    }
+                    if let Some(ty) = self
+                        .upstream
+                        .and_then(|exports| exports.get(binding))
+                        .and_then(|fields| fields.get(attribute))
+                        .and_then(|entry| entry.static_type.declared_known())
+                    {
+                        return self.access_path(
+                            ordinary(Ok(ty.clone()), false).owned_by_bindings(),
                             segments,
                             binding.as_str(),
                         );
@@ -6973,7 +7107,7 @@ mod judgement {
                     }
                     result
                 }
-                ExprKind::For => {
+                ExprKind::For { .. } => {
                     if let Some(collection) = children.first()
                         && collection.value_shape().is_some_and(|shape| {
                             !matches!(shape, ValueShape::List | ValueShape::Map)

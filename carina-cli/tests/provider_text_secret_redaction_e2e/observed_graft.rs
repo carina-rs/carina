@@ -817,13 +817,13 @@ fn plan_json_saved_deferred_replace_divergent_history_masks_observed_list() {
                 format!("test.Sink {{ config = {{ revision = 1 payload = {SECRET_MAP} }} }}");
             std::fs::write(
                 scene.dir.path().join("main.crn"),
-                format!("let items = for member in ['seed'] {{ {child} }}\n"),
+                format!("let items = for (_, member) in ['seed'] {{ {child} }}\n"),
             )
             .unwrap();
             scene.apply().await.unwrap();
             scene.fixture.trace(&["create"]);
             std::fs::write(scene.dir.path().join("main.crn"), format!(
-                "let producer = test.Sink {{ config = {{ revision = 1 payload = {{ public = 'ordinary' }} }} }}\nlet items = for member in producer.members {{ {child} }}\n"
+                "let producer = test.Sink {{ config = {{ revision = 1 payload = {{ public = 'ordinary' }} }} }}\nlet items = for (_, member) in producer.members {{ {child} }}\n"
             )).unwrap();
             scene.plan(true, true).await;
         },

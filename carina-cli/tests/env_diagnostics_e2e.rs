@@ -668,7 +668,7 @@ fn real_secret_directory_reachability_preserves_diagnostic_boundaries() {
     cases.extend([
         ("for_list", "for value in secret(['CANARY_4409_SECRET']) { mock.test.pattern_modes { full = value } }\n".into(), "provider mock {}\n"),
         ("for_map", "for key, value in secret({ CANARY_4409_SECRET = 'public' }) { mock.test.pattern_modes { full = key } }\n".into(), "provider mock {}\n"),
-        ("for_bound_list", "let rows = for value in secret(['CANARY_4409_SECRET']) { mock.test.pattern_modes { full = value } }\n".into(), "provider mock {}\n"),
+        ("for_bound_list", "let rows = for (_, value) in secret(['CANARY_4409_SECRET']) { mock.test.pattern_modes { full = value } }\n".into(), "provider mock {}\n"),
         ("for_bound_map", "let rows = for key, value in secret({ CANARY_4409_SECRET = 'public' }) { mock.test.pattern_modes { full = key } }\n".into(), "provider mock {}\n"),
         ("module_argument", "let m = use { source = './m' }\nm { value = secret('CANARY_4409_SECRET') }\n".into(), "provider mock {}\n"),
         ("export", "exports { value: String = secret('CANARY_4409_SECRET') }\n".into(), "provider mock {}\n"),

@@ -67,9 +67,13 @@ use crate::schema::{
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use binding_address::absolute_binding_address_for_test;
-pub use binding_address::{AbsoluteBindingAddress, BindingAddress, RelativeBindingName};
+pub use binding_address::{
+    AbsoluteBindingAddress, BindingAddress, BoundForAddress, CheckedBindingAddress,
+    ForAddressDefer, ForKeyError, RelativeBindingName, decompose_binding_address,
+};
 pub(crate) use binding_address::{
-    binding_with_index, binding_with_map_key, module_argument_placeholder,
+    AdmittedForMember, BindingLookup, ForAddressAdmission, ForAddressMoment, ForAdmissionFailure,
+    admit_bound_for_addresses, classify_for_key_type, module_argument_placeholder,
 };
 pub use directive_expr::{
     ArgumentValueOrigin, DirectiveExpr, DirectiveResolutionError, DirectiveResolutionErrors,
@@ -2775,14 +2779,14 @@ fn select_classified_segment<P: PlaceholderKind, B: BindingAddress>(
                     }),
                     PathSegment::Subscript {
                         index: Subscript::Int { index },
-                    } => Value::Deferred(DeferredValue::BindingRef {
-                        binding: binding_with_index(binding, index),
-                    }),
+                    } => BindingLookup::new(binding)
+                        .select(&Subscript::Int { index })
+                        .reference(),
                     PathSegment::Subscript {
                         index: Subscript::Str { key },
-                    } => Value::Deferred(DeferredValue::BindingRef {
-                        binding: binding_with_map_key(binding, &key),
-                    }),
+                    } => BindingLookup::new(binding)
+                        .select(&Subscript::Str { key })
+                        .reference(),
                 },
                 Value::Deferred(DeferredValue::Secret(_)) => {
                     unreachable!("Secret has an opaque known arm")

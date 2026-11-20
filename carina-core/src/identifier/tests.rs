@@ -8995,6 +8995,70 @@ fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_move() {
 }
 
 #[test]
+fn for_value_keys_anonymous_rewrite_failure_omits_suggestion() {
+    let mut resources = parse_loop_fixture(
+        "for x in ['same', 'same'] { mock.ec2.Vpc { identity_input = x } }",
+        "anonymous.crn",
+    );
+    let error = compute_anonymous_identifiers_for_test(
+        &mut resources,
+        &[],
+        &loop_identity_registry(true),
+        &|_| Vec::new(),
+    )
+    .unwrap_err();
+    let AnonymousIdentityError::Loop(mut conflict) = error else {
+        panic!("expected loop conflict")
+    };
+    *conflict.origin.source_mut() = crate::resource::LoopSource::authored(
+        std::path::Path::new("anonymous.crn"),
+        crate::parser::SourceSpan::dummy(),
+        "for x in",
+        crate::resource::LoopKind::For,
+    );
+    let text = conflict.to_string();
+    assert!(text.contains("cannot be identified safely"), "{text}");
+    assert!(!text.contains("let vpc ="), "{text}");
+    assert!(!text.contains("moved {"), "{text}");
+}
+
+#[test]
+fn for_value_keys_anonymous_rewrite_uses_indexed_form() {
+    for source in [
+        "for name in ['same', 'same'] { mock.ec2.Vpc { identity_input = name } }",
+        "for item in [{ name = 'same' }, { name = 'same' }] { mock.ec2.Vpc { identity_input = item.name } }",
+    ] {
+        let mut resources = parse_loop_fixture(source, "anonymous.crn");
+        let error = compute_anonymous_identifiers_for_test(
+            &mut resources,
+            &[],
+            &loop_identity_registry(true),
+            &|_| Vec::new(),
+        )
+        .expect_err("anonymous duplicate identities still require an explicit rewrite");
+        let rendered = error.to_string();
+        let rewrite = rendered
+            .split_once("let vpc = ")
+            .expect("the diagnostic supplies a bound rewrite")
+            .1
+            .split("\n\nmoved {")
+            .next()
+            .unwrap();
+        assert!(rewrite.starts_with("for (_, "), "{rendered}");
+        let rebound = parse_loop_fixture(&format!("let vpc = {rewrite}"), "bound.crn");
+        assert_eq!(
+            rebound
+                .iter()
+                .map(|resource| resource.binding.as_ref().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            ["vpc[0]", "vpc[1]"],
+        );
+        assert!(rendered.contains("from = mock.ec2.Vpc '_for0[0]'"));
+        assert!(rendered.contains("to = mock.ec2.Vpc 'vpc[0]'"));
+    }
+}
+
+#[test]
 fn loop_attribute_derived_conflict_renders_exact_rewrite() {
     let source = "for cidr in ['10.0.0.0/16', '10.1.0.0/16'] {\n  mock.ec2.Vpc {\n    identity_input = cidr\n  }\n}";
     let mut resources = parse_loop_fixture(source, "loops.crn");
@@ -9012,7 +9076,7 @@ fn loop_attribute_derived_conflict_renders_exact_rewrite() {
             "identified safely because multiple 'mock.ec2.Vpc' elements derive identity ",
             "from mutable attributes.\n",
             "Rewrite the loop with a binding and migrate its existing state addresses:\n\n",
-            "let vpc = for cidr in ['10.0.0.0/16', '10.1.0.0/16'] {\n",
+            "let vpc = for (_, cidr) in ['10.0.0.0/16', '10.1.0.0/16'] {\n",
             "  mock.ec2.Vpc {\n",
             "    identity_input = cidr\n",
             "  }\n",
@@ -9113,8 +9177,8 @@ fn attribute_derived_distinct_single_element_loops_report_two_rewrites() {
     );
     assert!(rendered.contains("unbound `for` at loops.crn:1"));
     assert!(rendered.contains("unbound `for` at loops.crn:4"));
-    assert!(rendered.contains("let vpc = for cidr"));
-    assert!(rendered.contains("let vpc_2 = for cidr"));
+    assert!(rendered.contains("let vpc = for (_, cidr)"));
+    assert!(rendered.contains("let vpc_2 = for (_, cidr)"));
 }
 
 #[test]
@@ -9336,7 +9400,7 @@ fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
         .expect_err("mutable-derived loop peers require a binding");
 
     assert!(
-        error.to_string().contains("let vpc_2 = for cidr"),
+        error.to_string().contains("let vpc_2 = for (_, cidr)"),
         "sibling value binding was not reserved: {error}",
     );
 }
@@ -9352,7 +9416,7 @@ fn loop_conflict_suggestion_reserves_later_value_bindings() {
             .expect_err("mutable-derived loop peers require a binding");
 
     assert!(
-        error.to_string().contains("let vpc_2 = for cidr"),
+        error.to_string().contains("let vpc_2 = for (_, cidr)"),
         "later value binding was not reserved: {error}",
     );
 }
