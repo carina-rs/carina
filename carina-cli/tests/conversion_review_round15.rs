@@ -323,11 +323,30 @@ async fn read_only_operand(target: &str) {
         assert_eq!(init["ok"], true, "{init}");
         let seed = binary(&fixture, &["apply", "--auto-approve", "--lock=false"]);
         assert_eq!(seed["ok"], true, "{seed}");
-        let mut baseline = carina_state::check_and_migrate(
-            &serde_json::to_string(&saved_state(&fixture)).unwrap(),
+        let mut baseline =
+            carina_state::load_state(&serde_json::to_string(&saved_state(&fixture)).unwrap())
+                .unwrap();
+        let q_identifier = baseline
+            .find_resource("mock", "iam.Roles", "q")
+            .unwrap()
+            .identifier()
+            .unwrap()
+            .to_string();
+        let mut provider_state: Json = serde_json::from_slice(
+            &std::fs::read(fixture.path().join("provider-state.json")).unwrap(),
         )
-        .unwrap()
-        .into_state();
+        .unwrap();
+        // Data-source responses use addresses, separately from managed identifiers.
+        let q = provider_state["states"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&q_identifier)
+            .unwrap();
+        provider_state["data_sources"]["iam.Roles.q"] = q;
+        fixture.write(
+            "provider-state.json",
+            &serde_json::to_string(&provider_state).unwrap(),
+        );
         assert!(baseline.remove_resource("mock", "iam.Roles", "q").is_some());
         fixture.write(
             "carina.state.json",

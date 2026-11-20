@@ -1154,7 +1154,7 @@ fn deferred_template_retains_literal_guard_evidence() {
                     id: old.resolved_id(),
                     identifier: crate::provider::AppliedIdentifier::new("existing").unwrap(),
                     generation: crate::effect::EffectGeneration::Current,
-                    previous_attributes: HashMap::new(),
+                    previous_attributes: std::collections::BTreeMap::new(),
                     directives: Default::default(),
                     binding: None,
                     dependencies: Default::default(),

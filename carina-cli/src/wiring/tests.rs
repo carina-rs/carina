@@ -1,3 +1,19 @@
+fn test_registry_source(value: &str) -> carina_core::provider_source::RegistrySource {
+    use carina_core::provider_source::{ProviderSource, RemoteSource};
+    let ProviderSource::Remote(RemoteSource::Registry(source)) = value.parse().unwrap() else {
+        panic!("expected registry source: {value}");
+    };
+    source
+}
+
+fn test_github_source(value: &str) -> carina_core::provider_source::GithubSource {
+    use carina_core::provider_source::{ProviderSource, RemoteSource};
+    let ProviderSource::Remote(RemoteSource::GithubDirect(source)) = value.parse().unwrap() else {
+        panic!("expected github source: {value}");
+    };
+    source
+}
+
 use super::*;
 
 #[test]
@@ -586,7 +602,7 @@ fn state_block_import_propagates_unavailable_historical_secret() {
             compositions: &[],
             managed_current: &current,
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     );
@@ -752,7 +768,9 @@ fn retained_deferred_warnings_match_source_location_for_both_file_owners() {
             message: "unrelated same-line warning".into(),
         },
     ];
-    let bindings = carina_core::binding_index::IterableBindings::from_upstream_only(HashMap::new());
+    let bindings = carina_core::binding_index::IterableBindings::from_upstream_only(
+        std::collections::BTreeMap::new(),
+    );
     let mut pair = CanonicalResourcePair::for_test(parsed.clone(), Vec::new());
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
@@ -923,12 +941,7 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
         &[],
     );
     let resources = canonical_unresolved(Vec::new(), context.schemas());
-    let materialization =
-        DeferredForExpansionWitness::after_expansion(resources.parsed().deferred_for_expressions());
-    let expanded_resources = ExpandedCanonicalResources {
-        resources,
-        materialization,
-    };
+    let expanded_resources = ExpandedCanonicalResources { resources };
     let residual_deferred_for = expanded_resources
         .parsed()
         .deferred_for_expressions()
@@ -980,8 +993,8 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
                 provider: &provider,
                 normalizer: &provider,
                 provider_configs: &[],
-                remote_bindings: &HashMap::new(),
-                state_file: &state_file,
+                remote_bindings: &Default::default(),
+                state_file: &carina_state::ObservedStateFile::for_test((state_file).clone()),
                 state_block_claims: &state_block_claims,
                 resolved_state_block_targets: &resolved_state_block_targets,
                 preparation_errors: Some(preparation_errors),
@@ -1223,10 +1236,10 @@ let item = test.thing {
         let planned = create_plan_from_parsed_with_upstream_with_ctx(
             validated,
             &provider_configs,
-            &state_file,
+            &carina_state::ObservedStateFile::for_test((state_file).clone()),
             refresh,
             ProgressSink::Human,
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &StateBlockClaims::default(),
             &crate::test_support::empty_state_block_targets(),
             crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -1321,20 +1334,19 @@ async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() 
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &state_file,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
         false,
         ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &StateBlockClaims::default(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -1417,20 +1429,19 @@ async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_stat
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &state_file,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
         false,
         ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &StateBlockClaims::default(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -1535,11 +1546,10 @@ fn anonymous_to_named_fixed_point_uses_state_origin_after_undeclared_hash_projec
         serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
     )
     .expect("write real state fixture");
-    let state_file = carina_state::state::check_and_migrate(
+    let state_file = carina_state::state::load_state(
         &std::fs::read_to_string(&state_path).expect("read real state fixture"),
     )
-    .expect("decode real state fixture")
-    .into_state();
+    .expect("decode real state fixture");
     let state_origin =
         ResolvedResourceId::with_provider_identity("test", "thing", STATE_ORIGIN, None);
     let projected_hash =
@@ -1639,20 +1649,19 @@ let first = test.thing {
         )
         .expect("write real state fixture");
         let state_file = Some(
-            carina_state::state::check_and_migrate(
+            carina_state::state::load_state(
                 &std::fs::read_to_string(&state_path).expect("read real state fixture"),
             )
-            .expect("decode real state fixture")
-            .into_state(),
+            .expect("decode real state fixture"),
         );
 
         let planned = create_plan_from_parsed_with_upstream_with_ctx(
             validated,
             &provider_configs,
-            &state_file,
+            &carina_state::ObservedStateFile::for_test((state_file).clone()),
             false,
             ProgressSink::Human,
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &StateBlockClaims::default(),
             &crate::test_support::empty_state_block_targets(),
             crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -1766,20 +1775,19 @@ let direct = awscc.ec2.Route {
         )
         .expect("write real state fixture");
         let state_file = Some(
-            carina_state::state::check_and_migrate(
+            carina_state::state::load_state(
                 &std::fs::read_to_string(&state_path).expect("read real state fixture"),
             )
-            .expect("decode real state fixture")
-            .into_state(),
+            .expect("decode real state fixture"),
         );
 
         let planned = create_plan_from_parsed_with_upstream_with_ctx(
             validated,
             &provider_configs,
-            &state_file,
+            &carina_state::ObservedStateFile::for_test((state_file).clone()),
             false,
             ProgressSink::Human,
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &StateBlockClaims::default(),
             &crate::test_support::empty_state_block_targets(),
             crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -2719,6 +2727,7 @@ macro_rules! unexpected_resume_create {
 }
 
 enum ReadBehavior {
+    WrongIdentity,
     Success,
     NotFound,
     ApiError,
@@ -3227,7 +3236,6 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     let installed = carina_provider_resolver::find_file_provider_source(
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         &config,
-        &mut |_| {},
     )
     .unwrap();
 
@@ -3370,8 +3378,8 @@ async fn unverified_official_factory_load_case() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "aws".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+            source: test_github_source(source),
             version: version.parse().unwrap(),
             tag: serde_json::from_str(&format!("\"v{version}\"")).unwrap(),
             asset_id: serde_json::from_str("42").unwrap(),
@@ -3482,7 +3490,7 @@ fn validated_provider_configs(
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
-                &HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },
@@ -3544,7 +3552,7 @@ where
     create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         provider_configs,
-        state_file,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
         refresh,
         ProgressSink::Human,
         &carina_core::upstream_exports::remote_bindings_for_test(remote_bindings.clone()),
@@ -3675,7 +3683,7 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     )
@@ -3809,7 +3817,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     )
@@ -3843,11 +3851,19 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
             panic!("test orphan unexpectedly has an unknown create outcome: {unknown:?}")
         }
     };
-    let mut orphans = Orphans::from([carina_core::differ::Orphan::present(
-        present,
-        Some(absolute_binding("resource")),
-        carina_core::resource::PersistedDirectives::default(),
-    )]);
+    let mut orphans = Orphans::from(
+        [carina_core::differ::Orphan::present(
+            present,
+            Some(absolute_binding("resource")),
+            carina_core::resource::PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                carina_core::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
     let normalizer = TransformingNormalizer;
     let normalizer = std::sync::Arc::new(normalizer);
     let saved_attrs = crate::empty_lifted_saved_attrs();
@@ -3940,7 +3956,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         compositions: &[],
         managed_current: &input_states,
         data_source_values: &DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     assert_eq!(
@@ -4015,7 +4031,10 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
     let refreshed =
         State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
             .with_identifier("resource-123");
-    orphans.insert(orphan.with_refreshed_state(refreshed.to_snapshot()));
+    orphans.insert(
+        carina_core::resource::ResolvedResourceId::new(id.clone()),
+        orphan.with_refreshed_state(refreshed.to_snapshot()),
+    );
     let state = match orphans[&id].current() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
@@ -4635,10 +4654,10 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
     let result = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &None,
+        &carina_state::ObservedStateFile::for_test(None),
         false,
         ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &StateBlockClaims::default(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -4919,6 +4938,14 @@ impl Provider for ReadWithRetryProvider {
         let attempt = self.read_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             match self.behavior {
+                ReadBehavior::WrongIdentity => Ok(ReadOutcome::found(
+                    AppliedState::new(
+                        ResourceId::with_identity("test.Resource", "unexpected"),
+                        identifier.as_str(),
+                        HashMap::new(),
+                    )
+                    .unwrap(),
+                )),
                 ReadBehavior::Success => Ok(ReadOutcome::found(
                     AppliedState::new(id, identifier.as_str(), HashMap::new())
                         .expect("typed read identifier is non-empty"),
@@ -5023,8 +5050,6 @@ impl ProviderNormalizer for SavedAttrsHydratingNormalizer {
     ) -> BoxFuture<'a, ProviderResult<()>> {
         for (id, state) in states {
             if let Some(saved) = saved_attrs.get(id) {
-                #[allow(clippy::iter_over_hash_type)]
-                // keyed rebuild: test hydration fills distinct missing saved keys
                 for (attribute, value) in saved {
                     state
                         .attributes
@@ -5166,10 +5191,10 @@ let shared = read test.shared.Type {}
     let plan_context = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &state_file,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
         true,
         ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &StateBlockClaims::default(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -5299,7 +5324,10 @@ async fn outcome_unknown_refresh_preserves_managed_and_orphan_rows_without_provi
         carina_core::resource::PersistedDirectives::default(),
     );
     let orphan = PreparedRows::from_snapshots(
-        [(id, orphan.into_current())],
+        [(
+            carina_core::resource::ResolvedResourceId::new(id),
+            orphan.into_current(),
+        )],
         &ResolvedRemovedClaims::resolve(&[], None),
     )
     .refreshable
@@ -6784,9 +6812,9 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
 
     let resource = Resource::with_provider("mock", "test.Resource", "unknown", None);
     let address = StateBlockAddress::new("mock", "test.Resource", "unknown");
-    let state = carina_state::check_and_migrate(
+    let state = carina_state::load_state(
         &serde_json::json!({
-            "version": 20,
+            "version": 21,
             "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
             "serial": 1,
             "lineage": "import-unknown",
@@ -6795,6 +6823,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
                 "resource_type": "test.Resource",
                 "identity": "unknown",
                 "provider": "mock",
+                "dependency_bindings": [],
                 "current": {
                     "kind": "create_outcome_unknown",
                     "started_at": "2026-10-23T08:00:00Z"
@@ -6804,8 +6833,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
         })
         .to_string(),
     )
-    .unwrap()
-    .into_state();
+    .unwrap();
     let state_file = Some(state);
     let state_blocks = vec![StateBlock::Import {
         to: address.clone(),
@@ -6906,9 +6934,9 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
         "shared",
         Some("unknown".to_string()),
     );
-    let state = carina_state::check_and_migrate(
+    let state = carina_state::load_state(
         &serde_json::json!({
-            "version": 20,
+            "version": 21,
             "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
             "serial": 1,
             "lineage": "import-other-instance",
@@ -6917,6 +6945,7 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
                 "resource_type": "test.Resource",
                 "identity": "shared",
                 "provider": "mock",
+                "dependency_bindings": [],
                 "current": {
                     "kind": "create_outcome_unknown",
                     "started_at": "2026-10-23T08:00:00Z"
@@ -6927,8 +6956,7 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
         })
         .to_string(),
     )
-    .unwrap()
-    .into_state();
+    .unwrap();
     let state_file = Some(state);
     let state_blocks = vec![StateBlock::Import {
         to: StateBlockAddress::new("mock", "test.Resource", "shared"),
@@ -8382,11 +8410,10 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let canonical_resources = canonical_pair_from_resolved(
@@ -8398,10 +8425,10 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &state_file,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
         false,
         ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &StateBlockClaims::default(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -8641,11 +8668,10 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let canonical_resources = canonical_pair_from_resolved(
@@ -8657,7 +8683,7 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &state_file,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
         false,
         ProgressSink::Human,
         &expanded_remote_bindings,
@@ -9904,10 +9930,10 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     let plan_ctx = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &Some(state_file.clone()),
+        &carina_state::ObservedStateFile::for_test(Some(state_file.clone())),
         false,
         ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &StateBlockClaims::empty(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -9965,7 +9991,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         compositions: &[],
         managed_current: &plan_input_states,
         data_source_values: &plan_ctx.data_source_values,
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
 
@@ -10196,7 +10222,7 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
                     managed_current: ManagedCurrentView::base(&crate::managed_current_from_states(
                         current_states.clone(),
                     )),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &empty_registry,
                     wait_aliases: &[],
                     session,
@@ -10254,7 +10280,7 @@ fn resolve_data_source_refs_for_refresh_defers_unresolved_apply_time_input() {
                 DataSourceRefreshContext {
                     compositions: &[],
                     managed_current: ManagedCurrentView::base(&HashMap::new()),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &empty_registry,
                     wait_aliases: &[],
                     session,
@@ -10303,7 +10329,7 @@ fn resolve_data_source_refs_for_refresh_defers_bare_binding_ref_to_new_resource(
                 DataSourceRefreshContext {
                     compositions: &[],
                     managed_current: ManagedCurrentView::base(&HashMap::new()),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &empty_registry,
                     wait_aliases: &[],
                     session,
@@ -10344,7 +10370,7 @@ fn resolve_data_source_refs_for_refresh_defers_unknown_input_instead_of_calling_
                 DataSourceRefreshContext {
                     compositions: &[],
                     managed_current: ManagedCurrentView::base(&HashMap::new()),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &empty_registry,
                     wait_aliases: &[],
                     session,
@@ -10396,7 +10422,7 @@ fn resolve_data_source_refs_for_refresh_defers_resolvable_interpolation_when_tar
                 DataSourceRefreshContext {
                     compositions: &[],
                     managed_current: ManagedCurrentView::base(&HashMap::new()),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &empty_registry,
                     wait_aliases: &[],
                     session,
@@ -10444,7 +10470,7 @@ fn resolve_data_source_refs_for_refresh_defers_folded_input_with_missing_depende
                 DataSourceRefreshContext {
                     compositions: &[],
                     managed_current: ManagedCurrentView::base(&HashMap::new()),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &carina_core::schema::SchemaRegistry::new(),
                     wait_aliases: &[],
                     session,
@@ -10511,7 +10537,7 @@ fn resolve_data_source_refs_for_refresh_does_not_treat_missing_create_only_readb
                     managed_current: ManagedCurrentView::base(&crate::managed_current_from_states(
                         current_states.clone(),
                     )),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &registry,
                     wait_aliases: &[],
                     session,
@@ -10574,7 +10600,7 @@ fn resolve_data_source_refs_for_refresh_defers_when_any_input_references_new_res
                     managed_current: ManagedCurrentView::base(&crate::managed_current_from_states(
                         current_states.clone(),
                     )),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &empty_registry,
                     wait_aliases: &[],
                     session,
@@ -10628,7 +10654,7 @@ fn resolve_data_source_refs_for_refresh_defers_read_chain_from_new_resource() {
                 DataSourceRefreshContext {
                     compositions: &[],
                     managed_current: ManagedCurrentView::base(&HashMap::new()),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &empty_registry,
                     wait_aliases: &[],
                     session,
@@ -10712,7 +10738,7 @@ fn resolve_data_source_refs_for_refresh_reads_existing_resource_even_when_replac
                     managed_current: ManagedCurrentView::base(&crate::managed_current_from_states(
                         current_states.clone(),
                     )),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &registry,
                     wait_aliases: &[],
                     session,
@@ -10771,7 +10797,7 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
                         DataSourceRefreshContext {
                             compositions: &[],
                             managed_current: ManagedCurrentView::base(&HashMap::new()),
-                            remote_bindings: &HashMap::new(),
+                            remote_bindings: &Default::default(),
                             schemas: &schemas,
                             wait_aliases: &[],
                             session,
@@ -11588,7 +11614,7 @@ fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     )
@@ -11644,7 +11670,7 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     )
@@ -11724,7 +11750,7 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     )
@@ -11863,7 +11889,7 @@ fn late_anonymous_reconciliation_composes_from_projected_source_to_new_hash() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     )
@@ -12009,7 +12035,7 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     )
@@ -12519,10 +12545,10 @@ let records = for (_, opt) in cert.domain_validation_options {{
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &state_file,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
         false,
         ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &claims,
         &targets,
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -12590,7 +12616,7 @@ let records = for (_, opt) in cert.domain_validation_options {{
         "deferred effects must follow state-block effects: {:#?}",
         plan.effects()
     );
-    (*plan).clone()
+    plan.as_plan().clone()
 }
 
 #[tokio::test]
@@ -12759,7 +12785,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &HashSet::new(),
             &HashSet::new(),
@@ -12808,7 +12834,7 @@ mod expand_same_config_deferred_for_tests {
         let out = futures::executor::block_on(prepared.expand_parsed(
             &mut parsed,
             &schemas,
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             DeferredForWarningPolicy::Suppress,
             &ProviderRouter::new(),
             &identity_context,
@@ -12900,11 +12926,19 @@ mod expand_same_config_deferred_for_tests {
                 panic!("test orphan unexpectedly has an unknown create outcome: {unknown:?}")
             }
         };
-        let orphan_owned = Orphans::from([carina_core::differ::Orphan::present(
-            present,
-            Some(absolute_binding("a")),
-            carina_core::resource::PersistedDirectives::default(),
-        )]);
+        let orphan_owned = Orphans::from(
+            [carina_core::differ::Orphan::present(
+                present,
+                Some(absolute_binding("a")),
+                carina_core::resource::PersistedDirectives::default(),
+            )]
+            .map(|orphan| {
+                (
+                    carina_core::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                    orphan,
+                )
+            }),
+        );
         let selected: Vec<&ResourceId> = refreshable
             .select(&resources, &orphan_owned)
             .map(|r| &r.id)
@@ -12948,7 +12982,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13030,7 +13064,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13091,7 +13125,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13137,7 +13171,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13192,7 +13226,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13259,7 +13293,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13428,7 +13462,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13548,7 +13582,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13583,7 +13617,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &moved_targets,
             &std::collections::HashSet::new(),
@@ -13676,7 +13710,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13705,7 +13739,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &moved_targets,
             &std::collections::HashSet::new(),
@@ -13812,7 +13846,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13849,7 +13883,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &already_refreshed,
@@ -13988,7 +14022,7 @@ mod kind_default_source_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &std::collections::HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -14147,8 +14181,8 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::Revision {
+            source: test_github_source(source),
             revision: revision.into(),
             resolved_sha: resolved_sha.clone(),
             artifact_id: test_artifact_id(42),
@@ -14225,8 +14259,8 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::Revision {
+            source: test_github_source(source),
             revision: revision.into(),
             resolved_sha,
             artifact_id: test_artifact_id(42),
@@ -14292,8 +14326,8 @@ async fn registry_source_reaches_cli_artifact_loader() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::Version {
+            source: test_registry_source(source),
             version: version.into(),
             constraint: None,
         },
@@ -14354,8 +14388,8 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::Version {
+            source: test_registry_source(source),
             version: version.into(),
             constraint: None,
         },
@@ -14425,7 +14459,6 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
     let installed = carina_provider_resolver::find_file_provider_source(
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         &config,
-        &mut |_| {},
     )
     .unwrap();
 
@@ -14461,8 +14494,8 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+            source: test_github_source(source),
             version: "1.0.0".parse().unwrap(),
             tag: serde_json::from_str("\"v1.0.0\"").unwrap(),
             asset_id: serde_json::from_str("42").unwrap(),
@@ -14619,8 +14652,8 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+            source: test_github_source(source),
             version: "1.0.0".parse().unwrap(),
             tag: serde_json::from_str("\"v1.0.0\"").unwrap(),
             asset_id: serde_json::from_str("42").unwrap(),
@@ -15357,7 +15390,7 @@ mod resolved_value_constraint_gate {
                 compositions: &[],
                 managed_current: &HashMap::new(),
                 data_source_values: &DataSourceValues::empty(),
-                remote_bindings: &HashMap::new(),
+                remote_bindings: &Default::default(),
                 wait_aliases: &[],
             },
         )
@@ -15536,7 +15569,7 @@ exports { team_prefix: String = "x" }"#,
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
             validated,
             &provider_configs,
-            &None,
+            &carina_state::ObservedStateFile::for_test(None),
             true,
             ProgressSink::Human,
             &remote_bindings,
@@ -15610,7 +15643,7 @@ exports { team_prefix: String = "x" }"#,
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -15621,10 +15654,10 @@ exports { team_prefix: String = "x" }"#,
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
             validated,
             &provider_configs,
-            &None,
+            &carina_state::ObservedStateFile::for_test(None),
             true,
             ProgressSink::Human,
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &StateBlockClaims::default(),
             &crate::test_support::empty_state_block_targets(),
             crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -16044,9 +16077,8 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                 );
                 let (create, cancellation) =
                     carina_core::executor::dispatch_create(&provider, prepared);
-                create.await.unwrap();
+                let identifier = create.await.unwrap().identifier().clone();
                 drop(cancellation);
-                let identifier = carina_core::provider::AppliedIdentifier::new("mock-id").unwrap();
                 let read_id = if explicit {
                     id.clone()
                 } else {
@@ -16176,7 +16208,7 @@ async fn round2_binding_stability_reuses_normalized_inputs() {
                     schemas: &schemas,
                     saved_attrs: &saved,
                     prev_explicit: &HashMap::new(),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     wait_aliases: &[],
                     provider: &provider,
                     reference_preparation:
@@ -16383,4 +16415,132 @@ fn schema_override_errors_choose_the_first_argument() {
             "provider schema override names undeclared default provider 'zulu'"
         );
     }
+}
+
+#[tokio::test]
+async fn plan_read_outcomes_retain_matching_sources_for_observation_output() {
+    use carina_core::parser::ProviderContext;
+    use carina_state::state::ResourceState;
+
+    let parsed = parse(
+        r#"
+provider test {}
+
+let shared = read test.shared.Type {}
+"#,
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .expect("parse managed-to-data-source fixture");
+    let data_source_id = parsed.data_sources[0].id.clone();
+    let identity = data_source_id
+        .identity()
+        .expect("let-bound data source identity is resolved")
+        .clone();
+    let mut prior_row = ResourceState::try_applied(
+        data_source_id.resource_type.clone(),
+        identity,
+        data_source_id.provider.clone(),
+        "managed-provider-id",
+    )
+    .expect("fixture identifier is non-empty");
+    prior_row.binding = Some(absolute_binding("shared"));
+    prior_row.set_persisted_attribute(
+        "managed_saved",
+        serde_json::json!("managed-write-only-value"),
+    );
+    let partial_read = carina_core::resource::PartialReadMarker::new(
+        carina_core::resource::PendingReRead::incomplete("managed read omitted an attribute"),
+        BTreeSet::from(["managed_missing".to_string()]),
+    )
+    .expect("fixture has a missing attribute");
+    prior_row = crate::fixture_resource_state_metadata(
+        prior_row,
+        Some(vec!["managed_saved".to_string()]),
+        Some(Some(partial_read.clone())),
+    );
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(prior_row)
+        .expect("test state row is unique");
+    let state_file = Some(state_file);
+    let provider_configs = resolved_provider_configs(&parsed);
+    let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(ManagedAndDataSourceFactory)],
+        provider_configs.as_provider_configs(),
+    );
+    let ctx = wiring.context();
+    let canonical_resources = canonical_pair(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        ctx.schemas(),
+    );
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+
+    let plan_context = create_plan_from_parsed_with_upstream_with_ctx(
+        validated,
+        &provider_configs,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
+        true,
+        ProgressSink::Human,
+        &std::collections::BTreeMap::new(),
+        &StateBlockClaims::default(),
+        &crate::test_support::empty_state_block_targets(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
+    )
+    .await
+    .expect("managed orphan and same-id data source must coexist through planning");
+    let plan_context = plan_context.resources();
+
+    let read_ids = plan_context
+        .data_source_values
+        .read_states()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        read_ids.len(),
+        1,
+        "measurement reaches a real data-source read"
+    );
+    for id in read_ids {
+        assert!(
+            plan_context
+                .data_sources
+                .iter()
+                .any(|source| &source.id == id)
+        );
+        assert!(
+            plan_context
+                .data_source_values
+                .data_sources()
+                .iter()
+                .any(|source| &source.id == id)
+        );
+    }
+    eprintln!(
+        "S5 production plan: 1 read, 0 missing ctx.data_sources entries; total read/source pairing retained"
+    );
+}
+
+// Compatibility measurement: native reads do not establish the map-key invariant.
+#[tokio::test]
+async fn native_refresh_can_return_an_embedded_id_different_from_lookup_key() {
+    let provider = ReadWithRetryProvider::new(ReadBehavior::WrongIdentity);
+    let id = ResourceId::with_identity("test.Resource", "expected");
+    let loaded = crate::test_support::refresh_current(Current::from_state(
+        State::existing(id.clone(), HashMap::new()).with_identifier("expected-id"),
+    ));
+    let current = refresh_loaded_resource_with_retry(
+        &crate::provider_text_fixtures::boundary(Box::new(provider)),
+        loaded,
+        None,
+        &SchemaRegistry::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        current.id(),
+        &ResourceId::with_identity("test.Resource", "unexpected")
+    );
+    assert_ne!(current.id(), &id);
 }

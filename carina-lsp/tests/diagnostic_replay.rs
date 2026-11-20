@@ -623,13 +623,13 @@ fn replay_fingerprint_observes_the_same_projected_artifact_as_factory_loading() 
         Some(artifacts.path().to_path_buf()),
     );
     let prober = replay::provider_prober(&manifest);
-    let before = prober(fixture.path(), &config).unwrap();
+    let before = prober(fixture.path(), &config);
     assert!(
         before.artifact.is_some(),
         "replay fingerprints must describe the selected artifact"
     );
     std::fs::write(artifact, b"replacement with different metadata").unwrap();
-    assert_ne!(before, prober(fixture.path(), &config).unwrap());
+    assert_ne!(before, prober(fixture.path(), &config));
 }
 
 #[test]

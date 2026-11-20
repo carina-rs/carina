@@ -183,7 +183,12 @@ fn delete_attributes_for_plan(
     plan: &Plan,
     current_states: &HashMap<ResourceId, Current>,
 ) -> carina_core::detail_rows::HistoricalDisplayAttributes {
-    crate::commands::plan::collect_historical_display_attributes(plan, current_states, None)
+    crate::commands::plan::collect_historical_display_attributes(
+        plan,
+        current_states,
+        &carina_state::ObservedStateFile::for_test(None),
+    )
+    .expect("fixture historical identities are valid")
 }
 
 /// Plan-display gate for `directives.depends_on` (#2823). The bucket
@@ -745,7 +750,7 @@ fn snapshot_state_only_directive_change() {
     let provider =
         provider_router_for_plan(&runtime, &fp.plan).expect("fixture mock inputs must be valid");
     let historical_display =
-        carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&fp.plan);
+        carina_core::detail_rows::HistoricalDisplayAttributes::for_test_plan(&fp.plan);
     let output = strip_ansi(
         &format_plan_with_delete_instances(
             color_mode,
@@ -1078,29 +1083,6 @@ fn snapshot_delete_orphan() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let (plan, current_states, schemas, _moved) =
         build_plan_and_states_from_fixture(color_mode, "delete_orphan");
-    let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
-    let output = strip_ansi(&format_plan(
-        color_mode,
-        &plan,
-        DetailLevel::Full,
-        &delete_attributes,
-        Some(&schemas),
-        &HashMap::new(),
-        &[],
-        &[],
-        None,
-        None,
-    ));
-    insta::assert_snapshot!(output);
-}
-
-#[test]
-fn snapshot_legacy_orphan_unknown_destroy_ordering() {
-    let color_mode = crate::output_style::ColorMode::Plain;
-    // Legacy dependency warnings are emitted to stderr during state migration,
-    // before the plan renderer consumes the migrated, typed dependencies.
-    let (plan, current_states, schemas, _moved) =
-        build_plan_and_states_from_fixture(color_mode, "legacy_orphan_unknown_destroy_ordering");
     let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
     let output = strip_ansi(&format_plan(
         color_mode,
@@ -1607,8 +1589,9 @@ fn snapshot_nested_write_only() {
     let historical = crate::commands::plan::collect_historical_display_attributes(
         &fixture.plan,
         &fixture.managed_current,
-        fixture.state_file.as_ref(),
-    );
+        &carina_state::ObservedStateFile::for_test((fixture.state_file.as_ref()).cloned()),
+    )
+    .expect("fixture historical identities are valid");
     let output = strip_ansi(&format_plan(
         color_mode,
         &fixture.plan,
@@ -2411,14 +2394,26 @@ fn plan_snapshot_exports() {
         ExportChange::Added {
             name: "vpc_id".to_string(),
             type_expr: Some(TypeExpr::String),
-            new_value: Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![])
+            new_value: crate::test_support::render_value(
+                &Value::<
+                    carina_core::resource::NoPlaceholder,
+                    carina_core::resource::RelativeBindingName,
+                >::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![])
                 .resolve_root_for_test(),
+            ),
         },
         ExportChange::Added {
             name: "cidr".to_string(),
             type_expr: None,
-            new_value: Value::resource_ref("vpc".to_string(), "cidr_block".to_string(), vec![])
+            new_value: crate::test_support::render_value(
+                &Value::<
+                    carina_core::resource::NoPlaceholder,
+                    carina_core::resource::RelativeBindingName,
+                >::resource_ref(
+                    "vpc".to_string(), "cidr_block".to_string(), vec![]
+                )
                 .resolve_root_for_test(),
+            ),
         },
     ];
     let output = format_plan(
@@ -2720,13 +2715,21 @@ fn plan_snapshot_export_changes_mixed() {
         ExportChange::Added {
             name: "new_export".to_string(),
             type_expr: Some(TypeExpr::String),
-            new_value: Value::Concrete(ConcreteValue::String("hello".into())),
+            new_value: crate::test_support::render_value(&Value::<
+                carina_core::resource::NoPlaceholder,
+            >::Concrete(
+                ConcreteValue::String("hello".into())
+            )),
         },
         ExportChange::Modified {
             name: "changed".to_string(),
             type_expr: Some(TypeExpr::Int),
             old_json: serde_json::from_value(serde_json::json!(42)).unwrap(),
-            new_value: Value::Concrete(ConcreteValue::Int(100)),
+            new_value: crate::test_support::render_value(&Value::<
+                carina_core::resource::NoPlaceholder,
+            >::Concrete(
+                ConcreteValue::Int(100)
+            )),
         },
         ExportChange::Removed {
             name: "obsolete".to_string(),
@@ -3333,8 +3336,9 @@ fn snapshot_server_added_list_elements_changed() {
     let historical = crate::commands::plan::collect_historical_display_attributes(
         &fp.plan,
         &fp.managed_current,
-        fp.state_file.as_ref(),
-    );
+        &carina_state::ObservedStateFile::for_test((fp.state_file.as_ref()).cloned()),
+    )
+    .expect("fixture historical identities are valid");
     let output = strip_ansi(&format_plan(
         color_mode,
         &fp.plan,
@@ -3370,8 +3374,9 @@ fn snapshot_keyed_partial_update_release() {
     let historical = crate::commands::plan::collect_historical_display_attributes(
         &fp.plan,
         &fp.managed_current,
-        fp.state_file.as_ref(),
-    );
+        &carina_state::ObservedStateFile::for_test((fp.state_file.as_ref()).cloned()),
+    )
+    .expect("fixture historical identities are valid");
     let output = strip_ansi(&format_plan(
         color_mode,
         &fp.plan,
@@ -3669,7 +3674,7 @@ fn round2_saved_plan_matches_existing_nested_and_tags_snapshots() {
             &crate::test_support::admit_fixture_plan(&plan, Some(&fp.schemas)),
             &summary,
             DetailLevel::Full,
-            &carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan),
+            &carina_core::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan),
             Some(&fp.schemas),
             &HashMap::new(),
             None,

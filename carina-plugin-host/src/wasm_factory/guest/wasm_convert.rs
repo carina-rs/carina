@@ -205,6 +205,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
             Ok(wit::Value::SecretVal(json_str))
         }
         CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        CoreValue::Reference(never) | CoreValue::Conversion(never) => match *never {},
     }
 }
 
@@ -583,6 +584,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
             inner.project_plaintext_json_for_transport(core_value_to_json)
         }
         CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        CoreValue::Reference(never) | CoreValue::Conversion(never) => match *never {},
     }
 }
 
@@ -789,7 +791,7 @@ pub(crate) fn wit_to_core_value_map(
 // confinement-allow-return: Decoded structured persisted attributes; keys remain data inside confinement.
 pub(crate) fn wit_to_core_persisted_value_map(
     entries: &[(String, wit::PersistedValue)],
-) -> Result<HashMap<String, CoreSnapshotValue>, WasmValueDecodeError> {
+) -> Result<BTreeMap<String, CoreSnapshotValue>, WasmValueDecodeError> {
     entries
         .iter()
         .map(|(key, value)| {
@@ -4643,10 +4645,12 @@ mod tests {
                 if key == "token" && value == &digest
         ));
 
-        let saved = carina_core::provider::RawSavedAttrs::from_decoded_values_for_test(
-            HashMap::from([(id.clone(), HashMap::from([("token".to_string(), redacted)]))]),
-        )
-        .lift(&carina_core::schema::SchemaRegistry::new());
+        let saved =
+            carina_core::provider::RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+                id.clone(),
+                BTreeMap::from([("token".to_string(), redacted)]),
+            )]))
+            .lift(&carina_core::schema::SchemaRegistry::new());
         let wit_saved = core_saved_attrs_to_wit(saved.as_provider_saved_attrs(), &id)
             .expect("saved attributes must retain typed secret identity");
         assert!(matches!(
@@ -7453,6 +7457,9 @@ mod tests {
 
     #[test]
     fn protocol_json_reconstructs_every_core_builtin_validator_by_identity() {
+        #[allow(clippy::iter_over_hash_type)]
+        // Each registry entry is asserted independently; no product output
+        // or ordered result is constructed by this test traversal.
         for (kind, expected_identity) in carina_core::schema::builtin_validator_registry().keys() {
             let wire_type = match kind {
                 carina_core::schema::RefinedScalarKind::String => proto::AttributeType::String {

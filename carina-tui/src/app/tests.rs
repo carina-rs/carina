@@ -190,7 +190,7 @@ fn update_effect_has_detail_rows() {
                     Value::Concrete(ConcreteValue::String("Disabled".into())),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
             )
             .with_identifier("my-bucket-id"),
         ),
@@ -279,7 +279,7 @@ fn whole_value_list_uses_whole_value_detail_row() {
     );
     let (schemas, provider) =
         carina_core::provider::comparison_fixture_for_test(&schemas, std::iter::once(&id));
-    let historical_display = HistoricalDisplayAttributes::for_plan(&plan);
+    let historical_display = HistoricalDisplayAttributes::for_test_plan(&plan);
     let app = App::new(
         &plan.clone().admit(&schemas).unwrap(),
         &schemas,
@@ -838,7 +838,7 @@ fn move_suppressed_when_update_exists_for_same_target() {
                     Value::Concrete(ConcreteValue::String("Disabled".into())),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
             )
             .with_identifier("new-name-id"),
         ),

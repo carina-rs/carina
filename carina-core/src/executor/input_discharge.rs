@@ -1,4 +1,5 @@
 //! Linear preparation of exact provider requests and replacement delete permits.
+use std::collections::BTreeSet;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -456,9 +457,9 @@ pub(super) struct ExecutionInputChecks {
     run: Arc<()>,
     pub(super) checks: HashMap<usize, PendingInputObligation>,
     pub(super) paired: HashMap<usize, Vec<usize>>,
-    pub(super) absorbed: HashMap<usize, HashSet<usize>>,
+    pub(super) absorbed: HashMap<usize, BTreeSet<usize>>,
     cohorts: HashSet<usize>,
-    required_deletes: HashMap<usize, HashSet<usize>>,
+    required_deletes: HashMap<usize, BTreeSet<usize>>,
     receipts: HashMap<(usize, usize), DeleteDischargeReceipt>,
     consumed: HashSet<usize>,
     delete_targets: HashMap<usize, DeleteTarget>,
@@ -575,7 +576,7 @@ impl ExecutionInputChecks {
                 }
                 if result
                     .required_deletes
-                    .insert(delete_idx, HashSet::from([write]))
+                    .insert(delete_idx, BTreeSet::from([write]))
                     .is_some()
                 {
                     return Err(InputCheckConstructionError::DuplicateDelete { index: delete_idx });
@@ -749,6 +750,157 @@ mod tests {
     use crate::input_rules::FinalizedPlan;
     use crate::plan::Plan;
     use crate::resource::Value;
+
+    // Dispatch compatibility contract; output promotion must not alter rule evidence.
+    #[test]
+    fn dispatch_rule_input_keeps_kind_divergent_ignored_payload_plain() {
+        use crate::resource::{ConcreteValue, ResolvedResource, Resource};
+        use crate::schema::{
+            AttributeSchema, AttributeType, InputPath, InputPredicate, InputRule, InputRuleCode,
+            InputRuleScope, ResourceSchema, StructField,
+        };
+        let text = |s: &str| Value::Concrete(ConcreteValue::String(s.into()));
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            ResourceSchema::new("Sink")
+                .attribute(
+                    AttributeSchema::required(
+                        "config",
+                        AttributeType::struct_(
+                            "Config",
+                            vec![
+                                StructField::required("revision", AttributeType::int()).build(),
+                                StructField::required(
+                                    "payload",
+                                    AttributeType::union(vec![
+                                        AttributeType::map(AttributeType::string()),
+                                        AttributeType::list(AttributeType::string()),
+                                    ]),
+                                )
+                                .build(),
+                            ],
+                        ),
+                    )
+                    .build(),
+                )
+                .input_rule(InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("config.payload").unwrap(),
+                    InputRuleCode::new("payload.present").unwrap(),
+                    InputPredicate::Present,
+                ))
+                .validate()
+                .unwrap(),
+        );
+        let mut resource = Resource::with_provider("test", "Sink", "item", None).with_attribute(
+            "config",
+            Value::Concrete(ConcreteValue::Map(
+                [
+                    ("revision".into(), Value::Concrete(ConcreteValue::Int(2))),
+                    (
+                        "payload".into(),
+                        Value::Concrete(ConcreteValue::Map(
+                            [("original".into(), text("authored").into_secret())]
+                                .into_iter()
+                                .collect(),
+                        )),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        );
+        resource.directives.ignore_changes = vec![crate::resource::ParsedIgnorePath::new(vec![
+            crate::resource::ParsedIgnorePathSegment::Attribute("config".into()),
+            crate::resource::ParsedIgnorePathSegment::Attribute("payload".into()),
+        ])];
+        let from = SnapshotState::existing(
+            resource.id.clone(),
+            crate::test_support::snapshot_attributes::<crate::resource::NoPlaceholder>(
+                HashMap::from([(
+                    "config".into(),
+                    Value::Concrete(ConcreteValue::Map(
+                        [
+                            ("revision".into(), Value::Concrete(ConcreteValue::Int(1))),
+                            (
+                                "payload".into(),
+                                Value::Concrete(ConcreteValue::List(vec![text("x")])),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )),
+                )]),
+            ),
+        )
+        .with_identifier("item-id");
+        let desired = ResolvedResource::resolve_raw_fixture(resource.clone(), &schemas).unwrap();
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            from: Box::new(from.clone()),
+            to: desired,
+            identifier: AppliedIdentifier::new("item-id").unwrap(),
+            changed_attributes: vec!["config".into()],
+        });
+        let checked = FinalizedPlan::new(plan)
+            .check_inputs(&schemas, &HashMap::new())
+            .unwrap();
+        let admission = checked.execution_input_checks().remove(0);
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        let gate = super::super::ModuleConstraintGate::from_live_compositions(&[]);
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |types| {
+                let context = ProviderPreparationContext::for_test(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &schemas,
+                    types,
+                );
+                let ready = futures::executor::block_on(
+                    super::super::provider_ready::prepare_provider_ready_resource(
+                        resource, &context,
+                    ),
+                )
+                .unwrap();
+                let request =
+                    UpdateRequest::checked(from, &["config".into()], &ready, &context).unwrap();
+                let input = crate::input_rules::RuleInput::for_dispatch_update(
+                    request.protected_input(),
+                    &admission.schema,
+                );
+                let site = executor_write_site(&DischargeToken(()), &admission, input, &schemas)
+                    .unwrap()
+                    .unwrap();
+                let evaluation = site.evaluate();
+                eprintln!(
+                    "S2 dispatch findings={:?}; pending={:?}",
+                    evaluation.findings(),
+                    evaluation.pending()
+                );
+                let config = request.protected_input().patch().ops[0]
+                    .sent_value()
+                    .unwrap();
+                let Value::Concrete(ConcreteValue::Map(config)) = config else {
+                    panic!("config map")
+                };
+                assert_eq!(
+                    config["payload"],
+                    Value::Concrete(ConcreteValue::List(vec![text("x")])),
+                    "rule evidence keeps the legacy ordinary divergent subtree"
+                );
+                assert!(evaluation.findings().is_empty());
+                assert_eq!(
+                    evaluation.pending().len(),
+                    1,
+                    "the ignored Present target remains pending"
+                );
+            },
+        );
+    }
 
     #[test]
     fn secret_predicate_dispatch_rechecks_pending_values_on_the_protected_tree() {
@@ -1234,7 +1386,7 @@ mod tests {
             id: resource.resolved_id(),
             identifier: AppliedIdentifier::new("old").unwrap(),
             generation: EffectGeneration::Current,
-            previous_attributes: HashMap::new(),
+            previous_attributes: std::collections::BTreeMap::new(),
             directives: Default::default(),
             binding: None,
             dependencies: Default::default(),
@@ -1395,7 +1547,7 @@ mod tests {
                                     .attributes
                                     .clone()
                                     .into_iter()
-                                    .collect();
+                                    .collect::<std::collections::BTreeMap<_, _>>();
                                 let writeback = SecretPreservingAttributes::from_provider_values(
                                     &attributes,
                                     &attributes,
@@ -1447,7 +1599,7 @@ mod tests {
         // effect slot even if their resource and generation were identical.
         checks
             .required_deletes
-            .extend([(1, HashSet::from([0])), (2, HashSet::from([3]))]);
+            .extend([(1, BTreeSet::from([0])), (2, BTreeSet::from([3]))]);
         let target = DeleteTarget {
             id: ResourceId::with_identity("test", "same-instance"),
             identifier: AppliedIdentifier::new("old-id").unwrap(),
@@ -1480,7 +1632,7 @@ mod tests {
         let cohort = first.take_write(0).unwrap();
         let permit = cohort.cohort_receipts::<CreateRequest>(&[]).pop().unwrap();
         let mut second = ExecutionInputChecks::new(Vec::new(), &effects, &[]).unwrap();
-        second.required_deletes.insert(1, HashSet::from([0]));
+        second.required_deletes.insert(1, BTreeSet::from([0]));
         // Deliberately corrupt the private store to exercise its final check.
         second.receipts.insert((1, 0), permit);
         let ready = super::super::scheduler::ReadyDelete::for_test(DeletedInstanceKey::new(

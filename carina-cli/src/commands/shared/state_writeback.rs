@@ -720,7 +720,7 @@ pub(crate) fn resolve_export_values_post_apply<D>(
                         compositions: &[],
                         managed_current: &plan_input_current,
                         data_source_values: input.post_apply_states.data_source_values(),
-                        remote_bindings: &HashMap::new(),
+                        remote_bindings: &Default::default(),
                         wait_aliases: input.wait_aliases,
                     },
                 );
@@ -2131,23 +2131,26 @@ mod post_apply_states_tests {
 
         // state.resources carries the POST-apply value — this must win.
         let json = serde_json::json!({
-            "version": 5,
+            "version": 21,
+            "exports_version": 1,
             "serial": 1,
             "lineage": "test",
             "carina_version": "0.4.0",
             "resources": [
                 {
                     "resource_type": "s3.Bucket",
-                    "name": "log",
-                    "identifier": "log-bucket",
+                    "identity": "log",
                     "provider": "awscc",
-                    "attributes": { "versioning": "Enabled" }
+                    "current": {
+                        "kind": "applied",
+                        "identifier": "log-bucket",
+                        "attributes": { "versioning": "Enabled" },
+                        "nested_write_only": {}
+                    }
                 }
             ]
         });
-        let state = carina_state::check_and_migrate(&json.to_string())
-            .unwrap()
-            .into_state();
+        let state = carina_state::load_state(&json.to_string()).unwrap();
 
         let managed_current = crate::managed_current_from_states(managed_states);
         let post = PostApplyStates::from_current_and_state(
@@ -5099,9 +5102,7 @@ mod apply_state_save_tests {
 
         assert_aligned(&state);
         let serialized = serde_json::to_string(&state).expect("serialize state");
-        let round_tripped = carina_state::check_and_migrate(&serialized)
-            .expect("deserialize state")
-            .into_state();
+        let round_tripped = carina_state::load_state(&serialized).expect("deserialize state");
         assert_aligned(&round_tripped);
 
         let listener_current = round_tripped.build_state_for_resource(&id);

@@ -430,37 +430,19 @@ fn create_state_for_writeback(outcome: CreateOutcome) -> SnapshotState {
     complete_create_for_writeback(outcome, request).0
 }
 
-fn lifted_saved_attrs(
-    entries: impl IntoIterator<Item = (ResourceId, HashMap<String, SnapshotValue>)>,
-) -> carina_core::provider::LiftedSavedAttrs {
-    RawSavedAttrs::from_decoded_values_for_test(entries.into_iter().collect())
-        .lift(&carina_core::schema::SchemaRegistry::new())
-}
-
-fn migrate_legacy_state_attribute(
-    value: serde_json::Value,
-    display_type: &str,
-    identity: &str,
-    key: &str,
-) -> serde_json::Value {
-    let mut attributes = serde_json::Map::new();
-    attributes.insert(key.to_string(), value);
-    let mut document = serde_json::json!({
-        "version": 13,
-        "resources": [{
-            "provider": "",
-            "resource_type": display_type,
-            "identity": identity,
-            "attributes": attributes,
-            "deposed": [],
-        }],
-    });
-    carina_core::resource::legacy_secret_migration::migrate_state_document_v13(&mut document)
-        .expect("migrate legacy test state document");
-    document["resources"][0]["attributes"]
-        .as_object_mut()
-        .and_then(|attributes| attributes.remove(key))
-        .expect("migrated test document must retain its attribute")
+fn lifted_saved_attrs<M>(
+    entries: impl IntoIterator<Item = (ResourceId, M)>,
+) -> carina_core::provider::LiftedSavedAttrs
+where
+    M: IntoIterator<Item = (String, SnapshotValue)>,
+{
+    RawSavedAttrs::from_decoded_values_for_test(
+        entries
+            .into_iter()
+            .map(|(id, attributes)| (id, attributes.into_iter().collect()))
+            .collect(),
+    )
+    .lift(&carina_core::schema::SchemaRegistry::new())
 }
 
 fn redacted_secret_and_legacy_marker(plaintext: &str) -> (SnapshotValue, String) {
@@ -978,11 +960,9 @@ fn explicit_test_egress(
         "version = 5\n\n[[provider]]\nname = \"ignored-consent-name\"\nsource = {source:?}\nmode = \"file\"\nsha256 = {sha256:?}\n\n[provider.egress]\nconsent = \"explicit\"\nhosts = [\n{hosts}\n]\n"
     );
     std::fs::write(lock_dir.join("carina-providers.lock"), lock).expect("write test egress lock");
-    let (lock, _migration) =
-        LockFile::load(&carina_core::paths::ResolvedPath::new(lock_dir).unwrap())
-            .expect("load test egress lock")
-            .expect("test egress lock exists")
-            .into_parts();
+    let lock = LockFile::load(&carina_core::paths::ResolvedPath::new(lock_dir).unwrap())
+        .expect("load test egress lock")
+        .expect("test egress lock exists");
     let locked = lock
         .locked_egress(
             &declaration,
@@ -1370,9 +1350,8 @@ fn persisted_create_for_resume(
     let mut document =
         serde_json::to_value(carina_state::StateFile::new()).expect("fixture state serializes");
     document["resources"] = serde_json::json!([row]);
-    let loaded = carina_state::state::check_and_migrate(&document.to_string())
-        .expect("v15 fixture passes the public state loader")
-        .into_state();
+    let loaded = carina_state::state::load_state(&document.to_string())
+        .expect("current fixture passes the public state loader");
     match loaded.build_state_for_resource(id) {
         carina_core::resource::Current::CreateInFlight(pending) => pending,
         carina_core::resource::Current::Absent(state) => {
@@ -1419,7 +1398,7 @@ fn resolved_provider_config(
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
-                &HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },
@@ -6695,15 +6674,12 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
     Argon2::default()
         .hash_password_into(&material, salt, &mut output)
         .expect("hash legacy write-only fixture");
-    let encoded = migrate_legacy_state_attribute(
-        serde_json::json!(format!("_secret:argon2:{}", hex::encode(output))),
-        "mock.test.resource",
-        "legacy-write-only",
-        "__mock_write_only_secret__",
-    );
+    let encoded = serde_json::json!({"$secret": format!(
+        "argon2-legacy:{}:{}", hex::encode(salt), hex::encode(output)
+    )});
     let persisted: PersistedValue =
-        serde_json::from_value(encoded).expect("migration emits valid persisted JSON");
-    let typed = persisted.decode().expect("migration emits a typed secret");
+        serde_json::from_value(encoded).expect("fixture contains valid persisted JSON");
+    let typed = persisted.decode().expect("fixture contains a typed secret");
     let saved_attrs = lifted_saved_attrs([(
         id.clone(),
         HashMap::from([("__mock_write_only_secret__".to_string(), typed)]),

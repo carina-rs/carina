@@ -1,4 +1,7 @@
 use std::fs;
+#[path = "support/mock_state.rs"]
+mod mock_state;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -84,11 +87,11 @@ provider mock {}
         .expect("write injected state");
 
         let mut provider_state = read_json(&self.mock_state);
-        let seed = provider_state["states"]["test.resource.seed"].clone();
+        let seed = provider_state["states"][&mock_state::identifier(&self.project, "seed")].clone();
         provider_state["states"]
             .as_object_mut()
             .expect("mock states object")
-            .insert("example.gone.g".to_string(), seed);
+            .insert("gone-id".to_string(), seed);
         fs::write(
             &self.mock_state,
             serde_json::to_vec_pretty(&provider_state).expect("encode mock state"),
@@ -127,12 +130,13 @@ provider mock {}
         .expect("write retired-provider state");
     }
 
-    fn remove_mock_provider_resource(&self, key: &str) {
+    fn remove_mock_provider_resource(&self, identity: &str) {
         let mut provider_state = read_json(&self.mock_state);
+        let key = mock_state::identifier(&self.project, identity);
         let removed = provider_state["states"]
             .as_object_mut()
             .expect("mock states object")
-            .remove(key);
+            .remove(&key);
         assert!(removed.is_some(), "mock provider state has no {key}");
         fs::write(
             &self.mock_state,
@@ -231,7 +235,7 @@ fn removed_block_for_removed_provider_type_round_trips_through_saved_plan() {
     assert_eq!(scenario.state_resource_types(), vec!["test.resource"]);
     let provider_state = read_json(&scenario.mock_state);
     assert!(
-        provider_state["states"].get("example.gone.g").is_some(),
+        provider_state["states"].get("gone-id").is_some(),
         "removed must leave provider state untouched"
     );
 }
@@ -318,7 +322,7 @@ let t = mock.example.thing {}
         r#"let a = mock.test.resource { name = "a" }
 "#,
     );
-    scenario.remove_mock_provider_resource("example.thing.t");
+    scenario.remove_mock_provider_resource("t");
 
     let plan = scenario.plan();
     assert_success("no-op plan --out", &plan);

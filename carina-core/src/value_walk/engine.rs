@@ -303,6 +303,12 @@ macro_rules! dispatch_variants {
                 }
             ),
             Value::Deferred(DeferredValue::Access(access)) => expr!(Access, Parts::Access(access)),
+            Value::Reference(never) => {
+                match *<$p as ValueKind>::no_reference_payload::<$b>(&never) {}
+            }
+            Value::Conversion(never) => {
+                match *<$p as ValueKind>::no_conversion_payload::<$b>(&never) {}
+            }
         }
     }};
 }

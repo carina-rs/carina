@@ -1,3 +1,6 @@
+#[path = "support/creation.rs"]
+mod creation;
+
 use carina_core::resource::{ConcreteValue, DeferredValue, SnapshotValue, Value};
 
 fn root_resource_ref(
@@ -138,9 +141,7 @@ fn snapshot_saved_plan_root_and_nested_hash_round_trip() {
         plan.add(Effect::Create(ResolvedResource::new(
             resource.into_value_snapshot(),
         )));
-        let saved: SavedPlan = carina_core::value::redact_secrets_in_plan(&plan)
-            .unwrap()
-            .into();
+        let saved: SavedPlan = creation::recorded_snapshot(&plan).into();
         let bytes = serde_json::to_vec(&saved).unwrap();
         let decoded = serde_json::from_slice::<UnresolvedSavedPlan>(&bytes)
             .unwrap()
@@ -207,7 +208,7 @@ fn historical_bindings() -> carina_core::binding_index::ResolvedBindings {
         compositions: &[],
         managed_current: &current,
         data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     })
 }

@@ -1,6 +1,8 @@
 //! Admission of persisted exports to the source's consumer-visible contract.
 
 use crate::value::{PersistedExportValue, PersistedValueDecodeError};
+use std::collections::BTreeMap;
+#[cfg(any(test, feature = "test-utils"))]
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -12,7 +14,7 @@ use crate::validation::typecheck::{TypeExprValueError, TypecheckProviderContext}
 
 /// Loaded upstream snapshots. An absent binding remains unknown; an admitted
 /// empty snapshot establishes that all its exports are absent.
-pub type AdmittedRemoteBindings = HashMap<String, AdmittedUpstreamExports>;
+pub type AdmittedRemoteBindings = BTreeMap<String, AdmittedUpstreamExports>;
 
 /// A policy-classified export snapshot accepted by binding installation.
 ///
@@ -29,9 +31,9 @@ pub type AdmittedRemoteBindings = HashMap<String, AdmittedUpstreamExports>;
 /// ```
 ///
 /// ```compile_fail,E0308
-/// use std::collections::HashMap;
+/// use std::collections::BTreeMap;
 /// use carina_core::{binding_index::IterableBindings, resource::Value};
-/// fn install(raw: HashMap<String, HashMap<String, Value>>) {
+/// fn install(raw: BTreeMap<String, BTreeMap<String, Value>>) {
 ///     let _ = IterableBindings::from_upstream_only(raw);
 /// }
 /// ```
@@ -65,7 +67,7 @@ pub type AdmittedRemoteBindings = HashMap<String, AdmittedUpstreamExports>;
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdmittedUpstreamExports {
-    values: Arc<HashMap<String, Value>>,
+    values: Arc<BTreeMap<String, Value>>,
 }
 
 #[derive(Debug)]
@@ -111,7 +113,7 @@ impl ResolvedUpstreamSource {
     /// without source-type checking. Consumers still check the actual values.
     pub fn admit_snapshot(
         &self,
-        values: HashMap<String, Value>,
+        values: impl IntoIterator<Item = (String, Value)>,
         context: &dyn ProviderTypeCheckContext,
     ) -> Result<AdmittedUpstreamExports, UpstreamExportAdmissionError> {
         AdmittedUpstreamExports::admit_supplied(
@@ -148,8 +150,9 @@ impl AdmittedUpstreamExports {
         decode: impl Fn(S) -> Result<Option<Value>, PersistedValueDecodeError>,
         context: &dyn ProviderTypeCheckContext,
     ) -> Result<Self, UpstreamExportAdmissionError> {
-        let mut admitted = HashMap::new();
-        for (key, supplied) in values {
+        let supplied: BTreeMap<_, _> = values.into_iter().collect();
+        let mut admitted = BTreeMap::new();
+        for (key, supplied) in supplied {
             let declaration = match &surface.entries {
                 Some(entries) => match entries.get(&key) {
                     Some(declaration) => Some(declaration),
@@ -199,7 +202,7 @@ impl AdmittedUpstreamExports {
 }
 
 impl Deref for AdmittedUpstreamExports {
-    type Target = HashMap<String, Value>;
+    type Target = BTreeMap<String, Value>;
 
     fn deref(&self) -> &Self::Target {
         &self.values
@@ -233,6 +236,41 @@ mod tests {
     use super::*;
     use crate::parser::{ProviderContext, ResourceTypePath, TypeExpr};
     use crate::resource::ConcreteValue;
+
+    #[test]
+    fn issue_4491_admitted_upstream_keys_are_alphabetical_at_both_levels() {
+        let expected = ["alpha", "beta", "theta", "zeta"];
+        for _ in 0..8 {
+            let bindings = remote_bindings_for_test(
+                expected
+                    .iter()
+                    .rev()
+                    .map(|binding| {
+                        (
+                            (*binding).to_owned(),
+                            expected
+                                .iter()
+                                .rev()
+                                .map(|key| {
+                                    ((*key).to_owned(), Value::Concrete(ConcreteValue::Int(1)))
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            );
+            assert_eq!(
+                bindings.keys().map(String::as_str).collect::<Vec<_>>(),
+                expected
+            );
+            for values in bindings.values() {
+                assert_eq!(
+                    values.keys().map(String::as_str).collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+    }
 
     #[test]
     fn round1_2_admission_never_displays_upstream_scalar_contents() {

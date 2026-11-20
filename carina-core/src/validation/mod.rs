@@ -853,7 +853,6 @@ impl std::error::Error for BindingUseReport {}
 #[derive(Debug)]
 pub struct ResolvedFile<E> {
     inner: crate::parser::ExpandedFile<E>,
-    secrecy: Option<crate::secrecy::ValidatedSecrecyGraph>,
 }
 
 impl<E> ResolvedFile<E> {
@@ -865,16 +864,16 @@ impl<E> ResolvedFile<E> {
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn for_test(inner: crate::parser::ExpandedFile<E>) -> Self {
-        Self {
-            inner,
-            secrecy: None,
-        }
+        Self { inner }
     }
 
     pub fn validated_secrecy(
         &self,
     ) -> Result<&crate::secrecy::ValidatedSecrecyGraph, crate::secrecy::PendingSecrecy> {
-        self.secrecy.as_ref().ok_or(crate::secrecy::PendingSecrecy)
+        self.inner
+            .authored_inputs()
+            .map_err(|_| crate::secrecy::PendingSecrecy)?
+            .validated_secrecy()
     }
 
     pub fn as_file(&self) -> &crate::parser::ExpandedFile<E> {
@@ -902,6 +901,8 @@ pub enum ResolveFileError {
     Expression(Box<crate::parser::Located<inference::InferenceError>>),
     #[error(transparent)]
     Secrecy(Box<crate::secrecy::Finding>),
+    #[error(transparent)]
+    TemplateSecrecy(#[from] crate::secrecy::TemplateAdmissionError),
     #[error(transparent)]
     ResourceDirective(Box<crate::parser::Located<ResourceDirectiveFinding>>),
     #[error(transparent)]
@@ -1097,6 +1098,9 @@ fn binding_value_assignable_to_enum<B: BindingAddress>(
             target.ancestry,
         )
         .map_err(BindingResolutionError::Type),
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -1411,6 +1415,9 @@ fn deferred_value_mismatch<B: BindingAddress>(
             | crate::resource::ConcreteValue::StringList(_)
             | crate::resource::ConcreteValue::Map(_),
         ) => None,
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -2451,12 +2458,16 @@ fn finish_binding_resolution<E: crate::parser::IntoExpandedExportParam<AbsoluteB
     let schemas = judged.schemas();
     let file = judged.into_file();
     let mut inner = file.into_expanded(schemas, provider_context)?;
-    if let Some(graph) = &secrecy
-        && let Some(inputs) = &inner.authored_inputs
+    if let Some(graph) = secrecy
+        && let Some(inputs) = inner.authored_inputs.clone()
     {
-        inner.attach_authored_inputs(inputs.with_validated_secrecy(graph.clone()));
+        for template in inner.deferred_for_expressions_mut().iter_mut() {
+            let evidence = graph.template_evidence(template)?;
+            template.attach_template_evidence(evidence);
+        }
+        inner.attach_authored_inputs(inputs.with_validated_secrecy(graph));
     }
-    Ok(ResolvedFile { inner, secrecy })
+    Ok(ResolvedFile { inner })
 }
 
 fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
@@ -2637,6 +2648,12 @@ fn visit_refs_with_sink_inner<'a, P: PlaceholderKind, B: BindingAddress>(
         | GenericValue::Concrete(crate::resource::ConcreteValue::Duration(_))
         | GenericValue::Concrete(crate::resource::ConcreteValue::StringList(_))
         | GenericValue::Deferred(crate::resource::DeferredValue::Unknown(_)) => {}
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 
@@ -3026,6 +3043,9 @@ fn visit_computed_accesses_with_sink<'a, B: BindingAddress, E: InsideSecret>(
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => {}
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
     findings
 }
@@ -3214,8 +3234,7 @@ fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
             });
         }
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::DirectoryConstraint(_)
-            | inference::InferenceError::InsideSecret { .. }
+            error @ (inference::InferenceError::InsideSecret { .. }
             | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::InvalidIntegerArithmeticOperand { .. }
             | inference::InferenceError::HeterogeneousCollection { .. }
@@ -3397,6 +3416,9 @@ fn prove_integer_operand<B: BindingAddress>(
             | crate::resource::DeferredValue::Access(_)
             | crate::resource::DeferredValue::Unknown(_),
         ) => None,
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     };
 
     if let Some(RefType::Typed(source)) = reference_type {
@@ -4875,6 +4897,8 @@ mod user_function_refs {
             })
             | crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(_))
             | crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(_)) => {}
+            crate::resource::Value::Reference(never)
+            | crate::resource::Value::Conversion(never) => match *never {},
         }
     }
 }
@@ -6596,8 +6620,7 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
     let inferred = match deferred_iterable_shape_for_phase(&judged) {
         Ok(inferred) => Some(inferred),
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::DirectoryConstraint(_)
-            | inference::InferenceError::InsideSecret { .. }
+            error @ (inference::InferenceError::InsideSecret { .. }
             | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::MissingEvidence(_)
             | inference::InferenceError::IncompatibleCoalesceTypes { .. }
@@ -7381,6 +7404,16 @@ fn is_string_compatible_type_on_path<'a>(
     }
 }
 
+const ARGUMENTS_IN_ROOT_MESSAGE: &str =
+    "arguments blocks are only valid inside module definitions, not in root configurations.";
+
+fn arguments_block_is_misplaced(
+    block: &crate::parser::ConfigurationBlock,
+    is_root_configuration: bool,
+) -> bool {
+    *block == crate::parser::ConfigurationBlock::Arguments && is_root_configuration
+}
+
 /// Check that a root configuration does not contain `arguments` blocks.
 ///
 /// `arguments` is a module-input declaration: it belongs on the module side
@@ -7393,14 +7426,25 @@ fn is_string_compatible_type_on_path<'a>(
 /// the user is validating in isolation. We only flag the misplaced block
 /// when a `backend` or `provider` block is also present, since both are
 /// root-only constructs and unambiguously identify a root configuration.
-pub fn validate_no_arguments_in_root<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
-    let is_root = parsed.backend.is_some() || !parsed.providers.is_empty();
-    if !parsed.arguments.is_empty() && is_root {
-        return Err(
-            "arguments blocks are only valid inside module definitions, not in root configurations.".to_string(),
-        );
+pub fn validate_no_arguments_in_root<
+    P: crate::resource::PlaceholderKind,
+    T: crate::resource::PlaceholderKind,
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+    E,
+>(
+    tree: &crate::parser::AnalysisTree<'_, P, T, D, B, E>,
+) -> Result<(), String> {
+    if tree
+        .syntax()
+        .configuration_blocks()
+        .iter()
+        .any(|block| arguments_block_is_misplaced(block.detail(), tree.is_root_configuration()))
+    {
+        Err(ARGUMENTS_IN_ROOT_MESSAGE.to_string())
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 fn unknown_type_resolution_error(
@@ -8354,13 +8398,14 @@ pub fn configuration_placement_diagnostics<
     T: crate::resource::PlaceholderKind,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+    E,
 >(
-    tree: &crate::parser::AnalysisTree<'_, P, T, D, B>,
+    tree: &crate::parser::AnalysisTree<'_, P, T, D, B, E>,
 ) -> Vec<crate::parser::Located<&'static str>> {
     use crate::parser::ConfigurationBlock;
     tree.syntax().configuration_blocks().iter().filter_map(|block| {
         let message = match block.detail() {
-            ConfigurationBlock::Arguments if tree.is_root_configuration() => "arguments blocks are only valid inside module definitions, not in root configurations.",
+            kind if arguments_block_is_misplaced(kind, tree.is_root_configuration()) => ARGUMENTS_IN_ROOT_MESSAGE,
             ConfigurationBlock::Provider if tree.is_module_definition() => "provider blocks are not allowed inside modules. Define providers at the root configuration level.",
             ConfigurationBlock::State if tree.is_module_definition() => "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
             ConfigurationBlock::Backend if tree.is_module_definition() => "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
@@ -8592,7 +8637,7 @@ pub enum ModuleCallFindingMessage {
     ReferenceType(Box<ModuleCallReferenceDiagnostic>),
     TypeResolution(Box<crate::parser::Located<TypeResolutionDiagnostic>>),
     AttributeReference(Box<CompositionAttributeRefError>),
-    Constraint(crate::module_resolver::ConstraintDiagnostic),
+    Constraint(Box<crate::module_resolver::ModuleConstraintDiagnostic>),
 }
 
 impl ModuleCallFindingMessage {
@@ -8994,12 +9039,7 @@ impl ModuleCallFinding {
                     ModuleCallFindingMessage::ReferenceType(error) => call
                         .argument_value_location(&error.identity.argument)
                         .unwrap_or_else(|| call.declaration_location()),
-                    ModuleCallFindingMessage::Constraint(
-                        crate::module_resolver::ConstraintDiagnostic::Directory(_),
-                    ) => unreachable!("directory findings have authored anchors"),
-                    ModuleCallFindingMessage::Constraint(
-                        crate::module_resolver::ConstraintDiagnostic::ModuleCall(diagnostic),
-                    ) => match &diagnostic.kind {
+                    ModuleCallFindingMessage::Constraint(diagnostic) => match &diagnostic.kind {
                         crate::module_resolver::ModuleConstraintKind::ArgumentValidation {
                             argument,
                         } => call
@@ -10181,30 +10221,6 @@ impl ModuleCallChecker<'_> {
         compositions: &[crate::resource::LiveComposition<P>],
     ) {
         for report in reports {
-            let report = match report {
-                crate::module_resolver::ConstraintScopeReport::Directory(failures) => {
-                    for failure in failures {
-                        let anchor = ModuleCallFindingAnchor::new(failure.location().clone());
-                        let owner = ModuleCallFindingOwnerSource::Authored(anchor.clone());
-                        self.push_finding(ModuleCallFinding {
-                            kind: ModuleCallFindingKind::Constraint,
-                            owners: vec![ModuleCallFindingOwner {
-                                root: owner.clone(),
-                                immediate: owner,
-                            }],
-                            anchor,
-                            message: ModuleCallFindingMessage::Constraint(
-                                crate::module_resolver::ConstraintDiagnostic::Directory(
-                                    failure.detail().clone(),
-                                ),
-                            ),
-                            identity: None,
-                        });
-                    }
-                    continue;
-                }
-                crate::module_resolver::ConstraintScopeReport::ModuleCall(report) => report,
-            };
             for outcome in &report.outcomes {
                 let crate::module_resolver::ResolvedModuleConstraintStatus::Failed {
                     diagnostic,
@@ -10246,11 +10262,7 @@ impl ModuleCallChecker<'_> {
                     });
                 }
                 for owner in owners {
-                    let message = ModuleCallFindingMessage::Constraint(
-                        crate::module_resolver::ConstraintDiagnostic::ModuleCall(
-                            diagnostic.clone(),
-                        ),
-                    );
+                    let message = ModuleCallFindingMessage::Constraint(diagnostic.clone());
                     match authored_argument {
                         true => self.push_finding(ModuleCallFinding::argument_value(
                             ModuleCallFindingKind::Constraint,
@@ -10371,6 +10383,9 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
         )) => {
             module_call_value_is_context_free(expression.lhs())
                 && module_call_value_is_context_free(expression.rhs())
+        }
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
         }
     }
 }
@@ -10584,6 +10599,16 @@ impl<P> ExportsCheckedPreApply<P> {
 
     pub fn is_empty(&self) -> bool {
         self.original_params.is_empty()
+    }
+}
+
+impl ExportsCheckedPreApply<crate::parser::ExpandedInferredExportParam> {
+    pub fn rendered_display_values(
+        &self,
+    ) -> impl Iterator<Item = Option<crate::value::RenderedValue>> + '_ {
+        self.display_params
+            .iter()
+            .map(|param| param.value.as_ref().map(crate::value::render_value))
     }
 }
 
@@ -10955,6 +10980,16 @@ fn attribute_value_findings_from<S: ExportSource, P: PlaceholderKind, B: Binding
                                 None,
                             ));
                             continue;
+                        }
+                        crate::resource::Value::Reference(never) => {
+                            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(
+                                never,
+                            ) {}
+                        }
+                        crate::resource::Value::Conversion(never) => {
+                            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(
+                                never,
+                            ) {}
                         }
                     }
                 }

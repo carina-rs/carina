@@ -177,7 +177,12 @@ pub struct ResolvedReadBackend {
 }
 
 impl ResolvedReadBackend {
-    pub async fn read_state(&self) -> BackendResult<Option<crate::LoadedState>> {
+    pub async fn read_state_with_observations(
+        &self,
+    ) -> BackendResult<(Option<crate::StateFile>, crate::ObservationStateAuthority)> {
+        crate::ObservationStateAuthority::load(self.backend.as_ref()).await
+    }
+    pub async fn read_state(&self) -> BackendResult<Option<crate::StateFile>> {
         self.backend.read_state().await
     }
 
@@ -394,11 +399,11 @@ pub struct MigrationBackends {
 }
 
 impl MigrationBackends {
-    pub async fn read_source_state(&self) -> BackendResult<Option<crate::LoadedState>> {
+    pub async fn read_source_state(&self) -> BackendResult<Option<crate::StateFile>> {
         self.source.read_state().await
     }
 
-    pub async fn read_target_state(&self) -> BackendResult<Option<crate::LoadedState>> {
+    pub async fn read_target_state(&self) -> BackendResult<Option<crate::StateFile>> {
         self.target.read_state().await
     }
 
@@ -448,7 +453,7 @@ pub(crate) struct ExplicitUrlBackendSelection {
 }
 
 impl ExplicitUrlBackendSelection {
-    pub(crate) async fn read_state(&self) -> BackendResult<Option<crate::LoadedState>> {
+    pub(crate) async fn read_state(&self) -> BackendResult<Option<crate::StateFile>> {
         crate::backends::create_explicit_backend(&self.url)
             .await?
             .read_state()
@@ -890,7 +895,7 @@ mod tests {
             &carina_core::paths::DisplayPath::new(project.path().join("old.json")).unwrap()
         );
         let loaded_source = backends.read_source_state().await.unwrap().unwrap();
-        assert_eq!(loaded_source.into_state().lineage, "locked-old");
+        assert_eq!(loaded_source.lineage, "locked-old");
         assert!(backends.read_target_state().await.unwrap().is_none());
 
         let mut migrated = StateFile::new();
@@ -901,7 +906,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(loaded_target.into_state().lineage, "configured-new");
+        assert_eq!(loaded_target.lineage, "configured-new");
     }
 
     #[test]

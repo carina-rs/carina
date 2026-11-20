@@ -35,7 +35,7 @@ Display the plan in an interactive TUI (terminal user interface) mode. Allows na
 
 Save the plan to a JSON file for later use with `carina apply`. The saved plan includes the effects, resource definitions, provider configurations, state metadata for drift detection, and the identity (SHA-256, source and version) and schema fingerprints of the providers it was computed with. Re-run `carina plan --out` after re-installing or upgrading a provider: `carina apply` rejects a saved plan whose providers no longer match (see [Applying a Saved Plan](/reference/cli/apply/#applying-a-saved-plan)).
 
-Saved-plan format 46 supersedes 45 and stores every replacement dependent in
+Saved-plan format 47 supersedes 46 and stores every replacement dependent in
 identity order. Required dependent lists cannot be empty. Diagnostics use the
 existing 8 KiB truncation limit; saved plans retain the full set.
 The format retains quoted condition string literals,
@@ -48,10 +48,29 @@ It retains typed secret expressions and the required source identity. It stores
 the source path as an absolute locator, preserving symlinks, so apply can reload
 the project from another working directory and reject a retargeted source alias.
 It retains lifecycle directive values, per-element loop expressions, complete
-resolved dependency addresses, and the legacy dependency migration classification
-used by planning. Applying it replays that classification against locked state
-before writing state v21. Older saved plans are rejected; regenerate them with
+resolved dependency addresses. Full-state reads accept v21 only; see
+[State format upgrades](/guides/state-management/#state-format-upgrades) for
+rewriting older state.
+Older saved plans are rejected; regenerate them with
 `carina plan --out`.
+
+Managed-resource observations inherit the configuration's secret paths in text
+plans, JSON and saved plans, destroy and orphan rows, saved-apply drift text,
+apply diagnostics and provider free text, even when an external system changes
+their contents or structure. This output protection does not apply to data-source read values
+or reference bindings; those retain their existing annotation rules. Provider free-text substitution
+enrolls strings classified secret in the actual sent patch. A change of value kind
+on a path to a configured secret, or a change in the length of a secret-bearing
+list, hides the observed subtree at the first divergence. `StringList` and `List`
+are treated as the same kind. Maps match keys one to one: missing keys (including
+write-only secrets) and extra observed keys never widen protection. Matching
+keys retain their secret leaf or descendant protection; unmatched observed keys
+remain ordinary values. Public siblings outside a hidden subtree remain visible.
+
+`plan --json` and `plan --out` store a hash of the hidden observed subtree.
+A newly hidden container has no stored digest to reuse, so its hash receives a
+fresh random salt on every plan. This protection also applies to values selected
+by `ignore_changes`; their normal text change rows remain omitted.
 
 Saved plans never contain secret plaintext. Carina stores each secret as a
 typed placeholder containing only an Argon2id hash, including secrets nested
@@ -62,10 +81,11 @@ unchanged secret already exists in state, the plan reuses that exact digest
 and therefore keeps its salt. A pre-v12 digest may instead appear in the
 self-contained `argon2-legacy` form until the next write that has the
 plaintext available. Equal newly written secrets receive unrelated hashes,
-and a resource move does not change how a stored digest is verified. State
-writeback stores the same digest carried by the plan placeholder. The
-placeholder is not a provider value and cannot be applied directly. Backend
-attributes cannot be secret-derived because backend implementations accept only
+and a resource move does not change how a stored digest is verified. For authored
+secrets selected for state writeback, state stores the digest carried by the
+corresponding desired-input placeholder. Protecting a provider observation in a
+plan does not replace the stored authored digest. A placeholder is not a provider
+value and cannot be applied directly. Backend attributes cannot be secret-derived because backend implementations accept only
 ordinary configuration values; validation rejects `secret()` and `decrypt()`
 results there.
 

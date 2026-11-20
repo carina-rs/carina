@@ -335,7 +335,9 @@ mod tests {
     };
 
     fn rendered_string(value: &str) -> RenderedValue {
-        carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(value.into())))
+        carina_core::value::render_fixture_value(&Value::Concrete(ConcreteValue::String(
+            value.into(),
+        )))
     }
 
     fn string_value(value: &str) -> Value {
@@ -356,9 +358,9 @@ mod tests {
         let effect = Effect::Update {
             identifier: crate::fixture_applied_identifier("example-id"),
             from: Box::new(
-                State::existing(
+                State::<carina_core::resource::NoPlaceholder>::existing(
                     id.clone(),
-                    [("value".to_string(), old)].into_iter().collect(),
+                    [("value".to_string(), old)],
                 )
                 .with_identifier("example-id")
                 .to_snapshot(),
@@ -371,7 +373,7 @@ mod tests {
         };
         let mut plan = Plan::new();
         plan.add(effect);
-        let historical = HistoricalDisplayAttributes::for_plan(&plan);
+        let historical = HistoricalDisplayAttributes::for_test_plan(&plan);
         let (schemas, provider) = carina_core::provider::comparison_fixture_for_test(
             &carina_core::schema::SchemaRegistry::new(),
             std::iter::once(&id),

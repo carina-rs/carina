@@ -472,7 +472,7 @@ fn single_reference_integer_interpolation_checks_resolved_string_constraints() {
                 compositions: &[],
                 managed_current: &HashMap::new(),
                 data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-                remote_bindings: &HashMap::new(),
+                remote_bindings: &Default::default(),
                 wait_aliases: &[],
             },
         );
@@ -4828,63 +4828,58 @@ fn argument_param(name: &str) -> crate::parser::ArgumentParameter {
     }
 }
 
-fn provider(name: &str) -> crate::parser::ProviderConfig<ParserPlaceholder> {
-    crate::parser::ProviderConfig {
-        name: name.to_string(),
-        attributes: Default::default(),
-        default_tags: Default::default(),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: Default::default(),
-        binding: None,
-    }
+// The maintainer decision on #4398 makes the existing root prohibition
+// block-based. Use directory parsing so empty blocks retain their inventory.
+fn root_arguments_directory(arguments: &str, root: &str) -> Result<(), String> {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("arguments.crn"), arguments).unwrap();
+    std::fs::write(dir.path().join("providers.crn"), root).unwrap();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::config_loader::parse_directory(
+        &crate::paths::ResolvedPath::new(dir.path()).unwrap(),
+        &config,
+    )
+    .unwrap();
+    let tree = crate::parser::AnalysisTree::try_from_file(parsed.parsed()).unwrap();
+    validate_no_arguments_in_root(&tree)
 }
 
 #[test]
 fn arguments_with_backend_errors() {
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(argument_param("state_path"));
-    parsed.backend = Some(crate::parser::BackendConfig {
-        backend_type: "local".to_string(),
-        attributes: Default::default(),
-        attribute_spans: Default::default(),
-    });
-
-    let result = validate_no_arguments_in_root(&parsed);
     assert_eq!(
-        result.unwrap_err(),
+        root_arguments_directory(
+            "arguments { state_path: String }",
+            "backend local { path = 'state.json' }"
+        )
+        .unwrap_err(),
         "arguments blocks are only valid inside module definitions, not in root configurations."
     );
 }
 
 #[test]
 fn arguments_with_provider_errors() {
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(argument_param("vpc_cidr"));
-    parsed.providers.push(provider("aws"));
-
-    let result = validate_no_arguments_in_root(&parsed);
-    assert!(result.is_err());
+    assert!(
+        root_arguments_directory("arguments { vpc_cidr: String }", "provider mock {}").is_err()
+    );
 }
 
 #[test]
 fn arguments_alone_is_ok() {
-    // A directory with only `arguments` looks like a module the user
-    // is validating in isolation; we cannot prove it is a root, so
-    // do not flag it (issue #2198).
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(argument_param("vpc_cidr"));
-
-    let result = validate_no_arguments_in_root(&parsed);
-    assert!(result.is_ok());
+    assert!(root_arguments_directory("arguments { vpc_cidr: String }", "").is_ok());
+    assert!(root_arguments_directory("arguments {}", "").is_ok());
 }
 
 #[test]
-fn empty_arguments_in_root_ok() {
-    let parsed = empty_parsed();
-    let result = validate_no_arguments_in_root(&parsed);
-    assert!(result.is_ok());
+fn issue4398_root_arguments_block_placement() {
+    // Main CLI: succeeds for an empty block. Candidate CLI: existing arguments
+    // placement message. LSP already reports that message at the empty block.
+    for root in ["provider mock {}", "backend local { path = 'state.json' }"] {
+        let error = root_arguments_directory("arguments {}", root).unwrap_err();
+        assert_eq!(
+            error,
+            "arguments blocks are only valid inside module definitions, not in root configurations."
+        );
+    }
 }
 
 // --- rendered_typecheck_result tests ---
@@ -8225,7 +8220,7 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         })
     }
@@ -11767,7 +11762,7 @@ fn issue_4282_deferred_builtin_results_use_existing_resolved_value_checks() {
                     compositions: &[],
                     managed_current: &HashMap::new(),
                     data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     wait_aliases: &[],
                 },
             );

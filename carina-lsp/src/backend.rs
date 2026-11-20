@@ -7,7 +7,7 @@ use carina_core::parser::ProviderContext;
 use carina_core::paths::PathIdentity;
 use carina_core::provider::{self as provider_mod, ProviderFactory};
 use carina_core::schema::{CompletionValue, SchemaRegistry, collect_all_block_names};
-use carina_provider_resolver::{LegacyLockEntryError, ProviderArtifactFingerprint};
+use carina_provider_resolver::ProviderArtifactFingerprint;
 use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -54,7 +54,7 @@ struct ProviderState {
     /// `.carina/` deletions the editor's file watcher did not report
     /// (issue #2023 follow-up: VS Code excludes dot-prefixed directories
     /// from its watcher by default).
-    install_fingerprint: Vec<(String, ProviderInstallFingerprint)>,
+    install_fingerprint: Vec<(String, ProviderArtifactFingerprint)>,
 }
 
 impl ProviderState {
@@ -67,7 +67,7 @@ impl ProviderState {
         mut provider_errors: BTreeMap<String, String>,
         configs: Vec<(PathBuf, workspace::DiscoveredProviderConfig)>,
         prober: Option<ProviderInstallProber>,
-        install_fingerprint: Vec<(String, ProviderInstallFingerprint)>,
+        install_fingerprint: Vec<(String, ProviderArtifactFingerprint)>,
         environment: carina_core::EnvironmentSnapshot,
     ) -> Self {
         let use_builtin_mock = carina_provider_mock::uses_builtin_provider(
@@ -178,18 +178,17 @@ impl ProviderState {
 /// Injected from `main.rs` so the poller and factory builder share resolver
 /// path-selection behavior.
 pub type ProviderInstallProber = Arc<
-    dyn Fn(&Path, &carina_core::parser::ProviderConfig) -> ProviderInstallFingerprint + Send + Sync,
+    dyn Fn(&Path, &carina_core::parser::ProviderConfig) -> ProviderArtifactFingerprint
+        + Send
+        + Sync,
 >;
-
-pub type ProviderInstallFingerprint =
-    std::result::Result<ProviderArtifactFingerprint, LegacyLockEntryError>;
 
 /// Compute `(provider_name, metadata)` pairs for discovered configs.
 /// Ordered to match the input so equality comparisons are stable.
 fn probe_install_fingerprint(
     prober: &ProviderInstallProber,
     configs: &[(PathBuf, workspace::DiscoveredProviderConfig)],
-) -> Vec<(String, ProviderInstallFingerprint)> {
+) -> Vec<(String, ProviderArtifactFingerprint)> {
     configs
         .iter()
         .map(|(dir, cfg)| {
@@ -276,7 +275,7 @@ impl ProviderStates {
 pub type FactoryBuildResult = (
     Vec<Box<dyn ProviderFactory>>,
     BTreeMap<String, String>, // provider name -> error reason
-    Vec<(String, ProviderInstallFingerprint)>, // install fingerprint
+    Vec<(String, ProviderArtifactFingerprint)>, // install fingerprint
 );
 
 /// Function type for building provider factories from configs with their source directories.
@@ -1471,10 +1470,7 @@ mod tests {
             BTreeMap::new(),
             configs,
             None,
-            vec![(
-                "mock".to_string(),
-                Ok(ProviderArtifactFingerprint::default()),
-            )],
+            vec![("mock".to_string(), ProviderArtifactFingerprint::default())],
             carina_core::EnvironmentSnapshot::empty(),
         )
     }
@@ -1528,10 +1524,7 @@ mock.test.Thing {
             BTreeMap::new(),
             configs,
             None,
-            vec![(
-                "mock".to_string(),
-                Ok(ProviderArtifactFingerprint::default()),
-            )],
+            vec![("mock".to_string(), ProviderArtifactFingerprint::default())],
             carina_core::EnvironmentSnapshot::empty(),
         );
         let document = Document::new_with_path(
@@ -1599,10 +1592,7 @@ mock.test.Thing {
             BTreeMap::new(),
             configs,
             None,
-            vec![(
-                "mock".to_string(),
-                Ok(ProviderArtifactFingerprint::default()),
-            )],
+            vec![("mock".to_string(), ProviderArtifactFingerprint::default())],
             carina_core::EnvironmentSnapshot::empty(),
         );
         let path = temp.path().join("a.crn");
@@ -1849,10 +1839,7 @@ let duplicate = mock.test.resource {
             BTreeMap::new(),
             configs,
             None,
-            vec![(
-                "mock".to_string(),
-                Ok(ProviderArtifactFingerprint::default()),
-            )],
+            vec![("mock".to_string(), ProviderArtifactFingerprint::default())],
             carina_core::EnvironmentSnapshot::empty(),
         );
         let main_path = temp.path().join("main.crn");
@@ -1913,10 +1900,7 @@ let duplicate = mock.test.resource {
             )]),
             configs,
             None,
-            vec![(
-                "mock".to_string(),
-                Ok(ProviderArtifactFingerprint::default()),
-            )],
+            vec![("mock".to_string(), ProviderArtifactFingerprint::default())],
             carina_core::EnvironmentSnapshot::empty(),
         );
         let document = Document::new_with_path(
@@ -2103,10 +2087,10 @@ let duplicate = mock.test.resource {
     fn test_prober(installed_at: Option<PathBuf>) -> ProviderInstallProber {
         Arc::new(move |dir, _cfg| {
             let artifact = installed_at.as_deref().and_then(test_file_fingerprint);
-            Ok(ProviderArtifactFingerprint {
+            ProviderArtifactFingerprint {
                 artifact,
                 lock_file: test_file_fingerprint(&dir.join("carina-providers.lock")),
-            })
+            }
         })
     }
 
@@ -2141,14 +2125,14 @@ let duplicate = mock.test.resource {
 
         let before = probe_install_fingerprint(&prober, &configs);
         assert!(
-            before[0].1.as_ref().unwrap().artifact.is_some(),
+            before[0].1.artifact.is_some(),
             "initial probe should see the installed binary metadata"
         );
 
         std::fs::remove_file(&installed).unwrap();
         let after = probe_install_fingerprint(&prober, &configs);
         assert!(
-            after[0].1.as_ref().unwrap().artifact.is_none(),
+            after[0].1.artifact.is_none(),
             "probe after delete must record missing artifact metadata"
         );
         assert_ne!(before, after);

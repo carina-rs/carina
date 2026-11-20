@@ -582,6 +582,12 @@ fn directive_value_error<P: PlaceholderKind, B: BindingAddress>(
             }
         }
         Value::Concrete(_) => PendingDirectiveValue::Other,
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     };
     Err(DirectiveResolutionError(Box::new(
         DirectiveResolutionErrorDetails {
@@ -633,6 +639,12 @@ fn loop_expression_is_local<P: PlaceholderKind, B: BindingAddress>(value: &Value
             | DeferredValue::ModuleIf(_)
             | DeferredValue::Unavailable { .. },
         ) => false,
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 
@@ -657,6 +669,12 @@ fn directive_value_kind<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, 
         Value::Deferred(DeferredValue::Unknown(_)) => "unknown until apply".into(),
         Value::Deferred(DeferredValue::Secret(_)) => "got a secret value".into(),
         Value::Deferred(_) => "got a deferred expression".into(),
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 

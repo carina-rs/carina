@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use carina_state::check_and_migrate;
+use carina_state::load_state;
 use tempfile::TempDir;
 
 struct Scenario {
@@ -154,9 +154,7 @@ fn partial_update_records_state_and_next_plan_surfaces_unknown_reason() {
         state_text.contains("mock partial update"),
         "state file must persist partial update detail:\n{state_text}"
     );
-    let state = check_and_migrate(&state_text)
-        .expect("state file must decode")
-        .into_state();
+    let state = load_state(&state_text).expect("state file must decode");
     let updated = state
         .find_resource("mock", "test.resource", "r1")
         .expect("updated resource must have a state row");

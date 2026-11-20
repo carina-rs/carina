@@ -17,14 +17,127 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
 #[test]
+fn issue4398_arguments_members_parse() {
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for source in [
+        "arguments { require before == after, 'same' before: Int after: Int require before == after, 'same' }",
+        "arguments { before: Int require before == after, 'same' after: Int require before == after, 'same' }",
+    ] {
+        let file = parse(source, &config).unwrap();
+        assert_eq!(
+            file.arguments
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            ["before", "after"]
+        );
+        assert_eq!(file.requires.len(), 2);
+        assert_eq!(file.requires[0].condition, file.requires[1].condition);
+    }
+    let file = parse(
+        "arguments { require: Int required: Int requirements: Int }",
+        &config,
+    )
+    .unwrap();
+    assert_eq!(
+        file.arguments
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>(),
+        ["require", "required", "requirements"]
+    );
+    assert!(file.requires.is_empty());
+}
+
+#[test]
+fn issue4398_require_only_arguments_members() {
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let file = parse(
+        "arguments { require true, 'first' require false, 'second' }",
+        &config,
+    )
+    .unwrap();
+    assert!(file.arguments.is_empty());
+    assert_eq!(
+        file.requires
+            .iter()
+            .map(|r| r.error_message.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    for source in [
+        "require true, 'x'",
+        "arguments { n: Int { require true, 'x' } }",
+        "attributes { require true, 'x' }",
+        "if true { require true, 'x' }",
+    ] {
+        assert!(parse(source, &config).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn issue4398_module_require_inference_parity() {
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let file = parse("arguments { require 1.5 + 1 == 2, 'bad' n: Int }", &config).unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
+    let buffer = crate::config_loader::load_buffer_configuration(&file, &schemas, &config);
+    let findings = buffer.judged().report().findings();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(
+        findings[0].detail().to_string(),
+        "operator '+': left operand must be Int, got Float"
+    );
+}
+
+#[test]
+fn issue4398_directory_requires_are_not_declarations() {
+    use crate::config_loader::{DeclarationKind, parse_directory};
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for reverse in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let files = if reverse {
+            ["z.crn", "a.crn"]
+        } else {
+            ["a.crn", "z.crn"]
+        };
+        for (name, source) in files.into_iter().zip([
+            "arguments { require before == after, 'same' before: Int require before == after, 'same' }",
+            "arguments { require before == after, 'same' after: Int require before == after, 'same' }",
+        ]) { std::fs::write(dir.path().join(name), source).unwrap(); }
+        let parsed = parse_directory(
+            &crate::paths::ResolvedPath::new(dir.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
+        let tree = AnalysisTree::try_from_file(parsed.parsed()).unwrap();
+        let names: Vec<_> = tree
+            .syntax()
+            .declarations()
+            .iter()
+            .filter(|d| d.detail().kind() == DeclarationKind::Argument)
+            .map(|d| d.detail().name())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names.contains(&"before") && names.contains(&"after"),
+            "{names:?}"
+        );
+        assert_eq!(parsed.parsed().requires.len(), 4);
+        for require in &parsed.parsed().requires {
+            assert_eq!(require.condition, parsed.parsed().requires[0].condition);
+        }
+    }
+}
+
+#[test]
 fn constraint_interpolation_is_rejected_without_retaining_authored_text() {
     for (source, position) in [
         (
-            r#"require "${secret('CANARY_4386')}" == 'x', 'bad'"#,
+            r#"arguments { require "${secret('CANARY_4386')}" == 'x', 'bad' }"#,
             "`require` condition",
         ),
         (
-            r#"require length("${secret('CANARY_4386')}") > 0, 'bad'"#,
+            r#"arguments { require length("${secret('CANARY_4386')}") > 0, 'bad' }"#,
             "`require` condition",
         ),
         (
@@ -32,7 +145,7 @@ fn constraint_interpolation_is_rejected_without_retaining_authored_text() {
             "validation condition",
         ),
         (
-            r#"require false, "${secret('CANARY_4386')}""#,
+            r#"arguments { require false, "${secret('CANARY_4386')}" }"#,
             "`require` message",
         ),
     ] {
@@ -68,7 +181,7 @@ fn constraint_literal_values_keep_their_raw_escapes() {
         r#""a\nb\t\"\\""#,
         r#"'a\'b\\c'"#,
     ] {
-        let source = format!("require {literal} == {literal}, {literal}");
+        let source = format!("arguments {{ require {literal} == {literal}, {literal} }}");
         let parsed = parse_file(
             &source,
             std::path::Path::new("main.crn"),
@@ -96,7 +209,7 @@ fn constraint_literal_values_keep_their_raw_escapes() {
 
 #[test]
 fn constraint_interpolation_error_keeps_only_typed_position_and_authored_range() {
-    let source = "let heading = <<-TEXT\n  prefix\nTEXT\nrequire '日本語' == \"before ${secret({ CANARY_4386 = 'value' })} after\", 'bad'\n";
+    let source = "let heading = <<-TEXT\n  prefix\nTEXT\narguments { require '日本語' == \"before ${secret({ CANARY_4386 = 'value' })} after\", 'bad' }\n";
     let error = parse_file(
         source,
         std::path::Path::new("checked/main.crn"),
@@ -112,7 +225,7 @@ fn constraint_interpolation_error_keeps_only_typed_position_and_authored_range()
         }
     ));
     let range = error.diagnostic_range().unwrap();
-    assert_eq!((range.start_line, range.start_column), (4, 26));
+    assert_eq!((range.start_line, range.start_column), (4, 38));
     assert!(!format!("{error:?} {error}").contains("CANARY_4386"));
 }
 
@@ -5773,7 +5886,13 @@ fn resolve_provider_attributes_with_remote_uses_sibling_user_functions() {
     .expect("provider config must contain no parser placeholders");
     let resolved = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        |session| resolve_provider_attributes_with_remote(&parsed, &HashMap::new(), session),
+        |session| {
+            resolve_provider_attributes_with_remote(
+                &parsed,
+                &std::collections::BTreeMap::new(),
+                session,
+            )
+        },
     )
     .expect("provider attributes should use the merged user-function scope");
     assert_eq!(
@@ -5827,7 +5946,13 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
     .expect("provider config must contain no parser placeholders");
     let error = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        |session| resolve_provider_attributes_with_remote(&parsed, &HashMap::new(), session),
+        |session| {
+            resolve_provider_attributes_with_remote(
+                &parsed,
+                &std::collections::BTreeMap::new(),
+                session,
+            )
+        },
     )
     .expect_err("invalid sibling function should fail at the authored provider call");
     let ProviderConfigResolutionError::Parse(ParseError::Located { path, error }) = error else {
@@ -10288,8 +10413,8 @@ fn parse_require_and_argument_validation_integer_arithmetic() {
                     error_message = "count must be even"
                 }
             }
-        }
-        require count / 2 >= 1, "count must be at least two"
+
+        require count / 2 >= 1, "count must be at least two" }
     "#;
     let result = parse(
         input,
@@ -10327,15 +10452,7 @@ fn parse_require_and_argument_validation_integer_arithmetic() {
 
 #[test]
 fn validation_integer_operator_spans_use_original_lines_after_heredoc() {
-    let input = "let p = <<EOT\na\nb\nEOT\n\
-                 arguments {\n\
-                 count: Int {\n\
-                 validation {\n\
-                 condition = count + 1 > 0\n\
-                 }\n\
-                 }\n\
-                 }\n\
-                 require count / 2 >= 1, \"x\"\n";
+    let input = "let p = <<EOT\na\nb\nEOT\narguments {\ncount: Int {\nvalidation {\ncondition = count + 1 > 0\n}\n}\n\nrequire count / 2 >= 1, \"x\" }\n";
     let result = parse(
         input,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
@@ -13541,8 +13658,8 @@ fn test_parse_require_statement() {
         arguments {
             enable_https: Bool = true
             has_cert: Bool = false
-        }
-        require !enable_https || has_cert, "cert is required when HTTPS is enabled"
+
+        require !enable_https || has_cert, "cert is required when HTTPS is enabled" }
     "#;
     let result = parse(
         input,
@@ -13566,8 +13683,8 @@ fn test_parse_require_with_len_function() {
     let input = r#"
         arguments {
             subnet_ids: list(String)
-        }
-        require len(subnet_ids) >= 2, "ALB requires at least two subnets"
+
+        require len(subnet_ids) >= 2, "ALB requires at least two subnets" }
     "#;
     let result = parse(
         input,
@@ -13596,8 +13713,8 @@ fn test_parse_require_with_null() {
     let input = r#"
         arguments {
             cert_arn: String = "default"
-        }
-        require cert_arn != null, "cert_arn must not be null"
+
+        require cert_arn != null, "cert_arn must not be null" }
     "#;
     let result = parse(
         input,
@@ -13622,9 +13739,9 @@ fn test_parse_multiple_require_statements() {
             min_size: Int
             max_size: Int
             subnet_ids: list(String)
-        }
+
         require min_size <= max_size, "min_size must be <= max_size"
-        require len(subnet_ids) >= 2, "need at least two subnets"
+        require len(subnet_ids) >= 2, "need at least two subnets" }
     "#;
     let result = parse(
         input,
@@ -13647,8 +13764,8 @@ fn test_parse_require_with_and_operator() {
     let input = r#"
         arguments {
             port: Int = 80
-        }
-        require port >= 1 && port <= 65535, "port must be between 1 and 65535"
+
+        require port >= 1 && port <= 65535, "port must be between 1 and 65535" }
     "#;
     let result = parse(
         input,
@@ -13669,8 +13786,8 @@ fn test_parse_require_null_prefixed_variable() {
     let input = r#"
         arguments {
             nullable: Bool = true
-        }
-        require nullable, "must be true"
+
+        require nullable, "must be true" }
     "#;
     let result = parse(
         input,
@@ -21719,9 +21836,9 @@ fn for_iterable_structural_binding_has_a_user_facing_description() {
 fn validation_subscripts_share_expression_string_decoding_and_index_checks() {
     let parsed = parse(
         r#"
-            arguments { tags: map(String) }
+            arguments { tags: map(String)
             require tags["line\nkey"] == "value", "missing tag"
-            require tags[("KEY")] == "value", "missing parenthesized tag"
+            require tags[("KEY")] == "value", "missing parenthesized tag" }
         "#,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
@@ -21761,8 +21878,8 @@ fn validation_subscripts_share_expression_string_decoding_and_index_checks() {
 
     let error = parse(
         r#"
-            arguments { tags: list(String) }
-            require tags[-1] == "value", "missing tag"
+            arguments { tags: list(String)
+            require tags[-1] == "value", "missing tag" }
         "#,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )

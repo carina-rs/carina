@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use carina_state::{StateFile, check_and_migrate};
+use carina_state::{StateFile, load_state};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -48,11 +48,10 @@ impl Scenario {
     }
 
     fn state(&self) -> StateFile {
-        check_and_migrate(
+        load_state(
             &fs::read_to_string(self.project.join("carina.state.json")).expect("read local state"),
         )
         .expect("load local state")
-        .into_state()
     }
 
     fn budget_identity(&self) -> String {
@@ -89,16 +88,11 @@ impl Scenario {
         resource["identity"] = Value::String(old_identity.to_string());
         write_json(&state_path, &state);
 
-        let mut provider_state = read_json(&self.mock_state);
-        let states = provider_state["states"]
-            .as_object_mut()
-            .expect("mock provider states");
-        let new_key = format!("budgets.Budget.{new_identity}");
-        let attributes = states
-            .remove(&new_key)
-            .unwrap_or_else(|| panic!("missing mock provider row {new_key}: {states:#?}"));
-        states.insert(format!("budgets.Budget.{old_identity}"), attributes);
-        write_json(&self.mock_state, &provider_state);
+        let provider_state = read_json(&self.mock_state);
+        for row in state["resources"].as_array().expect("applied resources") {
+            let identifier = row["current"]["identifier"].as_str().unwrap();
+            assert!(provider_state["states"][identifier].is_object());
+        }
     }
 }
 

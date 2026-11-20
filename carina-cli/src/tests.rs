@@ -35,8 +35,8 @@ use carina_core::resource::{
 use carina_core::schema::SchemaRegistry;
 use carina_core::value::PersistedValue;
 use carina_state::{
-    BackendError, DeposedInstance, DeposedKey, LoadedState, LockInfo, ResourceState, RowBasis,
-    StateBackend, StateFile,
+    BackendError, DeposedInstance, DeposedKey, LockInfo, ResourceState, RowBasis, StateBackend,
+    StateFile,
 };
 
 use crate::commands::apply::{
@@ -94,8 +94,8 @@ fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAdd
 }
 
 #[test]
-fn saved_plan_version_is_46_for_ordered_dependents() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 46);
+fn saved_plan_version_is_47_for_current_state() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 47);
 }
 
 #[test]
@@ -329,7 +329,7 @@ fn saved_provider_configs(
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
-                &HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },
@@ -995,7 +995,6 @@ fn plan_file_serde_round_trip() {
                 .collect(),
             sorted_value_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
             sorted_explicit_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
-            legacy_dependency_classification: None,
             unresolved_resources: sorted_resources
                 .into_iter()
                 .map(Resource::into_value_snapshot)
@@ -1018,7 +1017,7 @@ fn plan_file_serde_round_trip() {
                     .to_snapshot(),
                 ),
             }],
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: vec![],
         },
@@ -1736,7 +1735,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
             Value::Concrete(ConcreteValue::String(run1_bucket_name.clone())),
         )]
         .into_iter()
-        .collect(),
+        .collect::<std::collections::BTreeMap<_, _>>(),
     )
     .with_identifier("my-app-abcd1234");
 
@@ -1868,7 +1867,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
             ),
         ]
         .into_iter()
-        .collect(),
+        .collect::<std::collections::BTreeMap<_, _>>(),
     )
     .with_identifier(run1_role_name.expose_plaintext());
 
@@ -2209,12 +2208,16 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
     let result = crate::commands::apply::detect_drift(
         color_mode,
         &[resolved_inner(resource)],
+        &Plan::new(),
         &[ReloadedCurrentStateEntry::managed(
             id.clone(),
             planned.clone(),
         )],
         &carina_state::PreparedRows::from_snapshots(
-            [(id, Current::from_state(planned))],
+            [(
+                carina_core::resource::ResolvedResourceId::new(id),
+                Current::from_state(planned),
+            )],
             &carina_state::ResolvedRemovedClaims::resolve(&[], None),
         )
         .refreshable,
@@ -2222,6 +2225,7 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
         &provider,
         &provider,
         None,
+        &crate::test_support::observation_authority_for_test(None),
         &schemas,
         ApplyTarget::Project(std::path::Path::new(".")),
     )
@@ -2521,8 +2525,8 @@ impl StateBackend for MockBackend {
         carina_core::shutdown::CleanupBudget::TWO_SECOND
     }
 
-    async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
-        Ok(Some(LoadedState::Pristine(StateFile::new())))
+    async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
+        Ok(Some(StateFile::new()))
     }
     async fn read_state_bytes(
         &self,
@@ -2638,8 +2642,8 @@ impl StateBackend for LockTrackingBackend {
         carina_core::shutdown::CleanupBudget::TWO_SECOND
     }
 
-    async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
-        Ok(Some(LoadedState::Pristine(StateFile::new())))
+    async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
+        Ok(Some(StateFile::new()))
     }
     async fn read_state_bytes(
         &self,
@@ -2768,8 +2772,8 @@ impl StateBackend for RefreshTestBackend {
         carina_core::shutdown::CleanupBudget::TWO_SECOND
     }
 
-    async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
-        Ok(self.initial_state.clone().map(LoadedState::Pristine))
+    async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
+        Ok(self.initial_state.clone())
     }
     async fn read_state_bytes(
         &self,
@@ -2946,10 +2950,11 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     std::fs::write(
         &mock_state_path,
         serde_json::json!({
-            "s3.Bucket.alive-deposed-bucket": {
+            "version": 3,
+            "states": {"old-bucket": {
                 "bucket": "old-bucket",
                 "status": "alive"
-            }
+            }}
         })
         .to_string(),
     )
@@ -3260,7 +3265,10 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
             // In the real code the typed orphan supplies `AppliedIdentifier`
             // and the provider returns `ReadOutcome::NotFound`.
             let refreshed = State::<carina_core::resource::NoPlaceholder>::not_found(id.clone());
-            orphan.with_refreshed_state(refreshed.to_snapshot())
+            (
+                carina_core::resource::ResolvedResourceId::new(id),
+                orphan.with_refreshed_state(refreshed.to_snapshot()),
+            )
         })
         .collect::<carina_state::LoadedOrphans>()
         .into_plan_orphans();
@@ -3649,7 +3657,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
         complete_create(State {
             id: id.clone(),
             identifier: Some("vpc-123".to_string()),
-            attributes: HashMap::from([(
+            attributes: std::collections::BTreeMap::from([(
                 "cidr_block".to_string(),
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )]),
@@ -3851,7 +3859,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
             State {
                 id: id.clone(),
                 identifier: Some("vpc-123".to_string()),
-                attributes: HashMap::from([(
+                attributes: std::collections::BTreeMap::from([(
                     "cidr_block".to_string(),
                     Value::Concrete(ConcreteValue::String("10.0.0.0/24".into())),
                 )]),
@@ -3932,9 +3940,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
 
 #[test]
 fn plan_file_serialization_redacts_secrets() {
-    use carina_core::value::{
-        redact_secrets_in_plan, redact_secrets_in_resource, redact_secrets_in_state,
-    };
+    use carina_core::value::redact_secrets_in_resource;
 
     // Build a plan with secrets in resources, states, and effects
     let secret_password = Value::Deferred(DeferredValue::Secret(
@@ -3992,13 +3998,12 @@ fn plan_file_serialization_redacts_secrets() {
                 "awscc",
             )]),
             backend_config: crate::commands::plan::SavedBackendConfig::default(),
-            plan: redact_secrets_in_plan(&plan).unwrap(),
+            plan: crate::test_support::creation_fixture::recorded_snapshot(&plan),
             sorted_resources: vec![
                 redact_secrets_in_resource(&resolved_inner(resource_with_secret.clone())).unwrap(),
             ],
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
-            legacy_dependency_classification: None,
             unresolved_resources: vec![redact_secrets_in_resource(&resource_with_secret).unwrap()]
                 .into_iter()
                 .map(|resource| resource.into_value_snapshot())
@@ -4009,9 +4014,11 @@ fn plan_file_serialization_redacts_secrets() {
             data_source_values: vec![],
             current_states: vec![CurrentStateEntry::managed(
                 ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None),
-                redact_secrets_in_state(&state_with_secret).unwrap(),
+                crate::test_support::protected_observation(&state_with_secret.to_snapshot())
+                    .snapshot()
+                    .unwrap(),
             )],
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: vec![],
         },
@@ -4069,14 +4076,13 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
             .collect(),
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
-            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
             data_source_origins: Vec::new(),
             data_source_values: Vec::new(),
             current_states: Vec::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         },
@@ -4119,14 +4125,13 @@ fn plan_file_validation_rejects_missing_resource_identity() {
             .collect(),
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
-            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
             data_source_origins: Vec::new(),
             data_source_values: Vec::new(),
             current_states: Vec::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         },
@@ -4189,14 +4194,13 @@ fn plan_file_with_deferred_effect(effect: Effect) -> PlanFile {
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
-            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
             data_source_origins: Vec::new(),
             data_source_values: Vec::new(),
             current_states: Vec::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         },
@@ -4549,7 +4553,6 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
             .collect(),
         sorted_value_destroy_dependencies: vec![Default::default()],
         sorted_explicit_destroy_dependencies: vec![Default::default()],
-        legacy_dependency_classification: None,
         unresolved_resources: Vec::new(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -4560,7 +4563,7 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
             State::<carina_core::resource::NoPlaceholder>::existing(target_id, HashMap::new())
                 .with_identifier("managed-id"),
         )],
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
     }
@@ -4678,7 +4681,6 @@ fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
-            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: (vec![data_source.clone().into_value_snapshot()])
@@ -4691,7 +4693,7 @@ fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
                 value: DataSourceValue::blocked_by_plan_error(),
             }],
             current_states: Vec::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         },
@@ -4989,7 +4991,6 @@ fn recorded_builtin_only_plan_round_trips_with_current_top_level_keys() {
         "data_source_origins",
         "data_source_values",
         "data_sources",
-        "legacy_dependency_classification",
         "plan",
         "persisted_directive_changes",
         "provider_artifacts",
@@ -5054,7 +5055,6 @@ fn recorded_builtin_only_plan_round_trips_with_current_top_level_keys() {
             "sorted_resources",
             "sorted_value_destroy_dependencies",
             "sorted_explicit_destroy_dependencies",
-            "legacy_dependency_classification",
             "unresolved_resources",
             "compositions",
             "data_sources",
@@ -5216,8 +5216,8 @@ impl StateBackend for CapturingBackend {
         carina_core::shutdown::CleanupBudget::TWO_SECOND
     }
 
-    async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
-        Ok(Some(LoadedState::Pristine(StateFile::new())))
+    async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
+        Ok(Some(StateFile::new()))
     }
     async fn read_state_bytes(
         &self,

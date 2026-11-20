@@ -4,7 +4,7 @@
 //! The shared row builders encapsulate all logic for deciding
 //! which rows to show for a given effect, keeping rendering frontends thin.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use indexmap::IndexMap;
 
@@ -48,14 +48,43 @@ pub enum DetailLevel {
 
 /// Historical attribute values prepared exclusively for display.
 ///
-/// The maps are private and the only constructors mask provider plaintext
-/// using either the desired secret shape or the persisted state shape. This
-/// keeps update/replacement/delete renderers from ever accepting raw provider
-/// state directly, and keeps the update view out of the deleted-instance map.
+/// The maps are private. Observed history enters only through owner-produced
+/// protected observations. A plan alone provides
+/// no history, so renderers cannot reconstruct authority from desired values.
+///
+/// A plan alone cannot construct observed history outside core.
+///
+/// ```compile_fail,E0624
+/// use carina_core::{detail_rows::HistoricalDisplayAttributes, plan::Plan};
+/// fn bypass(plan: &Plan) { let _ = HistoricalDisplayAttributes::for_plan(plan); }
+/// ```
+///
+/// Persisted maps cannot override the owner's generation products either.
+///
+/// ```compile_fail,E0599
+/// use carina_core::{detail_rows::HistoricalDisplayAttributes, effect::DeletedInstanceKey, provider::PersistedAttributes};
+/// fn bypass(display: &mut HistoricalDisplayAttributes, key: DeletedInstanceKey, raw: &PersistedAttributes) {
+///     display.set_delete_from_persisted(key, raw);
+/// }
+/// ```
+///
+/// Raw observation maps cannot enter a display boundary.
+/// Previously: the raw-map call compiled successfully.
+///
+/// ```compile_fail,E0599
+/// use std::collections::BTreeMap;
+/// use carina_core::{detail_rows::HistoricalDisplayAttributes, resource::{ResourceId, SnapshotValue}};
+/// fn bypass(display: &mut HistoricalDisplayAttributes, id: ResourceId, raw: BTreeMap<String, SnapshotValue>) {
+///     display.set_update_from_provider_and_persisted(id, &raw, None);
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct HistoricalDisplayAttributes {
     updates: HashMap<ResourceId, HistoricalUpdateAttributes>,
     deletes: HashMap<DeletedInstanceKey, HistoricalDeleteAttributes>,
+    old_instances: HashMap<DeletedInstanceKey, crate::value::ProtectedObservation>,
+    replacements: HashMap<usize, crate::value::ProtectedObservation>,
+    deferred: HashMap<DeletedInstanceKey, crate::value::ProtectedObservation>,
     releases: HashMap<ResourceId, Vec<HistoricalListKeyRelease>>,
 }
 
@@ -68,18 +97,54 @@ struct HistoricalListKeyRelease {
 
 #[derive(Debug, Clone)]
 struct HistoricalUpdateAttributes {
-    attributes: HashMap<String, Value>,
-    stored_attributes: Option<HashMap<String, Value>>,
+    attributes: BTreeMap<String, Value>,
+    stored_attributes: Option<BTreeMap<String, Value>>,
 }
 
 #[derive(Debug, Clone)]
 struct HistoricalDeleteAttributes {
-    attributes: HashMap<String, Value>,
-    stored_attributes: Option<HashMap<String, Value>>,
+    attributes: BTreeMap<String, Value>,
+    stored_attributes: Option<BTreeMap<String, Value>>,
     nested_write_only: NestedWriteOnlyRecord,
 }
 
 impl HistoricalDisplayAttributes {
+    /// A display without historical observations.
+    pub fn empty() -> Self {
+        Self {
+            updates: HashMap::new(),
+            deletes: HashMap::new(),
+            old_instances: HashMap::new(),
+            replacements: HashMap::new(),
+            deferred: HashMap::new(),
+            releases: HashMap::new(),
+        }
+    }
+
+    /// Install the complete owner's products for this exact plan. Historical
+    /// values cannot be reconstructed from desired inputs at a display boundary.
+    pub fn from_observations<S, V: crate::resource::PlanValueKind>(
+        plan: &Plan<S, V>,
+        observations: &crate::value::ProtectedObservations,
+    ) -> Result<Self, crate::value::SerializationError> {
+        observations.check_plan(plan)?;
+        let mut display = Self::for_plan(plan);
+        display.old_instances = observations.old_instance_history().clone();
+        display.replacements = observations.replacement_history().clone();
+        display.deferred = observations.deferred_history().clone();
+        for effect in plan.effects() {
+            if let Effect::Update { to, .. } = effect {
+                display.set_update_from_observation(observations.update_from(&to.id)?);
+            }
+        }
+        #[allow(clippy::iter_over_hash_type)]
+        // Keyed rebuild: the owner already classified every generation.
+        for (key, observation) in observations.deleted() {
+            display.set_delete_from_observation(key.clone(), observation)?;
+        }
+        Ok(display)
+    }
+
     pub(crate) fn reference_records(
         &self,
     ) -> impl Iterator<Item = (&ResourceId, &NestedWriteOnlyRecord)> {
@@ -90,7 +155,7 @@ impl HistoricalDisplayAttributes {
 
     pub(crate) fn reference_values(
         &self,
-    ) -> impl Iterator<Item = (&ResourceId, &HashMap<String, Value>)> {
+    ) -> impl Iterator<Item = (&ResourceId, &BTreeMap<String, Value>)> {
         self.updates
             .iter()
             .flat_map(|(id, entry)| {
@@ -109,7 +174,7 @@ impl HistoricalDisplayAttributes {
 
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn for_planning(plan: &Plan, saved: &crate::provider::LiftedSavedAttrs) -> Self {
-        let mut display = Self::for_plan(plan);
+        let mut display = Self::for_test_plan(plan);
         #[allow(clippy::iter_over_hash_type)]
         // keyed rebuild: each historical update receives saved attributes by exact resource ID
         for (id, attributes) in &mut display.updates {
@@ -124,13 +189,15 @@ impl HistoricalDisplayAttributes {
         display
     }
 
-    /// Build the fail-safe display view available from a plan alone. Desired
-    /// secret shapes mask their historical counterparts; callers with state
-    /// provenance should then refine it through the persisted-shape methods.
-    pub fn for_plan<S, V: crate::resource::PlanValueKind>(plan: &Plan<S, V>) -> Self {
+    /// Start a display with no observed history. Only owner products can add
+    /// Update, Delete or replacement history through the typed setters.
+    pub(crate) fn for_plan<S, V: crate::resource::PlanValueKind>(plan: &Plan<S, V>) -> Self {
         let mut display = Self {
             updates: HashMap::new(),
             deletes: HashMap::new(),
+            old_instances: HashMap::new(),
+            replacements: HashMap::new(),
+            deferred: HashMap::new(),
             releases: HashMap::new(),
         };
 
@@ -150,35 +217,6 @@ impl HistoricalDisplayAttributes {
                         key_field: key_field.as_str().to_string(),
                         keys: keys.iter().map(|key| key.key().to_string()).collect(),
                     }),
-                Effect::Read { .. }
-                | Effect::Create(_)
-                | Effect::ResumeCreate { .. }
-                | Effect::Update { .. }
-                | Effect::Delete { .. }
-                | Effect::Import { .. }
-                | Effect::Remove { .. }
-                | Effect::Move { .. }
-                | Effect::Wait { .. }
-                | Effect::DeferredCreate(_)
-                | Effect::DeferredReplace(_) => {}
-            }
-        }
-
-        for effect in plan.effects() {
-            match effect {
-                Effect::Update { from, to, .. } => {
-                    let attributes = display.filter_released(&from.id, from.attributes.clone());
-                    display.updates.insert(
-                        from.id.clone(),
-                        HistoricalUpdateAttributes {
-                            attributes: mask_attributes_using_secret_shape(
-                                &attributes,
-                                &to.attributes,
-                            ),
-                            stored_attributes: None,
-                        },
-                    );
-                }
                 Effect::Delete {
                     id,
                     identifier,
@@ -192,7 +230,7 @@ impl HistoricalDisplayAttributes {
                             identifier.to_string(),
                         ),
                         HistoricalDeleteAttributes {
-                            attributes: HashMap::new(),
+                            attributes: Default::default(),
                             stored_attributes: None,
                             nested_write_only: NestedWriteOnlyRecord::new(),
                         },
@@ -201,54 +239,82 @@ impl HistoricalDisplayAttributes {
                 Effect::Read { .. }
                 | Effect::Create(_)
                 | Effect::ResumeCreate { .. }
+                | Effect::Update { .. }
                 | Effect::Import { .. }
                 | Effect::Remove { .. }
                 | Effect::Move { .. }
-                | Effect::ReleaseListKeys { .. }
                 | Effect::Wait { .. }
                 | Effect::DeferredCreate(_)
                 | Effect::DeferredReplace(_) => {}
             }
         }
 
-        for replacement in plan.replace_display_info() {
-            let Some(Effect::Create(to)) = plan.effects().get(replacement.create_idx) else {
-                continue;
-            };
-            let Some(Effect::Delete {
-                id,
-                identifier,
-                generation,
-                ..
-            }) = plan.effects().get(replacement.delete_idx)
-            else {
-                continue;
-            };
-            display.deletes.insert(
-                DeletedInstanceKey::new(
-                    id.as_inner().clone(),
-                    generation.clone(),
-                    identifier.to_string(),
-                ),
-                HistoricalDeleteAttributes {
-                    attributes: mask_attributes_using_secret_shape(
-                        replacement.previous_attributes,
-                        &to.attributes,
-                    ),
-                    stored_attributes: None,
-                    nested_write_only: NestedWriteOnlyRecord::new(),
-                },
-            );
-        }
-
         display
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn for_test_plan<S: Clone, V: crate::resource::PlanValueKind>(plan: &Plan<S, V>) -> Self {
+        let observations = crate::value::ObservationState::empty_for_test()
+            .protect(crate::value::ObservationInputs::Plan {
+                deleted: &std::collections::HashMap::new(),
+                plan,
+                current: &HashMap::new(),
+                reads: &crate::data_source_value::DataSourceValues::empty(),
+            })
+            .expect("fixture observations bind to the complete plan");
+        Self::from_observations(plan, &observations).expect("fixture products belong to this plan")
+    }
+
+    /// A display getter exposes a draft containing only protected history.
+    /// The admitted execution plan stays private to comparison/dispatch.
+    fn protected_plan<S: Clone, V: crate::resource::PlanValueKind>(
+        &self,
+        plan: &AdmittedPlan<S, V>,
+    ) -> Plan<S, V> {
+        let protect_delete = |key: &DeletedInstanceKey, _values: &BTreeMap<String, Value>| {
+            self.deferred
+                .get(key)
+                .map(|observation| observation.display_attributes().clone())
+                .unwrap_or_default()
+        };
+        let mut protected = plan.clone().into_unadmitted();
+        for effect in protected.effects_mut() {
+            match effect {
+                Effect::Update { from, .. } => {
+                    from.attributes = self
+                        .update(&from.id)
+                        .map(|entry| entry.attributes.clone())
+                        .unwrap_or_default();
+                }
+                Effect::DeferredReplace(payload) => {
+                    payload.protect_history_for_display(protect_delete)
+                }
+                _ => {}
+            }
+        }
+        for old in &mut protected.replacement_inputs.old_instances {
+            old.attributes = self
+                .old_instances
+                .get(&old.instance)
+                .map(|observation| observation.display_attributes().clone())
+                .unwrap_or_default();
+        }
+        for metadata in &mut protected.replace_display {
+            metadata.previous_attributes = self
+                .replacements
+                .get(&metadata.delete_idx)
+                .map(|observation| observation.display_attributes().clone())
+                .unwrap_or_default();
+        }
+        protected
     }
 
     fn filter_released(
         &self,
         id: &ResourceId,
-        mut attributes: HashMap<String, Value>,
-    ) -> HashMap<String, Value> {
+        mut attributes: BTreeMap<String, Value>,
+    ) -> BTreeMap<String, Value> {
         let Some(releases) = self.releases.get(id) else {
             return attributes;
         };
@@ -273,24 +339,20 @@ impl HistoricalDisplayAttributes {
         attributes
     }
 
-    /// Refine an Update's old-side view using persisted secret shape without
-    /// discarding the desired-secret mask established by [`Self::for_plan`].
-    pub fn set_update_from_provider_and_persisted(
+    /// Install the owner's complete protected Update observation.
+    pub fn set_update_from_observation(
         &mut self,
-        id: ResourceId,
-        provider_attributes: &HashMap<String, Value>,
-        persisted_attributes: Option<&PersistedAttributes>,
+        observation: &crate::value::ProtectedObservation,
     ) {
-        let filtered_provider = self.filter_released(&id, provider_attributes.clone());
-        let persisted_masked =
-            mask_attributes_using_persisted_shape(&filtered_provider, persisted_attributes);
-        let desired_shape = self.updates.get(&id).map(|entry| &entry.attributes);
-        let masked = combine_with_desired_secret_shape(persisted_masked, desired_shape);
+        let id = observation.id().clone();
+        let masked = self.filter_released(&id, observation.display_attributes().clone());
         // Keep the stored anchor unfiltered: its list indices must stay
         // aligned with `prev_explicit::ListElements` so projection can still
         // hide server-added defaults. Only the provider/current comparison
         // view drops released keys.
-        let stored_attributes = persisted_attributes.map(PersistedAttributes::to_values);
+        let stored_attributes = observation
+            .persisted_attributes()
+            .map(PersistedAttributes::to_values);
         self.updates.insert(
             id,
             HistoricalUpdateAttributes {
@@ -300,49 +362,85 @@ impl HistoricalDisplayAttributes {
         );
     }
 
-    /// Replace a Delete generation's view using provider values and the
-    /// persisted JSON secret shape as masking authority.
-    pub fn set_delete_from_provider_and_persisted(
+    /// Install the owner's protected Delete observation for this exact identity.
+    pub fn set_delete_from_observation(
         &mut self,
         key: DeletedInstanceKey,
-        provider_attributes: &HashMap<String, Value>,
-        persisted_attributes: Option<&PersistedAttributes>,
-        nested_write_only: &NestedWriteOnlyRecord,
-    ) {
-        let persisted_masked =
-            mask_attributes_using_persisted_shape(provider_attributes, persisted_attributes);
-        let desired_shape = self.deletes.get(&key).map(|entry| &entry.attributes);
-        let masked = combine_with_desired_secret_shape(persisted_masked, desired_shape);
+        observation: &crate::value::ProtectedObservation,
+    ) -> Result<(), crate::value::SerializationError> {
+        if key.id() != observation.id() {
+            return Err(
+                crate::value::SerializationError::ObservationIdentityMismatch {
+                    expected: Box::new(key.id().clone()),
+                    actual: Box::new(observation.id().clone()),
+                },
+            );
+        }
+        let masked = observation.display_attributes().clone();
         self.deletes.insert(
             key,
             HistoricalDeleteAttributes {
                 attributes: masked,
-                stored_attributes: persisted_attributes.map(PersistedAttributes::to_values),
-                nested_write_only: nested_write_only.clone(),
+                stored_attributes: observation
+                    .persisted_attributes()
+                    .map(PersistedAttributes::to_values),
+                nested_write_only: observation.nested_write_only().clone(),
             },
         );
+        Ok(())
     }
 
-    /// Decode a deposed generation directly from persisted JSON. Valid
-    /// `$secret` tags become typed redacted values before reaching a renderer.
-    pub fn set_delete_from_persisted(
+    #[cfg(test)]
+    pub(crate) fn set_update_from_provider_and_persisted(
+        &mut self,
+        id: ResourceId,
+        attributes: &BTreeMap<String, Value>,
+        persisted: Option<&PersistedAttributes>,
+    ) {
+        let state = crate::resource::SnapshotState::existing(id, attributes.clone());
+        let mut observation = match persisted {
+            Some(persisted) => crate::value::ProtectedObservation::historical(&state, persisted),
+            None => crate::value::ProtectedObservation::classified(&state),
+        };
+        if let Some(previous) = self.updates.get(&state.id) {
+            let history = crate::value::ProtectedObservation::classified(
+                &crate::resource::SnapshotState::existing(
+                    state.id.clone(),
+                    previous.attributes.clone(),
+                ),
+            );
+            observation = observation
+                .with_history(&history)
+                .expect("fixture history uses its update identity");
+        }
+        self.set_update_from_observation(&observation);
+    }
+    #[cfg(test)]
+    pub(crate) fn set_delete_from_provider_and_persisted(
         &mut self,
         key: DeletedInstanceKey,
-        persisted_attributes: &PersistedAttributes,
+        attributes: &BTreeMap<String, Value>,
+        persisted: Option<&PersistedAttributes>,
+        nested: &NestedWriteOnlyRecord,
     ) {
-        let persisted = persisted_attributes.to_values();
-        let desired_shape = self.deletes.get(&key).map(|entry| &entry.attributes);
-        let masked = combine_with_desired_secret_shape(persisted, desired_shape);
-        self.deletes.insert(
-            key,
-            HistoricalDeleteAttributes {
-                attributes: masked,
-                stored_attributes: Some(persisted_attributes.to_values()),
-                // State v18 introduced provenance only for the current
-                // instance; historical generations have no leaf record.
-                nested_write_only: NestedWriteOnlyRecord::new(),
-            },
-        );
+        let state = crate::resource::SnapshotState::existing(key.id().clone(), attributes.clone());
+        let mut observation = match persisted {
+            Some(persisted) => crate::value::ProtectedObservation::historical(&state, persisted),
+            None => crate::value::ProtectedObservation::classified(&state),
+        };
+        if let Some(previous) = self.deletes.get(&key) {
+            let history = crate::value::ProtectedObservation::classified(
+                &crate::resource::SnapshotState::existing(
+                    state.id.clone(),
+                    previous.attributes.clone(),
+                ),
+            );
+            observation = observation
+                .with_history(&history)
+                .expect("fixture history uses its delete identity");
+        }
+        self.set_delete_from_observation(key, &observation.with_nested_write_only(Some(nested)))
+            .expect("fixture observation uses its delete key");
     }
 
     fn update(&self, id: &ResourceId) -> Option<&HistoricalUpdateAttributes> {
@@ -352,64 +450,6 @@ impl HistoricalDisplayAttributes {
     fn delete(&self, key: &DeletedInstanceKey) -> Option<&HistoricalDeleteAttributes> {
         self.deletes.get(key)
     }
-}
-
-fn mask_attributes_using_secret_shape<Q: crate::resource::ValueKind>(
-    plaintext: &HashMap<String, Value>,
-    shape: &IndexMap<String, crate::resource::Value<Q>>,
-) -> HashMap<String, Value> {
-    plaintext
-        .iter()
-        .map(|(key, value)| {
-            let value = shape.get(key).map_or_else(
-                || value.clone(),
-                |shape| crate::value::mask_plaintext_using_secret_shape(value, shape),
-            );
-            (key.clone(), value)
-        })
-        .collect()
-}
-
-fn mask_attributes_using_persisted_shape(
-    plaintext: &HashMap<String, Value>,
-    shape: Option<&PersistedAttributes>,
-) -> HashMap<String, Value> {
-    plaintext
-        .iter()
-        .map(|(key, value)| {
-            let value = shape.map_or_else(
-                || value.clone(),
-                |shape| crate::value::mask_plaintext_using_persisted_attribute(value, shape, key),
-            );
-            (key.clone(), value)
-        })
-        .collect()
-}
-
-fn mask_attributes_using_value_shape(
-    plaintext: &HashMap<String, Value>,
-    shape: &HashMap<String, Value>,
-) -> HashMap<String, Value> {
-    plaintext
-        .iter()
-        .map(|(key, value)| {
-            let value = shape.get(key).map_or_else(
-                || value.clone(),
-                |shape| crate::value::mask_plaintext_using_secret_shape(value, shape),
-            );
-            (key.clone(), value)
-        })
-        .collect()
-}
-
-fn combine_with_desired_secret_shape(
-    values: HashMap<String, Value>,
-    desired_shape: Option<&HashMap<String, Value>>,
-) -> HashMap<String, Value> {
-    desired_shape.map_or_else(
-        || values.clone(),
-        |shape| mask_attributes_using_value_shape(&values, shape),
-    )
 }
 
 /// Output-neutral representation of a detail row for plan display.
@@ -712,7 +752,7 @@ pub enum ListOfMapsDiffField {
 /// ```
 #[derive(Debug)]
 pub struct PreparedPlanDisplay {
-    plan: std::sync::Arc<crate::input_rules::InputCheckedPlan>,
+    plan: Plan,
     historical: HistoricalDisplayAttributes,
     detail: DetailLevel,
     rows: Vec<Vec<DetailRow>>,
@@ -768,19 +808,16 @@ impl PreparedPlanDisplay {
                 })
                 .collect::<HostResult<Vec<_>>>()?
         };
+        let protected_plan = historical.protected_plan(plan.plan());
         Ok(Self {
-            plan,
+            plan: protected_plan,
             historical,
             detail,
             rows,
         })
     }
 
-    pub fn plan(&self) -> &AdmittedPlan {
-        &self.plan
-    }
-
-    pub fn checked_plan(&self) -> &crate::input_rules::InputCheckedPlan {
+    pub fn plan(&self) -> &Plan {
         &self.plan
     }
 
@@ -791,6 +828,7 @@ impl PreparedPlanDisplay {
     pub fn view(&self) -> PlanDisplay<'_> {
         PlanDisplay {
             plan: &self.plan,
+            protected_plan: DisplayPlan::Borrowed(&self.plan),
             historical: &self.historical,
             rows: DisplayRows::Prepared {
                 detail: self.detail,
@@ -816,9 +854,15 @@ pub struct PlanDisplay<
     S = crate::resource::ModuleSource,
     V: crate::resource::PlanValueKind = crate::resource::NoPlaceholder,
 > {
-    plan: &'a AdmittedPlan<S, V>,
+    plan: &'a Plan<S, V>,
+    protected_plan: DisplayPlan<'a, S, V>,
     historical: &'a HistoricalDisplayAttributes,
     rows: DisplayRows<'a>,
+}
+
+enum DisplayPlan<'a, S, V: crate::resource::PlanValueKind> {
+    Borrowed(&'a Plan<S, V>),
+    Owned(Box<Plan<S, V>>),
 }
 
 enum DisplayRows<'a> {
@@ -836,16 +880,23 @@ impl<'a, S, V: crate::resource::PlanValueKind> PlanDisplay<'a, S, V> {
         plan: &'a AdmittedPlan<S, V>,
         historical: &'a HistoricalDisplayAttributes,
         comparisons: DetailComparisons<'a>,
-    ) -> Self {
+    ) -> Self
+    where
+        S: Clone,
+    {
         Self {
             plan,
+            protected_plan: DisplayPlan::Owned(Box::new(historical.protected_plan(plan))),
             historical,
             rows: DisplayRows::Build(comparisons),
         }
     }
 
-    pub fn plan(&self) -> &'a AdmittedPlan<S, V> {
-        self.plan
+    pub fn plan(&self) -> &Plan<S, V> {
+        match &self.protected_plan {
+            DisplayPlan::Borrowed(plan) => plan,
+            DisplayPlan::Owned(plan) => plan,
+        }
     }
 
     pub fn detail_rows(
@@ -955,6 +1006,10 @@ pub fn build_detail_rows_by_instance<S, V: crate::resource::PlanValueKind>(
                 ComparisonResolutionError::MissingResourceSchema { id: to.id.clone() }
             })?;
             let resolved = provider.comparison_for(registry, &to.id)?;
+            let raw_comparison = CanonicalComparisonAttributes::canonicalize(
+                from.attributes.clone(),
+                resolved.owner_schema().schema().as_schema(),
+            );
             match comparisons {
                 DetailComparisons::Planning(references) => {
                     resolved
@@ -962,6 +1017,7 @@ pub fn build_detail_rows_by_instance<S, V: crate::resource::PlanValueKind>(
                         .with_references(references, &to.id, |comparison| {
                             build_update_rows(
                                 historical,
+                                &raw_comparison,
                                 to,
                                 changed_attributes,
                                 Some(resolved.owner_schema().schema().as_schema()),
@@ -976,6 +1032,7 @@ pub fn build_detail_rows_by_instance<S, V: crate::resource::PlanValueKind>(
                     resolved.context().with_recorded_effects(|comparison| {
                         build_update_rows(
                             historical,
+                            &raw_comparison,
                             to,
                             changed_attributes,
                             Some(resolved.owner_schema().schema().as_schema()),
@@ -1219,6 +1276,7 @@ fn default_tag_annotation(default_tag_keys: &DefaultTagKeys, key: &str) -> Optio
 #[allow(clippy::too_many_arguments)]
 fn build_update_rows<S, D, R: ReferenceEquality, V: crate::resource::PlanValueKind>(
     historical: &HistoricalUpdateAttributes,
+    raw_comparison: &CanonicalComparisonAttributes,
     to: &crate::resource::Resource<S, V, crate::resource::AbsoluteBindingAddress, D>,
     changed_attributes: &[String],
     schema: Option<&ResourceSchema>,
@@ -1253,6 +1311,15 @@ fn build_update_rows<S, D, R: ReferenceEquality, V: crate::resource::PlanValueKi
             crate::resource::UnschematizedComparisonAttributes::new(to.resolved_attributes()),
         ),
     };
+    let verdict_inputs = to.resolved_ignore_changes.mask_comparison_attributes(
+        &comparison_attributes,
+        raw_comparison,
+        stored_attributes.as_ref(),
+        schema,
+    );
+    let verdict_projection = project_from_attrs(&verdict_inputs, explicit, schema, comparison);
+    let change_verdict =
+        attribute_change_verdict(&verdict_inputs, &verdict_projection, schema, comparison);
     let masked = to.resolved_ignore_changes.mask_comparison_attributes(
         &comparison_attributes,
         &from_attributes,
@@ -1283,6 +1350,7 @@ fn build_update_rows<S, D, R: ReferenceEquality, V: crate::resource::PlanValueKi
             comparison,
         )
         .with_explicit(Some(&projected.authoring))
+        .with_change_verdict(&change_verdict)
         .with_recorded_effects(recorded_effects),
     );
     rows.extend(attr_rows.rows);
@@ -1392,6 +1460,8 @@ fn string_list_diff_row(
     }
 }
 
+type AttributeChangeVerdict<'a> = dyn Fn(&str, LeafProvenance<'_>, &Value, bool) -> bool + 'a;
+
 struct AttributeDiffContext<'a, R: ReferenceEquality> {
     from_attrs_raw: &'a CanonicalComparisonAttributes,
     from_attrs_projected: &'a CanonicalComparisonAttributes,
@@ -1404,6 +1474,7 @@ struct AttributeDiffContext<'a, R: ReferenceEquality> {
     explicit: Option<&'a ProjectedAuthoring>,
     comparison: ComparisonContext<'a, R>,
     recorded_effects: bool,
+    change_verdict: Option<&'a AttributeChangeVerdict<'a>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1440,6 +1511,7 @@ impl<'a, R: ReferenceEquality> AttributeDiffContext<'a, R> {
             explicit: None,
             comparison,
             recorded_effects: false,
+            change_verdict: None,
         }
     }
 
@@ -1464,7 +1536,13 @@ impl<'a, R: ReferenceEquality> AttributeDiffContext<'a, R> {
             explicit: None,
             comparison,
             recorded_effects: false,
+            change_verdict: None,
         }
+    }
+
+    fn with_change_verdict(mut self, verdict: &'a AttributeChangeVerdict<'a>) -> Self {
+        self.change_verdict = Some(verdict);
+        self
     }
 
     fn with_recorded_effects(mut self, recorded_effects: bool) -> Self {
@@ -1553,6 +1631,41 @@ fn project_from_attrs<R: ReferenceEquality>(
             ExplicitProjection::for_desired(masked, explicit, schema, &comparison).current()
         }
         None => crate::explicit::ProjectedAttributes::unprojected(masked.current().clone(), None),
+    }
+}
+
+/// Renderers receive a decision, never the unredacted comparison operands.
+fn attribute_change_verdict<'a, R: ReferenceEquality + 'a>(
+    masked: &'a crate::resource::MaskedComparisonAttributes,
+    projected: &'a crate::explicit::ProjectedAttributes,
+    schema: Option<&'a ResourceSchema>,
+    comparison: ComparisonContext<'a, R>,
+) -> impl Fn(&str, LeafProvenance<'_>, &Value, bool) -> bool + 'a {
+    move |key, provenance, fallback, forces_replacement| {
+        let comparison = comparison.with_left_origins(&projected.origins);
+        let from = projected.attributes().get(key).or_else(|| {
+            forces_replacement
+                .then(|| masked.current().get(key))
+                .flatten()
+        });
+        let attr_type = schema
+            .and_then(|schema| schema.attributes.get(key))
+            .map(|attribute| &attribute.attr_type);
+        let defs = schema
+            .map(|schema| &schema.defs)
+            .unwrap_or(empty_defs_for_schema_walks());
+        key_should_enter_patch(
+            key,
+            schema,
+            provenance,
+            AttrComparison {
+                from,
+                to: masked.desired().get(key).unwrap_or(fallback),
+                saved: None,
+                type_info: attr_type.map(|attr_type| TypedAttr { attr_type, defs }),
+            },
+            &comparison.at_path(key),
+        )
     }
 }
 
@@ -1660,18 +1773,26 @@ fn build_attribute_diff_rows<S, D, R: ReferenceEquality, V: crate::resource::Pla
             attr_type,
             defs: ctx.defs,
         });
-        let is_same = !key_should_enter_patch(
-            &key,
-            ctx.schema,
-            ctx.leaf_provenance(&key),
-            AttrComparison {
-                from: old_value,
-                to: new_value,
-                saved: None,
-                type_info,
-            },
-            &ctx.comparison,
-        );
+        let is_same = !match ctx.change_verdict {
+            Some(verdict) => verdict(
+                &key,
+                ctx.leaf_provenance(&key),
+                new_value,
+                forces_replacement,
+            ),
+            None => key_should_enter_patch(
+                &key,
+                ctx.schema,
+                ctx.leaf_provenance(&key),
+                AttrComparison {
+                    from: old_value,
+                    to: new_value,
+                    saved: None,
+                    type_info,
+                },
+                &ctx.comparison,
+            ),
+        };
 
         if is_same {
             if !raw_is_same {
@@ -1860,6 +1981,10 @@ pub fn build_replace_detail_rows_from_display<S, D, V: crate::resource::PlanValu
     let schema = resolved.owner_schema().schema().as_schema();
     let comparison_attributes =
         CanonicalComparisonAttributes::canonicalize(to.resolved_attributes(), schema);
+    let raw_comparison = CanonicalComparisonAttributes::canonicalize(
+        replacement.previous_attributes.clone(),
+        schema,
+    );
     let rendered_changes = std::cell::RefCell::new(crate::differ::RenderedChanges::new());
     let mut rows = match comparisons {
         DetailComparisons::Planning(references) => {
@@ -1868,6 +1993,7 @@ pub fn build_replace_detail_rows_from_display<S, D, V: crate::resource::PlanValu
                 .with_references(references, &to.id, |comparison| {
                     build_replace_rows_from_attributes(
                         &historical_attributes.attributes,
+                        &raw_comparison,
                         historical_attributes.stored_attributes.as_ref(),
                         &historical_attributes.nested_write_only,
                         to,
@@ -1886,6 +2012,7 @@ pub fn build_replace_detail_rows_from_display<S, D, V: crate::resource::PlanValu
             resolved.context().with_recorded_effects(|comparison| {
                 build_replace_rows_from_attributes(
                     &historical_attributes.attributes,
+                    &raw_comparison,
                     historical_attributes.stored_attributes.as_ref(),
                     &historical_attributes.nested_write_only,
                     to,
@@ -1919,8 +2046,9 @@ fn build_replace_rows_from_attributes<
     R: ReferenceEquality,
     V: crate::resource::PlanValueKind,
 >(
-    previous_attributes: &HashMap<String, Value>,
-    stored_attributes: Option<&HashMap<String, Value>>,
+    previous_attributes: &BTreeMap<String, Value>,
+    raw_comparison: &CanonicalComparisonAttributes,
+    stored_attributes: Option<&BTreeMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
     to: &crate::resource::Resource<S, V, crate::resource::AbsoluteBindingAddress, D>,
     comparison_attributes: &CanonicalComparisonAttributes,
@@ -1950,6 +2078,15 @@ fn build_replace_rows_from_attributes<
             crate::resource::UnschematizedComparisonAttributes::new(attributes),
         ),
     });
+    let verdict_inputs = to.resolved_ignore_changes.mask_comparison_attributes(
+        comparison_attributes,
+        raw_comparison,
+        stored_attributes.as_ref(),
+        schema,
+    );
+    let verdict_projection = project_from_attrs(&verdict_inputs, explicit, schema, comparison);
+    let change_verdict =
+        attribute_change_verdict(&verdict_inputs, &verdict_projection, schema, comparison);
     let masked = to.resolved_ignore_changes.mask_comparison_attributes(
         comparison_attributes,
         &previous_attributes,
@@ -1981,7 +2118,8 @@ fn build_replace_rows_from_attributes<
             },
             comparison,
         )
-        .with_explicit(Some(&projected.authoring)),
+        .with_explicit(Some(&projected.authoring))
+        .with_change_verdict(&change_verdict),
     );
     rows.extend(attr_rows.rows);
 
@@ -3195,12 +3333,12 @@ mod tests {
         effect: &Effect,
         registry: Option<&SchemaRegistry>,
         detail: DetailLevel,
-        delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
+        delete_attributes: Option<&HashMap<ResourceId, BTreeMap<String, Value>>>,
         prev_explicit: Option<&HashMap<ResourceId, crate::explicit::ExplicitFields>>,
     ) -> Vec<DetailRow> {
         let mut plan = Plan::new();
         plan.add(effect.clone());
-        let mut historical_attributes = HistoricalDisplayAttributes::for_plan(&plan);
+        let mut historical_attributes = HistoricalDisplayAttributes::for_test_plan(&plan);
         if let Effect::Update { from, .. } = effect
             && let Some(update) = historical_attributes.updates.get_mut(&from.id)
         {
@@ -3584,7 +3722,7 @@ mod tests {
             .unwrap();
         let saved: UnresolvedSavedPlan = serde_json::from_slice(&wire).unwrap();
         let saved = saved.resolve_with_schemas(&registry).unwrap();
-        let mut historical = HistoricalDisplayAttributes::for_plan(&saved);
+        let mut historical = HistoricalDisplayAttributes::for_test_plan(&saved);
         let update = historical.updates.get_mut(&to.id).unwrap();
         update.stored_attributes = Some(update.attributes.clone());
         let (schemas, provider) = crate::provider::comparison_fixture_for_test(&registry, [&to.id]);
@@ -3640,7 +3778,7 @@ mod tests {
         let from = State {
             id: to.id.clone(),
             identifier: Some("resource-123".into()),
-            attributes: HashMap::from([
+            attributes: std::collections::BTreeMap::from([
                 ("key".into(), string("canonical/old")),
                 ("name".into(), string("old")),
             ]),
@@ -3662,7 +3800,7 @@ mod tests {
                     .unwrap();
             let unresolved: UnresolvedSavedPlan = serde_json::from_slice(&wire).unwrap();
             let saved_plan = unresolved.resolve_with_schemas(&registry).unwrap();
-            let historical = HistoricalDisplayAttributes::for_plan(&saved_plan);
+            let historical = HistoricalDisplayAttributes::for_test_plan(&saved_plan);
             let (schemas, provider) =
                 crate::provider::comparison_fixture_for_test(&registry, [&to.id]);
             let rows = build_detail_rows_by_instance(
@@ -3728,7 +3866,7 @@ mod tests {
             &plan,
             &to,
             plan.replace_display_info().next().unwrap(),
-            &HistoricalDisplayAttributes::for_plan(&plan),
+            &HistoricalDisplayAttributes::for_test_plan(&plan),
             None,
             DetailLevel::Full,
             None,
@@ -3832,7 +3970,7 @@ mod tests {
             assert!(!wire.contains("new-private-token"));
             let unresolved: UnresolvedSavedPlan = serde_json::from_str(&wire).unwrap();
             let loaded = unresolved.resolve_with_schemas(&registry).unwrap();
-            let historical = HistoricalDisplayAttributes::for_plan(&loaded);
+            let historical = HistoricalDisplayAttributes::for_test_plan(&loaded);
             let (registry, provider) =
                 crate::provider::comparison_fixture_for_test(&registry, std::iter::once(&id));
             let rows = if replacement {
@@ -3955,7 +4093,7 @@ mod tests {
             ))
         ));
 
-        let historical = HistoricalDisplayAttributes::for_plan(&rehydrated);
+        let historical = HistoricalDisplayAttributes::for_test_plan(&rehydrated);
         let (registry, provider) =
             crate::provider::comparison_fixture_for_test(&registry, std::iter::once(&id));
         let rows = build_detail_rows_by_instance(
@@ -3997,6 +4135,11 @@ mod tests {
                 |comparison| {
                     build_replace_rows_from_attributes(
                         &crate::test_support::snapshot_attributes((from.attributes).clone()),
+                        &CanonicalComparisonAttributes::from_unschematized(
+                            crate::resource::UnschematizedComparisonAttributes::new(
+                                from.attributes.clone(),
+                            ),
+                        ),
                         Some(&crate::test_support::snapshot_attributes(
                             (from.attributes).clone(),
                         )),
@@ -4279,7 +4422,7 @@ mod tests {
         };
         let mut plan = Plan::new();
         plan.add(effect);
-        let mut historical = HistoricalDisplayAttributes::for_plan(&plan);
+        let mut historical = HistoricalDisplayAttributes::for_test_plan(&plan);
         let persisted = PersistedAttributes::from_typed_persisted_wire_values(
             crate::test_support::snapshot_attributes(HashMap::from([
                 (
@@ -4530,14 +4673,14 @@ mod tests {
 
     #[test]
     fn test_update_changed_attributes() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("s3.Bucket", "my-bucket"),
             [(
                 "versioning".to_string(),
                 Value::Concrete(ConcreteValue::String("Disabled".into())),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("s3.Bucket", "my-bucket").with_attribute(
             "versioning",
@@ -4581,7 +4724,7 @@ mod tests {
                 ),
             ]),
         );
-        let from = State::existing(
+        let from: State = State::existing(
             to.id.clone(),
             [(
                 "tags".to_string(),
@@ -4601,7 +4744,7 @@ mod tests {
                 ]))),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier(
@@ -4787,7 +4930,7 @@ mod tests {
         let Effect::Create(saved_to) = &plan.effects()[0] else {
             panic!("replacement create effect must survive saved-plan round trip");
         };
-        let historical = HistoricalDisplayAttributes::for_plan(&plan);
+        let historical = HistoricalDisplayAttributes::for_test_plan(&plan);
         let rows = build_replace_detail_rows_from_display(
             &plan,
             saved_to,
@@ -4836,7 +4979,7 @@ mod tests {
 
     #[test]
     fn test_update_hidden_unchanged_in_full_mode() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("s3.Bucket", "my-bucket"),
             [
                 (
@@ -4853,7 +4996,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute(
@@ -4929,7 +5072,7 @@ mod tests {
         // Both desired fields contribute even when prior authoring records only one.
         use crate::explicit::ExplicitFields;
 
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("s3.Bucket", "my-bucket"),
             [
                 (
@@ -4946,7 +5089,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute(
@@ -5018,7 +5161,7 @@ mod tests {
             explicit_dependencies: Default::default(),
             blocked_by_updates: Default::default(),
         };
-        let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
+        let mut delete_attrs: HashMap<ResourceId, BTreeMap<String, Value>> = HashMap::new();
         delete_attrs.insert(
             id.clone(),
             [(
@@ -5066,7 +5209,7 @@ mod tests {
 
     #[test]
     fn test_update_removed_attribute() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("s3.Bucket", "my-bucket"),
             [
                 (
@@ -5079,7 +5222,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("s3.Bucket", "my-bucket").with_attribute(
             "name",
@@ -5131,7 +5274,7 @@ mod tests {
             previous_attributes: crate::test_support::snapshot_attributes(previous_attributes),
         });
         let replacement = plan.replace_display_info().next().unwrap();
-        let historical = HistoricalDisplayAttributes::for_plan(&plan);
+        let historical = HistoricalDisplayAttributes::for_test_plan(&plan);
 
         let rows = build_replace_detail_rows_from_display(
             &plan,
@@ -5188,7 +5331,6 @@ mod tests {
             )])),
         });
 
-        let mut historical = HistoricalDisplayAttributes::for_plan(&plan);
         let Effect::Delete {
             id,
             identifier,
@@ -5212,7 +5354,22 @@ mod tests {
             .expect("encode persisted comment"),
         )]))
         .expect("persisted attributes");
-        historical.set_delete_from_persisted(delete_key, &persisted);
+        let deleted = HashMap::from([(
+            delete_key.clone(),
+            crate::resource::SnapshotState::existing(
+                delete_key.id().clone(),
+                persisted.to_values(),
+            ),
+        )]);
+        let observations = crate::value::ObservationState::empty_for_test()
+            .protect(crate::value::ObservationInputs::Display {
+                plan: &plan,
+                current: &HashMap::new(),
+                deleted: &deleted,
+            })
+            .unwrap();
+        let historical =
+            HistoricalDisplayAttributes::from_observations(&plan, &observations).unwrap();
 
         let rows = build_replace_detail_rows_from_display(
             &plan,
@@ -5249,9 +5406,11 @@ mod tests {
         let old_rules = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::Map(rule.clone()),
         )]));
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("test.Widget", "beta"),
-            [("rules".to_string(), old_rules)].into_iter().collect(),
+            [("rules".to_string(), old_rules)]
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "beta");
         let effect = Effect::Update {
@@ -5605,7 +5764,8 @@ mod tests {
             .with_attribute("rules", applied_rules.clone());
         let desired: Resource =
             Resource::new("test.Listener", "listener").with_attribute("rules", desired_rules);
-        let stored = HashMap::from([("rules".to_string(), applied_rules.clone())]);
+        let stored =
+            std::collections::BTreeMap::from([("rules".to_string(), applied_rules.clone())]);
         let sent = crate::executor::AcceptedRequest::create_for_test();
         let sent_desired = sent.sent_desired_attributes(&applied);
         let prior = crate::explicit::build_from_resource_for_stored_values_after_send(
@@ -5786,7 +5946,7 @@ mod tests {
             "Name".to_string(),
             Value::Concrete(ConcreteValue::String("test".into())),
         );
-        let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
+        let mut delete_attrs: HashMap<ResourceId, BTreeMap<String, Value>> = HashMap::new();
         delete_attrs.insert(
             id.clone(),
             [(
@@ -5841,7 +6001,7 @@ mod tests {
         let dvo = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::Map(entry),
         )]));
-        let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
+        let mut delete_attrs: HashMap<ResourceId, BTreeMap<String, Value>> = HashMap::new();
         delete_attrs.insert(
             id.clone(),
             [("domain_validation_options".to_string(), dvo)]
@@ -5879,7 +6039,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
             "cidr_block",
@@ -5909,7 +6069,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("tok".into())),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "beta");
         let rows = replace_rows_for_test(
@@ -5948,7 +6108,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::Map(settings)),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "beta");
         let rows =
@@ -5989,7 +6149,9 @@ mod tests {
         )]));
         let from = State::existing(
             ResourceId::with_identity("test.Widget", "beta"),
-            [("rules".to_string(), old_rules)].into_iter().collect(),
+            [("rules".to_string(), old_rules)]
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "beta");
         let rows = replace_rows_for_test(from, to, &["rules"], DetailLevel::Explicit, vec![], None);
@@ -6049,7 +6211,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("wafv2.WebAcl", "edge")
             .with_attribute(
@@ -6123,7 +6285,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("arn:old".into())),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "w").with_attribute(
             "arn",
@@ -6159,7 +6321,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("arn:old".into())),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "w").with_attribute(
             "arn",
@@ -6220,7 +6382,7 @@ mod tests {
                 )])),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "w").with_attribute(
             "rules",
@@ -6262,7 +6424,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::Map(old_settings)),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "w").with_attribute(
             "settings",
@@ -6288,7 +6450,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::StringList(vec!["only-one".into()])),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "w").with_attribute(
             "aliases",
@@ -6328,7 +6490,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "w")
             .with_attribute(
@@ -6447,7 +6609,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "w").with_attribute(
             "external_name",
@@ -6666,7 +6828,7 @@ mod tests {
     /// "Allow"`.
     #[test]
     fn update_with_only_enum_equal_leaves_emits_no_phantom_row() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("iam.Role", "r"),
             [(
                 "policy".to_string(),
@@ -6676,7 +6838,7 @@ mod tests {
                 ),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("iam.Role", "r").with_attribute(
             "policy",
@@ -6742,7 +6904,7 @@ mod tests {
             to: resolved(to),
             changed_attributes: vec!["function_name".to_string()],
         });
-        let historical = HistoricalDisplayAttributes::for_plan(&plan);
+        let historical = HistoricalDisplayAttributes::for_test_plan(&plan);
         let scope = ReferenceScope::available("aws", "us-east-1", "123456789012")
             .expect("fixture scope is valid");
         let witness = crate::schema::ValidatedProviderSchemaWitness::new(
@@ -6799,7 +6961,7 @@ mod tests {
             to: resolved(to),
             changed_attributes: vec!["name".to_string()],
         });
-        let historical = HistoricalDisplayAttributes::for_plan(&plan);
+        let historical = HistoricalDisplayAttributes::for_test_plan(&plan);
 
         let error = build_detail_rows_by_instance(
             &plan.effects()[0],
@@ -6823,7 +6985,7 @@ mod tests {
     /// it. Guards against the fix over-suppressing.
     #[test]
     fn update_real_sibling_change_still_renders_without_enum_phantom() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("iam.Role", "r"),
             [
                 (
@@ -6839,7 +7001,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("iam.Role", "r")
             .with_attribute(
@@ -6878,7 +7040,7 @@ mod tests {
     /// aliases, so the shared exact comparison keeps the raw-spelling change.
     #[test]
     fn update_with_empty_schema_uses_exact_comparison() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("iam.Role", "r"),
             [(
                 "policy".to_string(),
@@ -6888,7 +7050,7 @@ mod tests {
                 ),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("iam.Role", "r").with_attribute(
             "policy",
@@ -6920,7 +7082,7 @@ mod tests {
     /// counted — the displayed total would not add up.
     #[test]
     fn update_full_mode_counts_enum_equal_attr_as_unchanged() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("iam.Role", "r"),
             [(
                 "policy".to_string(),
@@ -6930,7 +7092,7 @@ mod tests {
                 ),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("iam.Role", "r").with_attribute(
             "policy",
@@ -6993,14 +7155,14 @@ mod tests {
             m.insert("a".to_string(), Value::Concrete(v));
             Value::Concrete(ConcreteValue::Map(m))
         };
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("x.Thing", "t"),
             [(
                 "modes".to_string(),
                 mk(ConcreteValue::enum_identifier("on".to_string())),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("x.Thing", "t")
             .with_attribute("modes", mk(ConcreteValue::String("On".into())));
@@ -7025,7 +7187,7 @@ mod tests {
     /// real enum-value changes.
     #[test]
     fn update_real_enum_change_still_renders_with_registry() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("iam.Role", "r"),
             [(
                 "policy".to_string(),
@@ -7035,7 +7197,7 @@ mod tests {
                 ),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         // Desired flips effect to the API-canonical `Deny` — a real
         // change, not a spelling alias of `allow`.
@@ -7071,7 +7233,7 @@ mod tests {
     /// just `count == 1` in isolation.
     #[test]
     fn update_full_mode_multi_attr_tally_balances() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("iam.Role", "r"),
             [
                 (
@@ -7091,7 +7253,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("iam.Role", "r")
             .with_attribute(
@@ -7474,11 +7636,11 @@ mod tests {
     #[test]
     fn update_string_list_of_enum_only_genuine_add_renders() {
         let registry = modes_registry();
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("x.Thing", "t"),
             [("modes".to_string(), enum_list(&["allow"]))]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to =
             Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
@@ -7688,14 +7850,14 @@ mod tests {
         // uses `Value::semantically_equal`, which compares
         // `StringList(["x"])` to `List([String("x")])` as unequal even
         // though both `format_value` to `["x"]`.
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("x.Thing", "t"),
             [(
                 "tags".to_string(),
                 Value::Concrete(ConcreteValue::StringList(vec!["only-one".into()])),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("x.Thing", "t").with_attribute(
             "tags",
@@ -7731,7 +7893,7 @@ mod tests {
     /// rather than dropping the change entirely.
     #[test]
     fn top_level_changed_keeps_secret_rotation_visible() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("x.Thing", "t"),
             [(
                 "password".to_string(),
@@ -7740,7 +7902,7 @@ mod tests {
                 )),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("x.Thing", "t").with_attribute(
             "password",
@@ -8125,11 +8287,11 @@ mod tests {
     /// aliases to canonicalize, so the raw-spelling list change remains.
     #[test]
     fn update_string_list_of_enum_with_empty_schema_uses_exact_comparison() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("x.Thing", "t"),
             [("modes".to_string(), enum_list(&["allow"]))]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to =
             Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
@@ -8161,3 +8323,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "detail_rows_observed_secret_tests.rs"]
+mod observed_api_tests;

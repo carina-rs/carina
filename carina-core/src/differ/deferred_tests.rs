@@ -58,7 +58,7 @@ fn delete_effect_for_binding(binding: &str) -> Effect {
 fn review5_4283_deferred_absorption_uses_the_recorded_generation_snapshot() {
     let current = crate::effect::DeferredReplaceDelete {
         generation: EffectGeneration::Current,
-        previous_attributes: HashMap::from([(
+        previous_attributes: std::collections::BTreeMap::from([(
             "name".into(),
             crate::resource::SnapshotValue::Concrete(ConcreteValue::String("current-B".into())),
         )]),

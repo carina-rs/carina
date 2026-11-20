@@ -37,7 +37,7 @@ use carina_core::resource::{
 use carina_core::resource::{ConcreteValue, State};
 use carina_core::shutdown::ShutdownToken;
 use carina_core::upstream_exports::AdmittedRemoteBindings;
-use carina_core::value::{RenderedKey, render_value};
+use carina_core::value::RenderedKey;
 use carina_state::{
     LockInfo, RowBasis, S3AutoCreate, S3Bootstrap, StateBackend, StateFile, StorageReadiness,
 };
@@ -541,7 +541,7 @@ fn bootstrap_resolved_bindings(
     parsed: &carina_core::parser::ExpandedInferredFile,
 ) -> ResolvedBindings {
     let managed_current = HashMap::new();
-    let remote_bindings = HashMap::new();
+    let remote_bindings = std::collections::BTreeMap::new();
     let wait_aliases: Vec<WaitAliasSpec> = parsed
         .wait_bindings
         .iter()
@@ -964,13 +964,13 @@ async fn execute_rehydrated_saved_plan(
 async fn verify_upstream_snapshot(
     wiring: &crate::wiring::WiringContext,
     sources: &[crate::commands::plan::UpstreamSource],
-    snapshot: &HashMap<String, HashMap<String, Value>>,
+    snapshot: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, Value>>,
     project_dir: &ResolvedPath,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
     let provider_context = wiring.provider_context().as_provider_context();
     let mut cycle_guard = super::plan::seed_cycle_guard(project_dir);
-    let mut current = HashMap::new();
+    let mut current = AdmittedRemoteBindings::new();
     for source in sources {
         let state = ExpandedUpstreamState {
             binding: source.binding.clone(),
@@ -1031,11 +1031,10 @@ pub(crate) fn upstream_snapshot_drift(binding: &str, apply_target: ApplyTarget<'
 ///
 /// Split out so it can be unit-tested without a real upstream backend.
 fn diff_upstream_snapshot(
-    snapshot: &HashMap<String, HashMap<String, Value>>,
+    snapshot: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, Value>>,
     current: &AdmittedRemoteBindings,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), String> {
-    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for (binding, planned_attrs) in snapshot {
         match current.get(binding) {
             None => {
@@ -1052,7 +1051,6 @@ fn diff_upstream_snapshot(
             Some(_) => {}
         }
     }
-    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for binding in current.keys() {
         if !snapshot.contains_key(binding) {
             return Err(format!(
@@ -1069,7 +1067,28 @@ fn diff_upstream_snapshot(
 #[cfg(test)]
 mod upstream_snapshot_tests {
     use super::*;
-    use carina_core::upstream_exports::remote_bindings_for_test;
+    use std::collections::BTreeMap;
+
+    fn remote_bindings_for_test(
+        bindings: BTreeMap<String, BTreeMap<String, Value>>,
+    ) -> AdmittedRemoteBindings {
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        bindings
+            .into_iter()
+            .map(|(name, values)| {
+                let admitted = carina_core::validation::deferred_types::with_session_for_test(
+                    &context,
+                    |session| {
+                        carina_core::upstream_exports::ResolvedUpstreamSource::for_test(&name, None)
+                            .admit_snapshot(values, session)
+                    },
+                )
+                .expect("fixture admission");
+                (name, admitted)
+            })
+            .collect()
+    }
 
     #[test]
     fn round2_4_wrapped_admission_failure_remains_drift() {
@@ -1140,7 +1159,7 @@ mod upstream_snapshot_tests {
         let error = verify_upstream_snapshot(
             &wiring,
             &sources,
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &ResolvedPath::new(root.path()).unwrap(),
             ApplyTarget::Project(root.path()),
         )
@@ -1154,7 +1173,7 @@ mod upstream_snapshot_tests {
         assert!(matches!(error, AppError::Backend(_)), "{error:?}");
     }
 
-    fn binding(name: &str, attrs: &[(&str, &str)]) -> (String, HashMap<String, Value>) {
+    fn binding(name: &str, attrs: &[(&str, &str)]) -> (String, BTreeMap<String, Value>) {
         let map = attrs
             .iter()
             .map(|(k, v)| {
@@ -1169,10 +1188,12 @@ mod upstream_snapshot_tests {
 
     #[test]
     fn matching_snapshot_passes() {
-        let snapshot: HashMap<String, HashMap<String, Value>> =
-            vec![binding("network", &[("vpc_id", "vpc-A")])]
-                .into_iter()
-                .collect();
+        let snapshot: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, Value>,
+        > = vec![binding("network", &[("vpc_id", "vpc-A")])]
+            .into_iter()
+            .collect();
         let current = remote_bindings_for_test(snapshot.clone());
         assert!(
             diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
@@ -1185,10 +1206,12 @@ mod upstream_snapshot_tests {
         // Same binding name, but the attribute value changed underneath.
         // This is the original bug: cascade re-resolution would silently
         // see "vpc-B" while the static plan was built around "vpc-A".
-        let snapshot: HashMap<String, HashMap<String, Value>> =
-            vec![binding("network", &[("vpc_id", "vpc-A")])]
-                .into_iter()
-                .collect();
+        let snapshot: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, Value>,
+        > = vec![binding("network", &[("vpc_id", "vpc-A")])]
+            .into_iter()
+            .collect();
         let current = remote_bindings_for_test(
             vec![binding("network", &[("vpc_id", "vpc-B")])]
                 .into_iter()
@@ -1205,11 +1228,13 @@ mod upstream_snapshot_tests {
 
     #[test]
     fn binding_disappeared_fails() {
-        let snapshot: HashMap<String, HashMap<String, Value>> =
-            vec![binding("network", &[("vpc_id", "vpc-A")])]
-                .into_iter()
-                .collect();
-        let current = remote_bindings_for_test(HashMap::new());
+        let snapshot: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, Value>,
+        > = vec![binding("network", &[("vpc_id", "vpc-A")])]
+            .into_iter()
+            .collect();
+        let current = remote_bindings_for_test(std::collections::BTreeMap::new());
         let err = diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
             .expect_err("must fail");
         assert!(err.contains("missing now"), "got: {err}");
@@ -1217,7 +1242,10 @@ mod upstream_snapshot_tests {
 
     #[test]
     fn binding_appeared_fails() {
-        let snapshot: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let snapshot: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, Value>,
+        > = std::collections::BTreeMap::new();
         let current = remote_bindings_for_test(
             vec![binding("network", &[("vpc_id", "vpc-A")])]
                 .into_iter()
@@ -1230,8 +1258,9 @@ mod upstream_snapshot_tests {
 
     #[test]
     fn empty_both_sides_passes() {
-        let empty: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let current = remote_bindings_for_test(HashMap::new());
+        let empty: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Value>> =
+            std::collections::BTreeMap::new();
+        let current = remote_bindings_for_test(std::collections::BTreeMap::new());
         assert!(
             diff_upstream_snapshot(&empty, &current, ApplyTarget::Project(Path::new("."))).is_ok()
         );
@@ -1414,57 +1443,12 @@ pub(crate) async fn save_state_unlocked_after_execute(
     }
 }
 
-/// Read state from the backend and, if `check_and_migrate` lifted the
-/// on-disk schema in memory, persist the upgraded shape immediately
-/// under the current lock.
-///
-/// This is the lock-held entry-point used by `apply`, `destroy`, and
-/// `state refresh`. Without it, the no-op short-circuits inside those
-/// commands (e.g. "No changes needed." when no resource diff exists)
-/// would skip the writer entirely and leave the on-disk version
-/// stuck at the older schema — which is the bug reported in
-/// carina#3315 and which makes carina#3283's "Disk state will be
-/// rewritten during the next apply or state refresh of that project."
-/// warning text a lie.
-///
-/// Persistence happens exactly once per state file's schema lifetime:
-/// after the first successful run under this helper the on-disk
-/// version matches `StateFile::CURRENT_VERSION`, so subsequent
-/// `read_state` calls produce a pristine `LoadedState` and this
-/// helper is a no-op write-wise.
-pub(crate) async fn load_state_persist_if_migrated(
-    backend: &dyn StateBackend,
-    lock: StateLockRef<'_>,
-) -> Result<Option<StateFile>, AppError> {
-    match backend.read_state().await.map_err(AppError::Backend)? {
-        None => Ok(None),
-        Some(carina_state::LoadedState::Pristine(state)) => Ok(Some(state)),
-        Some(carina_state::LoadedState::Migrated { mut state, .. }) => {
-            state.finish_rowless_dependency_migration();
-            if state.requires_legacy_dependency_migration() {
-                // v20 dependency names are an intentionally unwritable
-                // typestate. The expanded graph later classifies them before
-                // any state mutation or persistence is allowed.
-                return Ok(Some(state));
-            }
-            match lock {
-                StateLockRef::Held(lock) => save_state_locked(backend, lock, &mut state).await?,
-                StateLockRef::Disabled(disabled) => {
-                    save_state_unlocked(backend, disabled, &mut state).await?
-                }
-            }
-            Ok(Some(state))
-        }
-    }
-}
-
 /// Remove pre-#3181 identifier-less data-source rows identified by the
 /// parser's typed `read` addresses and persist the normalized state while the
 /// caller's lock is held.
 ///
-/// This is intentionally separate from JSON migration: identifier-less
-/// managed rows and historical data-source rows have the same old wire shape,
-/// so cleanup requires both that shape and the parsed resource kind/address.
+/// Identifier-less managed rows and historical data-source rows share a wire
+/// shape, so cleanup also requires the parsed resource kind/address.
 /// An identifier-bearing managed row is preserved even when a data source now
 /// occupies the same address.
 pub(crate) async fn prune_legacy_data_source_rows_persist_if_changed(
@@ -1477,12 +1461,6 @@ pub(crate) async fn prune_legacy_data_source_rows_persist_if_changed(
         return Ok(());
     };
     if state.remove_legacy_data_source_rows(data_sources) == 0 {
-        return Ok(());
-    }
-    if state.requires_legacy_dependency_migration() {
-        // The pre-v21 typestate is intentionally not serializable. The
-        // expanded-graph phase below persists this parser-aware cleanup
-        // together with the configuration-aware dependency migration.
         return Ok(());
     }
     match lock {
@@ -1641,15 +1619,23 @@ pub(crate) async fn detect_drift<S: Clone>(
         carina_core::resource::AbsoluteBindingAddress,
         (),
     >],
+    observation_plan: &carina_core::plan::Plan<S>,
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
     refresh_rows: &carina_state::RefreshRows,
     historical_addresses: &HistoricalResourceAddresses,
     operation_provider: &dyn HostProvider,
     comparison_provider: &ProviderRouter,
     state_file: Option<&StateFile>,
+    observation_authority: &carina_state::ObservationStateAuthority,
     schemas: &carina_core::schema::SchemaRegistry,
     apply_target: ApplyTarget<'_>,
 ) -> Result<DriftCheckResult, AppError> {
+    enum DriftedAttribute<'a> {
+        Changed(&'a str),
+        Removed(&'a str),
+        Added(&'a str),
+    }
+
     let mut drift_detected = false;
     let mut drift_messages: Vec<String> = Vec::new();
     let mut actual_states = HashMap::new();
@@ -1663,6 +1649,13 @@ pub(crate) async fn detect_drift<S: Clone>(
         })
         .collect();
 
+    let observation_history = planned_state_entries
+        .iter()
+        .map(|entry| {
+            let crate::commands::plan::ReloadedCurrentStateEntry::Managed { id, current } = entry;
+            (id.clone(), *current.clone())
+        })
+        .collect::<HashMap<_, _>>();
     for resource in sorted_resources {
         let resolved_resource = ResolvedResource::resolve_with_schemas(resource.clone(), schemas)?;
         // carina#3181: `sorted_resources` is managed-only — drift
@@ -1672,18 +1665,11 @@ pub(crate) async fn detect_drift<S: Clone>(
         let planned_snapshot = planned_states.get(&resource.id).copied();
         let planned_current = planned_snapshot.map(|snapshot| snapshot.as_ref());
         let planned_state = planned_current.and_then(|current| match current {
-            Current::Absent(state) => Some(state.state()),
-            Current::Present(present) => Some(present.state()),
+            Current::Absent(state) => Some((state.state(), false)),
+            Current::Present(present) => Some((present.state(), true)),
             Current::CreateInFlight(_pending) => None,
             Current::CreateOutcomeUnknown(_unknown) => None,
-            Current::MissingIdentifier(state) => Some(state.state()),
-        });
-        let planned_exists = planned_current.and_then(|current| match current {
-            Current::Absent(_absent) => Some(false),
-            Current::Present(_present) => Some(true),
-            Current::CreateInFlight(_pending) => None,
-            Current::CreateOutcomeUnknown(_unknown) => None,
-            Current::MissingIdentifier(_unidentified) => Some(true),
+            Current::MissingIdentifier(state) => Some((state.state(), true)),
         });
         let historical_id = planned_current
             .map(|_| historical_addresses.origin_for(&resource.id))
@@ -1721,8 +1707,7 @@ pub(crate) async fn detect_drift<S: Clone>(
         actual_state.id = resource.id.clone();
         actual_states.insert(resource.id.clone(), actual_state.clone());
 
-        if let Some(planned) = planned_state {
-            let planned_exists = planned_exists.expect("planned state and variant are paired");
+        if let Some((planned, planned_exists)) = planned_state {
             if planned_exists != actual_state.exists {
                 drift_detected = true;
                 if planned_exists {
@@ -1763,29 +1748,15 @@ pub(crate) async fn detect_drift<S: Clone>(
                     actual_state.attributes.clone(),
                     schema,
                 );
-                // Compare attributes for existing resources
-                let attr_diffs = typed_comparison.context().with_observation(|comparison| {
-                    let mut attr_diffs: Vec<String> = Vec::new();
-                    for (key, planned_val) in &planned_comparison {
-                        let historical_shape = planned_state
-                            .and_then(|state| state.attributes.get(key))
-                            .unwrap_or(planned_val);
-                        let masked_planned = carina_core::value::mask_plaintext_using_secret_shape(
-                            planned_val,
-                            historical_shape,
-                        );
-                        match actual_comparison.get(key) {
-                            Some(actual_val) if secret_drift.contains(key) => {
-                                let masked = carina_core::value::mask_plaintext_using_secret_shape(
-                                    actual_val,
-                                    historical_shape,
-                                );
-                                attr_diffs.push(format!(
-                                    "      {}: {} → {}",
-                                    RenderedKey::from_raw(key),
-                                    render_value(&masked_planned),
-                                    render_value(&masked)
-                                ));
+                // Equality needs raw operands, but output protection is needed
+                // only when a comparison produces a diagnostic to render.
+                let drifted_attributes =
+                    typed_comparison.context().with_observation(|comparison| {
+                        let mut drifted_attributes = Vec::new();
+                        for (key, planned_val) in &planned_comparison {
+                            match actual_comparison.get(key) {
+                            Some(_) if secret_drift.contains(key) => {
+                                drifted_attributes.push(DriftedAttribute::Changed(key));
                             }
                             Some(actual_val)
                                 if !carina_core::diff_helpers::resource_attribute_values_equal(
@@ -1796,39 +1767,60 @@ pub(crate) async fn detect_drift<S: Clone>(
                                     comparison,
                                 ) =>
                             {
-                                let masked = carina_core::value::mask_plaintext_using_secret_shape(
-                                    actual_val,
-                                    historical_shape,
-                                );
-                                attr_diffs.push(format!(
-                                    "      {}: {} → {}",
-                                    RenderedKey::from_raw(key),
-                                    render_value(&masked_planned),
-                                    render_value(&masked)
-                                ));
+                                drifted_attributes.push(DriftedAttribute::Changed(key));
                             }
                             None => {
-                                attr_diffs.push(format!(
-                                    "      {}: {} → (removed)",
-                                    RenderedKey::from_raw(key),
-                                    render_value(&masked_planned)
-                                ));
+                                drifted_attributes.push(DriftedAttribute::Removed(key));
                             }
                             _ => {}
                         }
-                    }
-                    for (key, actual_val) in &actual_comparison {
-                        if !planned_comparison.contains_key(key) {
-                            attr_diffs.push(format!(
+                        }
+                        for key in actual_comparison.keys() {
+                            if !planned_comparison.contains_key(key) {
+                                drifted_attributes.push(DriftedAttribute::Added(key));
+                            }
+                        }
+                        drifted_attributes
+                    })?;
+                if !drifted_attributes.is_empty() {
+                    let [planned_snapshot, actual_snapshot] =
+                        [&planned_comparison, &actual_comparison].map(|attributes| SnapshotState {
+                            attributes: attributes
+                                .iter()
+                                .map(|(key, value)| (key.clone(), value.clone()))
+                                .collect(),
+                            ..actual_state.clone()
+                        });
+                    let observations = observation_authority.protect(
+                        carina_core::value::ObservationInputs::SavedApply {
+                            plan: observation_plan,
+                            history: &observation_history,
+                            planned: &planned_snapshot,
+                            actual: &actual_snapshot,
+                        },
+                    )?;
+                    let comparisons = observations.comparisons()?;
+                    let mut attr_diffs = Vec::new();
+                    for attribute in drifted_attributes {
+                        attr_diffs.push(match attribute {
+                            DriftedAttribute::Changed(key) => format!(
+                                "      {}: {} → {}",
+                                RenderedKey::from_raw(key),
+                                comparisons.planned.rendered_attribute(key)?,
+                                comparisons.actual.rendered_attribute(key)?
+                            ),
+                            DriftedAttribute::Removed(key) => format!(
+                                "      {}: {} → (removed)",
+                                RenderedKey::from_raw(key),
+                                comparisons.planned.rendered_attribute(key)?
+                            ),
+                            DriftedAttribute::Added(key) => format!(
                                 "      {}: (none) → {}",
                                 RenderedKey::from_raw(key),
-                                render_value(actual_val)
-                            ));
-                        }
+                                comparisons.actual.rendered_attribute(key)?
+                            ),
+                        });
                     }
-                    attr_diffs
-                })?;
-                if !attr_diffs.is_empty() {
                     drift_detected = true;
                     drift_messages.push(format!(
                         "  {} {}: attributes have changed since plan was created:",
@@ -1892,21 +1884,29 @@ pub(crate) async fn detect_drift_for_test<S: Clone>(
         planned_state_entries.iter().map(|entry| {
             let crate::commands::plan::ReloadedCurrentStateEntry::Managed { id, current } = entry;
             (
-                historical_addresses.origin_for(id).clone(),
+                ResolvedResourceId::new(historical_addresses.origin_for(id).clone()),
                 *current.clone(),
             )
         }),
         &carina_state::ResolvedRemovedClaims::resolve(&[], None),
     );
+    let mut plan = carina_core::plan::Plan::<S>::default();
+    plan.retain_observation_desired_for_test(
+        sorted_resources
+            .iter()
+            .map(|resource| (&resource.id, &resource.attributes)),
+    );
     detect_drift(
         color_mode,
         &sorted_resources,
+        &plan,
         planned_state_entries,
         &rows.refreshable,
         historical_addresses,
         operation_provider,
         &comparison_provider,
         state_file,
+        &crate::test_support::observation_authority_for_test(state_file),
         &schemas,
         apply_target,
     )
@@ -2505,13 +2505,10 @@ async fn run_apply_locked_owned(
     let project_display = project_label.as_path();
     let runtime = validated_config.context().runtime().clone();
     let color_mode = validated_config.context().runtime().color_mode();
-    // Read current state from backend. carina#3315: if `check_and_migrate`
-    // lifted an older on-disk schema in memory, persist the upgrade
-    // under the current lock before any short-circuit path can return
-    // — otherwise the carina#3283 warning text ("Disk state will be
-    // rewritten during the next apply or state refresh of that project.")
-    // becomes a lie.
-    let mut state_file = match load_state_persist_if_migrated(backend.as_ref(), lock.as_ref()).await
+    let mut state_file = match carina_state::ObservationStateAuthority::load(backend.as_ref())
+        .await
+        .map(|(file, authority)| authority.bind(file))
+        .map_err(AppError::Backend)
     {
         Ok(state) => state,
         Err(error) => {
@@ -2646,7 +2643,7 @@ async fn run_apply_locked_owned(
             if persisted_state.is_some() {
                 let loaded_orphans = expansion_prelude.loaded_orphans(std::iter::empty());
                 let orphan_results: Vec<
-                    Result<(ResourceId, carina_core::differ::Orphan), AppError>,
+                    Result<(ResolvedResourceId, carina_core::differ::Orphan), AppError>,
                 > = stream::iter(loaded_orphans)
                     .map(|(id, loaded)| async move {
                         let refreshed = refresh_loaded_orphan_with_retry(
@@ -2673,9 +2670,9 @@ async fn run_apply_locked_owned(
                         Current::MissingIdentifier(_state) => true,
                     };
                     if exists {
-                        orphan_refreshed_ids.insert(id.clone());
+                        orphan_refreshed_ids.insert(id.as_inner().clone());
                     }
-                    refreshed_orphans.insert(loaded);
+                    refreshed_orphans.insert(id, loaded);
                 }
                 orphans = refreshed_orphans.into_plan_orphans();
             }
@@ -2789,15 +2786,10 @@ async fn run_apply_locked_owned(
                 moved_origins,
                 prev_explicit,
                 wait_aliases,
-                legacy_dependency_classification: _,
-                migrated_legacy_state,
             } = artifacts;
-            let legacy_state_migrated = migrated_legacy_state.is_some();
-            if let Some(migrated) = migrated_legacy_state {
-                state_file = Some(migrated);
-            }
+            let execution_plan = plan.checked();
             #[cfg(any(test, feature = "test-utils"))]
-            capture_live_apply_plan_for_test(&runtime, &plan)?;
+            capture_live_apply_plan_for_test(&runtime, execution_plan)?;
             let crate::wiring::PostExpansionApplyResources {
                 resolved: resolved_resources,
                 paired_unresolved: paired_unresolved_resources,
@@ -2812,7 +2804,7 @@ async fn run_apply_locked_owned(
                 .into_executable()
                 .map_err(|error| AppError::Config(error.to_string()))?;
 
-            if can_use_export_only_fast_path(&plan, &executable_data_source_values) {
+            if can_use_export_only_fast_path(execution_plan, &executable_data_source_values) {
                 // No mutating effects — the plan only holds `Read` (data-source
                 // reads) or `Wait` effects, or is entirely empty. Either way no
                 // resource apply pipeline needs to run; route through the
@@ -2835,7 +2827,7 @@ async fn run_apply_locked_owned(
                         managed_current: &managed_current,
                         data_source_values: &data_source_values,
                         state_file: state_file.as_ref(),
-                        plan: &plan,
+                        plan: execution_plan,
                         schemas: ctx.schemas(),
                         wait_aliases: &wait_aliases,
                         provider_context: ctx.provider_context(),
@@ -2850,39 +2842,20 @@ async fn run_apply_locked_owned(
                     &checked_exports_pre_apply,
                     current_exports,
                 );
-                let directive_changes =
-                    persisted_directive_changes(state_file.as_ref(), &resolved_resources, &plan);
+                let directive_changes = persisted_directive_changes(
+                    state_file.as_ref(),
+                    &resolved_resources,
+                    execution_plan,
+                );
                 let directive_change_count = directive_changes.len();
 
                 if export_changes.is_empty() && directive_change_count == 0 {
-                    if legacy_state_migrated {
-                        println!(
-                            "{}",
-                            "Persisting configuration-aware state dependency migration."
-                                .cyan(color_mode)
-                        );
-                        let pre_resolve_compositions_noop = parsed.compositions.clone();
-                        return Ok(SourceApplyAfterHeartbeat::PersistExports(Box::new(
-                            SourceApplyPersistExports {
-                                validated_config: validated_expansion,
-                                state_file,
-                                resources: paired_unresolved_resources,
-                                compositions: pre_resolve_compositions_noop,
-                                checked_exports: checked_exports_pre_apply,
-                                wait_aliases,
-                                managed_current,
-                                data_source_values,
-                                directive_change_count: 0,
-                                export_change_count: 0,
-                            },
-                        )));
-                    }
                     println!("{}", "No changes needed.".green(color_mode));
                     return Ok(SourceApplyAfterHeartbeat::Done(None));
                 }
 
                 let summary = PlanChangeSummary::new(
-                    &plan,
+                    execution_plan,
                     &export_changes,
                     &residual_deferred_for,
                     &directive_changes,
@@ -2929,7 +2902,7 @@ async fn run_apply_locked_owned(
                     );
                 }
                 let state_file = if directive_change_count > 0 {
-                    let mut state = state_file.unwrap_or_default();
+                    let mut state = state_file.into_file().unwrap_or_default();
                     apply_persisted_directive_changes(
                         &mut state,
                         &resolved_resources,
@@ -2937,7 +2910,7 @@ async fn run_apply_locked_owned(
                     )?;
                     Some(state)
                 } else {
-                    state_file
+                    state_file.into_file()
                 };
                 // No-op apply path: compositions were never resolved (no head-of-
                 // pipeline pass ran). carina#3181: compositions live in
@@ -2970,7 +2943,7 @@ async fn run_apply_locked_owned(
                     managed_current: &managed_current,
                     data_source_values: &data_source_values,
                     state_file: state_file.as_ref(),
-                    plan: &plan,
+                    plan: execution_plan,
                     schemas: ctx.schemas(),
                     wait_aliases: &wait_aliases,
                     provider_context: ctx.provider_context(),
@@ -2984,10 +2957,13 @@ async fn run_apply_locked_owned(
                 &checked_exports_pre_apply,
                 &current_exports,
             );
-            let directive_changes =
-                persisted_directive_changes(state_file.as_ref(), &resolved_resources, &plan);
+            let directive_changes = persisted_directive_changes(
+                state_file.as_ref(),
+                &resolved_resources,
+                execution_plan,
+            );
             let summary = PlanChangeSummary::new(
-                &plan,
+                execution_plan,
                 &export_changes,
                 &residual_deferred_for,
                 &directive_changes,
@@ -3003,7 +2979,7 @@ async fn run_apply_locked_owned(
                 &provider,
             )?;
             let moved_hints = crate::moved_hint::detect_moved_block_hints(
-                &plan,
+                execution_plan,
                 &managed_current,
                 ctx.schemas(),
                 &provider,
@@ -3032,20 +3008,23 @@ async fn run_apply_locked_owned(
             // `ProviderNormalizer`; the same object is passed in both positions
             // so apply re-normalizes with exactly the plan-time normalizer
             // (carina#3060). They must stay the same object.
-            let observer = observer_factory(color_mode, &plan, project_display);
+            let observer = observer_factory(color_mode, execution_plan, project_display);
             let provider = Arc::new(provider);
             let state_save_inputs = Arc::new(
                 ApplyStateSaveInputs::new(
                     resolved_resources.clone(),
-                    plan.clone().into_unadmitted(),
+                    execution_plan.plan().clone().into_unadmitted(),
                     ctx.schemas().clone(),
                     None,
                     provider.as_ref(),
                 )?
                 .with_reference_evidence(Some(plan.references().clone())),
             );
-            let saver =
-                start_apply_state_saver(state_file, mid_run_writer, Arc::clone(&state_save_inputs));
+            let saver = start_apply_state_saver(
+                state_file.into_file(),
+                mid_run_writer,
+                Arc::clone(&state_save_inputs),
+            );
             let publisher = saver.publisher();
             let checkpoint_sink = ExecutionCheckpointSink::new(move |snapshot| {
                 publisher.send_replace(Some(snapshot));
@@ -3053,7 +3032,7 @@ async fn run_apply_locked_owned(
             // Remove, Move, and keyed-list release need no provider call.
             // Report them now; every checkpoint's state writeback materializes
             // them from the plan.
-            let state_only_success_count = execute_state_only_effects(color_mode, &plan);
+            let state_only_success_count = execute_state_only_effects(color_mode, execution_plan);
             let outcome = execute_effects_with_observer(
                 plan.checked(),
                 &pre_resolve_compositions,
@@ -3087,7 +3066,7 @@ async fn run_apply_locked_owned(
             // Execute import effects: read imported resources from the provider
             execute_import_effects(
                 color_mode,
-                &plan,
+                execution_plan,
                 provider.as_ref(),
                 &mut result,
                 &cancel,
@@ -3812,6 +3791,79 @@ async fn run_apply_from_plan_with_observer_factory(
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_, SavedModuleSource>,
 ) -> Result<(), AppError> {
+    run_apply_from_plan_using(
+        runtime,
+        plan,
+        plan_argument,
+        auto_approve,
+        lock,
+        parallelism,
+        accept_legacy_name_overrides,
+        provider_context,
+        cancel,
+        observer_factory,
+        |runtime, providers, directory| {
+            ProviderLoad::load(
+                runtime,
+                providers,
+                directory,
+                &mut crate::commands::human_provider_notices(runtime.color_mode()),
+            )
+        },
+    )
+    .await
+}
+
+/// Exercise saved apply, including drift verification, with native factories.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn run_saved_apply_with_factories_for_test(
+    runtime: &crate::runtime::CommandRuntime,
+    path: &Path,
+    factories: Vec<crate::wiring::LoadedProviderFactory>,
+) -> Result<(), AppError> {
+    let plan = ResolvedPath::new(path).unwrap();
+    let context = ProviderContext::new(runtime.environment().clone());
+    run_apply_from_plan_using(
+        runtime,
+        &plan,
+        path,
+        true,
+        true,
+        crate::DEFAULT_PARALLELISM,
+        false,
+        &context,
+        ShutdownToken::running(),
+        &cli_observer_factory,
+        |runtime, providers, _| {
+            Ok(ProviderLoad::for_test_with_provider_phase(
+                runtime, factories, providers,
+            ))
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_apply_from_plan_using(
+    runtime: &crate::runtime::CommandRuntime,
+    plan: &ResolvedPath,
+    plan_argument: &Path,
+    auto_approve: bool,
+    lock: bool,
+    parallelism: NonZeroUsize,
+    accept_legacy_name_overrides: bool,
+    provider_context: &ProviderContext,
+    cancel: ShutdownToken,
+    observer_factory: &ObserverFactory<'_, SavedModuleSource>,
+    load_providers: impl FnOnce(
+        &crate::runtime::CommandRuntime,
+        &[carina_core::parser::ProviderConfig<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >],
+        &ResolvedPath,
+    ) -> Result<ProviderLoad, AppError>,
+) -> Result<(), AppError> {
     let color_mode = runtime.color_mode();
     let plan_path = plan_argument;
     let bytes = plan.read().map_err(|error| AppError::PlanFileRead {
@@ -3850,92 +3902,7 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 42
-    // retains replacement history and create-first dependency requirements;
-    // format 41 uses typed Secret nodes exclusively. Format 40
-    // requires an absolute source locator and its planned canonical identity.
-    // Format 39 stores resolved dependency addresses and legacy migration
-    // classifications.
-    // Format 38 retains lifecycle values, default origins, and loop call sites;
-    // earlier binaries could silently discard safety directives. Format 37
-    // requires a relative diagnostic file (or null) and line on each deferred-for
-    // template. Format 36 adds typed deferred-for templates and stage-specific
-    // placeholder types.
-    // Format 35 stores tri-state prevent_destroy directives, so format 34
-    // plans must be regenerated. Format 34 adds typed deferred integer
-    // arithmetic expressions. Format 33 adds the typed keyed-list release
-    // effect. Format 32 records provider
-    // instance reference scopes and create-outcome-unknown markers for
-    // protocol v13. Format 31 persists authored ignore paths; format 30 was
-    // never emitted. Format 29 persists anonymous-loop provenance, typed
-    // deferred-loop targets, and Move origins. Format 27 requires normalized
-    // composition call origins. Plan-file version 26
-    // persists the exact provider artifacts used to compute the plan. Plan-file
-    // version 25 persists every data-source outcome so apply never re-derives
-    // it from a partial graph.
-    // Plan-file version 24 removes the
-    // redundant wait target schema kind now that waits are managed-only.
-    // Version 23 persists the provider-schema fingerprints checked before
-    // saved-plan execution.
-    // Version 22 persists deferred coalesce operands and complete deferred-for
-    // iterable expressions. Version 21 represents an
-    // in-flight managed current instance as an address-level marker and never
-    // serializes its provider token; apply reloads that continuation from
-    // locked state. Version 20 explicitly tags current-state ownership and
-    // managed lifecycle classification but cannot represent the marker and
-    // must be regenerated. Version 19 inferred ownership from the saved
-    // data-source list and must likewise be regenerated. Version 19 guarantees
-    // that mutation effects carry validated
-    // provider identifiers, update effects persist their identifier explicitly,
-    // and `removed` can record malformed deposed generations it abandons by key
-    // without serializing their known-invalid identifier. Version 18 included
-    // that redundant identifier and must be regenerated for the current shape.
-    // Version 17 lacks the update identifier field and must likewise be
-    // regenerated.
-    // Version 17 guaranteed that state-originated secret placeholders came
-    // from structural secret tags; v16 may contain marker-shaped user strings
-    // that were misclassified and must be regenerated. Version 16 guarantees
-    // that unquoted wait RHS
-    // identifiers use the typed enum representation; v15
-    // encoded them as Strings indistinguishable from intentionally quoted
-    // comparisons and must be regenerated. Version 15 guarantees that secret
-    // placeholders carry self-contained salts and that resource placeholders
-    // can be reused byte-for-byte by state writeback. Version 14 guarantees
-    // that embedded current states were created after legacy `_`-prefixed host
-    // attributes moved behind the state migration boundary and orphan state
-    // became structurally paired with its host metadata during planning.
-    //
-    // Plan-file version 12 stores secrets as typed placeholders and makes
-    // saved-plan apply re-evaluate and verify them. A v11 plan's secret hashes
-    // are indistinguishable from user strings and must be regenerated.
-    //
-    // Plan-file version 10 persists
-    // `Effect::Delete.generation`; older binaries would silently
-    // degrade deposed deletes to current deletes through serde's
-    // additive default, so v9 plans must not cross this boundary.
-    //
-    // Plan-file version 8 removes the
-    // legacy Replace effect shape; older saved plans must be regenerated.
-    //
-    // Plan-file version 6
-    // (carina#3486) persists the pre-resolution resource snapshot used
-    // by apply-time dependency analysis and reference re-resolution.
-    //
-    // Plan-file version 5
-    // (carina#3329) changed `Effect::Import.identifier`'s on-disk shape
-    // from a plain string to a tagged `Value`, so a deferred upstream-
-    // state reference inside the import id can survive plan→apply as
-    // a `Value::Deferred(Interpolation)` rather than being silently
-    // substituted to empty. Pre-#3329 plans (version 4) serialise
-    // `identifier` as a raw string and would otherwise hit an opaque
-    // serde error at deserialisation; the explicit version check
-    // produces a clean "re-run plan" message instead.
-    //
-    // Plan-file version 4 (carina#3248) persists `compositions` so the
-    // saved-plan apply path can rebuild the same `ResolvedBindings`
-    // view as the live-apply path (carina#3246). Older plans cannot be
-    // applied by the post-#3248 binding-construction path and are
-    // rejected outright per the repo's no-backward-compat policy.
+    // Reject non-current saved plans before decoding their payload.
     if header.version != PlanFile::CURRENT_VERSION {
         return Err(AppError::UnsupportedPlanVersion {
             path: plan_path.to_path_buf(),
@@ -4027,13 +3994,7 @@ async fn run_apply_from_plan_with_observer_factory(
         .iter()
         .map(carina_core::parser::ProviderConfig::loading_projection)
         .collect::<Vec<_>>();
-    let providers = ProviderLoad::load(
-        runtime,
-        &loading_configs,
-        base_dir,
-        &mut crate::commands::human_provider_notices(runtime.color_mode()),
-    )?
-    .into_complete()?;
+    let providers = load_providers(runtime, &loading_configs, base_dir)?.into_complete()?;
     // Backend drift remains a mutation-safety gate even when the saved plan
     // has no secrets. Loading the syntax tree is deliberately separate from
     // validation and provider-config resolution: placeholder-free plans may
@@ -4186,18 +4147,12 @@ async fn run_apply_from_plan_locked_owned(
 
     let project_dir = apply_target.source_dir();
     let legacy_data_source_ids = inspected_plan.legacy_data_source_ids();
-    // Read current state and validate lineage. carina#3315: a
-    // pending in-memory schema migration must be persisted under
-    // the apply lock, after input re-admission. Run the saved-plan
-    // lineage/serial check first, so the operator sees the original
-    // on-disk serial (the one the saved plan was diffed against)
-    // rather than a +1 bump caused by our own migration persist.
-    let (mut state_file, pending_migration) =
-        match try_with_lock!(backend.read_state().await.map_err(AppError::Backend)) {
-            None => (None, None),
-            Some(carina_state::LoadedState::Pristine(state)) => (Some(state), None),
-            Some(carina_state::LoadedState::Migrated { state, info }) => (Some(state), Some(info)),
-        };
+    // Validate lineage and serial against the original locked state.
+    let (mut state_file, observation_authority) = try_with_lock!(
+        carina_state::ObservationStateAuthority::load(backend.as_ref())
+            .await
+            .map_err(AppError::Backend)
+    );
     if let Some(state) = state_file.as_ref() {
         try_with_lock!(check_legacy_name_overrides(
             state,
@@ -4244,30 +4199,10 @@ async fn run_apply_from_plan_locked_owned(
     // historical pre-#3181 data-source rows without erasing an identifier-
     // bearing managed orphan at the same address. Normalize those artifacts
     // only after checking the saved plan against the original
-    // on-disk serial. Persist that cleanup together with any schema migration
-    // only after the rehydrated effects have passed input re-admission.
+    // on-disk serial. Persist cleanup only after input re-admission.
     let removed_legacy_data_source_rows = state_file.as_mut().is_some_and(|state| {
         state.remove_legacy_data_source_rows_by_ids(&legacy_data_source_ids) > 0
     });
-    if let Some(mut state) = state_file.take() {
-        if state.requires_legacy_dependency_migration() {
-            let classification = try_with_lock!(
-                inspected_plan
-                    .legacy_dependency_classification()
-                    .cloned()
-                    .ok_or_else(|| AppError::Config(
-                        "saved plan does not contain the pending legacy dependency classification"
-                            .to_string(),
-                    ))
-            );
-            state = try_with_lock!(crate::wiring::replay_legacy_migration(
-                color_mode,
-                state,
-                classification
-            ));
-        }
-        state_file = Some(state);
-    }
     let heartbeat_outcome = with_lock_heartbeat(
         backend.shared_backend(),
         lock,
@@ -4325,12 +4260,14 @@ async fn run_apply_from_plan_locked_owned(
             let drift_check = detect_drift(
                 color_mode,
                 validated_plan.sorted_resources(),
+                validated_plan.observation_plan(),
                 validated_plan.current_states(),
                 validated_plan.refresh_rows(),
                 &historical_addresses,
                 validated_plan.provider(),
                 validated_plan.provider(),
                 state_file.as_ref(),
+                &observation_authority,
                 wiring.schemas(),
                 apply_target,
             )
@@ -4343,13 +4280,11 @@ async fn run_apply_from_plan_locked_owned(
             } = drift_check;
 
             if let Some(drift_messages) = drift_messages {
-                // Preserve the historical migration-on-drift behavior. A
-                // non-drift rejection still cannot write state before admission.
-                if (pending_migration.is_some() || removed_legacy_data_source_rows)
+                // Persist data-source cleanup before returning the drift rejection.
+                if removed_legacy_data_source_rows
                     && let Some(state) = state_file.as_mut()
-                    && !state.requires_legacy_dependency_migration()
                 {
-                    mid_run_writer.write_schema_migration(state).await?;
+                    mid_run_writer.write_state(state).await?;
                 }
                 return Err(render_saved_plan_drift(color_mode, &drift_messages, apply_target));
             }
@@ -4448,20 +4383,19 @@ async fn run_apply_from_plan_locked_owned(
                 })?;
             let plan = checked_plan_file.plan();
 
-            // Admit upstream values before any migration write or binding installation.
+            // Admit upstream values before cleanup writes or binding installation.
             let upstream_snapshot = super::plan::admit_saved_upstream_snapshot(
                 wiring.runtime(), rehydrated_plan_file.upstream_sources(), source,
                 wiring.provider_context().as_provider_context(), wiring.schemas(),
                 rehydrated_plan_file.upstream_snapshot(), apply_target,
             )?;
 
-            // Persist migrations only after successful re-admission, using
+            // Persist data-source cleanup after successful re-admission, using
             // the heartbeat's serialized lock owner.
-            if (pending_migration.is_some() || removed_legacy_data_source_rows)
+            if removed_legacy_data_source_rows
                 && let Some(state) = state_file.as_mut()
-                && !state.requires_legacy_dependency_migration()
             {
-                mid_run_writer.write_schema_migration(state).await?;
+                mid_run_writer.write_state(state).await?;
             }
 
             println!("  {} No drift detected.", "✓".green(color_mode));
@@ -4527,8 +4461,8 @@ async fn run_apply_from_plan_locked_owned(
                 let historical_display = collect_historical_display_attributes(
                     plan,
                     &managed_current,
-                    state_file.as_ref(),
-                );
+                    &observation_authority.clone().bind(state_file.clone()),
+                )?;
                 let summary = PlanChangeSummary::from_reloaded_plan(
                     rehydrated_plan_file.reloaded_plan_file(),
                 );
@@ -4575,7 +4509,7 @@ async fn run_apply_from_plan_locked_owned(
 
             // Build display-safe historical attributes from current and persisted state.
             let historical_display =
-                collect_historical_display_attributes(plan, &managed_current, state_file.as_ref());
+                collect_historical_display_attributes(plan, &managed_current, &observation_authority.clone().bind(state_file.clone()))?;
 
             let summary =
                 PlanChangeSummary::from_reloaded_plan(rehydrated_plan_file.reloaded_plan_file());

@@ -32,7 +32,6 @@ mod dependencies;
 mod element_tests;
 mod elements;
 pub use dependencies::{UnexpandedDependencies, UnexpandedDependencyOperand};
-pub(crate) use elements::ModuleDeclarationBlocks;
 pub(crate) use elements::{AccessLocations, AccessProvenance};
 pub use elements::{
     AttributeKeyLocation, ConfigurationBlock, DeclarationAnnotation, DeclarationRecord,
@@ -223,3 +222,6 @@ mod tests;
 pub(crate) use ast::resolve_loop_directive_value;
 #[cfg(test)]
 pub(crate) use types::bare_type_for_test;
+
+#[cfg(feature = "test-utils")]
+pub(crate) use resolve::{RESOLUTION_EVENTS, STORAGE_EVENTS, SecretStorageOperand};

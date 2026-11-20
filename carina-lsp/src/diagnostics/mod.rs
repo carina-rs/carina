@@ -569,17 +569,6 @@ fn render_module_call_findings(
 ) -> Vec<Diagnostic> {
     findings
         .iter()
-        // Directory declarations publish through their retained expression
-        // report on both directory and buffer-only paths. This renderer owns
-        // the module-call carrier of constraint outcomes.
-        .filter(|finding| {
-            !matches!(
-                finding.message(),
-                carina_core::validation::ModuleCallFindingMessage::Constraint(
-                    carina_core::module_resolver::ConstraintDiagnostic::Directory(_)
-                )
-            )
-        })
         .flat_map(|finding| finding.diagnostics())
         .filter_map(|finding| {
             let mut diagnostic = render_merged(
@@ -2321,22 +2310,7 @@ impl DiagnosticRun<'_> {
                 }
             }
             let pre_expansion_input = merged.unwrap_or(parsed);
-            let recovery_snapshot = if let (None, Some(base), Some(buffer)) =
-                (merged, base_path, doc.parsed_buffer())
-            {
-                carina_core::config_loader::DirectoryBufferSnapshot::capture(
-                    base,
-                    buffer.clone(),
-                    &overrides,
-                )
-                .ok()
-            } else {
-                None
-            };
-            let mut admission_file = recovery_snapshot.map_or_else(
-                || pre_expansion_input.clone(),
-                |snapshot| snapshot.into_scoped_file(),
-            );
+            let mut admission_file = pre_expansion_input.clone();
             if merged.is_none()
                 && let Ok(tree) = carina_core::parser::AnalysisTree::try_from_file(&admission_file)
             {

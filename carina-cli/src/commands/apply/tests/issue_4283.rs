@@ -326,7 +326,7 @@ async fn plan(fixture: &ApplyCancellationFixture, cloud: &Cloud) -> PlanFile {
     let planned = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         prepared.provider_inputs.configs(),
-        &state,
+        &carina_state::ObservedStateFile::for_test((state).clone()),
         true,
         ProgressSink::MachineStdout,
         prepared.provider_inputs.remote_bindings(),

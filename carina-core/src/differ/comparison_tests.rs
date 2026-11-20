@@ -1,6 +1,7 @@
 use super::comparison::SavedAttr;
 use super::diff_for_test as diff;
 use super::{create_plan_for_tests as create_plan, *};
+use std::collections::BTreeMap;
 type State = crate::resource::State;
 use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
@@ -36,9 +37,9 @@ fn type_aware_equal<P: crate::resource::StateValueLeaf, Q: crate::resource::Stat
     super::type_aware_equal(a, b, attr_type, defs, &exact_comparison_context())
 }
 
-fn find_changed_attributes<P: crate::resource::StateValueLeaf>(
+fn find_changed_attributes<'a, P: crate::resource::StateValueLeaf + 'a>(
     desired: &HashMap<String, Value>,
-    current: &HashMap<String, crate::resource::Value<P>>,
+    current: impl IntoIterator<Item = (&'a String, &'a crate::resource::Value<P>)>,
     saved: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&ExplicitFields>,
@@ -49,7 +50,7 @@ fn find_changed_attributes<P: crate::resource::StateValueLeaf>(
         .map(|(key, value)| (key.clone(), value.to_snapshot()))
         .collect();
     let current = current
-        .iter()
+        .into_iter()
         .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
         .collect();
     let saved = saved.map(|values| {
@@ -96,7 +97,7 @@ fn key_should_enter_patch(
 fn diff_test<P: crate::resource::StateValueLeaf>(
     desired: &Resource,
     current: &crate::resource::State<P>,
-    saved: Option<&HashMap<String, crate::resource::SnapshotValue>>,
+    saved: Option<&BTreeMap<String, crate::resource::SnapshotValue>>,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> Diff {
@@ -1682,7 +1683,7 @@ fn secret_wrapped_oidc_listener_fixture(
 ) -> (
     ResourceSchema,
     HashMap<String, Value>,
-    HashMap<String, crate::resource::SnapshotValue>,
+    BTreeMap<String, crate::resource::SnapshotValue>,
 ) {
     use crate::schema::{
         CompiledAttributeSchema as AttributeSchema, CompiledStructField as StructField,
@@ -1750,7 +1751,7 @@ fn secret_wrapped_oidc_listener_fixture(
     (
         schema,
         HashMap::from([("default_actions".to_string(), desired_actions)]),
-        HashMap::from([("default_actions".to_string(), current_actions)]),
+        std::collections::BTreeMap::from([("default_actions".to_string(), current_actions)]),
     )
 }
 

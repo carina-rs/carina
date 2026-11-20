@@ -174,6 +174,7 @@ impl DeclarationLocation {
                 | Rule::attributes_param
                 | Rule::exports_param
                 | Rule::validate_expr
+                | Rule::require_condition
                 | Rule::for_expr
                 | Rule::if_expr
                 | Rule::resource_address
@@ -1124,6 +1125,12 @@ fn require_integer_operator_provenance<P: ValueKind, B: BindingAddress>(
             | DeferredValue::Placeholder(_)
             | DeferredValue::Unknown(_),
         ) => {}
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
     Ok(())
 }
@@ -1176,6 +1183,12 @@ where
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => {}
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
     Ok(())
 }

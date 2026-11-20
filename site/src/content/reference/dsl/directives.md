@@ -226,6 +226,20 @@ Carina fills each readable ignored leaf from the latest provider read. This
 prevents the update from writing the configured stale value over the value
 owned by the external system.
 
+Managed-resource observations retain their configured secret sensitivity in text
+plans, JSON and saved plans, destroy and orphan rows, saved-apply drift text,
+apply diagnostics and provider free text, including when the provider returns
+different text or a different container shape. This output protection does not
+apply to data-source read values or reference bindings; those retain their
+existing annotation rules. Provider free-text substitution enrolls strings
+classified secret in the actual sent patch. A change of value
+kind on a path to a configured secret, or a length change in a secret-bearing
+list, hides the observed subtree at the first divergence on these output surfaces. `StringList` and `List` are treated as the same kind. Maps match
+keys one to one: missing keys (including write-only secrets) and extra observed
+keys never widen protection. Matching keys retain their secret leaf or descendant
+protection; unmatched observed keys remain ordinary values. Public siblings outside
+the hidden subtree remain visible. Ordinary ignored change rows are still omitted.
+
 Providers cannot return write-only values, so Carina cannot refill an ignored
 write-only leaf from a read. During an unrelated update, Carina skips
 reasserting a wholly ignored write-only attribute, or a containing attribute

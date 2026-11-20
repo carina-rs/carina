@@ -43,8 +43,8 @@ use crate::provider_text::{
 pub use crate::resource::ProviderDirectiveSchema;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, Directives, PartialReadMarker, PendingReRead,
-    PreventDestroyResolution, PreventDestroySource, ProviderResource, Resource, ResourceId,
-    SnapshotState, SnapshotValue, State, StateValueLeaf, UnavailableSecretError, Value,
+    PreventDestroyResolution, PreventDestroySource, ProviderResource, ResolvedResourceId, Resource,
+    ResourceId, SnapshotState, SnapshotValue, State, StateValueLeaf, UnavailableSecretError, Value,
     ValueString,
 };
 #[cfg(test)]
@@ -1135,7 +1135,7 @@ pub(crate) struct ProtectedUpdateInput {
     id: ResourceId,
     attributes: IndexMap<String, Value>,
     ignored: crate::resource::ResolvedIgnoreChanges,
-    patch: UpdatePatch,
+    patch: RuleUpdatePatch,
     selection: crate::input_rules::InputSelectionAuthority,
 }
 
@@ -1159,9 +1159,16 @@ impl ProtectedUpdateInput {
         &self.ignored
     }
     pub(crate) fn patch(&self) -> &UpdatePatch {
-        &self.patch
+        &self.patch.0
     }
 }
+
+/// Binding/positional annotation consumed only by dispatch rules.
+#[derive(Clone)]
+struct RuleUpdatePatch(UpdatePatch);
+/// Output annotation consumed only by diagnostics and free-text enrollment.
+#[derive(Debug, Clone)]
+struct DiagnosticUpdatePatch(UpdatePatch);
 
 /// Per-operation request record for [`Provider::update`].
 ///
@@ -1217,6 +1224,7 @@ pub struct UpdateRequest {
     /// Effective directives resolved from the managed resource schema.
     directives: ProviderDirectives,
     input: Arc<ProtectedUpdateInput>,
+    diagnostics: DiagnosticUpdatePatch,
     #[cfg(any(test, feature = "test-utils"))]
     desired_for_fixture: ProviderReadyResource,
 }
@@ -1230,36 +1238,39 @@ impl UpdateRequest {
     ) -> Result<Self, crate::executor::ProviderPreparationError> {
         let patch = context.prepare_update_patch(changed_attributes, resource, &from)?;
         let protected = resource.protected_desired_tree();
-        let annotated_patch = UpdatePatch {
-            ops: patch
-                .payload()
-                .as_inner()
-                .ops
-                .iter()
-                .map(|op| match op {
-                    PatchOp::Add { key, value } => PatchOp::Add {
-                        key: key.clone(),
-                        value: resource.diagnostic_value(key, value),
-                    },
-                    PatchOp::Replace { key, value } => PatchOp::Replace {
-                        key: key.clone(),
-                        value: resource.diagnostic_value(key, value),
-                    },
-                    PatchOp::Reassert { key, value } => PatchOp::Reassert {
-                        key: key.clone(),
-                        value: resource.diagnostic_value(key, value),
-                    },
-                    PatchOp::Remove { key } => PatchOp::Remove { key: key.clone() },
-                })
-                .collect(),
-        };
+        let annotate_patch =
+            |annotate: fn(&ProviderReadyResource, &str, &Value) -> Value| UpdatePatch {
+                ops: patch
+                    .payload()
+                    .as_inner()
+                    .ops
+                    .iter()
+                    .map(|op| match op {
+                        PatchOp::Add { key, value } => PatchOp::Add {
+                            key: key.clone(),
+                            value: annotate(resource, key, value),
+                        },
+                        PatchOp::Replace { key, value } => PatchOp::Replace {
+                            key: key.clone(),
+                            value: annotate(resource, key, value),
+                        },
+                        PatchOp::Reassert { key, value } => PatchOp::Reassert {
+                            key: key.clone(),
+                            value: annotate(resource, key, value),
+                        },
+                        PatchOp::Remove { key } => PatchOp::Remove { key: key.clone() },
+                    })
+                    .collect(),
+            };
         let input = Arc::new(ProtectedUpdateInput {
             id: protected.id().clone(),
             attributes: protected.attributes().clone(),
             ignored: protected.ignored().clone(),
-            patch: annotated_patch,
+            patch: RuleUpdatePatch(annotate_patch(ProviderReadyResource::rule_input_value)),
             selection: protected.selection_authority().clone(),
         });
+        let diagnostics =
+            DiagnosticUpdatePatch(annotate_patch(ProviderReadyResource::diagnostic_value));
         Ok(Self {
             #[cfg(any(test, feature = "test-utils"))]
             desired_for_fixture: resource.clone(),
@@ -1267,6 +1278,7 @@ impl UpdateRequest {
             patch,
             directives: *resource.directives(),
             input,
+            diagnostics,
         })
     }
 
@@ -1286,7 +1298,13 @@ impl UpdateRequest {
     }
 
     pub(crate) fn diagnostic_values(&self) -> impl Iterator<Item = &Value> {
-        self.input.patch.ops.iter().filter_map(PatchOp::sent_value)
+        // The owner classified this exact sent patch before transport removed
+        // annotations. Enroll every string in its secret leaves and Whole units.
+        self.diagnostics
+            .0
+            .ops
+            .iter()
+            .filter_map(PatchOp::sent_value)
     }
 
     pub(crate) fn protected_input(&self) -> &ProtectedUpdateInput {
@@ -1727,22 +1745,26 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ///
 /// Nor can callers add an arbitrary desired map after construction:
 ///
-/// ```compile_fail
-/// use std::collections::HashMap;
+/// ```compile_fail,E0599
+/// use std::collections::BTreeMap;
 /// use carina_core::provider::SavedAttrs;
+/// use carina_core::resource::{ResourceId, SnapshotValue};
 ///
 /// let mut saved = SavedAttrs::new();
-/// saved.insert(todo!("resource id"), HashMap::new());
+/// saved.insert(ResourceId::with_identity("test.Resource", "example"), BTreeMap::<String, SnapshotValue>::new());
 /// ```
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct SavedAttrs(HashMap<ResourceId, HashMap<String, crate::resource::SnapshotValue>>);
+pub struct SavedAttrs(HashMap<ResourceId, BTreeMap<String, crate::resource::SnapshotValue>>);
 
 impl SavedAttrs {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, crate::resource::SnapshotValue>> {
+    pub fn get(
+        &self,
+        id: &ResourceId,
+    ) -> Option<&BTreeMap<String, crate::resource::SnapshotValue>> {
         self.0.get(id)
     }
 
@@ -1751,7 +1773,7 @@ impl SavedAttrs {
     ) -> impl Iterator<
         Item = (
             &ResourceId,
-            &HashMap<String, crate::resource::SnapshotValue>,
+            &BTreeMap<String, crate::resource::SnapshotValue>,
         ),
     > {
         self.0.iter()
@@ -1761,12 +1783,12 @@ impl SavedAttrs {
 impl<'a> IntoIterator for &'a SavedAttrs {
     type Item = (
         &'a ResourceId,
-        &'a HashMap<String, crate::resource::SnapshotValue>,
+        &'a BTreeMap<String, crate::resource::SnapshotValue>,
     );
     type IntoIter = std::collections::hash_map::Iter<
         'a,
         ResourceId,
-        HashMap<String, crate::resource::SnapshotValue>,
+        BTreeMap<String, crate::resource::SnapshotValue>,
     >;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -1783,7 +1805,7 @@ impl<'a> IntoIterator for &'a SavedAttrs {
 /// `RedactedSecret` values. Persisted strings always remain strings.
 ///
 /// Raw JSON cannot be inserted after construction. State loaders call
-/// [`Self::from_encoded`] after versioned migrations rewrite legacy encodings;
+/// [`Self::from_encoded`] to validate current structural encodings;
 /// callers that already hold validated values use [`Self::from_persisted_values`].
 ///
 /// ```compile_fail
@@ -1802,7 +1824,7 @@ impl<'a> IntoIterator for &'a SavedAttrs {
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PersistedAttributes {
-    encoded: HashMap<String, PersistedValue>,
+    encoded: BTreeMap<String, PersistedValue>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1925,12 +1947,12 @@ impl PersistedAttributes {
     /// transport. Redacted secrets arrive as `RedactedSecret`; strings are
     /// always encoded as strings without content inspection.
     pub fn from_typed_persisted_wire_values(
-        values: HashMap<String, crate::resource::SnapshotValue>,
+        values: impl IntoIterator<Item = (String, crate::resource::SnapshotValue)>,
     ) -> Result<Self, PersistedAttributesError> {
         let mut values: Vec<_> = values.into_iter().collect();
         values.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-        let mut encoded = HashMap::with_capacity(values.len());
+        let mut encoded = BTreeMap::new();
         for (attribute_key, value) in values {
             let value = PersistedValue::encode_provider_value(&value, None).map_err(|error| {
                 PersistedAttributesError::InvalidWireValue(PersistedWireValueError {
@@ -1946,17 +1968,20 @@ impl PersistedAttributes {
     /// Construct a persisted attribute map from complete values produced by
     /// the core persisted encoder.
     pub fn from_persisted_values(
-        encoded: HashMap<String, PersistedValue>,
+        encoded: impl IntoIterator<Item = (String, PersistedValue)>,
     ) -> Result<Self, PersistedAttributesError> {
-        Ok(Self { encoded })
+        Ok(Self {
+            encoded: encoded.into_iter().collect(),
+        })
     }
 
-    /// Validate JSON entering through the state-row load seam after versioned
-    /// migrations have rewritten legacy encodings.
+    /// Validate current persisted JSON entering through the state-row load seam.
     pub fn from_encoded(
-        encoded: HashMap<String, serde_json::Value>,
+        encoded: impl IntoIterator<Item = (String, serde_json::Value)>,
     ) -> Result<Self, PersistedAttributesError> {
         let encoded = encoded
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
             .into_iter()
             .map(|(attribute_key, value)| {
                 PersistedValue::from_serialized_json(value)
@@ -1974,13 +1999,31 @@ impl PersistedAttributes {
         Ok(Self { encoded })
     }
 
+    /// Render one loaded persisted attribute with its structural secret tags.
+    pub fn rendered_attribute(&self, key: &str) -> Option<crate::value::RenderedValue> {
+        self.get(key).as_ref().map(crate::value::render_value)
+    }
+
+    /// Render the same canonical persisted values used for state comparison.
+    pub fn rendered_comparison_attributes(
+        &self,
+        schema: &ResourceSchema,
+    ) -> BTreeMap<String, crate::value::RenderedValue> {
+        let values =
+            crate::resource::CanonicalComparisonAttributes::canonicalize(self.to_values(), schema);
+        values
+            .iter()
+            .map(|(key, value)| (key.clone(), crate::value::render_value(value)))
+            .collect()
+    }
+
     /// Decode one stored attribute with structural persisted-secret semantics.
     pub fn get(&self, key: &str) -> Option<crate::resource::SnapshotValue> {
         self.encoded.get(key)?.decode()
     }
 
     /// Decode every non-null stored attribute with structural persisted-secret semantics.
-    pub fn to_values(&self) -> HashMap<String, crate::resource::SnapshotValue> {
+    pub fn to_values(&self) -> BTreeMap<String, crate::resource::SnapshotValue> {
         self.encoded
             .iter()
             .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
@@ -1988,7 +2031,7 @@ impl PersistedAttributes {
     }
 
     /// Decode every stored value into ordinary JSON for display surfaces.
-    pub fn to_decoded_json(&self) -> HashMap<String, serde_json::Value> {
+    pub fn to_decoded_json(&self) -> BTreeMap<String, serde_json::Value> {
         self.encoded
             .iter()
             .map(|(key, value)| (key.clone(), value.decoded_json()))
@@ -2030,7 +2073,7 @@ impl PersistedAttributes {
 
     /// Return ordinary persisted string attributes for identity-prefix
     /// reconciliation. Typed secret hashes are deliberately excluded.
-    pub fn plain_string_values(&self) -> HashMap<String, String> {
+    pub fn plain_string_values(&self) -> BTreeMap<String, String> {
         self.encoded
             .keys()
             .filter_map(|key| match self.get(key) {
@@ -2042,7 +2085,8 @@ impl PersistedAttributes {
             .collect()
     }
 
-    pub(crate) fn encoded(&self) -> &HashMap<String, PersistedValue> {
+    #[cfg(test)]
+    pub(crate) fn encoded(&self) -> &BTreeMap<String, PersistedValue> {
         &self.encoded
     }
 
@@ -2353,7 +2397,7 @@ impl RawSavedAttrs {
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn from_decoded_values_for_test(
-        saved_attrs: HashMap<ResourceId, HashMap<String, crate::resource::SnapshotValue>>,
+        saved_attrs: HashMap<ResourceId, BTreeMap<String, crate::resource::SnapshotValue>>,
     ) -> Self {
         Self {
             attributes: SavedAttrs(saved_attrs),
@@ -2375,7 +2419,10 @@ impl RawSavedAttrs {
     }
 
     /// Read a raw resource entry without changing its typestate.
-    pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, crate::resource::SnapshotValue>> {
+    pub fn get(
+        &self,
+        id: &ResourceId,
+    ) -> Option<&BTreeMap<String, crate::resource::SnapshotValue>> {
         self.attributes.get(id)
     }
 }
@@ -2408,7 +2455,10 @@ impl LiftedSavedAttrs {
     }
 
     /// Read saved attributes for one resource.
-    pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, crate::resource::SnapshotValue>> {
+    pub fn get(
+        &self,
+        id: &ResourceId,
+    ) -> Option<&BTreeMap<String, crate::resource::SnapshotValue>> {
         self.attributes.get(id)
     }
 
@@ -2443,14 +2493,14 @@ impl LiftedSavedAttrs {
 pub struct AppliedState {
     pub(crate) id: ResourceId,
     pub(crate) identifier: AppliedIdentifier,
-    pub(crate) attributes: HashMap<String, crate::resource::SnapshotValue>,
+    pub(crate) attributes: BTreeMap<String, crate::resource::SnapshotValue>,
 }
 
 impl AppliedState {
     pub fn new(
         id: ResourceId,
         identifier: impl Into<String>,
-        attributes: HashMap<String, Value>,
+        attributes: impl IntoIterator<Item = (String, Value)>,
     ) -> Result<Self, EmptyAppliedIdentifier> {
         Ok(Self {
             id,
@@ -2465,7 +2515,7 @@ impl AppliedState {
     pub fn from_identifier(
         id: ResourceId,
         identifier: AppliedIdentifier,
-        attributes: HashMap<String, Value>,
+        attributes: impl IntoIterator<Item = (String, Value)>,
     ) -> Self {
         Self {
             id,
@@ -2480,12 +2530,12 @@ impl AppliedState {
     pub fn from_snapshot_parts(
         id: ResourceId,
         identifier: AppliedIdentifier,
-        attributes: HashMap<String, crate::resource::SnapshotValue>,
+        attributes: impl IntoIterator<Item = (String, crate::resource::SnapshotValue)>,
     ) -> Self {
         Self {
             id,
             identifier,
-            attributes,
+            attributes: attributes.into_iter().collect(),
         }
     }
 
@@ -2497,7 +2547,7 @@ impl AppliedState {
         &self.identifier
     }
 
-    pub fn attributes(&self) -> &HashMap<String, crate::resource::SnapshotValue> {
+    pub fn attributes(&self) -> &BTreeMap<String, crate::resource::SnapshotValue> {
         &self.attributes
     }
 
@@ -2506,7 +2556,7 @@ impl AppliedState {
     ) -> (
         ResourceId,
         AppliedIdentifier,
-        HashMap<String, crate::resource::SnapshotValue>,
+        BTreeMap<String, crate::resource::SnapshotValue>,
     ) {
         (self.id, self.identifier, self.attributes)
     }
@@ -2847,6 +2897,7 @@ impl FreshPendingCreate {
                 secrets,
             )),
             started_at: self.started_at.clone(),
+            dependency_bindings: Default::default(),
         }
     }
 
@@ -2941,6 +2992,7 @@ impl PendingCreate {
                 secrets,
             )),
             started_at: self.started_at.clone(),
+            dependency_bindings: Default::default(),
         }
     }
 
@@ -3341,7 +3393,7 @@ impl IdentifiedCreate<Bound> {
     pub fn observed_state(&self) -> SnapshotState {
         let attributes = match &self.observation {
             CreateObservation::Observed(state) => state.attributes().clone(),
-            CreateObservation::Unobserved(_reason) => HashMap::new(),
+            CreateObservation::Unobserved(_reason) => BTreeMap::new(),
         };
         let state = State::existing(self.id.clone(), attributes)
             .with_identifier(self.identifier.as_str().to_string());
@@ -3370,8 +3422,9 @@ pub enum InFlightPersistence<'a> {
 
 /// A create continuation bound to the exact resource route it was issued for.
 ///
-/// Persisted continuations are produced only by decoding their complete state
-/// row, so no API can bind an already-decoded envelope to an arbitrary route.
+/// State loaders must decode the complete row. Core's typed state-row
+/// projection also restores an in-memory payload's binding from its containing
+/// row; standalone payload binding is crate-private.
 ///
 /// ```compile_fail
 /// use carina_core::provider::{InFlightCreate, PendingEnvelope, Timestamp};
@@ -3400,6 +3453,8 @@ pub struct InFlightCreate {
     id: ResourceId,
     pending: PendingRecord,
     started_at: Timestamp,
+    // Host-owned destroy metadata; the containing state row persists it.
+    pub(crate) dependency_bindings: Box<crate::resource::PersistedDestroyDependencies>,
 }
 
 impl Serialize for InFlightCreate {
@@ -3423,9 +3478,14 @@ impl Serialize for InFlightCreate {
     }
 }
 
-/// Loader-produced binding of an ID-less persisted envelope to its containing
-/// state row. The tuple field is private, and [`InFlightCreate`] itself does
-/// not implement `Deserialize`; state loaders must decode the complete row.
+/// Binding of an ID-less persisted envelope to its containing state row.
+/// Complete-row decoding and the
+/// [`current_from_state_row`](crate::state_document::current_from_state_row)
+/// projection produce this binding. That projection is public and trusts its
+/// caller to pass the row's own address; tying the address to the row by type
+/// is tracked in carina#4519. The tuple field is private, and
+/// [`InFlightCreate`] itself does not implement `Deserialize`; state loaders
+/// must decode the complete row.
 ///
 /// ```compile_fail
 /// use carina_core::provider::{InFlightCreate, StateRowInFlightCreate};
@@ -3434,21 +3494,56 @@ impl Serialize for InFlightCreate {
 ///     StateRowInFlightCreate(pending)
 /// }
 /// ```
+///
+/// ```compile_fail,E0624
+/// use carina_core::provider::{InFlightCreate, StateRowInFlightCreate};
+/// use carina_core::resource::ResolvedResourceId;
+/// fn bypass(id: &ResolvedResourceId, pending: InFlightCreate) -> StateRowInFlightCreate {
+///     StateRowInFlightCreate::bind(id, pending)
+/// }
+/// ```
 #[derive(Debug)]
 pub struct StateRowInFlightCreate(InFlightCreate);
 
 impl StateRowInFlightCreate {
+    /// Bind an in-memory continuation to its persisted row address, including
+    /// the provider instance that the row would supply during decoding.
+    pub(crate) fn bind(id: &ResolvedResourceId, mut pending: InFlightCreate) -> Self {
+        pending.id = id.as_inner().clone();
+        if let PendingRecord::Fresh(fresh) = &mut pending.pending {
+            fresh.id = id.as_inner().clone();
+        }
+        Self(pending)
+    }
+
     pub fn into_inner(self) -> InFlightCreate {
         self.0
     }
 }
 
-/// Loader-produced binding of an outcome-unknown timestamp to its containing
-/// state-row address.
+/// Binding of an outcome-unknown timestamp to its containing state-row address.
+/// Complete-row decoding and the
+/// [`current_from_state_row`](crate::state_document::current_from_state_row)
+/// projection produce this binding (see [`StateRowInFlightCreate`] for the
+/// caller-trust caveat); state loaders must decode the complete row.
+///
+/// ```compile_fail,E0624
+/// use carina_core::provider::{StateRowUnknownCreateOutcome, UnknownCreateOutcome};
+/// use carina_core::resource::ResolvedResourceId;
+/// fn bypass(id: &ResolvedResourceId, unknown: UnknownCreateOutcome) -> StateRowUnknownCreateOutcome {
+///     StateRowUnknownCreateOutcome::bind(id, unknown)
+/// }
+/// ```
 #[derive(Debug)]
 pub struct StateRowUnknownCreateOutcome(UnknownCreateOutcome);
 
 impl StateRowUnknownCreateOutcome {
+    /// Bind an in-memory unknown outcome to the address supplied by its row.
+    pub(crate) fn bind(id: &ResolvedResourceId, mut unknown: UnknownCreateOutcome) -> Self {
+        unknown.id = id.as_inner().clone();
+        Self(unknown)
+    }
+
     pub fn into_inner(self) -> UnknownCreateOutcome {
         self.0
     }
@@ -3503,6 +3598,7 @@ impl<'de> Deserialize<'de> for StateRowInFlightCreate {
                 secrets,
             )),
             started_at,
+            dependency_bindings: Default::default(),
         }))
     }
 }
@@ -3515,6 +3611,7 @@ impl InFlightCreate {
             id,
             pending: PendingRecord::Fresh(pending.into()),
             started_at,
+            dependency_bindings: Default::default(),
         }
     }
 
@@ -3586,6 +3683,7 @@ impl InFlightCreate {
                 id: self.id,
                 pending: PendingRecord::Persisted(envelope),
                 started_at: self.started_at,
+                dependency_bindings: self.dependency_bindings,
             })),
         }
     }
@@ -3616,6 +3714,7 @@ impl InFlightCreate {
             id: self.id,
             pending,
             started_at: self.started_at,
+            dependency_bindings: self.dependency_bindings,
         }
     }
 
@@ -3652,6 +3751,7 @@ impl InFlightCreate {
             id: self.id,
             pending,
             started_at: self.started_at,
+            dependency_bindings: self.dependency_bindings,
         }
     }
 
@@ -3833,6 +3933,8 @@ impl Drop for PendingCallEgress {
 pub struct UnknownCreateOutcome {
     id: ResourceId,
     started_at: Timestamp,
+    // Host-owned destroy metadata; the containing state row persists it.
+    pub(crate) dependency_bindings: Box<crate::resource::PersistedDestroyDependencies>,
 }
 
 impl Serialize for UnknownCreateOutcome {
@@ -3851,7 +3953,11 @@ impl Serialize for UnknownCreateOutcome {
 
 impl UnknownCreateOutcome {
     fn new(id: ResourceId, started_at: Timestamp) -> Self {
-        Self { id, started_at }
+        Self {
+            id,
+            started_at,
+            dependency_bindings: Default::default(),
+        }
     }
 
     pub fn id(&self) -> &ResourceId {
@@ -6943,6 +7049,11 @@ pub(crate) fn merge_default_tags_with_placeholders<S, D, P: crate::resource::Pla
             }
             Err(
                 source @ (SerializationError::NullProviderSecret
+                | SerializationError::ObservationIdentityMismatch { .. }
+                | SerializationError::MissingObservationResource { .. }
+                | SerializationError::MissingObservationAttribute { .. }
+                | SerializationError::MissingObservationComparisons
+                | SerializationError::ObservationPlanMismatch
                 | SerializationError::UnresolvedEnumIdentifier { .. }
                 | SerializationError::UnexpandedModuleIf { .. }
                 | SerializationError::UnavailableSecret(_)
@@ -8476,6 +8587,8 @@ pub(crate) fn canonicalize_custom_type_value(
             | RawShape::Ref(_),
             _,
         ) => unreachable!("identified scalar guard excludes non-scalar declarations"),
+        (_, crate::resource::Value::Reference(never)) => match *never {},
+        (_, crate::resource::Value::Conversion(never)) => match *never {},
     }
 }
 
@@ -11970,14 +12083,16 @@ mod tests {
         let marker = format!("_secret:argon2:{}", "ab".repeat(32));
         let encoded = serde_json::json!({ "token": marker });
         let persisted = PersistedAttributes::from_encoded(
-            serde_json::from_value(encoded.clone()).expect("attribute object"),
+            serde_json::from_value::<BTreeMap<String, serde_json::Value>>(encoded.clone())
+                .expect("attribute object"),
         )
         .expect("marker-shaped strings are ordinary persisted values");
         let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
         assert_eq!(persisted.get("token"), Some((plain.clone()).to_snapshot()));
 
         let persisted = PersistedAttributes::from_encoded(
-            serde_json::from_value(encoded).expect("attribute object"),
+            serde_json::from_value::<BTreeMap<String, serde_json::Value>>(encoded)
+                .expect("attribute object"),
         )
         .expect("state row decode");
         assert_eq!(persisted.get("token"), Some((plain).to_snapshot()));
@@ -12137,53 +12252,20 @@ mod tests {
         argon2::Argon2::default()
             .hash_password_into(material, b"carina-secret-v1", &mut output)
             .expect("hash pre-v12 fallback-salt fixture");
-        let encoded =
-            crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
-                serde_json::json!(format!("_secret:argon2:{}", hex::encode(output))),
-                "mock.test.resource",
-                "old",
-                "password",
-            )
-            .expect("migrate row-bound legacy digest");
+        let encoded = serde_json::json!({"$secret": format!(
+            "argon2-legacy:{}:{}", hex::encode(b"carina:mock.test.resource:old:password"), hex::encode(output)
+        )});
         let persisted =
-            PersistedValue::from_serialized_json(encoded).expect("migrated structural secret");
+            PersistedValue::from_serialized_json(encoded).expect("structural legacy secret");
         let crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
             crate::resource::SnapshotLeaf::RedactedSecret { hash },
-        )) = persisted.decode().expect("typed migrated secret")
+        )) = persisted.decode().expect("typed legacy secret")
         else {
-            panic!("migration must produce a typed redacted secret")
+            panic!("structural secret must decode as a typed redacted secret")
         };
 
         assert!(hash.verify(material));
         assert!(hash.encoded_digest().starts_with("argon2-legacy:"));
-    }
-
-    #[test]
-    fn state_row_upgrade_rejects_legacy_salt_too_long_for_its_digest_format() {
-        let error =
-            crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
-                serde_json::json!(format!("_secret:argon2:{}", "ab".repeat(32))),
-                "mock.test.resource",
-                &"x".repeat(5000),
-                "token",
-            )
-            .expect_err("an upgraded legacy digest must never exceed the parser's salt bound");
-        match error {
-            crate::resource::legacy_secret_migration::LegacySecretMigrationError::StateAttribute {
-                key,
-                source,
-            } => {
-                assert_eq!(key, "token");
-                assert!(matches!(
-                    *source,
-                    crate::resource::legacy_secret_migration::LegacySecretMigrationError::LegacySaltTooLong {
-                        actual,
-                        maximum: 4096,
-                    } if actual > 4096
-                ));
-            }
-            other => panic!("unexpected migration error: {other:?}"),
-        }
     }
 
     #[test]
@@ -12914,8 +12996,9 @@ mod tests {
         )]));
 
         let once = raw.lift(&registry);
-        let twice = crate::test_support::raw_saved_attrs(once.attributes.0.clone()).lift(&registry);
-        let sorted_pairs = |attrs: &HashMap<String, crate::resource::SnapshotValue>| {
+        let twice =
+            RawSavedAttrs::from_decoded_values_for_test(once.attributes.0.clone()).lift(&registry);
+        let sorted_pairs = |attrs: &BTreeMap<String, crate::resource::SnapshotValue>| {
             let mut pairs: Vec<_> = attrs
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
@@ -13539,7 +13622,7 @@ mod tests {
         let id = ResourceId::with_identity("test", "example");
         let state = AppliedState::new(id.clone(), "mock-id", HashMap::new())
             .expect("fixture identifier is non-empty");
-        let expected = State::existing(id, HashMap::new()).with_identifier("mock-id");
+        let expected = State::existing(id, BTreeMap::new()).with_identifier("mock-id");
         let diagnostic: PartialReadDiagnostic = PartialReadDiagnostic::new(
             crate::provider_text::ProviderDiagnostic::message("mock partial create".into()),
             (vec!["dns_name".to_string()])
@@ -16292,8 +16375,6 @@ mod tests {
                 Box::pin(async move {
                     for (id, saved_attrs) in saved {
                         if let Some(state) = states.get_mut(id) {
-                            #[allow(clippy::iter_over_hash_type)]
-                            // keyed rebuild: test hydration fills distinct missing saved attribute keys
                             for (key, value) in saved_attrs {
                                 state
                                     .attributes
@@ -16677,7 +16758,7 @@ mod provider_text_route_tests {
         let saved = SavedAttrs(
             desired
                 .iter()
-                .map(|r| (r.id.clone(), HashMap::new()))
+                .map(|r| (r.id.clone(), BTreeMap::new()))
                 .collect(),
         );
         router.normalize_state(&mut states).await.unwrap();

@@ -21,7 +21,7 @@ use carina_core::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, StructField,
     TypeIdentity, ValidatedResourceSchema,
 };
-use carina_state::{PublishedExports, StateFile, check_and_migrate};
+use carina_state::{PublishedExports, StateFile, load_state};
 
 use crate::commands::plan::compute_export_diffs;
 use crate::commands::shared::state_writeback::persisted_directive_changes;
@@ -296,7 +296,7 @@ impl FixturePlan {
         );
         carina_core::references::ReferencePreparation::default()
             .display(
-                checked.clone(),
+                checked,
                 &self.references.0,
                 historical,
                 detail,
@@ -424,8 +424,7 @@ where
         &project,
         &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
         &SchemaRegistry::new(),
-    )
-    .unwrap();
+    )?;
     let duplicate_declarations = loaded.duplicate_declarations;
     let unresolved_parsed = loaded.unresolved_parsed;
     let parsed = loaded.parsed;
@@ -440,25 +439,19 @@ where
         &parsed.providers,
         fixture_validation_enum_schemas(&fixture_pathbuf),
     );
-    let validation_config = validation_providers
-        .validate_config_pair(
-            parsed,
-            unresolved_parsed,
-            base_dir,
-            true,
-            &duplicate_declarations,
-        )
-        .unwrap_or_else(|error| panic!("fixture validation failed: {error}"));
+    let validation_config = validation_providers.validate_config_pair(
+        parsed,
+        unresolved_parsed,
+        base_dir,
+        true,
+        &duplicate_declarations,
+    )?;
     let canonical_resources = validation_config.into_resources_for_fixture();
     let provider_configs = canonical_resources.parsed().providers.clone();
     let mut state_file: Option<StateFile> = if state_path.exists() {
         let json = std::fs::read_to_string(&state_path).unwrap();
-        // Go through check_and_migrate so v5 fixtures (with the legacy
-        // `desired_keys` array) are lifted into v6 `explicit` trees on
-        // load. Direct `serde_json::from_str` would silently drop the
-        // legacy field and leave `explicit` empty, breaking the
-        // moved_prev_keys snapshot test.
-        Some(check_and_migrate(&json).unwrap().into_state())
+        // Fixtures use the same current-state loader as backend reads.
+        Some(load_state(&json).unwrap())
     } else {
         None
     };
@@ -542,7 +535,8 @@ where
     // unreadable — so `resolve_refs_for_plan` knows the binding name
     // and can stamp surviving refs as `(known after upstream apply: <ref>)`
     // instead of leaving the raw dot-form (#2366).
-    let mut remote_bindings: carina_core::upstream_exports::AdmittedRemoteBindings = HashMap::new();
+    let mut remote_bindings: carina_core::upstream_exports::AdmittedRemoteBindings =
+        Default::default();
     for us in &parsed.upstream_states {
         let dir = base_dir.join(&us.source).unwrap();
         let state_path = dir
@@ -796,7 +790,7 @@ where
                     normalizer: &provider_router,
                     provider_configs: raw_provider_configs,
                     remote_bindings: &remote_bindings,
-                    state_file: &state_file,
+                    state_file: &carina_state::ObservedStateFile::for_test(state_file.clone()),
                     state_block_claims: &state_block_claims,
                     resolved_state_block_targets: &resolved_state_block_targets,
                     preparation_errors: None,
@@ -819,12 +813,8 @@ where
                 moved_origins,
                 prev_explicit,
                 wait_aliases: _,
-                legacy_dependency_classification: _,
-                migrated_legacy_state,
             } = artifacts;
-            if let Some(migrated) = migrated_legacy_state {
-                state_file = Some(migrated);
-            }
+
             let moved_hints =
                 detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)
                     .expect("fixture moved-hint comparisons must resolve");
@@ -888,23 +878,15 @@ where
                 moved_origins,
                 prev_explicit,
                 wait_aliases: _,
-                legacy_dependency_classification: _,
-                migrated_legacy_state,
             } = artifacts;
-            if let Some(migrated) = migrated_legacy_state {
-                state_file = Some(migrated);
-            }
+
             let (checked, references) = match plan {
                 crate::wiring::PlannedPlan::Unrendered { plan, references } => {
-                    (*plan, FixtureReferences(references))
+                    (plan.into_checked(), FixtureReferences(references))
                 }
                 crate::wiring::PlannedPlan::Rendered {
-                    display,
-                    references,
-                } => (
-                    display.checked_plan().clone(),
-                    FixtureReferences(references),
-                ),
+                    plan, references, ..
+                } => (plan.into_checked(), FixtureReferences(references)),
             };
             let plan = checked.plan().clone().into_unadmitted();
             let moved_hints =
@@ -1674,7 +1656,12 @@ pub fn delete_instance_attributes_from_plan(
     managed_current: &HashMap<ResourceId, Current>,
     state_file: Option<&StateFile>,
 ) -> carina_core::detail_rows::HistoricalDisplayAttributes {
-    crate::commands::plan::collect_historical_display_attributes(plan, managed_current, state_file)
+    crate::commands::plan::collect_historical_display_attributes(
+        plan,
+        managed_current,
+        &carina_state::ObservedStateFile::for_test(state_file.cloned()),
+    )
+    .expect("fixture historical identities are valid")
 }
 
 #[cfg(test)]
@@ -1693,17 +1680,10 @@ mod tests {
                 let fixture = build_plan_from_fixture_path(&runtime, directory.path()).unwrap();
                 assert_eq!(fixture.desired_resources.len(), 1);
             } else {
-                let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    build_plan_from_fixture_path(&runtime, directory.path())
-                }));
-                let panic = rejected
+                let error = build_plan_from_fixture_path(&runtime, directory.path())
                     .err()
                     .expect("skipping resource admission cannot skip a Judge error");
-                let message = panic
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                    .unwrap();
+                let message = crate::error::format_error_with_source_chain(&error);
                 assert!(
                     message.contains("conversion target must be a loaded named scalar type"),
                     "{message}"

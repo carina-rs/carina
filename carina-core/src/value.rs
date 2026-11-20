@@ -59,6 +59,29 @@ impl std::fmt::Display for SerializationContext {
 /// message string.
 #[derive(Debug, Clone, Error)]
 pub enum SerializationError {
+    #[error("cannot protect observation: expected resource {expected}, actual resource {actual}")]
+    ObservationIdentityMismatch {
+        expected: Box<crate::resource::ResourceId>,
+        actual: Box<crate::resource::ResourceId>,
+    },
+
+    #[error("cannot protect saved-apply observation: no desired managed resource for {id}")]
+    MissingObservationResource {
+        id: Box<crate::resource::ResourceId>,
+    },
+
+    #[error("cannot render observation for {id}: attribute {attribute} is missing")]
+    MissingObservationAttribute {
+        id: Box<crate::resource::ResourceId>,
+        attribute: String,
+    },
+
+    #[error("cannot record observations belonging to a different plan")]
+    ObservationPlanMismatch,
+
+    #[error("cannot render saved-apply observations: comparison pair is missing")]
+    MissingObservationComparisons,
+
     #[error("cannot serialize: {}", crate::resource::INSIDE_SECRET_MESSAGE)]
     InsideSecret { kind: SecretSerializationErrorKind },
 
@@ -172,6 +195,11 @@ impl crate::resource::InsideSecret for SerializationError {
     fn inside_secret(self) -> Self {
         let kind = match self {
             Self::InsideSecret { kind } => kind,
+            error @ (Self::ObservationIdentityMismatch { .. }
+            | Self::MissingObservationResource { .. }
+            | Self::MissingObservationAttribute { .. }
+            | Self::MissingObservationComparisons
+            | Self::ObservationPlanMismatch) => return error,
             Self::NullProviderSecret => SecretSerializationErrorKind::NullProviderSecret,
             Self::UnavailableSecret(error) => {
                 return Self::UnavailableSecret(error.inside_secret());
@@ -681,10 +709,6 @@ pub(crate) struct PersistedListView<'a> {
 }
 
 impl<'a> PersistedView<'a> {
-    pub(crate) fn list_child(self, index: usize) -> Option<Self> {
-        self.as_list()?.get(index)
-    }
-
     pub(crate) fn as_map(self) -> Option<PersistedMapView<'a>> {
         let values = self.encoded.as_object()?;
         if values
@@ -938,6 +962,16 @@ fn value_to_json_inner<P: crate::resource::StateValueLeaf>(
             SnapshotLeaf::RedactedSecret { hash } => Ok(persisted_secret_json(&hash)),
             SnapshotLeaf::Expression(never) => match never {},
         },
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<
+                crate::resource::AbsoluteBindingAddress,
+            >(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<
+                crate::resource::AbsoluteBindingAddress,
+            >(never) {}
+        }
     }
 }
 
@@ -1097,45 +1131,6 @@ fn escape_persisted_map_key(key: &str) -> Cow<'_, str> {
     }
 }
 
-/// Upgrade one value tree written by state format v12 or earlier.
-///
-/// The legacy enum recognition deliberately matches the old decoder: an
-/// outer object containing only `Enum`, with all required typed identity and
-/// `api_value` fields, is treated as the enum it used to decode into. Its
-/// payload is re-emitted canonically. Every other object is user data, so `$`
-/// keys are escaped recursively.
-pub fn migrate_legacy_persisted_json(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Array(values) => {
-            for value in values {
-                migrate_legacy_persisted_json(value);
-            }
-        }
-        serde_json::Value::Object(values) => {
-            if values.len() == 1
-                && let Some(serde_json::Value::Object(payload)) = values.get(LEGACY_ENUM_KEY)
-                && let Some(canonical) = canonical_enum_from_payload(payload, false)
-            {
-                *value = canonical_enum_to_json(&canonical, PERSISTED_ENUM_KEY);
-                return;
-            }
-
-            let old = std::mem::take(values);
-            *values = old
-                .into_iter()
-                .map(|(key, mut value)| {
-                    migrate_legacy_persisted_json(&mut value);
-                    (escape_persisted_map_key(&key).into_owned(), value)
-                })
-                .collect();
-        }
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => {}
-    }
-}
-
 /// Convert `serde_json::Value` to DSL `Value`.
 ///
 /// Returns `None` for JSON null, since null represents a missing/unset value
@@ -1148,8 +1143,7 @@ pub fn json_to_dsl_value(json: &serde_json::Value) -> Result<Option<Value>, Json
 }
 
 /// Convert persisted state JSON to a DSL value, lifting structural `$secret`
-/// tags into their opaque typed representation. Versioned state migrations
-/// rewrite legacy string encodings before this conversion runs.
+/// tags into their opaque typed representation. Ordinary strings remain literal.
 fn persisted_json_to_dsl_value(
     json: &serde_json::Value,
     purpose: PersistedPurpose,
@@ -1347,20 +1341,19 @@ fn json_to_canonical_enum(
         return None;
     }
 
-    canonical_enum_from_payload(payload, true)
+    canonical_enum_from_payload(payload)
 }
 
 fn canonical_enum_from_payload(
     payload: &serde_json::Map<String, serde_json::Value>,
-    require_canonical_shape: bool,
 ) -> Option<CanonicalEnumValue> {
-    if require_canonical_shape && payload.len() != 2 {
+    if payload.len() != 2 {
         return None;
     }
     let serde_json::Value::Object(identity) = payload.get("identity")? else {
         return None;
     };
-    if require_canonical_shape && identity.len() != 3 {
+    if identity.len() != 3 {
         return None;
     }
     let provider = match identity.get("provider")? {
@@ -1513,7 +1506,11 @@ impl PrettyValue {
 }
 
 /// Render a value together with semantic span metadata.
-pub fn render_value<P: ValueKind>(value: &Value<P>) -> RenderedValue {
+///
+/// ```compile_fail,E0603
+/// use carina_core::value::render_value;
+/// ```
+pub(crate) fn render_value<P: ValueKind>(value: &Value<P>) -> RenderedValue {
     let mut sink = SpanSink::default();
     format_value_into(value, &mut sink).expect("SpanSink writes are infallible");
     sink.finish()
@@ -1964,6 +1961,12 @@ fn format_value_into_context<P: ValueKind, B: BindingAddress>(
                 sink.write_token(ValueSpanKind::Other, &placeholder.render())
             }
         }
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 
@@ -2242,6 +2245,12 @@ pub fn contains_secret<P: ValueKind, B: BindingAddress>(value: &Value<P, B>) -> 
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => false,
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 
@@ -2304,6 +2313,7 @@ pub fn contains_unredacted_secret(value: &Value) -> bool {
             | DeferredValue::Unknown(_),
         ) => false,
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        Value::Reference(never) | Value::Conversion(never) => match *never {},
     }
 }
 
@@ -2570,6 +2580,9 @@ fn secret_value_requires_provider_material(value: &Value) -> bool {
             | ConcreteValue::StringList(_),
         ) => false,
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -2864,6 +2877,16 @@ fn canonical_secret_template<P: PlaceholderKind>(
                 }
             })?,
         ),
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<
+                crate::resource::AbsoluteBindingAddress,
+            >(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<
+                crate::resource::AbsoluteBindingAddress,
+            >(never) {}
+        }
     })
 }
 
@@ -3051,298 +3074,54 @@ pub fn reject_secret_in_saved_plan_field(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum SecretRedactionGuide<'a> {
-    Evaluated(&'a Value),
-    SecretShape(&'a Value),
-    /// Hashes and live `Secret` wrappers in the snapshot guide classify
-    /// provider/historical plaintext as secret.
-    RedactedShape(&'a SnapshotValue),
-    /// The source value is authoritative for secret semantics; the redacted
-    /// guide supplies only a same-path digest that may be reused.
-    RedactedDesired(&'a SnapshotValue),
-    /// Persisted state is authoritative for classifying provider plaintext.
-    Persisted(PersistedView<'a>),
-    /// Desired `Secret` wrappers are authoritative; persisted state supplies
-    /// only a same-path digest that may be reused.
-    PersistedDesired(PersistedView<'a>),
-}
+#[path = "secret_protection.rs"]
+mod secret_protection;
+pub use secret_protection::ProtectedObservation;
+#[path = "value_observations.rs"]
+mod observations;
+pub(crate) use observations::observation_history_for_plan;
+pub use observations::{
+    BindingState, ObservationInputs, ObservationState, ProtectedComparisons, ProtectedObservations,
+};
+pub(crate) use secret_protection::SecretProtection;
 
-#[derive(Clone, Copy)]
-enum SecretRedactionMapGuide<'a> {
-    Evaluated(&'a IndexMap<String, Value>),
-    SecretShape(&'a IndexMap<String, Value>),
-    RedactedShape(&'a IndexMap<String, SnapshotValue>),
-    RedactedDesired(&'a IndexMap<String, SnapshotValue>),
-    Persisted(PersistedMapView<'a>),
-    PersistedDesired(PersistedMapView<'a>),
-}
-
-impl<'a> SecretRedactionMapGuide<'a> {
-    fn child(self, key: &str) -> Option<SecretRedactionGuide<'a>> {
-        match self {
-            Self::Evaluated(values) => values.get(key).map(SecretRedactionGuide::Evaluated),
-            Self::SecretShape(values) => values.get(key).map(SecretRedactionGuide::SecretShape),
-            Self::RedactedShape(values) => values.get(key).map(SecretRedactionGuide::RedactedShape),
-            Self::RedactedDesired(values) => {
-                values.get(key).map(SecretRedactionGuide::RedactedDesired)
-            }
-            Self::Persisted(values) => values.get(key).map(SecretRedactionGuide::Persisted),
-            Self::PersistedDesired(values) => {
-                values.get(key).map(SecretRedactionGuide::PersistedDesired)
-            }
-        }
-    }
-}
-
-impl<'a> SecretRedactionGuide<'a> {
-    fn protects_whole_value(self, source_is_secret: bool) -> bool {
-        match self {
-            Self::Evaluated(Value::Deferred(DeferredValue::Secret(_)))
-            | Self::SecretShape(Value::Deferred(DeferredValue::Secret(_)))
-            | Self::RedactedShape(Value::Deferred(DeferredValue::Secret(_)))
-            | Self::RedactedShape(Value::Deferred(DeferredValue::Placeholder(
-                SnapshotLeaf::RedactedSecret { .. },
-            ))) => true,
-            Self::RedactedDesired(Value::Deferred(DeferredValue::Placeholder(
-                SnapshotLeaf::RedactedSecret { .. },
-            ))) => source_is_secret,
-            Self::Persisted(value) => value.is_redacted_secret(),
-            Self::PersistedDesired(value) => value.is_redacted_secret() && source_is_secret,
-            _ => false,
-        }
-    }
-
-    fn secret_value<'b>(&'b self, source: &'b Value) -> Option<&'b Value> {
-        if !self.protects_whole_value(matches!(source, Value::Deferred(DeferredValue::Secret(_)))) {
-            return None;
-        }
-        match self {
-            Self::Evaluated(value @ Value::Deferred(DeferredValue::Secret(_))) => Some(value),
-            _ => Some(source),
-        }
-    }
-
-    fn previous_hash(self) -> Option<RedactedSecretHash> {
-        match self {
-            Self::RedactedShape(Value::Deferred(DeferredValue::Placeholder(
-                SnapshotLeaf::RedactedSecret { hash },
-            )))
-            | Self::RedactedDesired(Value::Deferred(DeferredValue::Placeholder(
-                SnapshotLeaf::RedactedSecret { hash },
-            ))) => Some(hash.clone()),
-            Self::Persisted(value) | Self::PersistedDesired(value) => value.redacted_secret_hash(),
-            _ => None,
-        }
-    }
-
-    fn as_map(self) -> Option<SecretRedactionMapGuide<'a>> {
-        match self {
-            Self::Evaluated(Value::Concrete(ConcreteValue::Map(values))) => {
-                Some(SecretRedactionMapGuide::Evaluated(values))
-            }
-            Self::SecretShape(Value::Concrete(ConcreteValue::Map(values))) => {
-                Some(SecretRedactionMapGuide::SecretShape(values))
-            }
-            Self::RedactedShape(Value::Concrete(ConcreteValue::Map(values))) => {
-                Some(SecretRedactionMapGuide::RedactedShape(values))
-            }
-            Self::RedactedDesired(Value::Concrete(ConcreteValue::Map(values))) => {
-                Some(SecretRedactionMapGuide::RedactedDesired(values))
-            }
-            Self::Persisted(values) => values.as_map().map(SecretRedactionMapGuide::Persisted),
-            Self::PersistedDesired(values) => values
-                .as_map()
-                .map(SecretRedactionMapGuide::PersistedDesired),
-            _ => None,
-        }
-    }
-
-    fn list_child(self, index: usize) -> Option<Self> {
-        match self {
-            Self::Evaluated(Value::Concrete(ConcreteValue::List(values))) => {
-                values.get(index).map(Self::Evaluated)
-            }
-            Self::SecretShape(Value::Concrete(ConcreteValue::List(values))) => {
-                values.get(index).map(Self::SecretShape)
-            }
-            Self::RedactedShape(Value::Concrete(ConcreteValue::List(values))) => {
-                values.get(index).map(Self::RedactedShape)
-            }
-            Self::RedactedDesired(Value::Concrete(ConcreteValue::List(values))) => {
-                values.get(index).map(Self::RedactedDesired)
-            }
-            Self::Persisted(values) => values.list_child(index).map(Self::Persisted),
-            Self::PersistedDesired(values) => values.list_child(index).map(Self::PersistedDesired),
-            _ => None,
-        }
-    }
-}
-
-fn redact_with_guide(
-    source: &Value,
-    guide: SecretRedactionGuide<'_>,
-) -> Result<SnapshotValue, SerializationError> {
-    if let Some(secret_value) = guide.secret_value(source) {
-        let previous = guide.previous_hash();
-        return Ok(SnapshotValue::redacted(hash_secret_value(
-            secret_value,
-            previous.as_ref(),
-        )?));
-    }
-
-    match source {
-        Value::Concrete(ConcreteValue::Map(values)) => {
-            let guide = guide.as_map();
-            let values = values
-                .iter()
-                .map(|(key, value)| {
-                    let value = match guide.and_then(|guide| guide.child(key)) {
-                        Some(guide) => redact_with_guide(value, guide)?,
-                        None => redact_secrets_only(value)?,
-                    };
-                    Ok((key.clone(), value))
-                })
-                .collect::<Result<IndexMap<_, _>, SerializationError>>()?;
-            Ok(Value::Concrete(ConcreteValue::Map(values)))
-        }
-        Value::Concrete(ConcreteValue::List(values)) => {
-            let values = values
-                .iter()
-                .enumerate()
-                .map(|(index, value)| match guide.list_child(index) {
-                    Some(guide) => redact_with_guide(value, guide),
-                    None => redact_secrets_only(value),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Value::Concrete(ConcreteValue::List(values)))
-        }
-        _ => redact_secrets_only(source),
-    }
-}
-
-/// Redact `source`, using its evaluated value as the authority for secret
-/// semantics. This recognizes any expression whose result is secret without
-/// duplicating evaluator policy at the saved-plan seam.
+/// Evaluation owns whether an expression's selected result is secret.
 pub fn redact_secrets_using_evaluated(
     source: &Value,
     evaluated: &Value,
 ) -> Result<SnapshotValue, SerializationError> {
     if contains_secret(evaluated) {
-        // Once evaluation reveals a secret anywhere below this path, persist
-        // the evaluated subtree rather than the authored expression. This
-        // keeps unresolved refs/unknowns needed at apply time while ensuring
-        // a FunctionCall or Interpolation cannot retain plaintext arguments
-        // that merely *produce* a secret after evaluation.
         return redact_secrets_only(evaluated);
     }
-    redact_with_guide(source, SecretRedactionGuide::Evaluated(evaluated))
+    redact_secrets_only(source)
 }
-
 fn redact_using_redacted_shape<P: crate::resource::StateValueLeaf>(
     value: &Value<P>,
-    redacted_shape: &SnapshotValue,
+    shape: &SnapshotValue,
 ) -> Result<SnapshotValue, SerializationError> {
-    redact_snapshot_with_guide(
-        &crate::resource::state_value_snapshot(value),
-        SecretRedactionGuide::RedactedShape(redacted_shape),
-    )
+    SecretProtection::for_output(shape).redact(value)
 }
-
 fn redact_desired_reusing_redacted_shape(
     value: &Value,
-    redacted_shape: &SnapshotValue,
+    shape: &SnapshotValue,
 ) -> Result<SnapshotValue, SerializationError> {
-    redact_with_guide(value, SecretRedactionGuide::RedactedDesired(redacted_shape))
+    SecretProtection::desired(value, &SecretProtection::for_output(shape)).redact(value)
 }
-
-fn redact_snapshot_with_guide(
-    source: &SnapshotValue,
-    guide: SecretRedactionGuide<'_>,
+/// Protect provider values using authored secret provenance, including divergence.
+#[cfg(test)]
+pub(crate) fn redact_plaintext_using_secret_shape<P: crate::resource::StateValueLeaf>(
+    value: &Value<P>,
+    shape: &Value,
 ) -> Result<SnapshotValue, SerializationError> {
-    if source.secret_hash().is_some() {
-        return Ok(source.clone());
-    }
-    if guide.protects_whole_value(matches!(source, Value::Deferred(DeferredValue::Secret(_)))) {
-        // Sensitivity covers the complete value, including plaintext siblings
-        // of existing hashes. Only an evaluated guide can supply missing material.
-        if let SecretRedactionGuide::Evaluated(value @ Value::Deferred(DeferredValue::Secret(_))) =
-            guide
-        {
-            return redact_with_guide(value, guide);
-        }
-        return crate::resource::SecretPayload::from(Box::new(source.clone()))
-            .try_project_plaintext(|source| {
-                redact_with_guide(&source.to_value_at("state")?, guide)
-            });
-    }
-    match source {
-        Value::Concrete(ConcreteValue::Map(values)) => {
-            let map_guide = guide.as_map();
-            let values = values
-                .iter()
-                .map(|(key, value)| {
-                    let value = match map_guide.and_then(|guide| guide.child(key)) {
-                        Some(guide) => redact_snapshot_with_guide(value, guide)?,
-                        None => redact_snapshot_secrets(value)?,
-                    };
-                    Ok((key.clone(), value))
-                })
-                .collect::<Result<IndexMap<_, _>, SerializationError>>()?;
-            Ok(Value::Concrete(ConcreteValue::Map(values)))
-        }
-        Value::Concrete(ConcreteValue::List(values)) => {
-            let values = values
-                .iter()
-                .enumerate()
-                .map(|(i, value)| match guide.list_child(i) {
-                    Some(guide) => redact_snapshot_with_guide(value, guide),
-                    None => redact_snapshot_secrets(value),
-                })
-                .collect::<Result<_, _>>()?;
-            Ok(Value::Concrete(ConcreteValue::List(values)))
-        }
-        _ => redact_with_guide(&source.to_value_at("state")?, guide),
-    }
+    SecretProtection::for_output(shape).redact(value)
 }
-
-/// Redact provider plaintext at paths marked secret by the desired value.
-pub fn redact_plaintext_using_secret_shape<P: crate::resource::StateValueLeaf>(
-    plaintext: &Value<P>,
-    secret_shape: &Value,
-) -> Result<SnapshotValue, SerializationError> {
-    redact_snapshot_with_guide(
-        &crate::resource::state_value_snapshot(plaintext),
-        SecretRedactionGuide::SecretShape(secret_shape),
-    )
-}
-
-/// Redact provider plaintext at paths marked by secret hashes in persisted
-/// state. Fresh provider plaintext is hashed with a new embedded salt.
-/// State values themselves are lifted into typed placeholders when decoded,
-/// so this function never classifies source strings as secrets by content.
+#[cfg(test)]
 fn redact_plaintext_using_persisted_state<P: crate::resource::StateValueLeaf>(
-    plaintext: &Value<P>,
+    value: &Value<P>,
     persisted: PersistedView<'_>,
 ) -> Result<SnapshotValue, SerializationError> {
-    redact_snapshot_with_guide(
-        &crate::resource::state_value_snapshot(plaintext),
-        SecretRedactionGuide::Persisted(persisted),
-    )
+    SecretProtection::from_persisted(persisted).redact(value)
 }
-
-/// Apply secret sensitivity to provider plaintext for display only.
-///
-/// Unlike saved-plan redaction this does not hash or verify anything. It
-/// preserves the plaintext for execution while ensuring formatters render
-/// every path marked secret by the desired value as `(secret)`.
-pub fn mask_plaintext_using_secret_shape<P: ValueKind, Q: ValueKind>(
-    plaintext: &Value<P>,
-    shape: &Value<Q>,
-) -> Value<P> {
-    project_secret_shape(plaintext, shape, SecretShapeProjectionMode::Display)
-}
-
 fn rebuild_projected_string_list<P: ValueKind>(values: Vec<Value<P>>) -> Value<P> {
     let strings = values
         .iter()
@@ -3357,201 +3136,36 @@ fn rebuild_projected_string_list<P: ValueKind>(values: Vec<Value<P>>) -> Value<P
     )
 }
 
-#[derive(Clone, Copy)]
-enum SecretShapeProjectionMode {
-    Display,
-    FailClosed,
-    ResolvedUnion,
-}
-
-impl SecretShapeProjectionMode {
-    fn preserves_secret_value(self) -> bool {
-        matches!(self, Self::FailClosed | Self::ResolvedUnion)
-    }
-
-    fn deferred_shape<P: ValueKind, Q: ValueKind>(
-        self,
-        value: &Value<P>,
-        shape: &Value<Q>,
-    ) -> Value<P> {
-        if matches!(shape, Value::Deferred(DeferredValue::Secret(_)))
-            || matches!(shape, Value::Deferred(DeferredValue::Placeholder(leaf)) if leaf.redacted_secret_hash().is_some())
-        {
-            return Value::Deferred(DeferredValue::Secret(Box::new(value.clone()).into()));
-        }
-
-        match self {
-            Self::Display => value.clone(),
-            Self::FailClosed => mark_secret(value),
-            Self::ResolvedUnion if matches!(value, Value::Concrete(_)) => value.clone(),
-            Self::ResolvedUnion => mark_secret(value),
-        }
-    }
-
-    fn unprojectable<P: ValueKind>(self, value: &Value<P>) -> Value<P> {
-        match self {
-            Self::Display => value.clone(),
-            Self::FailClosed | Self::ResolvedUnion => mark_secret(value),
-        }
-    }
-}
-
-fn mark_secret<P: ValueKind>(value: &Value<P>) -> Value<P> {
-    Value::Deferred(DeferredValue::Secret(Box::new(value.clone()).into()))
-}
-
-fn project_secret_shape<P: ValueKind, Q: ValueKind>(
+/// Preserve legacy binding propagation, including positional list matching.
+/// Output projection has a separate divergence policy.
+///
+/// ```compile_fail,E0603
+/// use carina_core::value::project_binding_secret_shape;
+/// ```
+pub(crate) fn project_binding_secret_shape<P: ValueKind, Q: ValueKind>(
     value: &Value<P>,
     shape: &Value<Q>,
-    mode: SecretShapeProjectionMode,
 ) -> Value<P> {
-    // Historical hashes already carry sensitivity. Display must keep them
-    // opaque rather than introduce a live Secret that needs evaluation.
-    if matches!(value, Value::Deferred(DeferredValue::Placeholder(leaf)) if leaf.redacted_secret_hash().is_some())
-    {
-        return value.clone();
-    }
-    if mode.preserves_secret_value() && matches!(value, Value::Deferred(DeferredValue::Secret(_))) {
-        return value.clone();
-    }
-    if !contains_secret(shape) {
-        return value.clone();
-    }
-    if matches!(shape, Value::Deferred(_)) {
-        return mode.deferred_shape(value, shape);
-    }
-
-    match (value, shape) {
-        (
-            Value::Concrete(ConcreteValue::Map(values)),
-            Value::Concrete(ConcreteValue::Map(shapes)),
-        ) => Value::Concrete(ConcreteValue::Map(
-            values
-                .iter()
-                .map(|(key, value)| {
-                    let projected = shapes.get(key).map_or_else(
-                        || value.clone(),
-                        |shape| project_secret_shape(value, shape, mode),
-                    );
-                    (key.clone(), projected)
-                })
-                .collect(),
-        )),
-        (
-            Value::Concrete(ConcreteValue::List(values)),
-            Value::Concrete(ConcreteValue::List(shapes)),
-        ) => Value::Concrete(ConcreteValue::List(
-            values
-                .iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    shapes.get(index).map_or_else(
-                        || value.clone(),
-                        |shape| project_secret_shape(value, shape, mode),
-                    )
-                })
-                .collect(),
-        )),
-        (
-            Value::Concrete(ConcreteValue::StringList(values)),
-            Value::Concrete(ConcreteValue::List(shapes)),
-        ) => rebuild_projected_string_list(
-            values
-                .iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    let value = Value::Concrete(ConcreteValue::String(value.clone()));
-                    shapes.get(index).map_or(value.clone(), |shape| {
-                        project_secret_shape(&value, shape, mode)
-                    })
-                })
-                .collect(),
-        ),
-        _ => mode.unprojectable(value),
-    }
+    SecretProtection::for_binding(shape).mask(value)
 }
-
-/// Apply a secret shape to provider plaintext, marking only the exact value
-/// whose secret-bearing shape cannot be projected structurally. Containers
-/// and their other children retain their independently projected shapes.
-pub fn mask_plaintext_using_secret_shape_fail_closed<P: ValueKind, Q: ValueKind>(
-    plaintext: &Value<P>,
-    shape: &Value<Q>,
-) -> Value<P> {
-    project_secret_shape(plaintext, shape, SecretShapeProjectionMode::FailClosed)
-}
-
-/// Combine the secret shape selected during apply with secret markers from
-/// the authored value used to build the plan.
-///
-/// The apply-time value is authoritative when a deferred authored expression
-/// has resolved to a concrete branch. Structural authored values are merged
-/// recursively so an unprojectable child fails closed at that child without
-/// tainting its container or siblings.
+/// A resolved deferred expression's selected public branch remains authoritative.
 pub fn union_secret_shapes_after_resolution(applied: &Value, authored: &Value) -> Value {
-    project_secret_shape(applied, authored, SecretShapeProjectionMode::ResolvedUnion)
+    SecretProtection::from_resolved_shape(authored).mask(applied)
 }
-
-/// Apply persisted secret sensitivity to provider plaintext.
+/// Preserve persisted sensitivity for binding propagation using the legacy
+/// positional list and lenient kind correspondence, independently of output.
 ///
-/// This masks values for display and for pre-apply validation without copying
-/// a stored hash into the runtime value. The raw JSON walker stays private;
-/// callers must supply the opaque persisted-state view and an attribute key.
-fn mask_plaintext_using_persisted_json_shape<P: ValueKind>(
-    plaintext: &Value<P>,
-    persisted: PersistedView<'_>,
-) -> Value<P> {
-    if persisted.is_redacted_secret() {
-        return Value::Deferred(DeferredValue::Secret(Box::new(plaintext.clone()).into()));
-    }
-    match plaintext {
-        Value::Concrete(ConcreteValue::Map(values)) => persisted.as_map().map_or_else(
-            || plaintext.clone(),
-            |shapes| {
-                Value::Concrete(ConcreteValue::Map(
-                    values
-                        .iter()
-                        .map(|(key, value)| {
-                            let masked = shapes.get(key).map_or_else(
-                                || value.clone(),
-                                |shape| mask_plaintext_using_persisted_json_shape(value, shape),
-                            );
-                            (key.clone(), masked)
-                        })
-                        .collect(),
-                ))
-            },
-        ),
-        Value::Concrete(ConcreteValue::List(values)) => persisted.as_list().map_or_else(
-            || plaintext.clone(),
-            |shapes| {
-                Value::Concrete(ConcreteValue::List(
-                    values
-                        .iter()
-                        .enumerate()
-                        .map(|(index, value)| {
-                            shapes.get(index).map_or_else(
-                                || value.clone(),
-                                |shape| mask_plaintext_using_persisted_json_shape(value, shape),
-                            )
-                        })
-                        .collect(),
-                ))
-            },
-        ),
-        _ => plaintext.clone(),
-    }
-}
-
-/// Mask one provider value according to the same attribute in persisted state.
-pub fn mask_plaintext_using_persisted_attribute<P: ValueKind>(
-    plaintext: &Value<P>,
+/// ```compile_fail,E0603
+/// use carina_core::value::project_persisted_binding_attribute;
+/// ```
+pub(crate) fn project_persisted_binding_attribute<P: ValueKind>(
+    value: &Value<P>,
     persisted: &crate::provider::PersistedAttributes,
     key: &str,
 ) -> Value<P> {
-    persisted.encoded().get(key).map_or_else(
-        || plaintext.clone(),
-        |shape| mask_plaintext_using_persisted_json_shape(plaintext, shape.view()),
+    persisted.encoded_value(key).map_or_else(
+        || value.clone(),
+        |shape| SecretProtection::for_persisted_binding(shape.view()).mask(value),
     )
 }
 
@@ -3933,7 +3547,7 @@ where
 /// Redact all secrets in an attributes map.
 pub fn redact_secrets_in_attributes(
     attrs: &HashMap<String, Value>,
-) -> Result<HashMap<String, SnapshotValue>, SerializationError> {
+) -> Result<BTreeMap<String, SnapshotValue>, SerializationError> {
     redact_attrs_with_guide(attrs.iter(), |_, value| redact_secrets_in_value(value))
 }
 
@@ -3974,10 +3588,10 @@ pub fn redact_secrets_in_resource_reusing_persisted_hashes<S: Clone, D: Clone>(
 > {
     let attributes = redact_attrs_with_guide(resource.attributes.iter(), |key, value| {
         match persisted.encoded_value(key) {
-            Some(previous) => redact_with_guide(
-                value,
-                SecretRedactionGuide::PersistedDesired(previous.view()),
-            ),
+            Some(previous) => {
+                SecretProtection::desired(value, &SecretProtection::from_persisted(previous.view()))
+                    .redact(value)
+            }
             None => redact_secrets_only(value),
         }
     })?;
@@ -4367,7 +3981,8 @@ pub fn rehydrate_saved_composition_with_candidate(
 }
 
 /// Redact all secrets in a `State`, returning a new State with secrets replaced by hashes.
-pub fn redact_secrets_in_state<P: crate::resource::StateValueLeaf>(
+#[cfg(test)]
+pub(crate) fn redact_secrets_in_state<P: crate::resource::StateValueLeaf>(
     state: &crate::resource::State<P>,
 ) -> Result<crate::resource::SnapshotState, SerializationError> {
     let state = state.to_snapshot();
@@ -4382,34 +3997,8 @@ pub fn redact_secrets_in_state<P: crate::resource::StateValueLeaf>(
     })
 }
 
-pub fn redact_secrets_in_state_using_resource<D, P: crate::resource::StateValueLeaf>(
-    state: &crate::resource::State<P>,
-    desired: &crate::resource::Resource<
-        crate::resource::ModuleSource,
-        crate::resource::NoPlaceholder,
-        crate::resource::AbsoluteBindingAddress,
-        D,
-    >,
-) -> Result<crate::resource::SnapshotState, SerializationError> {
-    let state = state.to_snapshot();
-    let attributes = state
-        .attributes
-        .iter()
-        .map(|(key, value)| {
-            let value = match desired.attributes.get(key) {
-                Some(shape) => redact_plaintext_using_secret_shape(value, shape)?,
-                None => redact_snapshot_secrets(value)?,
-            };
-            Ok((key.clone(), value))
-        })
-        .collect::<Result<_, SerializationError>>()?;
-    Ok(crate::resource::State {
-        attributes,
-        ..state
-    })
-}
-
-pub fn redact_secrets_in_state_using_persisted<P: crate::resource::StateValueLeaf>(
+#[cfg(test)]
+pub(crate) fn redact_secrets_in_state_using_persisted<P: crate::resource::StateValueLeaf>(
     state: &crate::resource::State<P>,
     persisted: &crate::provider::PersistedAttributes,
 ) -> Result<crate::resource::SnapshotState, SerializationError> {
@@ -4470,7 +4059,6 @@ pub fn verify_historical_state_secrets(
     let mut state = saved.clone();
     let mut drifted_attributes = BTreeSet::new();
     let mut drift_errors = Vec::new();
-    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for (key, saved_value) in &saved.attributes {
         if !contains_redacted_secret(saved_value) {
             continue;
@@ -4544,16 +4132,16 @@ fn redact_deferred_template<S: Clone>(
     )
 }
 
-pub fn redact_secrets_in_effect<S: Clone>(
+pub(crate) fn redact_secrets_in_effect<S: Clone>(
     effect: &crate::effect::Effect<S>,
 ) -> Result<crate::effect::Effect<S, SnapshotLeaf>, SerializationError> {
     redact_secrets_in_effect_with_history(effect, &HashMap::new())
 }
 
 fn redact_historical_attributes<'a>(
-    attributes: &HashMap<String, SnapshotValue>,
+    attributes: &BTreeMap<String, SnapshotValue>,
     mut guide: impl FnMut(&str) -> Option<&'a SnapshotValue>,
-) -> Result<HashMap<String, SnapshotValue>, SerializationError> {
+) -> Result<BTreeMap<String, SnapshotValue>, SerializationError> {
     redact_attrs_with_guide(attributes.iter(), |key, value| match guide(key) {
         Some(shape) => redact_using_redacted_shape(value, shape),
         None => redact_snapshot_secrets(value),
@@ -4585,8 +4173,9 @@ fn redact_secrets_in_effect_with_history<S: Clone>(
             }
         }
 
-        crate::effect::Effect::Update { from, .. } => {
-            **from = redact_secrets_in_state(from)?;
+        crate::effect::Effect::Update { from, to, .. } => {
+            from.attributes =
+                redact_historical_attributes(&from.attributes, |key| to.attributes.get(key))?;
         }
         crate::effect::Effect::ReleaseListKeys { keys, .. } => {
             *keys = crate::effect::ReleasedListKeys::try_new(
@@ -4606,7 +4195,8 @@ fn redact_secrets_in_effect_with_history<S: Clone>(
 }
 
 /// Redact all secrets in a `Plan`, returning a new Plan with secrets replaced by hashes.
-pub fn redact_secrets_in_plan(
+#[cfg(test)]
+pub(crate) fn redact_secrets_in_plan(
     plan: &crate::plan::Plan,
 ) -> Result<crate::plan::SnapshotPlan, SerializationError> {
     let planned_resources: HashMap<
@@ -4638,7 +4228,7 @@ fn create_effect_ids<S, V: crate::resource::PlanValueKind>(
         .collect()
 }
 
-pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
+pub(crate) fn redact_secrets_in_plan_with_desired_and_historical<D>(
     plan: &crate::plan::Plan,
     planned_resources: &HashMap<
         crate::resource::ResourceId,
@@ -4677,14 +4267,16 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
                     changed_attributes,
                 } => crate::effect::Effect::Update {
                     from: Box::new(crate::resource::SnapshotState {
-                        attributes: redact_historical_attributes(&from.attributes, |key| {
-                            match historical.get(&from.id) {
+                        attributes: redact_historical_attributes(
+                            ProtectedObservation::for_resource(from, to, None)?
+                                .display_attributes(),
+                            |key| match historical.get(&from.id) {
                                 Some(state) => state.attributes.get(key),
                                 None => planned_resources
                                     .get(&from.id)
                                     .and_then(|resource| resource.attributes.get(key)),
-                            }
-                        })?,
+                            },
+                        )?,
                         ..from.as_ref().clone()
                     }),
                     identifier: identifier.clone(),
@@ -4742,7 +4334,6 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
         let resource_id = create_ids.get(metadata.create_idx).and_then(Option::as_ref);
         let historical = resource_id.and_then(|id| historical.get(id));
         let guide = resource_id.and_then(|id| planned_resources.get(id));
-        #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
         for (key, value) in &mut metadata.previous_attributes {
             *value = if let Some(shape) = historical.and_then(|state| state.attributes.get(key)) {
                 redact_using_redacted_shape(value, shape)?
@@ -4956,7 +4547,6 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<
         verified: &crate::resource::SnapshotState,
     ) -> Result<crate::resource::SnapshotState, SecretRehydrationSiteError> {
         let mut out = saved.clone();
-        #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
         for (key, value) in &mut out.attributes {
             if !contains_redacted_secret(value) {
                 continue;
@@ -5080,7 +4670,6 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<
                 )
             })?;
         let (redacted, verified) = state_evidence(resource_id)?;
-        #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
         for (key, value) in &mut metadata.previous_attributes {
             if !contains_redacted_secret(value) {
                 continue;
@@ -6244,6 +5833,12 @@ fn canonical_map_key_text<H: ValueKind, B: BindingAddress>(
             "String or Enum map key".to_string(),
             unexpected.type_name(),
         )),
+        crate::resource::Value::Reference(never) => {
+            match *<H as crate::resource::ValueKind>::no_reference_payload::<B>(&never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<H as crate::resource::ValueKind>::no_conversion_payload::<B>(&never) {}
+        }
     }
 }
 
@@ -6748,6 +6343,12 @@ fn first_enum_identifier_inner<H: ValueKind, B: BindingAddress>(
             | DeferredValue::BindingRef { .. },
         ) => None,
         Value::Deferred(DeferredValue::Placeholder(_)) => None,
+        crate::resource::Value::Reference(never) => {
+            match *<H as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<H as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 
@@ -8845,7 +8446,7 @@ mod tests {
     }
 
     #[test]
-    fn state_row_load_upgrades_raw_legacy_marker_to_structural_secret_tag() {
+    fn structural_legacy_secret_tag_decodes_while_raw_marker_stays_literal() {
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let marker = format!("_secret:argon2:{hash}");
         let mut json = serde_json::json!({ "nested": [marker.clone()] });
@@ -8863,20 +8464,16 @@ mod tests {
             "a raw legacy marker is not a context-free persisted encoding",
         );
 
-        json = crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
-            json,
-            "test.resource",
-            "old",
-            "tags",
-        )
-        .expect("migrate legacy test state document");
+        json = serde_json::json!({"nested": [{"$secret": format!(
+            "argon2-legacy:{}:{hash}", hex::encode(b"carina:test.resource:old:tags")
+        )}]});
         assert!(
             json["nested"][0][PERSISTED_SECRET_KEY]
                 .as_str()
                 .is_some_and(|digest| digest.starts_with("argon2-legacy:")),
         );
         let persisted = PersistedValue::from_serialized_json(json)
-            .expect("migrated persisted JSON")
+            .expect("structural persisted JSON")
             .decode()
             .expect("persisted JSON value");
         let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(map)) = persisted
@@ -8900,7 +8497,7 @@ mod tests {
         let digest = format!("argon2:{}", "ab".repeat(32));
         assert!(
             RedactedSecretHash::from_encoded_digest(&digest).is_none(),
-            "a raw legacy digest must first be upgraded by its state-file row",
+            "a legacy digest must carry an explicit salt",
         );
     }
 
@@ -8908,20 +8505,11 @@ mod tests {
     fn redacted_secret_hash_deserialize_accepts_only_its_serialized_encoding() {
         let bare_hash = "ab".repeat(32);
         let marker = format!("_secret:argon2:{bare_hash}");
-        let migrated =
-            crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
-                serde_json::json!(marker),
-                "test.resource",
-                "old",
-                "comment",
-            )
-            .expect("migrate legacy test state document");
-        let digest = RedactedSecretHash::from_encoded_digest(
-            migrated[PERSISTED_SECRET_KEY]
-                .as_str()
-                .expect("migrated digest"),
-        )
-        .expect("state load must upgrade a raw legacy marker");
+        let digest = RedactedSecretHash::from_encoded_digest(&format!(
+            "argon2-legacy:{}:{bare_hash}",
+            hex::encode(b"carina:test.resource:old:comment")
+        ))
+        .expect("valid explicit legacy digest");
         let encoded = serde_json::to_value(&digest).expect("serialize typed digest");
 
         let decoded_hash: RedactedSecretHash =
@@ -10549,7 +10137,7 @@ mod tests {
             );
         let managed = vec![source];
         let current_states = std::collections::HashMap::new();
-        let remote_bindings = std::collections::HashMap::new();
+        let remote_bindings = std::collections::BTreeMap::new();
         let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &managed,
             compositions: &[],
@@ -11951,8 +11539,7 @@ mod tests {
             "persisted secret tags must classify plaintext below escaped keys",
         );
 
-        let masked =
-            mask_plaintext_using_persisted_attribute(&plaintext_tree, &inventory, "settings");
+        let masked = project_persisted_binding_attribute(&plaintext_tree, &inventory, "settings");
         let rendered = format_value(&masked);
         for plaintext in ["TOP_PLAINTEXT", "LIST_PLAINTEXT", "MAP_PLAINTEXT"] {
             assert!(
@@ -12266,7 +11853,7 @@ mod tests {
         });
 
         assert_eq!(
-            mask_plaintext_using_secret_shape_fail_closed(&plaintext, &shape),
+            project_binding_secret_shape(&plaintext, &shape),
             Value::Deferred(DeferredValue::Secret(Box::new(plaintext).into())),
             "an unresolved non-structural shape containing a secret must never leave provider plaintext unwrapped",
         );
@@ -12286,7 +11873,7 @@ mod tests {
         ]));
 
         assert_eq!(
-            mask_plaintext_using_secret_shape(&plaintext, &shape),
+            SecretProtection::for_output(&shape).mask(&plaintext),
             Value::Concrete(ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::String("public".into())),
                 Value::Deferred(DeferredValue::Secret(
@@ -12317,7 +11904,7 @@ mod tests {
             ("sibling".to_string(), plain.clone()),
         ])));
 
-        let masked = mask_plaintext_using_secret_shape_fail_closed(&plaintext, &shape);
+        let masked = project_binding_secret_shape(&plaintext, &shape);
         let Value::Concrete(ConcreteValue::Map(values)) = masked else {
             panic!("fail-closed masking must preserve the map container");
         };
@@ -12345,10 +11932,7 @@ mod tests {
             )),
         )])));
 
-        assert_eq!(
-            mask_plaintext_using_secret_shape_fail_closed(&plaintext, &shape),
-            plaintext,
-        );
+        assert_eq!(project_binding_secret_shape(&plaintext, &shape), plaintext,);
     }
 
     #[test]
@@ -14465,7 +14049,7 @@ mod tests {
 
     fn make_resource(attrs: Vec<(&str, Value)>) -> crate::resource::Resource {
         use crate::resource::{ExpandedResource as Resource, ResourceId};
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashSet;
         let mut attributes = IndexMap::new();
         for (k, v) in attrs {
             attributes.insert(k.to_string(), v);
@@ -14475,7 +14059,7 @@ mod tests {
             attributes,
             directives: Default::default(),
             resolved_ignore_changes: Default::default(),
-            prefixes: HashMap::new(),
+            prefixes: Default::default(),
             binding: Some(absolute_binding("p1")),
             dependencies: Default::default(),
             module_source: None,
@@ -14636,8 +14220,7 @@ mod tests {
 
     fn make_state(attrs: Vec<(&str, Value)>) -> crate::resource::State {
         use crate::resource::{ResourceId, State};
-        use std::collections::HashMap;
-        let mut attributes = HashMap::new();
+        let mut attributes = std::collections::BTreeMap::new();
         for (k, v) in attrs {
             attributes.insert(k.to_string(), v);
         }
@@ -15847,8 +15430,11 @@ mod unknown_secret_diagnostic_tests {
     fn secret_origin_4275_round2_evaluated_hashing_masks_errors() {
         let source = Value::Concrete(ConcreteValue::String("source".into())).to_snapshot();
         assert_masked_hash_error(
-            redact_snapshot_with_guide(&source, SecretRedactionGuide::Evaluated(&invalid_secret()))
-                .unwrap_err(),
+            redact_secrets_using_evaluated(
+                &source.to_value_at("state").unwrap(),
+                &invalid_secret(),
+            )
+            .unwrap_err(),
         );
     }
 
@@ -15913,3 +15499,34 @@ mod unknown_secret_diagnostic_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "value_observed_secret_tests.rs"]
+mod observed_secret_tests;
+
+/// Render a scalar identifier after its caller established that it is public.
+pub fn render_identifier_literal(identifier: &str) -> RenderedValue {
+    render_value(&Value::<crate::resource::NoPlaceholder>::Concrete(
+        ConcreteValue::String(identifier.into()),
+    ))
+}
+
+/// Raw rendering is available only to synthetic cross-crate fixtures.
+#[cfg(feature = "test-utils")]
+pub fn render_fixture_value<P: ValueKind>(value: &Value<P>) -> RenderedValue {
+    render_value(value)
+}
+
+/// Raw plan and detached shape projection are internal implementation details.
+///
+/// ```compile_fail,E0432
+/// use carina_core::value::redact_secrets_in_plan;
+/// ```
+/// ```compile_fail,E0603
+/// use carina_core::value::redact_secrets_in_effect;
+/// ```
+/// ```compile_fail,E0432
+/// use carina_core::value::redact_plaintext_using_secret_shape;
+/// ```
+#[cfg(doctest)]
+const RAW_OBSERVATION_MASKERS_API: () = ();

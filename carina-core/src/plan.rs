@@ -9,7 +9,7 @@
 pub mod replacement;
 
 use crate::resource::ResolvedDependencies;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -622,7 +622,7 @@ pub(crate) struct ReplaceDisplayMetadata {
     /// Pre-replace state values. Used by display and snapshot tests;
     /// may contain secrets (the redaction walker visits this field
     /// in Phase 7).
-    pub previous_attributes: HashMap<String, SnapshotValue>,
+    pub previous_attributes: BTreeMap<String, SnapshotValue>,
 }
 
 /// Borrowed public view of replacement display metadata.
@@ -645,20 +645,20 @@ pub struct ReplaceDisplayInfo<'a> {
     /// Temporary name when CBD used a name swap. `None` for DBC.
     pub temporary_name: Option<&'a TemporaryName>,
     /// Pre-replace state values used as the "from" side of display diffs.
-    pub(crate) previous_attributes: &'a HashMap<String, SnapshotValue>,
+    pub(crate) previous_attributes: &'a BTreeMap<String, SnapshotValue>,
 }
 
 /// Opaque historical replacement values that may only be converted through
 /// the persisted-state writeback encoder.
 #[derive(Debug, Clone, Copy)]
 pub struct ReplacementPreviousAttributesForStateWriteback<'a> {
-    attributes: &'a HashMap<String, SnapshotValue>,
+    attributes: &'a BTreeMap<String, SnapshotValue>,
 }
 
 impl<'a> ReplacementPreviousAttributesForStateWriteback<'a> {
     /// Borrow plan-time provider/history values for the state layer's sealed
     /// writeback selection step.
-    pub fn provider_attributes(self) -> &'a HashMap<String, SnapshotValue> {
+    pub fn provider_attributes(self) -> &'a BTreeMap<String, SnapshotValue> {
         self.attributes
     }
 }
@@ -751,6 +751,15 @@ impl IgnoredChangeSummary {
 pub struct Plan<S = ModuleSource, V: PlanValueKind = NoPlaceholder> {
     effects: Vec<EffectWithSource<S, V>>,
     #[serde(skip)]
+    pub(crate) observation_identity: std::sync::Arc<()>,
+    /// The desired projection belongs to the plan, including unchanged inputs.
+    /// Runtime authority never changes the saved-plan wire representation.
+    #[serde(skip)]
+    pub(crate) observation_desired: std::collections::HashMap<
+        ResourceId,
+        indexmap::IndexMap<String, crate::value::SecretProtection>,
+    >,
+    #[serde(skip)]
     replacements: ReplacementScheduling,
     #[serde(default, skip_serializing_if = "ReplacementInputs::is_empty")]
     pub(crate) replacement_inputs: Box<ReplacementInputs>,
@@ -790,6 +799,8 @@ impl<S, V: PlanValueKind> Default for Plan<S, V> {
     fn default() -> Self {
         Self {
             effects: Vec::new(),
+            observation_identity: std::sync::Arc::new(()),
+            observation_desired: HashMap::new(),
             replacements: ReplacementScheduling::default(),
             replacement_inputs: Box::default(),
             ignored_change_summaries: Vec::new(),
@@ -814,8 +825,8 @@ pub type SnapshotPlan<S = ModuleSource> = Plan<S, SnapshotLeaf>;
 ///
 /// ```compile_fail,E0308
 /// use carina_core::{detail_rows::{PlanDisplay, HistoricalDisplayAttributes, DetailComparisons}, plan::Plan};
-/// let draft = Plan::new();
-/// let historical = HistoricalDisplayAttributes::for_plan(&draft);
+/// let draft: Plan = Plan::new();
+/// let historical = HistoricalDisplayAttributes::empty();
 /// PlanDisplay::unprepared(&draft, &historical, DetailComparisons::RecordedEffects);
 /// ```
 ///
@@ -921,6 +932,8 @@ impl UnresolvedSavedPlan {
     pub(crate) fn from_recorded_snapshot(plan: SavedPlan) -> Self {
         let Plan {
             replacements: _replacements,
+            observation_identity: _,
+            observation_desired: _,
             effects,
             ignored_change_summaries,
             replace_display,
@@ -1029,6 +1042,8 @@ impl UnresolvedSavedPlan {
         // approved targets until final admission after historical restoration.
         Ok(Plan {
             replacements: ReplacementScheduling::default(),
+            observation_identity: std::sync::Arc::new(()),
+            observation_desired: HashMap::new(),
             effects,
             ignored_change_summaries,
             replace_display,
@@ -1046,6 +1061,8 @@ impl<V: PlanValueKind> From<Plan<ModuleSource, V>> for Plan<SavedModuleSource, V
         let Plan {
             replacements,
             effects,
+            observation_identity,
+            observation_desired,
             ignored_change_summaries,
             replace_display,
             replacement_inputs,
@@ -1056,6 +1073,8 @@ impl<V: PlanValueKind> From<Plan<ModuleSource, V>> for Plan<SavedModuleSource, V
         } = plan;
         Self {
             replacements,
+            observation_identity,
+            observation_desired,
             effects: effects.into_iter().map(EffectWithSource::from).collect(),
             ignored_change_summaries,
             replace_display,
@@ -1076,13 +1095,14 @@ impl Plan {
     /// Add a token-free resume effect and retain only its non-secret display
     /// timestamp. The provider token is joined from locked state at dispatch.
     pub fn add_resume_create(&mut self, resource: ResolvedResource, started_at: Timestamp) {
-        self.effects.push(Effect::ResumeCreate {
+        self.add(Effect::ResumeCreate {
             resource,
             started_at,
         });
     }
 
     pub(crate) fn add_replacement(&mut self, group: ReplacementGroup) {
+        self.observation_identity = std::sync::Arc::new(());
         let create_before_destroy = group.replacement.is_create_first();
         let temporary_name = group.replacement.temporary_name().cloned();
         let previous_attributes = group.replacement.old_instances()[0]
@@ -1116,6 +1136,7 @@ impl Plan {
             temporary_name,
             previous_attributes,
         });
+        self.capture_all_effect_observation_desired();
     }
 }
 
@@ -1157,6 +1178,8 @@ impl<S, V: PlanValueKind> Plan<S, V> {
         let Plan {
             replacements: _replacements,
             effects: _,
+            observation_identity: _,
+            observation_desired,
             ignored_change_summaries,
             replace_display,
             replacement_inputs,
@@ -1165,11 +1188,13 @@ impl<S, V: PlanValueKind> Plan<S, V> {
             abandoned_deposed,
             destroy_ordering_notices,
         } = self;
-        Plan {
+        let mut plan = Plan {
             // The replacement vector was mapped by a caller. Execution must
             // re-admit its prepared endpoints rather than inherit a proof.
             replacements: ReplacementScheduling::default(),
             effects,
+            observation_identity: std::sync::Arc::new(()),
+            observation_desired,
             ignored_change_summaries,
             replace_display,
             replacement_inputs,
@@ -1177,24 +1202,98 @@ impl<S, V: PlanValueKind> Plan<S, V> {
             errors,
             abandoned_deposed,
             destroy_ordering_notices,
-        }
+        };
+        plan.capture_all_effect_observation_desired();
+        plan
     }
 
+    fn capture_effect_observation_desired(
+        authority: &mut HashMap<
+            ResourceId,
+            indexmap::IndexMap<String, crate::value::SecretProtection>,
+        >,
+        effect: &Effect<S, V>,
+    ) {
+        match effect {
+            Effect::Create(resource)
+            | Effect::ResumeCreate { resource, .. }
+            | Effect::Update { to: resource, .. } => {
+                // Full authored inputs win over effect inputs that may have
+                // substituted an ignored observed value.
+                authority.entry(resource.id.clone()).or_insert_with(|| {
+                    crate::value::SecretProtection::attributes(&resource.attributes)
+                });
+            }
+            Effect::DeferredReplace(payload) => {
+                for old in &payload.deletes {
+                    if old.generation.is_current() {
+                        authority
+                            .entry(old.id.as_inner().clone())
+                            .or_insert_with(|| {
+                                crate::value::SecretProtection::attributes(
+                                    payload.template.template_resource().attributes(),
+                                )
+                            });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn capture_all_effect_observation_desired(&mut self) {
+        for effect in &self.effects {
+            Self::capture_effect_observation_desired(&mut self.observation_desired, effect);
+        }
+    }
     pub fn add(&mut self, effect: Effect<S, V>) {
+        self.observation_identity = std::sync::Arc::new(());
+        Self::capture_effect_observation_desired(&mut self.observation_desired, &effect);
         self.effects.push(effect);
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn retain_observation_desired_for_test<'a, P: crate::resource::ValueKind + 'a>(
+        &mut self,
+        resources: impl IntoIterator<
+            Item = (
+                &'a ResourceId,
+                &'a indexmap::IndexMap<String, crate::resource::Value<P>>,
+            ),
+        >,
+    ) {
+        self.retain_observation_desired(resources);
+    }
+
+    pub(crate) fn retain_observation_desired<'a, P: crate::resource::ValueKind + 'a>(
+        &mut self,
+        resources: impl IntoIterator<
+            Item = (
+                &'a ResourceId,
+                &'a indexmap::IndexMap<String, crate::resource::Value<P>>,
+            ),
+        >,
+    ) {
+        self.observation_identity = std::sync::Arc::new(());
+        for (id, attributes) in resources {
+            self.observation_desired.insert(
+                id.clone(),
+                crate::value::SecretProtection::attributes(attributes),
+            );
+        }
     }
 
     /// Retain the generation's own snapshot alongside its delete endpoint.
     /// The snapshot is replacement input even when no display row exists yet.
     pub fn add_delete(&mut self, old: DeferredReplaceDelete) {
         self.replacement_inputs.record_old(&old);
-        self.effects.push(old.to_delete_effect());
+        self.add(old.to_delete_effect());
     }
 
     pub(crate) fn previous_delete_attributes(
         &self,
         instance: &DeletedInstanceKey,
-    ) -> Option<HashMap<String, SnapshotValue>> {
+    ) -> Option<BTreeMap<String, SnapshotValue>> {
         self.replacement_inputs.previous(instance)
     }
 
@@ -1444,6 +1543,8 @@ impl<S, V: PlanValueKind> Plan<S, V> {
     pub fn contains_redacted_secret_placeholders(&self) -> bool {
         let Plan {
             replacements: _replacements,
+            observation_identity: _,
+            observation_desired: _,
             effects,
             ignored_change_summaries: _ignored_change_summaries,
             replace_display,
@@ -1538,6 +1639,7 @@ impl<S, V: PlanValueKind> Plan<S, V> {
     }
 
     pub(crate) fn effects_mut(&mut self) -> &mut Vec<Effect<S, V>> {
+        self.observation_identity = std::sync::Arc::new(());
         self.replacements = ReplacementScheduling::default();
         &mut self.effects
     }
@@ -2109,8 +2211,8 @@ mod tests {
         &FIXTURE
     }
 
-    fn previous_attributes() -> HashMap<String, SnapshotValue> {
-        HashMap::from([(
+    fn previous_attributes() -> BTreeMap<String, SnapshotValue> {
+        std::collections::BTreeMap::from([(
             "cidr_block".to_string(),
             Value::Concrete(crate::resource::ConcreteValue::String("10.0.0.0/16".into())),
         )])

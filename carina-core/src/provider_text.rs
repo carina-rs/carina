@@ -3561,7 +3561,7 @@ mod tests {
             assert!(read_back.attribute_is_missing(&raw));
             let mut state = diagnostic.into_state_for_writeback(State::existing(
                 ResourceId::with_identity("test", "example"),
-                Default::default(),
+                std::collections::BTreeMap::new(),
             ));
             assert!(
                 state

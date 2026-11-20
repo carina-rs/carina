@@ -90,6 +90,7 @@ pub mod saved_replay;
 pub mod schema;
 pub mod secrecy;
 pub mod shutdown;
+pub mod state_document;
 pub mod static_type;
 pub mod upstream_exports;
 pub mod utils;
@@ -112,11 +113,11 @@ pub(crate) mod test_support {
         resolved_graph::resolve_expanded_graph,
         resource::{RelativeBindingName, Resource, RootScope},
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     pub fn snapshot_attributes<P: crate::resource::StateValueLeaf>(
         values: impl IntoIterator<Item = (String, crate::resource::Value<P>)>,
-    ) -> HashMap<String, crate::resource::SnapshotValue> {
+    ) -> BTreeMap<String, crate::resource::SnapshotValue> {
         values
             .into_iter()
             .map(|(key, value)| (key, crate::resource::state_value_snapshot(&value)))
@@ -144,7 +145,7 @@ pub(crate) mod test_support {
 
     pub fn available_attributes(
         values: impl IntoIterator<Item = (String, crate::resource::SnapshotValue)>,
-    ) -> HashMap<String, crate::resource::ExpandedValue> {
+    ) -> BTreeMap<String, crate::resource::ExpandedValue> {
         values
             .into_iter()
             .map(|(key, value)| (key, available_value(&value)))
@@ -157,7 +158,7 @@ pub(crate) mod test_support {
     ) {
         let mut snapshot = snapshot_attributes(std::mem::take(values));
         crate::utils::lift_state_enum_leaves(&mut snapshot, schema);
-        *values = available_attributes(snapshot);
+        *values = available_attributes(snapshot).into_iter().collect();
     }
 
     pub fn raw_saved_attrs<P: crate::resource::StateValueLeaf>(

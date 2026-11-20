@@ -1,0 +1,21 @@
+version = 5
+
+[registry_host."registry.carina-rs.dev"]
+discovery_pin_present = false
+
+[[provider]]
+name = "aws"
+source = "carina-rs/aws"
+mode = "version"
+version = "0.5.0"
+sha256 = "pinned-checksum"
+
+[provider.registry]
+resolved_hostname = "registry.carina-rs.dev"
+sequence_present = false
+sequence_anchor_established = false
+valid_until_present = false
+signature_state = "required_legacy"
+legacy_certificate_identity = "https://github.com/carina-rs/carina/.github/workflows/release.yml@refs/tags/v0.5.0"
+legacy_certificate_oidc_issuer = "https://token.actions.githubusercontent.com"
+transparency_log_present = false

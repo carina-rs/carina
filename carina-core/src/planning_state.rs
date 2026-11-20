@@ -10,7 +10,7 @@ use crate::resource::{
 };
 use crate::schema::SchemaRegistry;
 use crate::wait::ResolvedWaitBinding;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Immutable projection of a persisted resource row, including all old generations.
 #[derive(Debug, Clone)]
@@ -41,7 +41,7 @@ pub struct PlanningDeposedRow {
     identifier: String,
     provider_instance: Option<String>,
     dependency_bindings: PersistedDestroyDependencies,
-    attributes: HashMap<String, SnapshotValue>,
+    attributes: BTreeMap<String, SnapshotValue>,
 }
 
 /// Immutable state-row values supplied by the state owner for core planning.
@@ -119,7 +119,7 @@ impl PlanningDeposedRow {
         identifier: String,
         provider_instance: Option<String>,
         dependency_bindings: PersistedDestroyDependencies,
-        attributes: HashMap<String, SnapshotValue>,
+        attributes: BTreeMap<String, SnapshotValue>,
     ) -> Self {
         Self {
             key,

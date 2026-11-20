@@ -1,32 +1,43 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-lineage-empty-explicit",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-lineage-empty-explicit",
   "resources": [
     {
-      "resource_type": "ec2.Vpc",
-      "identity": "vpc",
-      "provider": "awscc",
-      "identifier": "vpc-0123456789abcdef0",
-      "attributes": {
-        "cidr_block": "10.0.0.0/16",
-        "enable_dns_support": true,
-        "enable_dns_hostnames": true,
-        "vpc_id": "vpc-0123456789abcdef0",
-        "tags": {
-          "Name": "test-vpc"
-        }
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "vpc",
+      "current": {
+        "attributes": {
+          "cidr_block": "10.0.0.0/16",
+          "enable_dns_hostnames": true,
+          "enable_dns_support": true,
+          "tags": {
+            "Name": "test-vpc"
+          },
+          "vpc_id": "vpc-0123456789abcdef0"
+        },
+        "identifier": "vpc-0123456789abcdef0",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
         "kind": "unrecorded"
-      }
+      },
+      "identity": "vpc",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Vpc"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

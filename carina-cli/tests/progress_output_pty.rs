@@ -6,6 +6,9 @@
 //! independently, so they exercise the exact `IsTerminal` combinations that
 //! ordinary `Command::output()` tests cannot cover.
 
+#[path = "support/mock_state.rs"]
+mod mock_state;
+
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -123,7 +126,7 @@ LOOP_TARGETfor _, resource_name in (source.tags ?? {}) {
             &fs::read(&self.mock_state).expect("read mock provider state"),
         )
         .expect("parse mock provider state");
-        document["states"]["test.resource.source"]["tags"] =
+        document["states"][&mock_state::identifier(&self.project, "source")]["tags"] =
             serde_json::json!({ "one": "one", "two": "two" });
         fs::write(
             &self.mock_state,

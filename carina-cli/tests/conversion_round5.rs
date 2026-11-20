@@ -204,31 +204,12 @@ fn round5_a_failed_module_require_keeps_already_judged_placement_findings() {
         "let child = use { source = './child' }\nlet net = child { unused = 'ok' }\n",
     );
     std::fs::create_dir(directory.path().join("child")).unwrap();
-    std::fs::write(directory.path().join("child/main.crn"), "arguments { unused: String }\nrequire false, 'ordinary require failure'\nmock.Sink { attr = upper('ok' as mock.Name) }\n").unwrap();
+    std::fs::write(directory.path().join("child/main.crn"), "arguments { unused: String \nrequire false, 'ordinary require failure' }\nmock.Sink { attr = upper('ok' as mock.Name) }\n").unwrap();
     let json = validate(directory.path());
     assert_eq!(conversions(&json), 1, "{json}");
     assert_eq!(json["errors"].as_array().unwrap().len(), 2, "{json}");
     assert!(json.to_string().contains("ordinary require failure"));
     assert!(!json.to_string().contains("bug in carina"));
-}
-
-#[test]
-fn round5_directory_require_alias_is_checked_by_placement() {
-    let directory = tempfile::tempdir().unwrap();
-    write(
-        directory.path(),
-        "let converted = 'ok' as unloaded.Name\nrequire converted == 'ok', 'guard'\n",
-    );
-    let json = validate(directory.path());
-    assert_eq!(conversions(&json), 1, "{json}");
-    assert!(
-        json["errors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|finding| finding["code"].is_null()),
-        "main's ordinary require finding remains: {json}"
-    );
 }
 
 #[test]

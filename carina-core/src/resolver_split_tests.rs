@@ -49,7 +49,7 @@ fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
         attributes,
         directives: Default::default(),
         resolved_ignore_changes: Default::default(),
-        prefixes: HashMap::new(),
+        prefixes: Default::default(),
         binding: Some(absolute_binding(binding)),
         dependencies: Default::default(),
         module_source: None,
@@ -103,7 +103,7 @@ fn resolve_managed_refs_resolves_resource_ref_against_managed_sibling() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         });
         crate::validation::deferred_types::with_session_for_test(
@@ -130,7 +130,7 @@ fn resolve_managed_refs_records_dependency_bindings() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         });
         crate::validation::deferred_types::with_session_for_test(
@@ -176,7 +176,7 @@ fn resolve_managed_refs_falls_through_state_attributes() {
                 &[],
             ),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         });
         crate::validation::deferred_types::with_session_for_test(
@@ -203,7 +203,7 @@ fn resolve_live_composition_refs_post_apply_uses_provided_bindings() {
         compositions: &[],
         managed_current: &HashMap::new(),
         data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
 
@@ -239,7 +239,7 @@ fn resolve_live_composition_refs_post_apply_picks_post_apply_value_not_pre_apply
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         });
 
@@ -279,7 +279,7 @@ fn resolve_live_composition_refs_post_apply_leaves_non_ref_values_intact() {
         compositions: &[],
         managed_current: &HashMap::new(),
         data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     let mut compositions = vec![make_virtual("v", &[("literal", s("kept"))])];
@@ -310,7 +310,7 @@ fn resolve_managed_refs_with_empty_slice_is_ok() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         });
         crate::validation::deferred_types::with_session_for_test(
@@ -329,7 +329,7 @@ fn resolve_live_composition_refs_post_apply_with_empty_slice_is_ok() {
         compositions: &[],
         managed_current: &HashMap::new(),
         data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     let mut compositions: Vec<LiveComposition> = Vec::new();
@@ -356,7 +356,7 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         });
         crate::validation::deferred_types::with_session_for_test(
@@ -373,7 +373,7 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         });
         crate::validation::deferred_types::with_session_for_test(

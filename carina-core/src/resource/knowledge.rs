@@ -346,7 +346,7 @@ mod decision_contract {
         let mut bindings = ResolvedBindings::default();
         bindings.set_historical_with_completeness(
             "producer",
-            HashMap::from([("items".into(), snapshot)]),
+            std::collections::BTreeMap::from([("items".into(), snapshot)]),
             BindingValueSource::Local,
             BindingCompleteness::Complete,
         );
@@ -3276,6 +3276,12 @@ fn classify_value<
             }
             Ok(expression(value, EvaluationKind::ModuleIf, inputs))
         }
+        crate::resource::Value::Reference(never) => {
+            match *<Q as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<Q as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 /// Definitive absence of an eligible selection. Only the existing resolution
@@ -3693,7 +3699,7 @@ mod classification_contract {
                     compositions: &[],
                     managed_current: if present { &existing } else { &empty },
                     data_source_values: &DataSourceValues::empty(),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     wait_aliases: &[WaitAliasSpec {
                         binding: scope.resolve(RelativeBindingName::new("ready")),
                         target: producer.clone(),

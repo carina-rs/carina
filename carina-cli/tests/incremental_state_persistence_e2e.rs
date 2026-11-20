@@ -37,10 +37,14 @@ fn apply_persists_a_completed_create_before_sigkill() {
     let completed = state
         .find_resource("mock", "test.resource", FIRST)
         .expect("the completed create must be durable before the run ends");
-    assert_eq!(
-        completed.identifier().map(|id| id.as_str()),
-        Some("mock-id")
-    );
+    let identifier = completed
+        .identifier()
+        .expect("completed create has an identifier");
+    let provider: serde_json::Value = serde_json::from_slice(
+        &fs::read(&fixture.provider_state).expect("read provider store after kill"),
+    )
+    .unwrap();
+    assert!(provider["states"][identifier.as_str()].is_object());
     assert!(
         state
             .find_resource("mock", "test.resource", BLOCKED)
@@ -215,8 +219,8 @@ fn wait_for_state(
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(content) = fs::read_to_string(path)
-            && let Ok(state) = carina_state::check_and_migrate(&content)
-            && predicate(state.state())
+            && let Ok(state) = carina_state::load_state(&content)
+            && predicate(&state)
         {
             return;
         }
@@ -231,9 +235,7 @@ fn wait_for_state(
 }
 
 fn load_state(path: &Path) -> carina_state::StateFile {
-    carina_state::check_and_migrate(&fs::read_to_string(path).unwrap())
-        .unwrap()
-        .into_state()
+    carina_state::load_state(&fs::read_to_string(path).unwrap()).unwrap()
 }
 
 fn output_text(output: &Output) -> String {

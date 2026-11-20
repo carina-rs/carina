@@ -113,19 +113,19 @@ let distribution = mock.test.resource {{
     }
 
     fn seed_mock_provider_state(&self) {
-        let provider_state = serde_json::json!({
-            "test.resource.web_acl": {
+        let provider_state = serde_json::json!({"version": 3, "states": {
+            "web-acl-old-id": {
                 "name": "web-acl-old",
                 "identifier": "web-acl-old-id",
                 "comment": "v1"
             },
-            "test.resource.distribution": {
+            "dist-id": {
                 "name": "dist",
                 "identifier": "dist-id",
                 "comment": "dist-v1",
                 "web_acl_arn": "web-acl-old-id"
             }
-        });
+        }});
         fs::write(
             &self.mock_state_path,
             carina_core::utils::pretty_with_newline(&provider_state).unwrap(),

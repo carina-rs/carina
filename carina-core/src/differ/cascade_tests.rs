@@ -31,7 +31,7 @@ fn state(id: &ResourceId, attrs: &[(&str, Value)], identifier: &str) -> State {
             .iter()
             .map(|(key, value)| ((*key).to_string(), value.clone()))
             .map(|(key, value)| (key, value.to_snapshot()))
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
     )
     .with_identifier(identifier)
 }
@@ -1059,11 +1059,19 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
     .with_dependency_bindings(crate::test_support::persisted([ResolvedResourceId::new(
         vpc_id.clone(),
     )]));
-    let orphans = Orphans::from([Orphan::from_state(
-        child_state,
-        Some(absolute_binding("subnets.a")),
-        crate::resource::PersistedDirectives::default(),
-    )]);
+    let orphans = Orphans::from(
+        [Orphan::from_state(
+            child_state,
+            Some(absolute_binding("subnets.a")),
+            crate::resource::PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
 
     let template_resource: crate::resource::Resource<
         ModuleSource,
@@ -1158,7 +1166,7 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
         .expect("all scheduler dependencies must resolve")
         .into_deps_of();
     let mut remaining = deps;
-    let mut completed = HashSet::new();
+    let mut completed = std::collections::BTreeSet::new();
     loop {
         let ready = remaining
             .iter()
@@ -1400,7 +1408,7 @@ fn assert_deferred_create_cbd_is_acyclic(plan: &Plan, producer: &ResourceId) {
         .dependency_analysis(std::iter::empty::<&ResolvedResourceId>())
         .unwrap()
         .into_deps_of();
-    let mut completed = HashSet::new();
+    let mut completed = std::collections::BTreeSet::new();
     loop {
         let ready = deps
             .iter()
@@ -1715,11 +1723,19 @@ fn issue_4283_known_conflicting_child_cbd_rejected_before_parent_applies() {
     .with_dependency_bindings(crate::test_support::persisted([ResolvedResourceId::new(
         vpc_id.clone(),
     )]));
-    let orphans = Orphans::from([Orphan::from_state(
-        child_state,
-        Some(absolute_binding("subnets.a")),
-        crate::resource::PersistedDirectives::default(),
-    )]);
+    let orphans = Orphans::from(
+        [Orphan::from_state(
+            child_state,
+            Some(absolute_binding("subnets.a")),
+            crate::resource::PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
 
     let template_resource: crate::resource::Resource<
         ModuleSource,

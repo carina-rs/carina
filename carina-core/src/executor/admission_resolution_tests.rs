@@ -438,7 +438,7 @@ async fn review1_deferred_final_admission(replace: bool) {
             )),
             identifier: fixture_applied_identifier(format!("old-{i}")),
             generation: EffectGeneration::Current,
-            previous_attributes: HashMap::new(),
+            previous_attributes: std::collections::BTreeMap::new(),
             directives: Default::default(),
             binding: Some(absolute_binding(&format!("children[{i}]"))),
             dependencies: Default::default(),

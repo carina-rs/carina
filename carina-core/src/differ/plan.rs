@@ -1167,6 +1167,11 @@ fn create_plan_parts(
     let mut plan = Plan::new();
     let mut pending_replaces = HashMap::new();
     let authored_managed = managed.authored();
+    plan.retain_observation_desired(
+        authored_managed
+            .iter()
+            .map(|resource| (&resource.id, &resource.attributes)),
+    );
     let known_bindings = known_binding_names(authored_managed, data_sources);
     let comparison_saved = PlanInputSavedAttributes::new(saved_attrs, registry);
 
@@ -1411,7 +1416,7 @@ fn create_plan_parts(
         }
         let binding = orphan.binding_address().cloned();
         let explicit_dependencies = persisted_directives.depends_on.to_resolved_dependencies();
-        let mut dependencies = state.dependency_bindings.clone();
+        let mut dependencies = orphan.destroy_dependencies().clone();
         dependencies.extend_projected(&persisted_directives.depends_on);
         plan.add_delete(DeferredReplaceDelete {
             id: ResolvedResourceId::new(id.clone()),

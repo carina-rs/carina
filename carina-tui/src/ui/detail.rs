@@ -418,7 +418,7 @@ mod tests {
     fn removed_row_keeps_indentation_unstyled() {
         let row = DetailRow::Removed {
             key: "legacy".to_string(),
-            old: carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(
+            old: carina_core::value::render_fixture_value(&Value::Concrete(ConcreteValue::String(
                 "gone".into(),
             ))),
         };
@@ -536,10 +536,10 @@ mod tests {
     fn forcing_changed_renders_new_value_yellow() {
         let row = DetailRow::ChangedForcesReplacement {
             key: "name".to_string(),
-            old: carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(
+            old: carina_core::value::render_fixture_value(&Value::Concrete(ConcreteValue::String(
                 "old".into(),
             ))),
-            new: carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(
+            new: carina_core::value::render_fixture_value(&Value::Concrete(ConcreteValue::String(
                 "new".into(),
             ))),
         };
@@ -613,9 +613,9 @@ mod tests {
 
         let attribute = DetailRow::Attribute {
             key: "name".to_string(),
-            value: carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(
-                "plain".into(),
-            ))),
+            value: carina_core::value::render_fixture_value(&Value::Concrete(
+                ConcreteValue::String("plain".into()),
+            )),
             ref_binding: None,
             annotation: None,
         };

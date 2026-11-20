@@ -196,3 +196,59 @@ fn round13_policy_example_output() {
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert!(!String::from_utf8_lossy(&human.stderr).contains("let y"));
 }
+
+#[test]
+fn directory_read_error_chain_renders_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("blocked.crn");
+    std::fs::write(&file, [0xff]).unwrap();
+    let context =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let error = carina_core::config_loader::parse_directory_for_metadata_report(
+        &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &context,
+        &Default::default(),
+        &SchemaRegistry::new(),
+    )
+    .unwrap_err();
+    assert_eq!(error.source_file(), Some(file.as_path()));
+    assert_eq!(
+        error.io_error().unwrap().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to read {}: {}",
+            file.display(),
+            error.io_error().unwrap()
+        )
+    );
+    assert_eq!(
+        carina_cli::error::format_error_with_source_chain(&error),
+        error.to_string()
+    );
+}
+
+#[test]
+fn directory_discovery_error_chain_renders_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing");
+    let context =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let error = carina_core::config_loader::parse_directory_for_metadata_report(
+        &carina_core::paths::ResolvedPath::new(missing).unwrap(),
+        &context,
+        &Default::default(),
+        &SchemaRegistry::new(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.io_error().unwrap().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert_eq!(
+        carina_cli::error::format_error_with_source_chain(&error),
+        error.to_string()
+    );
+}

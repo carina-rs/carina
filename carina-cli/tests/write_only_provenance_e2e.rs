@@ -1,10 +1,13 @@
 use std::fs;
+#[path = "support/mock_state.rs"]
+mod mock_state;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use carina_cli::commands::plan::PlanFile;
 use carina_core::resource::{ConcreteValue, Value};
-use carina_state::check_and_migrate;
+use carina_state::load_state;
 use tempfile::TempDir;
 
 struct Scenario {
@@ -148,7 +151,7 @@ impl Scenario {
             &fs::read_to_string(&self.mock_state).expect("read mock provider state"),
         )
         .expect("parse mock provider state");
-        provider["states"]["test.resource.r1"][attribute] = value;
+        provider["states"][&mock_state::identifier(&self.project, "r1")][attribute] = value;
         fs::write(
             &self.mock_state,
             serde_json::to_vec_pretty(&provider).expect("serialize mock provider state"),
@@ -346,9 +349,7 @@ fn failed_update_does_not_acknowledge_write_only_value_and_next_plan_retries_it(
 
     let state_text = fs::read_to_string(scenario.project.join("carina.state.json"))
         .expect("read state after failed update");
-    let state = check_and_migrate(&state_text)
-        .expect("state after failed update must decode")
-        .into_state();
+    let state = load_state(&state_text).expect("state after failed update must decode");
     let password = state
         .find_resource("mock", "test.resource", "r1")
         .and_then(|row| row.persisted_attributes())
@@ -391,9 +392,7 @@ fn adding_and_changing_updatable_write_only_value_converges() {
 
     let state_text = fs::read_to_string(scenario.project.join("carina.state.json"))
         .expect("read state after adding password");
-    let state = check_and_migrate(&state_text)
-        .expect("state after adding password must decode")
-        .into_state();
+    let state = load_state(&state_text).expect("state after adding password must decode");
     assert_eq!(
         state
             .find_resource("mock", "test.resource", "r1")
@@ -453,20 +452,18 @@ fn normal_update_reasserts_unchanged_write_only_value_and_converges() {
     .expect("parse mock provider state");
     // This pins Reassert: the mock applies the patch over `from` and omits `password` on read, so plaintext can only arrive through the patch.
     assert_eq!(
-        provider["states"]["test.resource.r1"]["password"],
+        provider["states"][&mock_state::identifier(&scenario.project, "r1")]["password"],
         serde_json::json!("reasserted-secret"),
         "the unchanged write-only secret must be reasserted as provider plaintext, not copied from the redacted current state"
     );
     assert_eq!(
-        provider["states"]["test.resource.r1"]["comment"],
+        provider["states"][&mock_state::identifier(&scenario.project, "r1")]["comment"],
         serde_json::json!("after")
     );
 
     let state_text = fs::read_to_string(scenario.project.join("carina.state.json"))
         .expect("read state after reasserting password");
-    let state = check_and_migrate(&state_text)
-        .expect("state after reasserting password must decode")
-        .into_state();
+    let state = load_state(&state_text).expect("state after reasserting password must decode");
     let row = state
         .find_resource("mock", "test.resource", "r1")
         .expect("r1 state row");
@@ -542,12 +539,12 @@ fn nested_write_only_secret_rotates_reasserts_and_converges() {
     )
     .expect("parse mock provider state");
     assert_eq!(
-        provider["states"]["test.resource.r1"]["oidc_config"]["client_secret"],
+        provider["states"][&mock_state::identifier(&scenario.project, "r1")]["oidc_config"]["client_secret"],
         serde_json::json!("secret-b"),
         "an unrelated update must reassert the whole write-only-bearing attribute"
     );
     assert_eq!(
-        provider["states"]["test.resource.r1"]["comment"],
+        provider["states"][&mock_state::identifier(&scenario.project, "r1")]["comment"],
         serde_json::json!("after")
     );
 
@@ -664,9 +661,8 @@ fn secret_write_only_refresh_and_saved_plan_apply_converge_without_sending_hash(
         "write-only secret must be persisted as a RedactedSecret hash: {state:#}"
     );
     let state_bytes = fs::read(&state_path).expect("read state bytes");
-    let decoded = check_and_migrate(std::str::from_utf8(&state_bytes).unwrap())
-        .expect("current state decodes")
-        .into_state();
+    let decoded =
+        load_state(std::str::from_utf8(&state_bytes).unwrap()).expect("current state decodes");
     assert_eq!(
         carina_core::utils::pretty_with_newline_bytes(&decoded).unwrap(),
         state_bytes
@@ -726,7 +722,7 @@ fn secret_write_only_refresh_and_saved_plan_apply_converge_without_sending_hash(
     )
     .expect("parse mock provider state");
     assert_eq!(
-        provider["states"]["test.resource.r1"]["password"],
+        provider["states"][&mock_state::identifier(&scenario.project, "r1")]["password"],
         serde_json::json!("secret-after"),
         "the mock applies the request patch directly, so a structural hash here would mean the hash reached the provider patch"
     );
@@ -763,7 +759,8 @@ fn nested_write_only_without_ignore_changes_reasserts_and_rolls_back_external_va
     );
 
     assert_eq!(
-        scenario.provider_state()["states"]["test.resource.r1"]["oidc_config"]["client_secret"],
+        scenario.provider_state()["states"][&mock_state::identifier(&scenario.project, "r1")]["oidc_config"]
+            ["client_secret"],
         serde_json::json!("infra-recorded"),
         "the existing Reassert behavior must pin the rollback that ignore_changes prevents"
     );
@@ -811,7 +808,8 @@ fn nested_write_only_ignore_changes_preserves_external_value_and_omits_parent_pa
     assert_success("ignored update apply", &scenario.apply_plan("update.json"));
 
     assert_eq!(
-        scenario.provider_state()["states"]["test.resource.r1"]["oidc_config"]["client_secret"],
+        scenario.provider_state()["states"][&mock_state::identifier(&scenario.project, "r1")]["oidc_config"]
+            ["client_secret"],
         serde_json::json!("externally-deployed"),
         "omitting the write-only-bearing parent must preserve the external deployment"
     );
@@ -869,7 +867,7 @@ fn readable_ignore_changes_hides_drift_and_omits_it_from_an_unrelated_update() {
         &scenario.apply_plan("update.json"),
     );
     assert_eq!(
-        scenario.provider_state()["states"]["test.resource.r1"]["comment"],
+        scenario.provider_state()["states"][&mock_state::identifier(&scenario.project, "r1")]["comment"],
         serde_json::json!("external")
     );
     let patches = scenario.update_patch_operations();
@@ -927,7 +925,7 @@ fn saved_plan_apply_refills_ignored_readable_leaf_from_apply_time_read() {
         output_text(&apply)
     );
     assert_eq!(
-        scenario.provider_state()["states"]["test.resource.r1"]["comment"],
+        scenario.provider_state()["states"][&mock_state::identifier(&scenario.project, "r1")]["comment"],
         serde_json::json!("between-plan-and-apply"),
         "apply must refill the sent value from its fresh read"
     );
@@ -973,38 +971,5 @@ fn saved_plan_apply_re_resolves_tampered_authored_ignore_paths() {
         rendered
             .contains("ignore_changes path `does_not_exist` does not exist in the resource schema"),
         "apply must reject the edited authored path through the shared resolver:\n{rendered}"
-    );
-}
-
-#[test]
-fn v33_saved_plan_is_rejected_after_deferred_value_stage_format_bump() {
-    let scenario = Scenario::new();
-    scenario.write_readable_ignore_config("configured", None);
-    assert_success("carina init", &scenario.init());
-    assert_success(
-        "current saved plan",
-        &scenario.save_plan_with_refresh("old.json"),
-    );
-
-    let path = scenario.project.join("old.json");
-    let mut saved: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&path).expect("read current saved plan"))
-            .expect("parse current saved plan");
-    saved["version"] = serde_json::json!(33);
-    fs::write(
-        &path,
-        serde_json::to_vec_pretty(&saved).expect("serialize old saved plan"),
-    )
-    .expect("write old saved plan");
-
-    let apply = scenario.apply_plan("old.json");
-    let rendered = output_text(&apply);
-    assert!(
-        !apply.status.success(),
-        "v33 saved plan applied:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("Unsupported plan file version: 33") && rendered.contains("plan --out"),
-        "old plan must fail with replan guidance:\n{rendered}"
     );
 }

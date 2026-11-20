@@ -1,4 +1,6 @@
 mod backend_config;
+#[cfg(test)]
+mod ordering_tests;
 pub use backend_config::SavedBackendConfig;
 
 use carina_core::resource::{PersistedDestroyDependencies, ResolvedResourceId};
@@ -52,13 +54,9 @@ use carina_core::value::PersistedValue;
 use carina_core::value::{
     PersistedExportValue, redact_secrets_in_resource,
     redact_secrets_in_resource_reusing_persisted_hashes,
-    redact_secrets_in_resource_using_evaluated, redact_secrets_in_state,
-    redact_secrets_in_state_using_persisted, redact_secrets_in_state_using_resource,
+    redact_secrets_in_resource_using_evaluated,
 };
-use carina_state::{
-    LegacyDependencyClassification, ResolvedReadBackend, ResourceState, S3BootstrapInfo, StateFile,
-    StorageReadinessStatus,
-};
+use carina_state::{ResolvedReadBackend, S3BootstrapInfo, StateFile, StorageReadinessStatus};
 
 use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_for_read};
 use crate::DetailLevel;
@@ -498,14 +496,13 @@ mod provider_scope_evidence_tests {
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
-            legacy_dependency_classification: Default::default(),
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
             data_source_origins: Vec::new(),
             data_source_values: Vec::new(),
             current_states: Vec::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         }
@@ -528,7 +525,7 @@ mod provider_scope_evidence_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -607,7 +604,7 @@ mod provider_scope_evidence_tests {
         ));
         contents.upstream_snapshot.insert(
             "upstream".to_string(),
-            HashMap::from([
+            std::collections::BTreeMap::from([
                 ("minutes".to_string(), stamped_unknown.to_snapshot()),
                 ("secret_minutes".to_string(), stamped_redacted),
             ]),
@@ -720,58 +717,9 @@ pub struct PlanFileContents<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueK
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Since format 43, schema patterns carry explicit modes and reasons.
-    /// Format 45 stores condition strings, require messages, and wait RHS strings
-    /// with their checked source spelling.
-    /// Format 44 retains separate identity and member constraint layers.
-    /// Plan format 42 retains replacement history and create-first dependency
-    /// requirements for schema admission when loading saved plans.
-    /// Plan format 41 encodes secret(...) only as a typed Secret node.
-    /// Plan format 40 requires an absolute source locator and its planned
-    /// canonical identity so a retargeted symlink requires replanning.
-    /// Plan format 39 stores complete dependency addresses and legacy migration
-    /// classifications alongside the directive-value representation from 38.
-    ///
-    /// Plan format 38 resolves authored lifecycle directives and retains loop
-    /// expressions, default origins, and call-site diagnostics in templates.
-    /// Earlier plans could have silently discarded safety directives.
-    ///
-    /// Plan format 37 requires relative diagnostic files (or null) and line
-    /// numbers on every deferred-for template.
-    ///
-    /// Plan format 36 adds typed deferred-for templates, stage-specific
-    /// placeholder types, and template attributes stored only on
-    /// `template_resource`.
-    ///
-    /// Plan format 35 stores the tri-state `prevent_destroy` directive so an
-    /// explicit `false` remains distinct from an unspecified value, and
-    /// records the exact state-only directive change set approved by the
-    /// operator.
-    ///
-    /// Plan format 34 adds typed deferred integer arithmetic expressions.
-    ///
-    /// Plan format 33 adds the typed keyed-list release effect.
-    ///
-    /// Plan format 32 records provider-instance reference-scope evidence and
-    /// the create-outcome-unknown marker for provider protocol v13.
-    ///
-    /// Plan format 31 persists authored `ignore_changes` paths for schema-time
-    /// re-resolution. Plan format 30 was never emitted; provider protocol v13
-    /// uses format 32. Plan format 29 persists anonymous-loop provenance, typed
-    /// deferred-loop targets, and Move origins. Plan format 28 added typed
-    /// pending re-read reasons.
-    /// Plan format 27 adds a mandatory normalized module-call origin path to
-    /// every saved composition. Plan format 26 adds mandatory identities for
-    /// every loaded provider artifact. Plan format 25 adds the mandatory typed
-    /// `data_source_values` outcomes and removes duplicate data-source rows
-    /// from `current_states`.
-    /// Plan format 24 removes the redundant wait target schema kind now that
-    /// waits are managed-only. Plan format 23 adds the mandatory
-    /// `schema_fingerprints` snapshot. Plan format 21 explicitly tags managed
-    /// and data-source current-state entries, and explicitly tags each managed
-    /// [`Current`] variant. A serialized `Present` row is classified again
-    /// through [`Current::from_state`] when decoded, so the tag cannot mint an
-    /// invalid provider identifier.
+    /// Current plans retain resolved dependencies, typed secrets and lifecycle
+    /// values, source identity, and provider/schema evidence. Every other
+    /// version is rejected before payload decoding and must be regenerated.
     pub version: u32,
     /// Carina version that created this plan
     pub carina_version: String,
@@ -809,10 +757,6 @@ pub struct PlanFileContents<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueK
     /// Graph-projected managed-row explicit edges paired by index with
     /// `sorted_resources`.
     pub sorted_explicit_destroy_dependencies: Vec<PersistedDestroyDependencies>,
-    /// Exact classification of the plan-time v20 state, if migration was
-    /// pending. Saved-plan apply replays this only against the same lineage
-    /// and source names.
-    pub legacy_dependency_classification: Option<LegacyDependencyClassification>,
     /// Pre-resolution resources captured before ResourceRef substitution and
     /// stored in the same order as `sorted_resources`.
     ///
@@ -884,7 +828,7 @@ pub struct PlanFileContents<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueK
     /// plan-time and apply-time values during cascade re-resolution.
     ///
     /// Empty when the configuration declares no `upstream_state` blocks.
-    pub upstream_snapshot: HashMap<String, HashMap<String, Value<V>>>,
+    pub upstream_snapshot: BTreeMap<String, BTreeMap<String, Value<V>>>,
     /// `upstream_state` block sources (binding name → directory) as
     /// declared in the original `.crn` config (#2303). Persisted so
     /// `apply --plan` can re-load each upstream and compare against
@@ -932,7 +876,6 @@ where
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -967,7 +910,6 @@ where
                 .collect(),
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_classification,
             unresolved_resources: unresolved_resources
                 .into_iter()
                 .map(Resource::from)
@@ -1018,7 +960,6 @@ impl UnresolvedPlanFileContents {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -1043,7 +984,6 @@ impl UnresolvedPlanFileContents {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -1198,19 +1138,9 @@ impl PlanFile {
 
 /// Private current-format wire representation.
 ///
-/// Existing field order remains identical to the historical `PlanFile`
-/// serialization order. The mandatory directive-change and provider-evidence
-/// fields introduced by format 35 remain mandatory. Format 39's optional
-/// classification field is mandatory in the wire shape and is never
-/// defaulted. Format 40 requires the absolute source locator and canonical
-/// source identity captured at plan time. Format 41 removes the ordinary
-/// secret FunctionCall identity in favor of typed Secret nodes. Format 42 adds
-/// replacement previous_attributes, required_by, and required_children.
-/// Format 43 requires explicit schema-pattern modes. Format 44 records v13
-/// schema fingerprints and separate identity/member constraint layers. Format 45
-/// retains quoted condition literals, require messages, and wait RHS strings
-/// so decoding can reject interpolation. Format 46 stores non-empty dependent
-/// sets ordered by system-assigned resource/deferred effect identity.
+/// Requires directive changes, provider evidence, and the source locator and
+/// identity captured at plan time. Dependent sets are non-empty and ordered
+/// by system-assigned resource/deferred effect identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
     version: u32,
@@ -1235,7 +1165,6 @@ struct PlanFileWire {
     sorted_value_destroy_dependencies: Vec<PersistedDestroyDependencies>,
     #[serde(deserialize_with = "deserialize_persisted_destroy_dependency_vec")]
     sorted_explicit_destroy_dependencies: Vec<PersistedDestroyDependencies>,
-    legacy_dependency_classification: Option<LegacyDependencyClassification>,
     unresolved_resources:
         Vec<Resource<SavedModuleSource, SnapshotLeaf, AbsoluteBindingAddress, ()>>,
     compositions: Vec<SavedComposition>,
@@ -1259,7 +1188,7 @@ struct PlanFileWire {
     >,
     data_source_values: Vec<SavedDataSourceValue>,
     current_states: Vec<CurrentStateEntry>,
-    upstream_snapshot: HashMap<String, HashMap<String, SnapshotValue>>,
+    upstream_snapshot: BTreeMap<String, BTreeMap<String, SnapshotValue>>,
     upstream_sources: Vec<UpstreamSource>,
     #[serde(default)]
     wait_bindings: Vec<PlanWaitBinding>,
@@ -1640,7 +1569,6 @@ impl From<PlanFile> for PlanFileWire {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -1670,7 +1598,6 @@ impl From<PlanFile> for PlanFileWire {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -1706,7 +1633,6 @@ impl TryFrom<PlanFileWire> for PlanFile {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -1735,7 +1661,6 @@ impl TryFrom<PlanFileWire> for PlanFile {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -2161,7 +2086,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 46;
+    pub const CURRENT_VERSION: u32 = 47;
 
     #[cfg(test)]
     pub(crate) fn decode_for_test(self) -> DecodedPlanFile {
@@ -2444,7 +2369,6 @@ impl PlanFile {
             sorted_resources,
             sorted_value_destroy_dependencies: _,
             sorted_explicit_destroy_dependencies: _,
-            legacy_dependency_classification: _,
             unresolved_resources,
             compositions,
             data_sources,
@@ -2513,26 +2437,7 @@ impl PlanFile {
                 return true;
             }
         }
-        // Classification also carries prior managed rows which may have left
-        // the configuration. Known plan-only nodes cannot acquire that status.
-        !self
-            .data_sources
-            .iter()
-            .any(|source| &source.id == id.as_inner())
-            && !self
-                .data_source_origins
-                .iter()
-                .any(|source| &source.id == id.as_inner())
-            && !self
-                .compositions
-                .iter()
-                .any(|composition| &composition.id == id.as_inner())
-            && self
-                .legacy_dependency_classification
-                .as_ref()
-                .is_some_and(|classification| {
-                    classification.source_row_ids().any(|source| source == id)
-                })
+        false
     }
 
     pub(crate) fn validate_resource_identities(&self) -> Result<(), String> {
@@ -2573,15 +2478,6 @@ impl PlanFile {
                             "Invalid saved plan: {kind}[{index}] contains non-managed dependency `{dependency}`"
                         ));
                     }
-                }
-            }
-        }
-        if let Some(classification) = &self.legacy_dependency_classification {
-            for row in classification.row_ids() {
-                if !self.is_managed_row(row) {
-                    return Err(format!(
-                        "Invalid saved plan: legacy dependency classification contains unknown row `{row}`"
-                    ));
                 }
             }
         }
@@ -2988,7 +2884,7 @@ mod schema_fingerprint_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -3126,71 +3022,35 @@ mod schema_fingerprint_tests {
     }
 }
 
-pub(crate) fn collect_historical_display_attributes<S>(
+pub(crate) fn collect_historical_display_attributes<S: Clone>(
     plan: &Plan<S>,
     managed_current: &HashMap<ResourceId, Current>,
-    state_file: Option<&StateFile>,
-) -> HistoricalDisplayAttributes {
-    let mut display = HistoricalDisplayAttributes::for_plan(plan);
-    let moved_origins = MovedOrigins::from_plan(plan);
-
+    state_file: &carina_state::ObservedStateFile,
+) -> Result<HistoricalDisplayAttributes, carina_core::value::SerializationError> {
+    let mut deleted = HashMap::new();
     for effect in plan.effects() {
         for key in effect.deleted_resource_attribute_keys() {
-            match key.generation() {
-                carina_core::effect::EffectGeneration::Current => {
-                    if let Some(current) = managed_current.get(key.id()) {
-                        let state = match current {
-                            Current::Absent(state) => state.state(),
-                            Current::Present(present) => present.state(),
-                            Current::CreateInFlight(_pending) => continue,
-                            Current::CreateOutcomeUnknown(_unknown) => continue,
-                            Current::MissingIdentifier(state) => state.state(),
-                        };
-                        let persisted_id = moved_origins.origin_for(key.id());
-                        let persisted_row =
-                            state_file.and_then(|file| file.find_resource_for_id(persisted_id));
-                        let persisted = persisted_row.and_then(ResourceState::persisted_attributes);
-                        let empty_nested_write_only =
-                            carina_core::provider::NestedWriteOnlyRecord::new();
-                        let nested_write_only = persisted_row
-                            .map(ResourceState::nested_write_only)
-                            .unwrap_or(&empty_nested_write_only);
-                        display.set_delete_from_provider_and_persisted(
-                            key,
-                            &state.attributes,
-                            persisted,
-                            nested_write_only,
-                        );
-                    }
-                }
-                carina_core::effect::EffectGeneration::Deposed(deposed_key) => {
-                    if let Some(attrs) = state_file.and_then(|sf| {
-                        deposed_attributes_for_display(sf, key.id(), key.identifier(), deposed_key)
-                    }) {
-                        display.set_delete_from_persisted(key, &attrs);
-                    }
-                }
+            if let carina_core::effect::EffectGeneration::Deposed(deposed_key) = key.generation()
+                && let Some(attrs) = state_file.as_ref().and_then(|sf| {
+                    deposed_attributes_for_display(sf, key.id(), key.identifier(), deposed_key)
+                })
+            {
+                deleted.insert(
+                    key.clone(),
+                    SnapshotState::existing(key.id().clone(), attrs.to_values()),
+                );
             }
         }
-
-        // Update::from has already crossed the plan-input canonicalization
-        // boundary (including reconstruction of partial-read Unknown values).
-        // Mask that shape in place instead of replacing it with the raw
-        // refreshed state used by Delete effects.
-        if let Effect::Update { from, .. } = effect {
-            let persisted_id = moved_origins.origin_for(&from.id);
-            let persisted = state_file
-                .and_then(|file| file.find_resource_for_id(persisted_id))
-                .and_then(ResourceState::persisted_attributes);
-            display.set_update_from_provider_and_persisted(
-                from.id.clone(),
-                &from.attributes,
-                persisted,
-            );
-        }
     }
-
-    display
+    let observations =
+        state_file
+            .authority()
+            .protect(carina_core::value::ObservationInputs::Display {
+                plan,
+                current: managed_current,
+                deleted: &deleted,
+            })?;
+    HistoricalDisplayAttributes::from_observations(plan, &observations)
 }
 
 /// Resolves a plan address to the state row that owns its persisted history.
@@ -3549,7 +3409,7 @@ mod historical_display_tests {
                 &mut carina_core::references::ReferencePreparation::default(),
                 request,
                 &self.managed,
-                None,
+                &carina_state::ObservedStateFile::for_test(None),
                 &self.schemas,
                 &carina_core::input_rules::InputTypeContext::empty(),
                 &HashMap::new(),
@@ -3704,7 +3564,7 @@ mod historical_display_tests {
         .unwrap();
         let saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
             id.clone(),
-            HashMap::from([("key".into(), string("key/planning").to_snapshot())]),
+            BTreeMap::from([("key".into(), string("key/planning").to_snapshot())]),
         )]))
         .lift(&schemas);
         let mut preparation = ReferencePreparation::default();
@@ -3736,16 +3596,22 @@ mod historical_display_tests {
         let mut persisted = StateFile::new();
         persisted
             .upsert_resource(
-                ResourceState::try_applied("test.reference", "old", "mock", "reference-123")
-                    .unwrap()
-                    .with_attribute("key", serde_json::json!("key/display")),
+                carina_state::ResourceState::try_applied(
+                    "test.reference",
+                    "old",
+                    "mock",
+                    "reference-123",
+                )
+                .unwrap()
+                .with_attribute("key", serde_json::json!("key/display")),
             )
             .unwrap();
         let historical = collect_historical_display_attributes(
             &plan,
             &HashMap::from([(id.clone(), Current::from_state(refreshed))]),
-            Some(&persisted),
-        );
+            &carina_state::ObservedStateFile::for_test((Some(&persisted)).cloned()),
+        )
+        .expect("fixture historical identities are valid");
         // Neither frontend may compare again: this router has no provider.
         let no_provider = ProviderRouter::new();
         let summary = crate::plan_summary::PlanChangeSummary::new(
@@ -3757,7 +3623,7 @@ mod historical_display_tests {
         for detail in [crate::DetailLevel::Full, crate::DetailLevel::Explicit] {
             let display = preparation
                 .display(
-                    crate::test_support::creation_fixture::checked(plan.clone(), &schemas),
+                    &crate::test_support::creation_fixture::checked(plan.clone(), &schemas),
                     &references,
                     historical.clone(),
                     detail.to_core(),
@@ -3823,7 +3689,12 @@ mod historical_display_tests {
         // Exercise the same collector and row builder used by CLI and TUI
         // production paths. There is deliberately no persisted state shape:
         // the desired Secret shape must still mask the provider plaintext.
-        let historical = collect_historical_display_attributes(&plan, &current_states, None);
+        let historical = collect_historical_display_attributes(
+            &plan,
+            &current_states,
+            &carina_state::ObservedStateFile::for_test(None),
+        )
+        .expect("fixture historical identities are valid");
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "",
@@ -3960,12 +3831,6 @@ impl UnresolvedReloadedPlanFile {
         &self.contents.provider_configs
     }
 
-    pub(crate) fn legacy_dependency_classification(
-        &self,
-    ) -> Option<&LegacyDependencyClassification> {
-        self.contents.legacy_dependency_classification.as_ref()
-    }
-
     pub(crate) fn verify_schema_fingerprints(
         &self,
         references: &PlanSchemaReferences,
@@ -4011,7 +3876,6 @@ impl UnresolvedReloadedPlanFile {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -4052,7 +3916,6 @@ impl UnresolvedReloadedPlanFile {
             sorted_resources: resolve_resources(sorted_resources)?,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -4066,22 +3929,46 @@ impl UnresolvedReloadedPlanFile {
         let origins = MovedOrigins::from_plan(&contents.plan);
         // A move source can share an address with a data source. Keep their
         // refresh inputs separate and apply removed claims only to managed rows.
-        let managed_snapshots = current_states.iter().map(|entry| {
-            let ReloadedCurrentStateEntry::Managed { id, current } = entry;
-            (origins.origin_for(id).clone(), *current.clone())
-        });
+        let managed_snapshots = current_states
+            .iter()
+            .map(|entry| {
+                let ReloadedCurrentStateEntry::Managed { id, current } = entry;
+                let origin = origins.origin_for(id);
+                let key = ResolvedResourceId::try_new(origin.clone()).ok_or_else(|| {
+                    carina_core::resource::ResolvedResourceError::PendingIdentity(
+                        carina_core::resource::PendingResourceIdentityError::new(origin.clone()),
+                    )
+                })?;
+                Ok((key, *current.clone()))
+            })
+            .collect::<Result<Vec<_>, carina_core::resource::ResolvedResourceError>>()?;
         let refresh_rows = carina_state::PreparedRows::from_snapshots(
             managed_snapshots,
             &carina_state::ResolvedRemovedClaims::from_effects(contents.plan.effects()),
         )
         .refreshable;
-        let data_source_refresh_rows = carina_state::PreparedRows::from_snapshots(
-            contents.data_source_values.iter().filter_map(|saved| {
+        let data_source_snapshots = contents
+            .data_source_values
+            .iter()
+            .filter_map(|saved| {
                 let DataSourceValue::Read(state) = &saved.value else {
                     return None;
                 };
-                Some((saved.id.clone(), Current::from_snapshot(*state.clone())))
-            }),
+                Some(
+                    ResolvedResourceId::try_new(saved.id.clone())
+                        .map(|key| (key, Current::from_snapshot(*state.clone())))
+                        .ok_or_else(|| {
+                            carina_core::resource::ResolvedResourceError::PendingIdentity(
+                                carina_core::resource::PendingResourceIdentityError::new(
+                                    saved.id.clone(),
+                                ),
+                            )
+                        }),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let data_source_refresh_rows = carina_state::PreparedRows::from_snapshots(
+            data_source_snapshots,
             &carina_state::ResolvedRemovedClaims::resolve(&[], None),
         )
         .refreshable;
@@ -4146,7 +4033,6 @@ impl<V: PlanValueKind, P> ReloadedPlanFile<V, P> {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -4178,7 +4064,6 @@ impl<V: PlanValueKind, P> ReloadedPlanFile<V, P> {
                 sorted_resources,
                 sorted_value_destroy_dependencies,
                 sorted_explicit_destroy_dependencies,
-                legacy_dependency_classification,
                 unresolved_resources,
                 compositions,
                 data_sources,
@@ -4266,7 +4151,7 @@ impl<V: PlanValueKind, P> ReloadedPlanFile<V, P> {
         &mut self.contents.data_source_values
     }
 
-    pub(crate) fn upstream_snapshot(&self) -> &HashMap<String, HashMap<String, Value<V>>> {
+    pub(crate) fn upstream_snapshot(&self) -> &BTreeMap<String, BTreeMap<String, Value<V>>> {
         &self.contents.upstream_snapshot
     }
 
@@ -4297,7 +4182,7 @@ pub(crate) struct LivePlanFileValues {
     pub(crate) compositions: Vec<SavedComposition<NoPlaceholder>>,
     pub(crate) data_source_origins: Vec<SavedDataSource>,
     pub(crate) provider_configs: SavedProviderConfigs<NoPlaceholder>,
-    pub(crate) upstream_snapshot: HashMap<String, HashMap<String, Value>>,
+    pub(crate) upstream_snapshot: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 impl ReloadedPlanFile<SnapshotLeaf> {
@@ -4324,7 +4209,6 @@ impl ReloadedPlanFile<SnapshotLeaf> {
             backend_config,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_classification,
             data_source_values,
             current_states: saved_current_states,
             upstream_sources,
@@ -4338,6 +4222,9 @@ impl ReloadedPlanFile<SnapshotLeaf> {
             data_source_origins: _,
             upstream_snapshot: _,
         } = contents;
+        let observation_plan = values
+            .provider_configuration
+            .bind_observation_plan(values.plan);
         ReloadedPlanFile {
             provider_configuration: values.provider_configuration.clone(),
             refresh_rows,
@@ -4356,12 +4243,11 @@ impl ReloadedPlanFile<SnapshotLeaf> {
                 backend_config,
                 sorted_value_destroy_dependencies,
                 sorted_explicit_destroy_dependencies,
-                legacy_dependency_classification,
                 data_source_values,
                 current_states: saved_current_states,
                 upstream_sources,
                 wait_bindings,
-                plan: values.plan,
+                plan: observation_plan,
                 sorted_resources: values.provider_configuration.resources().to_vec(),
                 unresolved_resources: values.unresolved_resources,
                 compositions: values.compositions,
@@ -4454,7 +4340,7 @@ enum ReloadSavedManagedCurrent {
 }
 
 impl SavedManagedCurrent {
-    pub fn from_current(current: Current) -> Self {
+    pub(crate) fn from_current(current: Current) -> Self {
         let saved = match current {
             Current::Absent(state) => {
                 SavedManagedCurrentKind::Absent(Box::new(state.state().clone()))
@@ -4694,7 +4580,6 @@ mod managed_current_serde_tests {
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
-            legacy_dependency_classification: Default::default(),
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -4807,9 +4692,11 @@ mod managed_current_serde_tests {
     #[test]
     fn present_round_trip_uses_typed_identifier_when_raw_identifier_differs() {
         let id = ResourceId::with_provider_identity("aws", "s3.Bucket", "logs", None);
-        let raw =
-            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), Default::default())
-                .with_identifier("raw-provider-identifier");
+        let raw = State::<carina_core::resource::NoPlaceholder>::existing(
+            id.clone(),
+            std::collections::BTreeMap::new(),
+        )
+        .with_identifier("raw-provider-identifier");
         let typed = AppliedIdentifier::new("typed-provider-identifier")
             .expect("fixture identifier is non-empty");
         let entry = CurrentStateEntry::Managed {
@@ -5089,6 +4976,7 @@ mod managed_current_serde_tests {
 }
 
 impl CurrentStateEntry {
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn managed<P: StateValueLeaf>(id: ResourceId, state: State<P>) -> Self {
         Self::Managed {
             id,
@@ -5178,8 +5066,11 @@ pub(crate) fn build_plan_file_from_parts<E, R>(
     ctx: &crate::wiring::PlanContext,
     validated_config: &ValidatedConfig<R>,
 ) -> Result<PlanFile, PlanSaveError> {
-    let directive_changes =
-        persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources, &ctx.plan);
+    let directive_changes = persisted_directive_changes(
+        state_file.as_ref(),
+        &ctx.sorted_resources,
+        ctx.plan.as_plan(),
+    );
     build_plan_file_contents(
         path,
         parsed,
@@ -5222,23 +5113,8 @@ fn build_plan_file_contents<E>(
     let source_identity = source.identity();
     let mut composition_source_identities = CompositionSourceIdentityResolver::new(&source)?;
 
-    let desired_resources: HashMap<
-        ResourceId,
-        Resource<
-            ModuleSource,
-            carina_core::resource::NoPlaceholder,
-            carina_core::resource::AbsoluteBindingAddress,
-            (),
-        >,
-    > = ctx
-        .sorted_resources
-        .iter()
-        .map(|resource| (resource.id.clone(), resource.as_inner().clone()))
-        .collect();
     let provider_configs = SavedProviderConfigs::from(provider_configs).redact_secrets()?;
-    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for (binding, attributes) in &ctx.upstream_snapshot {
-        #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
         for (key, value) in attributes.iter() {
             // Export validation rejects secret-valued exports before an
             // upstream state snapshot can be produced. Keep this guard for
@@ -5279,72 +5155,30 @@ fn build_plan_file_contents<E>(
             })
             .collect::<PersistedResourceLookup<'_>>()
     });
-    let moved_origins = MovedOrigins::from_plan(&ctx.plan);
-    let redact_current_state = |id: &ResourceId,
-                                state: &SnapshotState|
-     -> Result<
-        SnapshotState,
-        carina_core::value::SerializationError,
-    > {
-        let persisted =
-            persisted_resource_for_plan_address(persisted_resources.as_ref(), &moved_origins, id);
-        // A moved resource's previous state row still lives at its source
-        // address until execution writes the destination row.
-        let redacted = match persisted.and_then(ResourceState::persisted_attributes) {
-            Some(persisted_attributes) => {
-                redact_secrets_in_state_using_persisted(state, persisted_attributes)?
-            }
-            None => state.to_snapshot(),
-        };
-        let redacted = match desired_resources.get(id) {
-            Some(desired) => redact_secrets_in_state_using_resource(&redacted, desired)?,
-            None if persisted.is_some() => redacted,
-            None => redact_secrets_in_state(&redacted)?,
-        };
-        Ok(redacted)
-    };
-    let mut redacted_managed_states = ctx
-        .managed_current
+    let moved_origins = MovedOrigins::from_plan(ctx.plan.as_plan());
+    let observations = ctx.protected_observations()?;
+    let protected_managed_states = observations.managed();
+    let redacted_managed_states = protected_managed_states
         .iter()
-        .filter_map(|(id, current)| {
-            let state = match current {
-                Current::Absent(state) => Some(state.state()),
-                Current::Present(present) => Some(present.state()),
-                Current::CreateInFlight(_pending) => None,
-                Current::CreateOutcomeUnknown(_unknown) => None,
-                Current::MissingIdentifier(state) => Some(state.state()),
-            };
-            state.map(|state| redact_current_state(id, state).map(|state| (id.clone(), state)))
-        })
-        .collect::<Result<HashMap<_, _>, carina_core::value::SerializationError>>()?;
-    for effect in ctx.plan.effects() {
-        if let Effect::DeferredReplace(payload) = effect {
-            for old in payload.deletes.iter() {
-                let state = SnapshotState::existing(
-                    old.id.as_inner().clone(),
-                    old.previous_attributes.clone(),
-                );
-                redacted_managed_states
-                    .entry(old.id.as_inner().clone())
-                    .or_insert(redact_current_state(old.id.as_inner(), &state)?);
-            }
-        }
-    }
+        .map(|(id, observation)| observation.snapshot().map(|state| (id.clone(), state)))
+        .collect::<Result<HashMap<_, _>, _>>()?;
     let redacted_managed_current = ctx
         .managed_current
         .iter()
         .map(|(id, current)| {
             let mut current = current.clone();
-            if let Some(attributes) = current.attributes_mut() {
-                *attributes = redacted_managed_states[id].attributes.clone();
+            if let Some(state) = redacted_managed_states.get(id)
+                && let Some(attributes) = current.attributes_mut()
+            {
+                *attributes = state.attributes.clone();
             }
             (id.clone(), current)
         })
         .collect::<HashMap<_, _>>();
-    let redacted_data_source_states = ctx
-        .data_source_values
-        .read_states()
-        .map(|(id, state)| Ok((id.clone(), redact_current_state(id, state)?)))
+    let redacted_data_source_states = observations
+        .reads()
+        .iter()
+        .map(|(id, observation)| observation.snapshot().map(|state| (id.clone(), state)))
         .collect::<Result<HashMap<_, _>, carina_core::value::SerializationError>>()?;
     let redacted_sorted_resources = ctx
         .sorted_resources
@@ -5374,130 +5208,10 @@ fn build_plan_file_contents<E>(
         .map(|resource| (resource.id.clone(), resource.clone()))
         .collect();
 
-    let recorded =
-        checked.record_snapshot(&redacted_desired_resources, &redacted_managed_states)?;
+    let recorded = checked.record_snapshot(&redacted_desired_resources, &observations)?;
     let wire_plan = recorded.into_wire();
 
     let contents = PlanFileContents::<ModuleSource, UnresolvedSavedPlan> {
-        // carina#4348: bumped 43→44 — v13 fingerprints and retained scalar
-        // identity/member layers change saved schema and pending-constraint evidence.
-        // carina#4292: bumped 42→43 — pattern modes change schema semantics;
-        // reject older headers before schema-fingerprint verification.
-        // carina#4283: bumped 41→42 — retain replacement history and dependency
-        // requirements; loading re-admits requests against the target schema.
-        // carina#4275: bumped 40→41 — secret(...) has no ordinary FunctionCall
-        // identity; older saved plans must be regenerated before decoding.
-        // carina#4202: bumped 39→40 — require the absolute source locator and
-        // canonical identity separately, rejecting retargeted source symlinks.
-        // Format 39 already records typed dependency handles (carina#3803).
-        // carina#4174: bumped 36→37 — deferred-for templates require file
-        // (relative path or null) and line for apply-time diagnostics.
-        // carina#4094: bumped 35→36 — saved plans use typed deferred-for
-        // templates and stage-specific placeholder types, with template
-        // attributes stored only on `template_resource`.
-        // carina#4150: bumped 34→35 — Directives now retain whether
-        // prevent_destroy was unspecified or explicitly false, and saved
-        // plans bind apply to the exact state-only directive change set.
-        // carina#4142: bumped 33→34 — saved plans can retain typed deferred
-        // integer arithmetic until apply-time reference resolution.
-        // carina#4118: bumped 32→33 — keyed partial-update releases add a
-        // serialized state-only Effect variant.
-        // carina#4067: bumped 29→31 — saved plans retain authored
-        // `ignore_changes` paths and re-resolve them only after schema
-        // fingerprint verification. Version 30 was never emitted; provider
-        // protocol v13 uses version 32.
-        // carina#4065: bumped 31→32 — saved plans bind every initialized
-        // provider instance to its reference scope and persist the
-        // create-outcome-unknown marker.
-        // carina#4109: bumped 28→29 — saved plans persist anonymous-loop
-        // provenance, typed bound/unbound deferred targets, and Move origins.
-        // V28 plans carry the old deferred payload and must be regenerated.
-        // carina#3883: bumped 27→28 — pending re-read unknowns now persist a
-        // typed reason shared with state markers. V27 plans carry the removed
-        // untyped unknown shape and must be regenerated.
-        // carina#4045: bumped 25→26 — saved plans persist the exact loaded
-        // provider artifacts used to compute the plan. carina#4060 keeps the
-        // format at 26 because it only tightens validation.
-        // carina#3993: bumped 24→25 — saved plans persist every data-source
-        // outcome so apply never re-derives it from a partial graph.
-        // carina#3916: bumped 23→24 — saved plans remove the redundant wait
-        // target schema kind now that waits are managed-only.
-        // carina#3983: bumped 22→23 — saved plans bind every referenced
-        // managed/data-source type to the canonical provider schema used by
-        // planning. Apply must verify this snapshot before provider I/O.
-        //
-        // carina#3909: bumped 20→21 — in-flight create snapshots store only
-        // their resource address and a marker. Apply reloads the continuation
-        // token from locked state and rejects either direction of status change.
-        //
-        // carina#3909 preparation: bumped 19→20 — saved current-state entries now carry
-        // explicit managed/data-source ownership and managed lifecycle tags.
-        // V19 inferred ownership from `data_sources`, which could silently
-        // reinterpret an entry whose id was absent from that list.
-        //
-        // carina#3913: bumped 18→19 — abandoned deposed generations now
-        // serialize only their resource address and generation key. The
-        // removed field was necessarily an invalid empty provider identifier;
-        // reject v18 files so the saved-plan shape stays explicit.
-        // carina#3855: bumped 15→16 — unquoted wait RHS identifiers are
-        // persisted as typed enum values. A v15 plan may contain the same
-        // dotted text as an ordinary String, which cannot be distinguished
-        // safely from an intentionally quoted comparison; require replanning.
-        //
-        // carina#3863 / carina#3865: bumped 14→15 — secret digests now
-        // carry their salt, including upgraded legacy placeholders in embedded
-        // current states. Saved-plan resource placeholders carry the exact
-        // digest that state writeback must reuse. A v14 plan contains
-        // context-derived digests and cannot satisfy those contracts.
-        //
-        // carina#3871: bumped 13→14 — orphan state and host metadata now
-        // travel as one typed value until planning finishes. V13
-        // `CurrentStateEntry` values may also contain legacy `_`-prefixed
-        // host attributes, so they must be regenerated at the state migration
-        // boundary instead of entering drift detection.
-        //
-        // carina#3869: bumped 12→13 — host metadata no longer lives in
-        // provider-facing resource attributes. Default-tag provenance moved
-        // to `Resource::default_tag_keys`, and resource type comes solely
-        // from `Resource::id`. A v12 plan must be regenerated rather than
-        // mixing its synthetic-attribute representation with v13 apply.
-        //
-        // carina#3861 / carina#2674: bumped 11→12 — secrets now use typed
-        // placeholders, and saved-plan apply must re-evaluate and verify them.
-        // A v11 plan represents secret hashes as ordinary strings and could
-        // send those hashes to a provider, so it must never cross this seam.
-        //
-        // carina#3805: bumped 10→11 — `compositions` stores the pending module
-        // constraints required by apply, and `data_source_origins` preserves
-        // the authored input paired with each canonical plan-time data source
-        // so apply can validate only values that become known at runtime. A
-        // v10 plan can enforce neither provider-boundary guarantee.
-        //
-        // Phase 9: bumped 8→9 — `data_sources` now stores the exact
-        // differ/executor view: resolved refresh-time reads and unresolved
-        // apply-time reads. Older v8 files may have serialized deferred reads
-        // after parser resolution, which loses the metadata needed by
-        // `apply --plan`.
-        //
-        // Phase 7: bumped 6→8 — saved plans no longer support the
-        // legacy Replace effect shape and replacement display metadata
-        // must survive plan redaction.
-        //
-        // carina#3486: bumped 5→6 — saved plans now persist
-        // `unresolved_resources`, the pre-resolution snapshot needed by
-        // apply-time dependency analysis and reference re-resolution.
-        //
-        // carina#3329: bumped 4→5 — `Effect::Import.identifier` is now
-        // a tagged `Value`, not a plain string, so a pre-#3329 v4 plan
-        // would otherwise fail to deserialize with an opaque serde
-        // error. The version check at apply time produces a clean
-        // "re-run plan" message instead.
-        //
-        // carina#3248: bumped 3→4 — saved plans now persist
-        // `compositions` so the saved-plan apply path can rebuild
-        // the same `ResolvedBindings` view as the live-apply path.
-        // Older plans (version below current) are rejected with a
-        // clear message pointing the user at re-running `plan`.
         version: PlanFile::CURRENT_VERSION,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -5519,7 +5233,6 @@ fn build_plan_file_contents<E>(
             .iter()
             .map(|resource| resource.persisted_explicit_destroy_dependencies().clone())
             .collect(),
-        legacy_dependency_classification: ctx.legacy_dependency_classification.clone(),
         unresolved_resources: ctx
             .unresolved_resources
             .iter()
@@ -5564,9 +5277,9 @@ fn build_plan_file_contents<E>(
             .map(|(data_source, value)| SavedDataSourceValue {
                 id: data_source.id.clone(),
                 value: match value {
-                    DataSourceValue::Read(_) => DataSourceValue::read(
-                        (redacted_data_source_states[&data_source.id].clone()).to_snapshot(),
-                    ),
+                    DataSourceValue::Read(_) => {
+                        DataSourceValue::read(redacted_data_source_states[&data_source.id].clone())
+                    }
                     DataSourceValue::DeferredToApply(unresolved) => {
                         DataSourceValue::deferred_to_apply(unresolved.clone())
                     }
@@ -5765,21 +5478,18 @@ fn plan_s3_storage_bootstrap(
 async fn load_plan_storage(
     readiness: StorageReadinessStatus,
     read_state: impl std::future::Future<
-        Output = carina_state::BackendResult<Option<carina_state::LoadedState>>,
+        Output = carina_state::BackendResult<(
+            Option<carina_state::StateFile>,
+            carina_state::ObservationStateAuthority,
+        )>,
     >,
     resources: &[Resource],
     use_locked_backend: bool,
-) -> Result<(Option<StateFile>, Option<S3BootstrapInfo>), AppError> {
-    let mut state_file: Option<StateFile> = None;
-    let state_bucket_bootstrap = match readiness {
+) -> Result<(carina_state::ObservedStateFile, Option<S3BootstrapInfo>), AppError> {
+    let (state_file, state_bucket_bootstrap) = match readiness {
         StorageReadinessStatus::Ready => {
-            // Plan keeps schema migrations in memory; mutation paths persist
-            // them under the state lock.
-            state_file = read_state
-                .await
-                .map_err(AppError::Backend)?
-                .map(|loaded| loaded.into_state());
-            None
+            let (loaded, authority) = read_state.await.map_err(AppError::Backend)?;
+            (authority.bind(loaded), None)
         }
         StorageReadinessStatus::Provisionable(storage) => {
             let bucket_name = storage.settings().bucket();
@@ -5791,7 +5501,11 @@ async fn load_plan_storage(
                         .get("bucket")
                         .is_some_and(|v| matches!(v, Value::Concrete(ConcreteValue::String(s)) if s.expose_plaintext() == bucket_name))
             });
-            plan_s3_storage_bootstrap(storage, has_bucket_resource, use_locked_backend)?
+            let authority =
+                carina_state::ObservationStateAuthority::for_provisionable_storage(&storage)?;
+            let bootstrap =
+                plan_s3_storage_bootstrap(storage, has_bucket_resource, use_locked_backend)?;
+            (authority.bind(None), bootstrap)
         }
         StorageReadinessStatus::Unavailable(unavailable) => {
             return Err(AppError::Backend(unavailable.into_error()));
@@ -5817,7 +5531,7 @@ mod storage_readiness_tests {
             // resolution; the read future panics if it is polled.
             let error = load_plan_storage(
                 backend.storage_readiness().await.unwrap().into_status(),
-                backend.read_state(),
+                carina_state::ObservationStateAuthority::load(&backend),
                 &[],
                 migration_pending,
             )
@@ -6128,7 +5842,7 @@ pub(crate) async fn run_plan_using(
             .storage_readiness()
             .await
             .map_err(AppError::Backend)?,
-        plan_backend.read_state(),
+        plan_backend.read_state_with_observations(),
         &parsed.resources,
         use_locked_backend,
     )
@@ -6235,11 +5949,7 @@ pub(crate) async fn run_plan_using(
     .await?;
     let ctx_wiring = validated_plan.context();
     let ctx = validated_plan.resources();
-    if let Some(migrated) = ctx.migrated_legacy_state.clone() {
-        // Planning remains read-only, but every post-expansion consumer must
-        // see the same graph-classified v21 projection the differ used.
-        state_file = Some(migrated);
-    }
+
     let parsed = ctx.parsed();
     // TOCTOU drift detection (#3111). `plan` took no state lock, so a
     // concurrent apply/destroy may have written state while the diff
@@ -6255,7 +5965,6 @@ pub(crate) async fn run_plan_using(
         drift_detection_test_barrier(runtime).await;
         match plan_backend.read_state().await {
             Ok(state_t1) => {
-                let state_t1 = state_t1.map(|loaded| loaded.into_state());
                 if let Some(drift) = detect_state_drift(Some(snapshot_t0), state_t1.as_ref()) {
                     eprintln!("{}", drift.warning(path).yellow(color_mode));
                 }
@@ -6285,7 +5994,7 @@ pub(crate) async fn run_plan_using(
 
     let iam_preflight_result = if check_iam {
         let result = crate::commands::iam_preflight::run_iam_preflight(
-            &ctx.plan,
+            ctx.plan.as_plan(),
             &ctx.provider,
             ctx_wiring.schemas(),
             strict_iam,
@@ -6327,7 +6036,7 @@ pub(crate) async fn run_plan_using(
         managed_current: &ctx.managed_current,
         data_source_values: &ctx.data_source_values,
         state_file: state_file.as_ref(),
-        plan: &ctx.plan,
+        plan: ctx.plan.as_plan(),
         schemas: ctx_wiring.schemas(),
         wait_aliases: &export_wait_aliases,
         provider_context: ctx_wiring.provider_context(),
@@ -6338,10 +6047,13 @@ pub(crate) async fn run_plan_using(
         .map(|state| state.exports.clone())
         .unwrap_or_default();
     let export_changes = compute_export_diffs(&checked_exports, &current_exports);
-    let directive_changes =
-        persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources, &ctx.plan);
+    let directive_changes = persisted_directive_changes(
+        state_file.as_ref(),
+        &ctx.sorted_resources,
+        ctx.plan.as_plan(),
+    );
     let summary = PlanChangeSummary::new(
-        &ctx.plan,
+        ctx.plan.as_plan(),
         &export_changes,
         &ctx.residual_deferred_for,
         &directive_changes,
@@ -6351,7 +6063,7 @@ pub(crate) async fn run_plan_using(
     // displayable work such as reads, waits, exports, or deferred loops.
     let has_changes = ctx.plan.mutation_count() > 0;
     let moved_hints = crate::moved_hint::detect_moved_block_hints(
-        &ctx.plan,
+        ctx.plan.as_plan(),
         &ctx.managed_current,
         ctx_wiring.schemas(),
         &ctx.provider,
@@ -6486,7 +6198,7 @@ pub(crate) async fn run_plan_using(
             file: image,
             inline: inline_image,
             input: PlanImageInput {
-                scheduled: &planned.schedule(&ctx.managed_current),
+                scheduled: &planned.checked().schedule(&ctx.managed_current),
                 desired_resources: &ctx.sorted_resources,
                 unresolved_resources: &ctx.unresolved_resources,
                 compositions: &ctx.compositions,
@@ -6640,54 +6352,22 @@ pub(crate) fn check_exports_pre_apply<D>(
                 // carina#3248: build the unified pre-apply bindings view so an
                 // export referencing `<module_instance>.<attr>` chains through the
                 // composition to the managed sibling literal (carina#3246).
-                let mut secret_aware_current = input.managed_current.clone();
-                if let Some(state_file) = input.state_file {
-                    let moved_origins = MovedOrigins::from_plan(input.plan);
-                    #[allow(clippy::iter_over_hash_type)]
-                    // keyed rebuild: secret masking operates independently per resource
-                    for (id, current) in &mut secret_aware_current {
-                        let Some(persisted) = moved_origins.find_persisted_row(state_file, id)
-                        else {
-                            continue;
-                        };
-                        let persisted_attributes = persisted.persisted_attributes();
-                        if let (Some(persisted_attributes), Some(attributes)) =
-                            (persisted_attributes, current.attributes_mut())
-                        {
-                            #[allow(clippy::iter_over_hash_type)]
-                            // keyed rebuild: each attribute uses its own persisted secret shape without fallible callbacks
-                            for (key, value) in attributes {
-                                *value =
-                                    carina_core::value::mask_plaintext_using_persisted_attribute(
-                                        value,
-                                        persisted_attributes,
-                                        key,
-                                    );
-                            }
-                        }
-                    }
-                }
-                let plan_input_current = carina_core::resource::into_plan_input_current_map(
-                    secret_aware_current,
-                    input.schemas,
-                    input.resources,
-                );
-                let mut bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
-                    carina_core::binding_index::LivePreApplyInputs {
-                        managed: input.resources,
-                        compositions: input.compositions,
-                        managed_current: &plan_input_current,
-                        data_source_values: input.data_source_values,
-                        remote_bindings: &HashMap::new(),
-                        wait_aliases: input.wait_aliases,
-                    },
-                );
-                bindings.apply_plan_stability(
-                    input.resources,
-                    &plan_input_current,
-                    input.plan,
-                    input.schemas,
-                );
+                let bindings =
+                    carina_core::binding_index::ResolvedBindings::pre_apply_live_from_state(
+                        carina_core::binding_index::LivePreApplyStateInputs {
+                            managed: input.resources,
+                            compositions: input.compositions,
+                            managed_current: input.managed_current,
+                            data_source_values: input.data_source_values,
+                            remote_bindings: &Default::default(),
+                            wait_aliases: input.wait_aliases,
+                        },
+                        input.plan,
+                        input.schemas,
+                        input
+                            .state_file
+                            .map(|file| file as &dyn carina_core::value::BindingState),
+                    );
 
                 carina_core::validation::check_export_values_pre_apply(
                     input.export_params,
@@ -6709,13 +6389,13 @@ pub enum ExportChange {
     Added {
         name: String,
         type_expr: Option<carina_core::parser::TypeExpr>,
-        new_value: Value,
+        new_value: carina_core::value::RenderedValue,
     },
     Modified {
         name: String,
         type_expr: Option<carina_core::parser::TypeExpr>,
         old_json: PersistedExportValue,
-        new_value: Value,
+        new_value: carina_core::value::RenderedValue,
     },
     Removed {
         name: String,
@@ -6748,7 +6428,11 @@ pub fn compute_export_diffs(
     let mut changes = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for param in checked_exports.display_values() {
+    for (param, rendered) in checked_exports
+        .display_values()
+        .iter()
+        .zip(checked_exports.rendered_display_values())
+    {
         seen.insert(param.name.clone());
         let Some(ref value) = param.value else {
             continue;
@@ -6763,7 +6447,9 @@ pub fn compute_export_diffs(
             (None, _) => changes.push(ExportChange::Added {
                 name: param.name.clone(),
                 type_expr: type_expr.clone(),
-                new_value: value.clone(),
+                new_value: rendered
+                    .clone()
+                    .expect("present export has a rendered value"),
             }),
             (Some(old), Some(new)) if old == &new => {
                 // unchanged — skip
@@ -6772,7 +6458,9 @@ pub fn compute_export_diffs(
                 name: param.name.clone(),
                 type_expr,
                 old_json: old.clone(),
-                new_value: value.clone(),
+                new_value: rendered
+                    .clone()
+                    .expect("present export has a rendered value"),
             }),
         }
     }
@@ -6990,7 +6678,7 @@ async fn load_provider_referenced_upstream_states<E>(
     schemas: &carina_core::schema::SchemaRegistry,
     policy: UpstreamMissingStatePolicy,
 ) -> Result<AdmittedRemoteBindings, AppError> {
-    let mut remote_bindings = HashMap::new();
+    let mut remote_bindings = AdmittedRemoteBindings::new();
     for referenced in provider_referenced_upstream_states(parsed) {
         let ProviderReferencedUpstream {
             upstream,
@@ -7230,7 +6918,7 @@ pub(crate) async fn load_selected_upstream_states<B: carina_core::resource::Bind
     selected_keys: Option<&HashSet<carina_core::resource::DependencyKey<String>>>,
 ) -> Result<AdmittedRemoteBindings, crate::error::UpstreamLoadFailure> {
     let color_mode = runtime.color_mode();
-    let mut result = HashMap::new();
+    let mut result = AdmittedRemoteBindings::new();
 
     for us in upstream_states {
         let identity = carina_core::upstream_exports::UpstreamSourceIdentity::resolve(us, base_dir)
@@ -7323,17 +7011,17 @@ pub(crate) async fn load_selected_upstream_states<B: carina_core::resource::Bind
 }
 
 /// A saved snapshot must retain every planned key and still pass admission.
-/// Check this before migrations, binding installation or apply confirmation.
+/// Check this before state writes, binding installation or apply confirmation.
 pub(crate) fn admit_saved_upstream_snapshot(
     runtime: &crate::runtime::CommandRuntime,
     sources: &[UpstreamSource],
     base_dir: &ResolvedPath,
     provider_context: &ProviderContext,
     schemas: &carina_core::schema::SchemaRegistry,
-    values: &HashMap<String, HashMap<String, Value>>,
+    values: &BTreeMap<String, BTreeMap<String, Value>>,
     apply_target: crate::commands::apply::ApplyTarget<'_>,
 ) -> Result<AdmittedRemoteBindings, AppError> {
-    let mut admitted = HashMap::new();
+    let mut admitted = AdmittedRemoteBindings::new();
     for source in sources {
         let binding = source.binding.to_string();
         let Some(values) = values.get(&binding) else {
@@ -7587,9 +7275,9 @@ mod load_upstream_states_tests {
                 Value::Concrete(ConcreteValue::Int(73))
             );
 
-            let snapshot = HashMap::from([(
+            let snapshot = std::collections::BTreeMap::from([(
                 "orgs".into(),
-                HashMap::from([("count".into(), Value::Concrete(ConcreteValue::Int(73)))]),
+                BTreeMap::from([("count".into(), Value::Concrete(ConcreteValue::Int(73)))]),
             )]);
             let saved = admit_saved_upstream_snapshot(
                 &runtime,
@@ -8064,7 +7752,7 @@ mod load_upstream_states_tests {
             &ResolvedPath::new(root.path()).unwrap(),
             &context,
             &carina_core::schema::SchemaRegistry::new(),
-            &HashMap::from([("orgs".into(), HashMap::new())]),
+            &std::collections::BTreeMap::from([("orgs".into(), std::collections::BTreeMap::new())]),
             crate::commands::apply::ApplyTarget::Project(root.path()),
         )
         .unwrap_err();
@@ -9686,7 +9374,8 @@ mod run_plan_out_tests {
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
                 plan: Box::new(
                     crate::test_support::creation_fixture::checked_with_derived_schemas(plan),
-                ),
+                )
+                .into(),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -9695,8 +9384,6 @@ mod run_plan_out_tests {
                 updated.clone(),
             ])
             .unwrap(),
-            legacy_dependency_classification: Default::default(),
-            migrated_legacy_state: None,
             unresolved_resources: [created, updated]
                 .into_iter()
                 .map(carina_core::executor::UnresolvedResource::from_pre_resolve)
@@ -9706,9 +9393,12 @@ mod run_plan_out_tests {
             managed_current: HashMap::new(),
             data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
             moved_origins: HashMap::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(Some(
+                &state_file,
+            )),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
         let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
@@ -9716,7 +9406,7 @@ mod run_plan_out_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -10113,22 +9803,22 @@ mod run_plan_out_tests {
                 plan: Box::new(crate::test_support::creation_fixture::checked(
                     Plan::new(),
                     &carina_core::schema::SchemaRegistry::new(),
-                )),
+                ))
+                .into(),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
-            legacy_dependency_classification: Default::default(),
-            migrated_legacy_state: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: vec![deferred_data_source],
             managed_current: HashMap::new(),
             data_source_values,
             moved_origins: HashMap::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(None),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
 
@@ -10137,7 +9827,7 @@ mod run_plan_out_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -10172,6 +9862,341 @@ mod run_plan_out_tests {
                 carina_core::resource::ConcreteValue::String("^target$".into())
             )),
             "saved plans must separately preserve the authored pre-normalization input"
+        );
+    }
+
+    #[test]
+    fn saved_plan_data_source_read_secret_input_does_not_taint_ordinary_attributes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("main.crn");
+        fs::write(&path, "provider mock {}\n").unwrap();
+
+        let mut parsed_data_source: DataSource =
+            DataSource::with_provider("mock", "iam.Roles", "roles", None);
+        parsed_data_source.binding = Some(absolute_binding("roles"));
+        parsed_data_source.set_attr(
+            "name_regex".to_string(),
+            Value::Concrete(carina_core::resource::ConcreteValue::String(
+                "^target$".into(),
+            )),
+        );
+
+        // R6 PIN on the previous behavior; RED on the initial observation owner.
+        parsed_data_source.set_attr(
+            "name_regex",
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "authored-private".into(),
+                )))
+                .into(),
+            )),
+        );
+        let deferred_data_source = parsed_data_source.clone();
+        let observed = carina_core::resource::SnapshotState::existing(
+            deferred_data_source.id.clone(),
+            HashMap::from([(
+                "name_regex".into(),
+                Value::Concrete(ConcreteValue::String("ordinary-read-result".into())),
+            )]),
+        );
+        let data_source_values =
+            carina_core::data_source_value::DataSourceValues::from_data_sources(
+                std::slice::from_ref(&deferred_data_source),
+                |_| carina_core::data_source_value::DataSourceValue::read(observed.clone()),
+            );
+
+        let mut parsed = carina_core::parser::ExpandedParsedFile::default();
+        parsed.data_sources = vec![parsed_data_source];
+        let parsed = resolve_file_for_test(parsed, tmp.path());
+        let ctx = crate::wiring::PlanContext {
+            plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
+                plan: Box::new(crate::test_support::creation_fixture::checked(
+                    Plan::new(),
+                    &carina_core::schema::SchemaRegistry::new(),
+                ))
+                .into(),
+                references: carina_core::references::prepare_empty_for_tests(),
+            }),
+            provider: ProviderRouter::new(),
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: vec![deferred_data_source],
+            managed_current: HashMap::new(),
+            data_source_values,
+            moved_origins: HashMap::new(),
+            upstream_snapshot: Default::default(),
+            prev_explicit: HashMap::new(),
+            residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(None),
+            expansion_trace: carina_core::resource::ExpansionTrace::new(),
+        };
+
+        let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &std::collections::BTreeMap::new(),
+                    session,
+                )
+            },
+        )
+        .unwrap();
+        let plan_file = build_plan_file_from_parts(
+            &carina_core::paths::ResolvedPath::new(&path).unwrap(),
+            &parsed,
+            &provider_configs,
+            SavedBackendConfig::default(),
+            &None,
+            &ctx,
+            &ValidatedConfig::from_factories_for_test(
+                &crate::test_support::TestCommandRuntime::new(),
+                (),
+                Vec::new(),
+                &[],
+            ),
+        )
+        .expect("saved plan should serialize");
+
+        let carina_core::data_source_value::DataSourceValue::Read(read) =
+            &plan_file.data_source_values[0].value
+        else {
+            panic!("expected read")
+        };
+        assert_eq!(
+            read.as_ref(),
+            &observed,
+            "data-source read attributes stay ordinary regardless of input secrecy"
+        );
+        let json = serde_json::to_string(&plan_file).unwrap();
+        assert!(json.contains("ordinary-read-result"));
+        assert!(!json.contains("authored-private"));
+    }
+
+    // S1: execution evidence must remain opaque even when an output consumer uses Debug.
+    #[test]
+    fn planned_output_debug_does_not_expose_raw_update_history() {
+        let desired = Resource::with_provider("mock", "test.resource", "item", None)
+            .with_attribute(
+                "comment",
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(
+                        "authored-debug-private".into(),
+                    )))
+                    .into(),
+                )),
+            );
+        let from = carina_core::resource::SnapshotState::existing(
+            desired.id.clone(),
+            HashMap::from([(
+                "comment".into(),
+                Value::Concrete(ConcreteValue::String("observed-debug-private".into())),
+            )]),
+        )
+        .with_identifier("item-id");
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            from: Box::new(from),
+            identifier: carina_core::provider::AppliedIdentifier::new("item-id").unwrap(),
+            to: ResolvedResource::new(desired.into_value_snapshot()),
+            changed_attributes: vec!["comment".into()],
+        });
+        let planned = crate::wiring::PlannedPlan::Unrendered {
+            plan: Box::new(
+                crate::test_support::creation_fixture::checked_with_derived_schemas(plan),
+            )
+            .into(),
+            references: carina_core::references::prepare_empty_for_tests(),
+        };
+        let debug = format!("{planned:?}");
+        assert!(
+            !debug.contains("observed-debug-private"),
+            "output Debug exposed raw history: {debug}"
+        );
+    }
+
+    // Legitimate moves use the same rekey transition as production before output.
+    #[test]
+    fn saved_plan_moved_observation_uses_destination_secret_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("main.crn");
+        fs::write(&path, "provider mock {}\n").unwrap();
+        let desired = Resource::with_provider("mock", "test.resource", "new", None).with_attribute(
+            "comment",
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "authored-private".into(),
+                )))
+                .into(),
+            )),
+        );
+        let origin = ResourceId::with_provider_identity("mock", "test.resource", "old", None);
+        let observed = State::existing(
+            origin.clone(),
+            HashMap::from([(
+                "comment".into(),
+                Value::Concrete(ConcreteValue::String("observed-private".into())),
+            )]),
+        )
+        .with_identifier("item-id");
+        let mut plan = Plan::new();
+        plan.add(Effect::Move {
+            from: carina_core::resource::ResolvedResourceId::new(origin.clone()),
+            to: carina_core::resource::ResolvedResourceId::new(desired.id.clone()),
+            origin: None,
+        });
+        let mut moved_current = HashMap::from([(origin.clone(), Current::from_state(observed))]);
+        carina_core::differ::rekey_current_for_move(
+            &mut moved_current,
+            &plan.move_authority(&origin, &desired.id).unwrap(),
+        )
+        .unwrap();
+        plan.retain_observation_desired_for_test([(&desired.id, &desired.attributes)]);
+        let parsed = carina_core::parser::ExpandedParsedFile::default();
+        let ctx = crate::wiring::PlanContext {
+            plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
+                plan: Box::new(
+                    crate::test_support::creation_fixture::checked_with_derived_schemas(plan),
+                )
+                .into(),
+                references: carina_core::references::prepare_empty_for_tests(),
+            }),
+            provider: ProviderRouter::new(),
+            sorted_resources: ResolvedResource::collect_resolved([desired.clone()]).unwrap(),
+            unresolved_resources: vec![
+                carina_core::executor::UnresolvedResource::from_pre_resolve(desired.clone()),
+            ],
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            managed_current: moved_current,
+            data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
+            moved_origins: HashMap::new(),
+            upstream_snapshot: Default::default(),
+            prev_explicit: HashMap::new(),
+            residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(None),
+            expansion_trace: carina_core::resource::ExpansionTrace::new(),
+        };
+        let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &std::collections::BTreeMap::new(),
+                    session,
+                )
+            },
+        )
+        .unwrap();
+        let saved = build_plan_file_from_parts(
+            &carina_core::paths::ResolvedPath::new(&path).unwrap(),
+            &parsed,
+            &provider_configs,
+            SavedBackendConfig::default(),
+            &None,
+            &ctx,
+            &ValidatedConfig::from_factories_for_test(
+                &crate::test_support::TestCommandRuntime::new(),
+                (),
+                Vec::new(),
+                &[],
+            ),
+        )
+        .expect("a moved observation must project at its destination without panicking");
+        let json = serde_json::to_string(&saved).unwrap();
+        assert!(!json.contains("observed-private") && !json.contains("authored-private"));
+        let CurrentStateEntry::Managed { id, .. } = &saved.current_states[0];
+        assert_eq!(id, &desired.id);
+        let encoded = serde_json::to_value(&saved).unwrap();
+        assert_eq!(
+            encoded["current_states"][0]["current"]["state"]["id"],
+            serde_json::to_value(&desired.id).unwrap()
+        );
+    }
+
+    #[test]
+    fn saved_plan_rejects_origin_id_at_destination_instead_of_rewriting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("main.crn");
+        fs::write(&path, "provider mock {}\n").unwrap();
+        let desired = Resource::with_provider("mock", "test.resource", "new", None).with_attribute(
+            "comment",
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "authored-private".into(),
+                )))
+                .into(),
+            )),
+        );
+        let origin = ResourceId::with_provider_identity("mock", "test.resource", "old", None);
+        let observed = State::existing(
+            origin.clone(),
+            HashMap::from([(
+                "comment".into(),
+                Value::Concrete(ConcreteValue::String("observed-private".into())),
+            )]),
+        )
+        .with_identifier("item-id");
+        let mut plan = Plan::new();
+        plan.add(Effect::Move {
+            from: carina_core::resource::ResolvedResourceId::new(origin),
+            to: carina_core::resource::ResolvedResourceId::new(desired.id.clone()),
+            origin: None,
+        });
+        let parsed = carina_core::parser::ExpandedParsedFile::default();
+        let ctx = crate::wiring::PlanContext {
+            plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
+                plan: Box::new(
+                    crate::test_support::creation_fixture::checked_with_derived_schemas(plan),
+                )
+                .into(),
+                references: carina_core::references::prepare_empty_for_tests(),
+            }),
+            provider: ProviderRouter::new(),
+            sorted_resources: ResolvedResource::collect_resolved([desired.clone()]).unwrap(),
+            unresolved_resources: vec![
+                carina_core::executor::UnresolvedResource::from_pre_resolve(desired.clone()),
+            ],
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            managed_current: HashMap::from([(desired.id.clone(), Current::from_state(observed))]),
+            data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
+            moved_origins: HashMap::new(),
+            upstream_snapshot: Default::default(),
+            prev_explicit: HashMap::new(),
+            residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(None),
+            expansion_trace: carina_core::resource::ExpansionTrace::new(),
+        };
+        let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &std::collections::BTreeMap::new(),
+                    session,
+                )
+            },
+        )
+        .unwrap();
+        let saved = build_plan_file_from_parts(
+            &carina_core::paths::ResolvedPath::new(&path).unwrap(),
+            &parsed,
+            &provider_configs,
+            SavedBackendConfig::default(),
+            &None,
+            &ctx,
+            &ValidatedConfig::from_factories_for_test(
+                &crate::test_support::TestCommandRuntime::new(),
+                (),
+                Vec::new(),
+                &[],
+            ),
+        );
+        assert!(
+            saved.is_err(),
+            "malformed moved current must return a typed identity error"
         );
     }
 
@@ -10220,22 +10245,22 @@ mod run_plan_out_tests {
                 plan: Box::new(crate::test_support::creation_fixture::checked(
                     Plan::new(),
                     &carina_core::schema::SchemaRegistry::new(),
-                )),
+                ))
+                .into(),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
-            legacy_dependency_classification: Default::default(),
-            migrated_legacy_state: None,
             unresolved_resources: Vec::new(),
             compositions: vec![prepared],
             data_sources: Vec::new(),
             managed_current: HashMap::new(),
             data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
             moved_origins: HashMap::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(None),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
 
@@ -10244,7 +10269,7 @@ mod run_plan_out_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -10290,13 +10315,12 @@ mod run_plan_out_tests {
             .into(),
         ));
         let ctx = crate::wiring::PlanContext {
-            legacy_dependency_classification: None,
-            migrated_legacy_state: None,
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
                 plan: Box::new(crate::test_support::creation_fixture::checked(
                     Plan::new(),
                     &carina_core::schema::SchemaRegistry::new(),
-                )),
+                ))
+                .into(),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -10315,6 +10339,7 @@ mod run_plan_out_tests {
             ),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(None),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
         let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
@@ -10322,7 +10347,7 @@ mod run_plan_out_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -10374,20 +10399,19 @@ mod run_plan_out_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
         )
         .unwrap();
         let ctx = crate::wiring::PlanContext {
-            legacy_dependency_classification: None,
-            migrated_legacy_state: None,
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
                 plan: Box::new(crate::test_support::creation_fixture::checked(
                     Plan::new(),
                     &carina_core::schema::SchemaRegistry::new(),
-                )),
+                ))
+                .into(),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -10398,9 +10422,10 @@ mod run_plan_out_tests {
             managed_current: HashMap::new(),
             data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
             moved_origins: HashMap::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(None),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
         let wiring = ValidatedConfig::from_factories_for_test_with_provider_phase(
@@ -10583,7 +10608,7 @@ mod export_diff_tests {
                 compositions: &[],
                 managed_current: &HashMap::new(),
                 data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
-                remote_bindings: &HashMap::new(),
+                remote_bindings: &Default::default(),
                 wait_aliases: &[],
             },
         );
@@ -10626,7 +10651,7 @@ mod export_diff_tests {
                 compositions: &[],
                 managed_current: &HashMap::new(),
                 data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
-                remote_bindings: &HashMap::new(),
+                remote_bindings: &Default::default(),
                 wait_aliases: &[],
             },
         );
@@ -10694,8 +10719,12 @@ mod plan_serialization_error_tests {
     #[test]
     fn plan_save_serialization_preserves_unavailable_secret_at_cli_boundary() {
         use crate::error::AppError;
+        use carina_core::effect::Effect;
+        use carina_core::plan::Plan;
         use carina_core::resource::SnapshotValue;
-        use carina_core::value::{redact_plaintext_using_secret_shape, redact_secrets_in_value};
+        use carina_core::resource::{ResolvedResource, SnapshotState};
+        use carina_core::value::redact_secrets_in_value;
+        use std::collections::HashMap;
 
         let secret = Value::Deferred(DeferredValue::Secret(
             Box::new(Value::Concrete(ConcreteValue::String(
@@ -10713,7 +10742,33 @@ mod plan_serialization_error_tests {
             .into(),
         ));
         for flag in [None, Some("--out"), Some("--json")] {
-            let error = redact_plaintext_using_secret_shape(&historical, &whole_secret)
+            let desired = ResolvedResource::new(
+                Resource::with_provider("mock", "test.resource", "whole", None)
+                    .with_attribute("payload", whole_secret.clone())
+                    .into_value_snapshot(),
+            );
+            let state = SnapshotState::existing(
+                desired.id.clone(),
+                HashMap::from([("payload".into(), historical.clone())]),
+            );
+            let mut plan = Plan::new();
+            plan.add(Effect::Update {
+                from: Box::new(state),
+                to: desired.clone(),
+                identifier: crate::fixture_applied_identifier("whole"),
+                changed_attributes: vec!["payload".into()],
+            });
+            let observations = crate::test_support::observation_authority_for_test(None)
+                .protect(carina_core::value::ObservationInputs::Display {
+                    deleted: &std::collections::HashMap::new(),
+                    plan: &plan,
+                    current: &HashMap::new(),
+                })
+                .unwrap();
+            let error = observations
+                .update_from(&desired.id)
+                .unwrap()
+                .snapshot()
                 .expect_err("whole-container redaction cannot recover a nested historical hash");
             let expected = match &error {
                 SerializationError::UnavailableSecret(error) => error.clone(),

@@ -432,6 +432,9 @@ fn contains_deferred_user_function_call(value: &Value) -> bool {
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => false,
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -543,6 +546,7 @@ pub(crate) fn contains_module_argument_matching<B: BindingAddress>(
             | ConcreteValue::Duration(_)
             | ConcreteValue::StringList(_),
         ) => false,
+        GenericValue::Reference(never) | GenericValue::Conversion(never) => match *never {},
     }
 }
 

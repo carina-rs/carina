@@ -1651,6 +1651,12 @@ fn recognize_companion<P: PlaceholderKind, V: PlaceholderKind, B: BindingAddress
                 base: base.to_owned(),
                 prefix: prefix.clone(),
             },
+            Value::Reference(never) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+            }
+            Value::Conversion(never) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+            }
             _ => CompanionRecognition::NotCompanion,
         };
     }

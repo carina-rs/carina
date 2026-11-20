@@ -251,7 +251,9 @@ async fn removed_no_refresh_saved_plan_apply() {
             )]),
         );
     snapshot.identifier = Some("old-id".into());
-    let snapshot = carina_core::value::redact_secrets_in_state(&snapshot).unwrap();
+    let snapshot = super::protected_observation(&snapshot.to_snapshot())
+        .snapshot()
+        .unwrap();
     let entry = plan::CurrentStateEntry::Managed {
         id,
         current: plan::SavedManagedCurrent::from_current(
@@ -446,7 +448,7 @@ async fn removed_no_refresh_state_preserves_deposed_read_behavior() {
         serde_json::from_value(serde_json::json!("historical")).unwrap(),
         "historical-id".into(),
         None,
-        Default::default(),
+        std::collections::BTreeMap::new(),
         Default::default(),
     );
     saved["resources"][0]["deposed"] = serde_json::json!([generation]);
@@ -465,8 +467,8 @@ async fn removed_no_refresh_state_preserves_deposed_read_behavior() {
         state["resources"][0]["deposed"].as_array().unwrap().len(),
         1
     );
-    let validated = carina_state::check_and_migrate_bytes(&f.bytes()).unwrap();
-    assert!(!validated.state().resources()[0].has_current_instance());
+    let validated = carina_state::load_state_bytes(&f.bytes()).unwrap();
+    assert!(!validated.resources()[0].has_current_instance());
     let log = fs::read_to_string(&f.log).unwrap();
     assert_eq!(
         log.lines().filter(|line| line.starts_with("read ")).count(),

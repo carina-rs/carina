@@ -6,7 +6,7 @@ use crate::schema::{
 
 use crate::resource::PersistedDirectives;
 use indexmap::IndexMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::explicit::{ExplicitFields, PendingPaths};
 use crate::plan::{
@@ -26,7 +26,7 @@ fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
 fn diff_test<P: crate::resource::StateValueLeaf>(
     desired: &Resource,
     current: &crate::resource::State<P>,
-    saved: Option<&HashMap<String, crate::resource::SnapshotValue>>,
+    saved: Option<&BTreeMap<String, crate::resource::SnapshotValue>>,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> Diff {
@@ -528,11 +528,19 @@ fn in_flight_orphan_is_create_in_flight_orphan_error() {
         Sent::AllRequestAttributes,
         1,
     ));
-    let orphans = Orphans::from([Orphan::create_in_flight(
-        pending,
-        Some(absolute_binding("orphan")),
-        crate::resource::PersistedDirectives::default(),
-    )]);
+    let orphans = Orphans::from(
+        [Orphan::create_in_flight(
+            pending,
+            Some(absolute_binding("orphan")),
+            crate::resource::PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
     let plan = create_plan(
         &[],
         &[],
@@ -585,11 +593,19 @@ fn outcome_unknown_blocks_both_desired_create_and_orphan_cleanup() {
     );
 
     let orphan_id = ResourceId::with_provider_identity("mock", "test.Resource", "orphan", None);
-    let orphans = Orphans::from([Orphan::create_outcome_unknown(
-        unknown_create_outcome(orphan_id.clone()),
-        Some(absolute_binding("orphan")),
-        crate::resource::PersistedDirectives::default(),
-    )]);
+    let orphans = Orphans::from(
+        [Orphan::create_outcome_unknown(
+            unknown_create_outcome(orphan_id.clone()),
+            Some(absolute_binding("orphan")),
+            crate::resource::PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
     let orphan_plan = create_plan(
         &[],
         &[],
@@ -631,11 +647,19 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
         &SchemaRegistry::new(),
         std::slice::from_ref(&imported),
     );
-    let orphans = Orphans::from([Orphan::create_outcome_unknown(
-        unknown_create_outcome(other_id.clone()),
-        Some(absolute_binding("shared")),
-        crate::resource::PersistedDirectives::default(),
-    )]);
+    let orphans = Orphans::from(
+        [Orphan::create_outcome_unknown(
+            unknown_create_outcome(other_id.clone()),
+            Some(absolute_binding("shared")),
+            crate::resource::PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
     let managed = ResolvedResource::collect_resolved([imported]).unwrap();
     let (_import_effect, replacement) = Effect::import_replacing_outcome_unknown(
         ResolvedResourceId::new(imported_id.clone()),
@@ -772,10 +796,8 @@ fn provider_ready<S: Clone, D: Clone + Default>(
     )
 }
 
-/// Build an `ExplicitFields::Struct` whose children are all `Leaf` —
-/// the shape `state v5 → v6` reads produce, and a convenient way to
-/// express "user previously authored these top-level keys" in tests
-/// that pre-date the nested authoring tree.
+/// Build an `ExplicitFields::Struct` whose `Leaf` children record the
+/// top-level keys previously authored by the user.
 fn explicit_top_level(keys: &[&str]) -> ExplicitFields {
     ExplicitFields::Struct {
         children: keys
@@ -2442,7 +2464,7 @@ fn unchanged_dsl_after_writeback_pairs_raw_saved_list_without_phantom_removal() 
             rule("second", true, false),
         ])),
     );
-    let saved_attributes = HashMap::from([(
+    let saved_attributes = std::collections::BTreeMap::from([(
         "rules".to_string(),
         Value::Concrete(ConcreteValue::List(vec![
             rule("first", false, true),
@@ -2469,7 +2491,8 @@ fn unchanged_dsl_after_writeback_pairs_raw_saved_list_without_phantom_removal() 
     assert_eq!(elements.len(), 3);
     assert!(matches!(elements[2], ExplicitFields::Unrecorded));
 
-    let current = existing_state(authored.id.clone(), saved_attributes.clone());
+    let current = State::existing(authored.id.clone(), saved_attributes.clone())
+        .with_identifier(authored.id.identity_display().to_string());
     let result = diff_test(
         &authored,
         &current,
@@ -2575,11 +2598,19 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
             )]),
         },
     )]);
-    let orphans = Orphans::from([Orphan::from_state(
-        web_acl_state,
-        Some(absolute_binding("web_acl")),
-        crate::resource::PersistedDirectives::default(),
-    )]);
+    let orphans = Orphans::from(
+        [Orphan::from_state(
+            web_acl_state,
+            Some(absolute_binding("web_acl")),
+            crate::resource::PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
 
     let plan = create_plan(
         &[desired],
@@ -2664,11 +2695,19 @@ fn orphan_delete_uses_typed_binding_without_state_attribute() {
         "provider-facing state must not carry orphan metadata"
     );
 
-    let orphans = Orphans::from([Orphan::from_state(
-        orphan_state,
-        Some(absolute_binding("service")),
-        crate::resource::PersistedDirectives::default(),
-    )]);
+    let orphans = Orphans::from(
+        [Orphan::from_state(
+            orphan_state,
+            Some(absolute_binding("service")),
+            crate::resource::PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
 
     let plan =
         create_plan(
@@ -2736,7 +2775,12 @@ fn desired_resource_uses_same_id_orphan_as_its_current_state_without_explicit_pr
             &SchemaRegistry::new(),
             &empty_lifted_saved_attrs(),
             &HashMap::new(),
-            &Orphans::from([orphan]),
+            &Orphans::from([orphan].map(|orphan| {
+                (
+                    crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                    orphan,
+                )
+            })),
             &[],
         );
 
@@ -2762,7 +2806,9 @@ fn orphan_collection_rekeys_index_and_provider_state_together() {
         Some(absolute_binding("service")),
         crate::resource::PersistedDirectives::default(),
     );
-    let mut orphans: Orphans = [orphan].into_iter().collect();
+    let mut orphans: Orphans = [(ResolvedResourceId::new(old_id.clone()), orphan)]
+        .into_iter()
+        .collect();
 
     let move_effect: Effect = Effect::Move {
         from: ResolvedResourceId::new(old_id.clone()),
@@ -2949,11 +2995,19 @@ fn orphan_delete_keeps_persisted_explicit_dependencies_without_binding_dependenc
         &Directives::default(),
         crate::test_support::persisted([x.clone()]),
     );
-    let orphans = Orphans::from([Orphan::from_state(
-        orphan_state,
-        Some(absolute_binding("service")),
-        directives,
-    )]);
+    let orphans = Orphans::from(
+        [Orphan::from_state(
+            orphan_state,
+            Some(absolute_binding("service")),
+            directives,
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
 
     let plan =
         create_plan(
@@ -3097,11 +3151,19 @@ fn prior_consumer_edge_is_not_added_when_desired_still_depends_on_delete_binding
     let dependency_state =
         existing_state(dependency_id.clone(), HashMap::new()).with_identifier("dependency-old");
     let current_states = HashMap::from([(consumer_id, consumer_state)]);
-    let orphans = Orphans::from([Orphan::from_state(
-        dependency_state,
-        Some(absolute_binding("dependency")),
-        crate::resource::PersistedDirectives::default(),
-    )]);
+    let orphans = Orphans::from(
+        [Orphan::from_state(
+            dependency_state,
+            Some(absolute_binding("dependency")),
+            crate::resource::PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
 
     let consumer = crate::resource::ResolvedResource::from_resolved_parts(
         consumer.into_value_snapshot(),
@@ -3167,11 +3229,19 @@ fn orphan_delete_waits_for_consumer_update_from_prior_depends_on() {
             crate::test_support::persisted([resolved_id(&dependency_id)]),
         ),
     )]);
-    let orphans = Orphans::from([Orphan::from_state(
-        dependency_state,
-        Some(absolute_binding("dependency")),
-        crate::resource::PersistedDirectives::default(),
-    )]);
+    let orphans = Orphans::from(
+        [Orphan::from_state(
+            dependency_state,
+            Some(absolute_binding("dependency")),
+            crate::resource::PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
 
     let plan = create_plan(
         &[consumer],
@@ -4389,11 +4459,19 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
-    let orphans = Orphans::from([Orphan::from_state(
-        existing_state(orphan_id.clone(), attrs),
-        None,
-        crate::resource::PersistedDirectives::default().with_prevent_destroy(true),
-    )]);
+    let orphans = Orphans::from(
+        [Orphan::from_state(
+            existing_state(orphan_id.clone(), attrs),
+            None,
+            crate::resource::PersistedDirectives::default().with_prevent_destroy(true),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
 
     let plan =
         create_plan(
@@ -4437,11 +4515,19 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
 #[test]
 fn schema_default_prevent_destroy_blocks_orphan_delete_when_schema_is_available() {
     let orphan_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
-    let orphans = Orphans::from([Orphan::from_state(
-        existing_state(orphan_id.clone(), HashMap::new()),
-        None,
-        PersistedDirectives::default(),
-    )]);
+    let orphans = Orphans::from(
+        [Orphan::from_state(
+            existing_state(orphan_id.clone(), HashMap::new()),
+            None,
+            PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
@@ -4480,11 +4566,19 @@ fn schema_default_prevent_destroy_blocks_orphan_delete_when_schema_is_available(
 #[test]
 fn unspecified_orphan_without_a_registered_schema_keeps_existing_delete_behavior() {
     let orphan_id = ResourceId::with_identity("retired.Type", "orphan");
-    let orphans = Orphans::from([Orphan::from_state(
-        existing_state(orphan_id, HashMap::new()),
-        None,
-        PersistedDirectives::default(),
-    )]);
+    let orphans = Orphans::from(
+        [Orphan::from_state(
+            existing_state(orphan_id, HashMap::new()),
+            None,
+            PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
 
     let plan =
         create_plan(
@@ -4847,11 +4941,19 @@ fn without_prevent_destroy_delete_works_normally() {
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
-    let orphans = Orphans::from([Orphan::from_state(
-        existing_state(orphan_id, attrs),
-        None,
-        crate::resource::PersistedDirectives::default(),
-    )]);
+    let orphans = Orphans::from(
+        [Orphan::from_state(
+            existing_state(orphan_id, attrs),
+            None,
+            crate::resource::PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
 
     let plan =
         create_plan(
@@ -4898,14 +5000,22 @@ fn prevent_destroy_collects_multiple_errors() {
     );
     let prevent_destroy =
         crate::resource::PersistedDirectives::default().with_prevent_destroy(true);
-    let orphans = Orphans::from([
-        Orphan::from_state(
-            existing_state(first_id, attrs1),
-            None,
-            prevent_destroy.clone(),
-        ),
-        Orphan::from_state(existing_state(second_id, attrs2), None, prevent_destroy),
-    ]);
+    let orphans = Orphans::from(
+        [
+            Orphan::from_state(
+                existing_state(first_id, attrs1),
+                None,
+                prevent_destroy.clone(),
+            ),
+            Orphan::from_state(existing_state(second_id, attrs2), None, prevent_destroy),
+        ]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
 
     let plan =
         create_plan(
@@ -5169,7 +5279,7 @@ fn nested_wait_enum_resolves_and_matches_provider_state() {
         Value::Concrete(ConcreteValue::CanonicalEnum(value))
             if value.api_value() == "SUCCESS"
     ));
-    let observed = HashMap::from([(
+    let observed = std::collections::BTreeMap::from([(
         "renewal_summary".to_string(),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "renewal_status".to_string(),
@@ -5244,7 +5354,7 @@ fn quoted_wait_value_traverses_a_string_map_when_planning() {
     else {
         unreachable!();
     };
-    let observed = HashMap::from([(
+    let observed = std::collections::BTreeMap::from([(
         "labels".to_string(),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "state".to_string(),
@@ -5330,7 +5440,7 @@ fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
         Value::Concrete(ConcreteValue::CanonicalEnum(value))
             if value.api_value() == "READY"
     ));
-    let observed = HashMap::from([(
+    let observed = std::collections::BTreeMap::from([(
         "statuses".to_string(),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "primary".to_string(),

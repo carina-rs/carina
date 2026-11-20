@@ -441,7 +441,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             | ExprKind::ModuleCall
             | ExprKind::Boolean
             | ExprKind::Declaration
-            | ExprKind::RequireCondition(_)
+            | ExprKind::RequireCondition
             | ExprKind::ProviderDeclaration
             | ExprKind::Unsupported(_)
             | ExprKind::NestedBlock { .. } => AuthoredForm::Computed,
@@ -628,7 +628,6 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
                         authored: true,
                     }
                 }
-                ExprKind::RequireCondition(_) => AuthoredNavigation::Covered,
                 _ => AuthoredNavigation::Covered,
             },
             AuthoredForm::Forward | AuthoredForm::Literal | AuthoredForm::Reference => {
@@ -642,7 +641,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             ExprKind::Interpolation { .. } => EdgeRole::InterpolationPart,
             ExprKind::Call(_) => EdgeRole::CallArgument,
             ExprKind::Integer { .. } => EdgeRole::ArithmeticOperand,
-            ExprKind::RequireCondition(_) => EdgeRole::Condition,
+            ExprKind::RequireCondition => EdgeRole::Condition,
             ExprKind::Access(_) | ExprKind::DynamicAccess => {
                 if index == 0 {
                     EdgeRole::AccessBase
@@ -1497,7 +1496,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
             let role = match &usage.node.node.kind {
                 ExprKind::Parens => EdgeRole::Parens,
                 ExprKind::Convert { .. } => EdgeRole::ConvertOperand,
-                ExprKind::RequireCondition(_) => EdgeRole::Condition,
+                ExprKind::RequireCondition => EdgeRole::Condition,
                 ExprKind::Definition => EdgeRole::AliasDefinition,
                 ExprKind::Secret => EdgeRole::SecretArgument,
                 ExprKind::List => EdgeRole::ListItem,
@@ -1604,6 +1603,8 @@ pub struct AuthoredSlots<B: BindingAddress = RelativeBindingName> {
     input_origin: Option<SlotDeclarationId>,
     /// Resource expansion identity, retained even when there are no attributes.
     instance: Option<ExpansionInstanceId>,
+    instantiation_origin: Option<(SlotDeclarationId, Option<ExpansionInstanceId>)>,
+    child_secrecy: Option<crate::secrecy::ChildSecrecy>,
 }
 // Admission metadata is not part of a resource's value semantics.
 impl<B: BindingAddress> PartialEq for AuthoredSlots<B> {
@@ -1626,6 +1627,8 @@ impl<B: BindingAddress> Default for AuthoredSlots<B> {
             declaration: None,
             input_origin: None,
             instance: None,
+            instantiation_origin: None,
+            child_secrecy: None,
         }
     }
 }
@@ -1642,6 +1645,22 @@ impl<B: BindingAddress> AuthoredSlots<B> {
     }
     pub(crate) fn instance(&self) -> Option<ExpansionInstanceId> {
         self.instance
+    }
+    pub(crate) fn instantiation_origin(
+        &self,
+    ) -> Option<(&SlotDeclarationId, Option<ExpansionInstanceId>)> {
+        self.instantiation_origin
+            .as_ref()
+            .map(|(declaration, instance)| (declaration, *instance))
+    }
+    pub(crate) fn child_secrecy(&self) -> Option<&crate::secrecy::ChildSecrecy> {
+        self.child_secrecy.as_ref()
+    }
+    pub(in crate::parser) fn set_child_secrecy(
+        &mut self,
+        secrecy: crate::parser::ast::DeferredChildSecrecy,
+    ) {
+        self.child_secrecy = Some(secrecy.into_inner());
     }
     pub(super) fn set_instance(&mut self, instance: ExpansionInstanceId) {
         self.instance = Some(instance);
@@ -1777,6 +1796,11 @@ impl<B: BindingAddress> AuthoredSlots<B> {
         }
     }
     pub(crate) fn reinstance(&mut self) {
+        self.instantiation_origin = self
+            .declaration
+            .clone()
+            .map(|declaration| (declaration, self.instance));
+        self.child_secrecy = None;
         let instance = ExpansionInstanceId::fresh();
         self.set_instance(instance);
         for slot in self.slots.values_mut() {
@@ -1803,6 +1827,8 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             declaration: self.declaration,
             input_origin: self.input_origin,
             instance: self.instance,
+            instantiation_origin: self.instantiation_origin,
+            child_secrecy: self.child_secrecy,
             slots: self
                 .slots
                 .into_iter()

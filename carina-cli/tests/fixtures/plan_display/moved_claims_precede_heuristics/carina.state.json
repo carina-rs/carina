@@ -1,35 +1,43 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-moved-claims-precede-heuristics",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-moved-claims-precede-heuristics",
   "resources": [
     {
-      "resource_type": "test.Widget",
-      "identity": "test_widget_11111111",
-      "provider": "awscc",
-      "identifier": "widget-live-1",
-      "attributes": {
-        "id": "widget-live-1",
-        "external_name": "claimed-widget"
-      },
-      "protected": false,
-      "directives": {
-        "force_delete": false,
-        "create_before_destroy": false
-      },
-      "prefixes": {},
-      "name_overrides": {},
       "binding": null,
+      "current": {
+        "attributes": {
+          "external_name": "claimed-widget",
+          "id": "widget-live-1"
+        },
+        "identifier": "widget-live-1",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "create_before_destroy": false,
+        "force_delete": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "external_name": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "test_widget_11111111",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "test.Widget"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

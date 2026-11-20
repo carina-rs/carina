@@ -102,7 +102,7 @@ pub struct App {
 impl App {
     #[cfg(test)]
     pub(crate) fn for_plan(plan: &Plan, schemas: &SchemaRegistry) -> Self {
-        let historical_display = HistoricalDisplayAttributes::for_plan(plan);
+        let historical_display = HistoricalDisplayAttributes::for_test_plan(plan);
         let (schemas, provider) = carina_core::provider::comparison_fixture_for_test(
             schemas,
             plan.effects().iter().map(Effect::resource_id),
@@ -302,6 +302,9 @@ impl App {
             return all_dfs;
         }
         let mut visible_set: HashSet<usize> = HashSet::new();
+        #[allow(clippy::iter_over_hash_type)]
+        // This only unions membership with ancestors. Output filters all_dfs,
+        // whose order is independent of the set's traversal.
         for &idx in &match_set {
             visible_set.insert(idx);
             // Walk up ancestors

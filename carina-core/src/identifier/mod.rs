@@ -316,6 +316,12 @@ fn value_has_authored_plan_time_expression<P: PlaceholderKind, B: BindingAddress
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => false,
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 
@@ -445,6 +451,14 @@ fn complete_identity_value<S, P: PlaceholderKind, B: BindingAddress, D>(
             )
             | Value::Deferred(_),
         ) => None,
+        IdentityPathInput::AuthoredPrefix(crate::resource::Value::Reference(never))
+        | IdentityPathInput::Value(crate::resource::Value::Reference(never)) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        IdentityPathInput::AuthoredPrefix(crate::resource::Value::Conversion(never))
+        | IdentityPathInput::Value(crate::resource::Value::Conversion(never)) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 
@@ -1838,9 +1852,9 @@ pub fn resolve_attr_prefix_findings<
 #[derive(Clone)]
 pub struct PrefixStateInfo {
     /// Attribute prefixes stored in state (e.g., {"bucket_name": "my-app-"})
-    pub prefixes: HashMap<String, String>,
+    pub prefixes: std::collections::BTreeMap<String, String>,
     /// Attribute values available for prefix reconciliation.
-    pub attribute_values: HashMap<String, PrefixStateValue>,
+    pub attribute_values: BTreeMap<String, PrefixStateValue>,
 }
 
 /// Persisted prefix value, including the typed case where a completed create
@@ -2057,6 +2071,12 @@ fn deterministic_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
         }
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
             format!("Placeholder({placeholder})")
+        }
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
         }
     }
 }
@@ -3161,7 +3181,7 @@ impl AnonymousIdStateInfo {
         origin_id: ResolvedResourceId,
         projected_id: Option<ResolvedResourceId>,
         schema: &ValidatedResourceSchema,
-        attributes: &HashMap<String, Value<P>>,
+        attributes: &BTreeMap<String, Value<P>>,
         name_overrides: &HashMap<String, NameOverride>,
     ) -> Option<Self> {
         Self::try_from_comparable_values(
@@ -3272,13 +3292,13 @@ impl StateIdentityValue {
 impl StateRowIdentityValues {
     fn from_state_row<P: crate::resource::StateValueLeaf>(
         schema: &ValidatedResourceSchema,
-        observed_attributes: &HashMap<String, Value<P>>,
+        observed_attributes: &BTreeMap<String, Value<P>>,
         name_overrides: &HashMap<String, NameOverride>,
     ) -> Self {
         let mut canonical = observed_attributes
             .iter()
             .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
-            .collect::<HashMap<_, _>>();
+            .collect::<BTreeMap<_, _>>();
         let identity_attributes = schema
             .identity_paths()
             .iter()
@@ -3798,7 +3818,7 @@ pub struct AnonymousIdBindingStateInfo {
     pub name: String,
     /// Persisted attribute values keyed by DSL attribute name (the state JSON
     /// attribute key). The consuming create-only schema canonicalizes them.
-    pub attribute_values: HashMap<String, crate::resource::SnapshotValue>,
+    pub attribute_values: BTreeMap<String, crate::resource::SnapshotValue>,
 }
 
 fn state_entry_matches_binding_scope(binding: &str, state_name: &str) -> bool {
@@ -4194,12 +4214,12 @@ impl StateCreateOnlyValues {
     /// attributes. Missing or non-comparable attributes remain absent.
     pub fn from_state_attributes<P: crate::resource::StateValueLeaf>(
         schema: &ValidatedResourceSchema,
-        observed_attributes: &HashMap<String, Value<P>>,
+        observed_attributes: &BTreeMap<String, Value<P>>,
     ) -> Self {
         let mut canonical = observed_attributes
             .iter()
             .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
-            .collect::<HashMap<_, _>>();
+            .collect::<BTreeMap<_, _>>();
         crate::value::canonicalize_snapshot_attribute_map_with_schema(
             &mut canonical,
             schema.as_schema(),
