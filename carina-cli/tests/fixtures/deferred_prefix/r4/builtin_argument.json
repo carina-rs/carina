@@ -31,7 +31,7 @@
     "child/arguments.crn": [],
     "child/main.crn": [
       {
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated",
         "range": {
           "end": {
             "character": 29,

@@ -36,7 +36,7 @@
     "mod_a/mod_b/arguments.crn": [],
     "mod_a/mod_b/main.crn": [
       {
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'root.local.identifier' and 'src.identifier', which is known only after apply",
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated",
         "range": {
           "end": {
             "character": 22,

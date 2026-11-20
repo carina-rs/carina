@@ -2,11 +2,25 @@
   "m1a_empty": {
     "backend.crn": [],
     "child/arguments.crn": [],
-    "child/main.crn": [],
+    "child/main.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 41,
+            "line": 0
+          },
+          "start": {
+            "character": 21,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+      }
+    ],
     "lets.crn": [],
     "main.crn": [
       {
-        "message": "mock.test.resource.<pending>: 'name_prefix' cannot be empty",
         "range": {
           "end": {
             "character": 17,
@@ -17,7 +31,8 @@
             "line": 1
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": "mock.test.resource.<pending>: 'name_prefix' cannot be empty"
       }
     ],
     "providers.crn": []
@@ -25,11 +40,25 @@
   "m1a2_conflict": {
     "backend.crn": [],
     "child/arguments.crn": [],
-    "child/main.crn": [],
+    "child/main.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 53,
+            "line": 0
+          },
+          "start": {
+            "character": 33,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+      }
+    ],
     "lets.crn": [],
     "main.crn": [
       {
-        "message": "mock.test.resource.<pending>: cannot specify both 'name_prefix' and 'name'",
         "range": {
           "end": {
             "character": 19,
@@ -40,7 +69,8 @@
             "line": 1
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": "mock.test.resource.<pending>: cannot specify both 'name_prefix' and 'name'"
       }
     ],
     "providers.crn": []
@@ -48,11 +78,25 @@
   "m1b_secret": {
     "backend.crn": [],
     "child/arguments.crn": [],
-    "child/main.crn": [],
+    "child/main.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 41,
+            "line": 0
+          },
+          "start": {
+            "character": 21,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+      }
+    ],
     "lets.crn": [],
     "main.crn": [
       {
-        "message": "mock.test.resource.<pending>: Required attribute 'name' is missing",
         "range": {
           "end": {
             "character": 26,
@@ -63,10 +107,10 @@
             "line": 1
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": "mock.test.resource.<pending>: Required attribute 'name' is missing"
       },
       {
-        "message": "mock.test.resource.<pending>: Unknown attribute 'name_prefix'",
         "range": {
           "end": {
             "character": 26,
@@ -77,7 +121,8 @@
             "line": 1
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": "mock.test.resource.<pending>: Unknown attribute 'name_prefix'"
       }
     ],
     "providers.crn": []
@@ -85,10 +130,24 @@
   "m1c_parse": {
     "backend.crn": [],
     "child/arguments.crn": [],
-    "child/main.crn": [],
+    "child/main.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 41,
+            "line": 0
+          },
+          "start": {
+            "character": 21,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+      }
+    ],
     "lets.crn": [
       {
-        "message": " --> 1:5\n  |\n1 | let = \n  |     ^---\n  |\n  = expected discard_pattern or identifier",
         "range": {
           "end": {
             "character": 5,
@@ -99,7 +158,8 @@
             "line": 0
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": " --> 1:5\n  |\n1 | let = \n  |     ^---\n  |\n  = expected discard_pattern or identifier"
       }
     ],
     "main.crn": [],
@@ -111,7 +171,6 @@
     "child/arguments.crn": [],
     "child/main.crn": [
       {
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
         "range": {
           "end": {
             "character": 41,
@@ -122,7 +181,8 @@
             "line": 0
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
       }
     ],
     "lets.crn": [],
@@ -136,7 +196,6 @@
     "child/arguments.crn": [],
     "child/main.crn": [
       {
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
         "range": {
           "end": {
             "character": 41,
@@ -147,12 +206,12 @@
             "line": 0
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
       }
     ],
     "lets.crn": [
       {
-        "message": "upstream_state 'net': source './upstream' does not exist",
         "range": {
           "end": {
             "character": 48,
@@ -163,7 +222,8 @@
             "line": 1
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": "upstream_state 'net': source './upstream' does not exist"
       }
     ],
     "main.crn": [],
@@ -174,7 +234,6 @@
     "child/arguments.crn": [],
     "child/main.crn": [
       {
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
         "range": {
           "end": {
             "character": 41,
@@ -185,13 +244,13 @@
             "line": 0
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
       }
     ],
     "lets.crn": [],
     "main.crn": [
       {
-        "message": "upstream_state `net` does not export `missing`.",
         "range": {
           "end": {
             "character": 39,
@@ -202,7 +261,8 @@
             "line": 2
           }
         },
-        "severity": 2
+        "severity": 2,
+        "message": "upstream_state `net` does not export `missing`."
       }
     ],
     "providers.crn": [],
@@ -219,7 +279,22 @@
     "envs/b/main.crn": [],
     "envs/b/providers.crn": [],
     "modules/app/arguments.crn": [],
-    "modules/app/main.crn": []
+    "modules/app/main.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 41,
+            "line": 0
+          },
+          "start": {
+            "character": 21,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+      }
+    ]
   },
   "m2_ancestor_provider": {
     "backend.crn": [],
@@ -233,15 +308,8 @@
     "envs/b/providers.crn": [],
     "main.crn": [],
     "modules/app/arguments.crn": [],
-    "modules/app/main.crn": [],
-    "providers.crn": []
-  },
-  "m3_invalid_attribute": {
-    "backend.crn": [],
-    "lets.crn": [],
-    "main.crn": [
+    "modules/app/main.crn": [
       {
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.id', which is not resolved when names are generated",
         "range": {
           "end": {
             "character": 41,
@@ -252,10 +320,31 @@
             "line": 0
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+      }
+    ],
+    "providers.crn": []
+  },
+  "m3_invalid_attribute": {
+    "backend.crn": [],
+    "lets.crn": [],
+    "main.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 41,
+            "line": 0
+          },
+          "start": {
+            "character": 21,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.id', which is not resolved when names are generated"
       },
       {
-        "message": "Unknown attribute 'id' on 'src' (type 'test.resource')",
         "range": {
           "end": {
             "character": 41,
@@ -266,7 +355,8 @@
             "line": 0
           }
         },
-        "severity": 2
+        "severity": 2,
+        "message": "Unknown attribute 'id' on 'src' (type 'test.resource')"
       }
     ],
     "providers.crn": []
@@ -276,7 +366,6 @@
     "lets.crn": [],
     "main.crn": [
       {
-        "message": "Undefined resource: 'nosuch'. Define it with 'let nosuch = aws...'",
         "range": {
           "end": {
             "character": 52,
@@ -287,10 +376,10 @@
             "line": 0
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": "Undefined resource: 'nosuch'. Define it with 'let nosuch = aws...'"
       },
       {
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'nosuch.identifier', which is not resolved when names are generated",
         "range": {
           "end": {
             "character": 52,
@@ -301,7 +390,8 @@
             "line": 0
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'nosuch.identifier', which is not resolved when names are generated"
       }
     ],
     "providers.crn": []
@@ -309,155 +399,8 @@
   "m4_unimported_child": {
     "backend.crn": [],
     "child/arguments.crn": [],
-    "child/main.crn": [],
-    "lets.crn": [],
-    "main.crn": [],
-    "providers.crn": []
-  },
-  "m4_bad_argument_type": {
-    "backend.crn": [],
-    "child/arguments.crn": [],
-    "child/main.crn": [],
-    "lets.crn": [],
-    "main.crn": [
-      {
-        "message": "module call 'c (anonymous call)': argument 'prefix': expected String, got int (1)",
-        "range": {
-          "end": {
-            "character": 14,
-            "line": 1
-          },
-          "start": {
-            "character": 13,
-            "line": 1
-          }
-        },
-        "severity": 1
-      }
-    ],
-    "providers.crn": []
-  },
-  "m4_missing_argument": {
-    "backend.crn": [],
-    "child/arguments.crn": [],
-    "child/main.crn": [],
-    "lets.crn": [],
-    "main.crn": [
-      {
-        "message": "Missing required argument 'prefix' for module 'c'",
-        "range": {
-          "end": {
-            "character": 4,
-            "line": 1
-          },
-          "start": {
-            "character": 0,
-            "line": 1
-          }
-        },
-        "severity": 1
-      }
-    ],
-    "providers.crn": []
-  },
-  "m4_standalone_with_provider": {
-    "backend.crn": [],
-    "child/arguments.crn": [
-      {
-        "message": "arguments blocks are only valid inside module definitions, not in root configurations.",
-        "range": {
-          "end": {
-            "character": 9,
-            "line": 0
-          },
-          "start": {
-            "character": 0,
-            "line": 0
-          }
-        },
-        "severity": 1
-      }
-    ],
-    "child/main.crn": [],
-    "child/providers.crn": [
-      {
-        "message": "provider blocks are not allowed inside modules. Define providers at the root configuration level.",
-        "range": {
-          "end": {
-            "character": 13,
-            "line": 0
-          },
-          "start": {
-            "character": 0,
-            "line": 0
-          }
-        },
-        "severity": 1
-      }
-    ],
-    "main.crn": [],
-    "providers.crn": []
-  },
-  "m4_standalone_with_backend": {
-    "backend.crn": [],
-    "child/arguments.crn": [
-      {
-        "message": "arguments blocks are only valid inside module definitions, not in root configurations.",
-        "range": {
-          "end": {
-            "character": 9,
-            "line": 0
-          },
-          "start": {
-            "character": 0,
-            "line": 0
-          }
-        },
-        "severity": 1
-      }
-    ],
-    "child/backend.crn": [
-      {
-        "message": "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
-        "range": {
-          "end": {
-            "character": 7,
-            "line": 0
-          },
-          "start": {
-            "character": 0,
-            "line": 0
-          }
-        },
-        "severity": 1
-      }
-    ],
-    "child/main.crn": [],
-    "child/providers.crn": [
-      {
-        "message": "provider blocks are not allowed inside modules. Define providers at the root configuration level.",
-        "range": {
-          "end": {
-            "character": 13,
-            "line": 0
-          },
-          "start": {
-            "character": 0,
-            "line": 0
-          }
-        },
-        "severity": 1
-      }
-    ],
-    "main.crn": [],
-    "providers.crn": []
-  },
-  "m1c_upstream_prefix_missing_export": {
-    "backend.crn": [],
-    "child/arguments.crn": [],
     "child/main.crn": [
       {
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.missing', which is not resolved when names are generated",
         "range": {
           "end": {
             "character": 41,
@@ -468,13 +411,234 @@
             "line": 0
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+      }
+    ],
+    "lets.crn": [],
+    "main.crn": [],
+    "providers.crn": []
+  },
+  "m4_bad_argument_type": {
+    "backend.crn": [],
+    "child/arguments.crn": [],
+    "child/main.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 41,
+            "line": 0
+          },
+          "start": {
+            "character": 21,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
       }
     ],
     "lets.crn": [],
     "main.crn": [
       {
-        "message": "module call 'c (anonymous call)': upstream_state `net` does not export `missing`.",
+        "range": {
+          "end": {
+            "character": 14,
+            "line": 1
+          },
+          "start": {
+            "character": 13,
+            "line": 1
+          }
+        },
+        "severity": 1,
+        "message": "module call 'c (anonymous call)': argument 'prefix': expected String, got int (1)"
+      }
+    ],
+    "providers.crn": []
+  },
+  "m4_missing_argument": {
+    "backend.crn": [],
+    "child/arguments.crn": [],
+    "child/main.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 41,
+            "line": 0
+          },
+          "start": {
+            "character": 21,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+      }
+    ],
+    "lets.crn": [],
+    "main.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 4,
+            "line": 1
+          },
+          "start": {
+            "character": 0,
+            "line": 1
+          }
+        },
+        "severity": 1,
+        "message": "Missing required argument 'prefix' for module 'c'"
+      }
+    ],
+    "providers.crn": []
+  },
+  "m4_standalone_with_provider": {
+    "backend.crn": [],
+    "child/arguments.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 9,
+            "line": 0
+          },
+          "start": {
+            "character": 0,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "arguments blocks are only valid inside module definitions, not in root configurations."
+      }
+    ],
+    "child/main.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 41,
+            "line": 0
+          },
+          "start": {
+            "character": 21,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+      }
+    ],
+    "child/providers.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 13,
+            "line": 0
+          },
+          "start": {
+            "character": 0,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "provider blocks are not allowed inside modules. Define providers at the root configuration level."
+      }
+    ],
+    "main.crn": [],
+    "providers.crn": []
+  },
+  "m4_standalone_with_backend": {
+    "backend.crn": [],
+    "child/arguments.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 9,
+            "line": 0
+          },
+          "start": {
+            "character": 0,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "arguments blocks are only valid inside module definitions, not in root configurations."
+      }
+    ],
+    "child/backend.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 7,
+            "line": 0
+          },
+          "start": {
+            "character": 0,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "backend blocks are not allowed inside modules. Define the backend at the root configuration level."
+      }
+    ],
+    "child/main.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 41,
+            "line": 0
+          },
+          "start": {
+            "character": 21,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+      }
+    ],
+    "child/providers.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 13,
+            "line": 0
+          },
+          "start": {
+            "character": 0,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "provider blocks are not allowed inside modules. Define providers at the root configuration level."
+      }
+    ],
+    "main.crn": [],
+    "providers.crn": []
+  },
+  "m1c_upstream_prefix_missing_export": {
+    "backend.crn": [],
+    "child/arguments.crn": [],
+    "child/main.crn": [
+      {
+        "range": {
+          "end": {
+            "character": 41,
+            "line": 0
+          },
+          "start": {
+            "character": 21,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+      }
+    ],
+    "lets.crn": [],
+    "main.crn": [
+      {
         "range": {
           "end": {
             "character": 24,
@@ -485,7 +649,8 @@
             "line": 1
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": "module call 'c (anonymous call)': upstream_state `net` does not export `missing`."
       }
     ],
     "providers.crn": [],
@@ -497,7 +662,6 @@
     "child/arguments.crn": [],
     "child/main.crn": [
       {
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.first', which is not resolved when names are generated",
         "range": {
           "end": {
             "character": 41,
@@ -508,12 +672,12 @@
             "line": 0
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
       }
     ],
     "lets.crn": [
       {
-        "message": "upstream_state 'net': source './upstream' does not exist",
         "range": {
           "end": {
             "character": 48,
@@ -524,7 +688,8 @@
             "line": 0
           }
         },
-        "severity": 1
+        "severity": 1,
+        "message": "upstream_state 'net': source './upstream' does not exist"
       }
     ],
     "main.crn": [],

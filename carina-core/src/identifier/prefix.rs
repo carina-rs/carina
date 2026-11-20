@@ -458,24 +458,73 @@ impl<F: std::fmt::Debug> std::fmt::Debug for PrefixCanonicalized<'_, F> {
             .finish_non_exhaustive()
     }
 }
+/// Live deferred-prefix publication bound to a canonical's suppression authority.
+/// Only that canonical can mint this borrowed view. The publisher cannot replace
+/// its findings with a list from a different analysis.
+///
+/// ```
+/// use carina_core::identifier::{DeferredPrefixPublication, PrefixCanonicalized};
+/// fn publication<'c, 's, F>(canonical: &'c PrefixCanonicalized<'s, F>)
+///     -> DeferredPrefixPublication<'c>
+/// {
+///     canonical.deferred_prefix_publication()
+/// }
+/// ```
+/// A publisher accepting this view cannot receive another source's findings:
+/// ```compile_fail,E0308
+/// use carina_core::identifier::{DeferredPrefixFinding, DeferredPrefixPublication};
+/// fn publish(_: DeferredPrefixPublication<'_>) {}
+/// fn mix_sources(foreign_findings: &[DeferredPrefixFinding]) {
+///     publish(foreign_findings);
+/// }
+/// ```
+/// Suppression authority alone cannot forge a publication view:
+/// ```compile_fail,E0451
+/// use carina_core::identifier::{DeferredPrefixPublication, PrefixObligations};
+/// fn forge(authority: &PrefixObligations) -> DeferredPrefixPublication<'_> {
+///     DeferredPrefixPublication { authority }
+/// }
+/// ```
+/// The publication cannot outlive its canonical analysis:
+/// ```compile_fail,E0515
+/// use carina_core::{identifier::{canonicalize_file_prefixes, DeferredPrefixPublication, SuffixSource}, parser::ParsedFile, schema::SchemaRegistry};
+/// fn leak<'s>(file: ParsedFile, schemas: &'s SchemaRegistry) -> DeferredPrefixPublication<'s> {
+///     let canonical = canonicalize_file_prefixes(file, schemas, SuffixSource::Preview);
+///     canonical.deferred_prefix_publication()
+/// }
+/// ```
+#[derive(Clone, Copy)]
+#[must_use]
+pub struct DeferredPrefixPublication<'c> {
+    authority: &'c PrefixObligations,
+}
+impl DeferredPrefixPublication<'_> {
+    /// Convert the bound authority at a Live boundary, including any formal
+    /// arguments that this standalone analysis has no caller to bind.
+    pub fn findings(self) -> std::vec::IntoIter<DeferredPrefixFinding> {
+        self.authority.clone().into_live_findings().into_iter()
+    }
+}
+
 impl<'s, F> PrefixCanonicalized<'s, F> {
     pub fn rejections(&self) -> &[AttributePrefixRejection] {
         &self.findings.rejections
     }
-    pub fn deferred_findings(&self) -> &[DeferredPrefixFinding] {
+    #[cfg(test)]
+    pub(crate) fn deferred_findings(&self) -> &[DeferredPrefixFinding] {
         &self.findings.companions.deferred
+    }
+    /// Bind publication to the same obligations that authorize prefix admission.
+    pub fn deferred_prefix_publication(&self) -> DeferredPrefixPublication<'_> {
+        DeferredPrefixPublication {
+            authority: &self.findings.companions,
+        }
     }
     pub(crate) fn prefix_findings(&self) -> &PrefixFindings {
         &self.findings
     }
     pub fn schemas(&self) -> &'s SchemaRegistry {
         self.schemas
-    }
-    /// Pending companion values need an expanded configuration for reporting.
-    pub fn has_pending_companions(&self) -> bool {
-        self.visits
-            .iter()
-            .any(|visit| matches!(visit.state, PrefixAdmission::Pending(_)))
     }
 }
 
@@ -2407,7 +2456,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_template_suppression_stays_an_unpublishable_argument_obligation() {
+    fn prefix_module_publication_retains_suppression_and_converts_formals() {
         let schemas = schemas();
         let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let parsed = crate::parser::parse_and_resolve(
@@ -2428,6 +2477,14 @@ mod tests {
         assert_eq!(
             findings[0].diagnostic_message(),
             "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        );
+        assert_eq!(
+            canonical
+                .deferred_prefix_publication()
+                .findings()
+                .collect::<Vec<_>>(),
+            findings,
+            "the publication retains the authority that suppressed Required/Unknown"
         );
     }
 

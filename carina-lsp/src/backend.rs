@@ -1150,6 +1150,10 @@ fn should_reload_for_event(event: &FileEvent) -> bool {
 }
 
 #[cfg(test)]
+#[path = "backend/tests/prefix_publication.rs"]
+mod prefix_publication_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use carina_core::provider::{BoxFuture, ProviderResult};
@@ -1356,48 +1360,27 @@ mod tests {
     }
 
     #[test]
-    fn deferred_prefix_module_publication_uses_authored_files_whichever_file_is_open() {
+    fn deferred_prefix_publication_uses_the_open_directory_context() {
         let sources: serde_json::Value = serde_json::from_str(include_str!(
             "../../carina-cli/tests/fixtures/deferred_prefix/c/inputs.json"
         ))
         .unwrap();
-        for (case, expected) in [
-            (
-                "b3_direct",
-                include_str!("../../carina-cli/tests/fixtures/deferred_prefix/c/b3_direct.json"),
-            ),
-            (
-                "b3_interpolation",
-                include_str!(
-                    "../../carina-cli/tests/fixtures/deferred_prefix/c/b3_interpolation.json"
-                ),
-            ),
-            (
-                "b3_alias",
-                include_str!("../../carina-cli/tests/fixtures/deferred_prefix/c/b3_alias.json"),
-            ),
-            (
-                "b3_nested",
-                include_str!("../../carina-cli/tests/fixtures/deferred_prefix/c/b3_nested.json"),
-            ),
-            (
-                "b1_three_modules",
-                include_str!(
-                    "../../carina-cli/tests/fixtures/deferred_prefix/c/b1_three_modules.json"
-                ),
-            ),
-            (
-                "b2_hop_deferred",
-                include_str!(
-                    "../../carina-cli/tests/fixtures/deferred_prefix/c/b2_hop_deferred.json"
-                ),
-            ),
-            (
-                "b2_hop_literal",
-                include_str!(
-                    "../../carina-cli/tests/fixtures/deferred_prefix/c/b2_hop_literal.json"
-                ),
-            ),
+        let callers: serde_json::Value = serde_json::from_str(include_str!(
+            "../../carina-cli/tests/fixtures/deferred_prefix/c/caller_prefix_publications.json"
+        ))
+        .unwrap();
+        let standalone: serde_json::Value = serde_json::from_str(include_str!(
+            "../../carina-cli/tests/fixtures/deferred_prefix/c/standalone_prefix_publications.json"
+        ))
+        .unwrap();
+        for case in [
+            "b3_direct",
+            "b3_interpolation",
+            "b3_alias",
+            "b3_nested",
+            "b1_three_modules",
+            "b2_hop_deferred",
+            "b2_hop_literal",
         ] {
             let directory = tempfile::tempdir().unwrap();
             let files = sources[case].as_object().unwrap();
@@ -1407,7 +1390,6 @@ mod tests {
                 std::fs::write(path, text.as_str().unwrap()).unwrap();
             }
             let state = builtin_mock_provider_state(directory.path());
-            let expected: serde_json::Value = serde_json::from_str(expected).unwrap();
             let prefix_inventory = |inventory: &serde_json::Value| {
                 inventory
                     .as_object()
@@ -1456,8 +1438,19 @@ mod tests {
                 }).collect::<serde_json::Map<_, _>>();
                 assert_eq!(
                     prefix_inventory(&serde_json::Value::Object(inventory)),
-                    prefix_inventory(&expected["lsp"]),
-                    "{case}, only {file} open"
+                    standalone[case]
+                        .get(
+                            std::path::Path::new(file)
+                                .parent()
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                        )
+                        .unwrap_or(&callers[case])
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    "{case}, only {file} open: own standalone module or unchanged caller context"
                 );
             }
         }

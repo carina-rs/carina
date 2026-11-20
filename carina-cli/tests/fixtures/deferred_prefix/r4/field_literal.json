@@ -12,11 +12,26 @@
   "lsp": {
     "backend.crn": [],
     "child/arguments.crn": [],
-    "child/main.crn": [],
+    "child/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'cfg.prefix', which is not resolved when names are generated",
+        "range": {
+          "end": {
+            "character": 26,
+            "line": 1
+          },
+          "start": {
+            "character": 2,
+            "line": 1
+          }
+        },
+        "severity": 1
+      }
+    ],
     "lets.crn": [],
     "main.crn": [],
     "providers.crn": []
   },
-  "text": "Validating...\n\u2713 2 resources validated successfully.\n  \u2022 mock.test.resource.instance.mock_test_resource_3de7d8b2\n  \u2022 _virtual.instance\n",
+  "text": "Validating...\n✓ 2 resources validated successfully.\n  • mock.test.resource.instance.mock_test_resource_3de7d8b2\n  • _virtual.instance\n",
   "text_exit": 0
 }

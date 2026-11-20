@@ -143,23 +143,23 @@ fn r7b_m4_call_and_placement_errors_keep_their_existing_cli_output() {
 }
 
 #[tokio::test]
-async fn r7b_r6_lsp_inventories_pending_lsp_source_decision() {
+async fn r7b_r6_lsp_inventories_use_standalone_module_prefixes() {
     let sources = r6_sources();
     let expected: Value = serde_json::from_str(include_str!(
-        "../fixtures/deferred_prefix/r7b/r6_head_lsp.json"
+        "../fixtures/deferred_prefix/r7b/r6_standalone_lsp.json"
     ))
     .unwrap();
     for (case, before) in expected.as_object().unwrap() {
         assert_eq!(
             sources_fixture(&sources[case]).editor_inventory().await,
             *before,
-            "LSP output remains pinned to 0b1ce7517: {case}"
+            "standalone module prefixes and unchanged caller output: {case}"
         );
     }
 }
 
 #[tokio::test]
-async fn r7b_m4_literal_caller_stays_clean() {
+async fn r7b_m4_literal_caller_is_clean_module_reports_unbound_argument() {
     let fixture = Fixture::new(
         "let c = use { source = './child' }\nc { prefix = 'app' }\n",
         "",
@@ -176,7 +176,15 @@ async fn r7b_m4_literal_caller_stays_clean() {
             .is_none_or(|errors| errors.as_array().unwrap().is_empty())
     );
     for (file, diagnostics) in fixture.editor_inventory().await.as_object().unwrap() {
-        assert_eq!(*diagnostics, json!([]), "{file}");
+        let expected = if file == "child/main.crn" {
+            json!([{
+                "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated",
+                "range": super::assignment(22), "severity": 1
+            }])
+        } else {
+            json!([])
+        };
+        assert_eq!(*diagnostics, expected, "{file}");
     }
 }
 

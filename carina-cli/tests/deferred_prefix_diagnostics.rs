@@ -121,17 +121,44 @@ impl Fixture {
         let inventory = self.editor_inventory().await;
         for file in &self.files {
             let expected_range = if file == authored { Some(range) } else { None };
-            let expected = match (message, expected_range) {
+            let before = match (message, expected_range) {
                 (Some(message), Some(range)) => {
                     json!([{"message":message, "range":range, "severity":1}])
                 }
                 _ => json!([]),
             };
+            let expected = if file == authored
+                && Path::new(file)
+                    .parent()
+                    .is_some_and(|directory| !directory.as_os_str().is_empty())
+            {
+                self.standalone_editor_findings(file)
+            } else {
+                before.clone()
+            };
+            if before != expected {
+                println!(
+                    "C4461_EXPECTATION_CHANGE={} {}",
+                    std::thread::current().name().unwrap_or("unnamed"),
+                    json!({"file":file,"before":before,"after":expected})
+                );
+            }
             assert_eq!(inventory[file], expected, "{file}");
         }
     }
 
+    fn standalone_editor_findings(&self, file: &str) -> serde_json::Value {
+        let directory = Path::new(file).parent().unwrap().to_str().unwrap();
+        let output = self.cli(&["validate", directory, "--json"]);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        r10::cli_file_inventory(self, &report, file)
+    }
+
     async fn editor_inventory(&self) -> serde_json::Value {
+        self.editor_inventory_for_files(&self.files).await
+    }
+
+    async fn editor_inventory_for_files(&self, files: &[String]) -> serde_json::Value {
         let home = tempfile::tempdir().unwrap();
         let dirs = UserDirs::under(home.path());
         let builder: FactoryBuilder =
@@ -143,7 +170,7 @@ impl Fixture {
         assert!(reload.schemas > 0);
         let states = states.into_inner();
         let mut inventory = serde_json::Map::new();
-        for file in &self.files {
+        for file in files {
             let path = self.root().join(file);
             let document = Document::new_with_path(
                 std::fs::read_to_string(&path).unwrap(),
@@ -302,7 +329,7 @@ async fn assert_module_declaration_findings(
 }
 
 #[tokio::test]
-async fn deferred_prefix_d_module_argument_directory_publication_sites() {
+async fn deferred_prefix_d_caller_and_module_use_their_own_analysis() {
     assert_module_declaration_findings(
         Fixture::new("let sink_module = use { source = './child' }\n\nlet sink = sink_module {\n  prefix = src.identifier\n}\n", SOURCE, true),
         &["'src.identifier'"],
@@ -311,7 +338,7 @@ async fn deferred_prefix_d_module_argument_directory_publication_sites() {
 }
 
 #[tokio::test]
-async fn deferred_prefix_d_two_call_sites_have_distinct_owners() {
+async fn deferred_prefix_d_two_calls_share_one_declaration_finding() {
     assert_module_declaration_findings(
         Fixture::new("let sink_module = use { source = './child' }\n\nlet first = sink_module {\n  prefix = src.identifier\n}\n\nlet second = sink_module {\n  prefix = src.identifier\n}\n", SOURCE, true),
         &["'src.identifier'"],
@@ -320,7 +347,7 @@ async fn deferred_prefix_d_two_call_sites_have_distinct_owners() {
 }
 
 #[tokio::test]
-async fn deferred_prefix_d_caller_alias_is_preserved() {
+async fn deferred_prefix_d_caller_alias_keeps_expanded_validate_dependency() {
     assert_module_declaration_findings(
         Fixture::new("let sink_module = use { source = './child' }\n\nlet sink = sink_module {\n  prefix = p\n}\n", &format!("{SOURCE}let p = src.identifier\n"), true),
         &["'src.identifier'"],
@@ -409,6 +436,27 @@ async fn assert_forwarded_findings(fixture: Fixture, findings: &[(&str, Range, &
             .unwrap()
             .push(json!({"message":message,"range":range,"severity":1}));
     }
+    for file in findings
+        .iter()
+        .map(|(file, _, _)| *file)
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if Path::new(file)
+            .parent()
+            .is_some_and(|directory| !directory.as_os_str().is_empty())
+        {
+            let before = lsp[file].clone();
+            let after = fixture.standalone_editor_findings(file);
+            if before != after {
+                println!(
+                    "C4461_EXPECTATION_CHANGE={} {}",
+                    std::thread::current().name().unwrap_or("unnamed"),
+                    json!({"file":file,"before":before,"after":after})
+                );
+            }
+            lsp.insert(file.into(), after);
+        }
+    }
     let actual = fixture.observation().await;
     assert_eq!(
         actual,
@@ -420,7 +468,7 @@ async fn assert_forwarded_findings(fixture: Fixture, findings: &[(&str, Range, &
 }
 
 #[tokio::test]
-async fn r1_nested_forwarding_owns_root_argument() {
+async fn r1_nested_forwarding_keeps_caller_and_standalone_dependencies() {
     let fixture = nested_fixture(
         "let mod_a = use { source = './mod_a' }\n\nlet a = mod_a {\n  prefix = src.identifier\n}\n",
         "prefix",
@@ -433,7 +481,7 @@ async fn r1_nested_forwarding_owns_root_argument() {
 }
 
 #[tokio::test]
-async fn r1_nested_local_reference_owns_inner_call() {
+async fn r1_nested_local_reference_keeps_caller_and_standalone_dependencies() {
     let fixture = nested_fixture(
         "let mod_a = use { source = './mod_a' }\n\nlet a = mod_a {\n  prefix = src.identifier\n}\n",
         "local.identifier",
@@ -454,7 +502,7 @@ async fn r1_nested_local_reference_owns_inner_call() {
 }
 
 #[tokio::test]
-async fn r1_nested_forwarding_keeps_two_root_instances() {
+async fn r1_nested_forwarding_shares_the_declaration_between_root_instances() {
     let fixture = nested_fixture(
         "let mod_a = use { source = './mod_a' }\n\nlet first = mod_a {\n  prefix = src.identifier\n}\n\nlet second = mod_a {\n  prefix = src.identifier\n}\n",
         "prefix",
@@ -578,7 +626,7 @@ async fn r1_secret_dependencies_do_not_share_alias_origins() {
 }
 
 #[tokio::test]
-async fn r1_callee_alias_retains_argument_owner() {
+async fn r1_callee_alias_keeps_caller_and_standalone_provenance() {
     let fixture=Fixture::new("let sink_module = use { source = './child' }\n\nlet sink = sink_module {\n  prefix = src.identifier\n}\n",SOURCE,true)
         .with_file("child/lets.crn","let forwarded = prefix\n")
         .with_file("child/main.crn","mock.test.resource {\n  name_prefix = forwarded\n}\n");
@@ -642,13 +690,15 @@ async fn assert_awaiting_prefix_keeps_sibling(
         &format!("mock.test.resource {{\n  name_prefix = prefix\n  {sibling}\n}}\n"),
     );
     let prefix_message = "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply";
+    let standalone_message = "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated";
+
     let mut lsp = fixture
         .files
         .iter()
         .map(|file| (file.clone(), json!([])))
         .collect::<serde_json::Map<_, _>>();
     lsp.insert("main.crn".into(),json!([{"message":format!("mock.test.resource.<pending>: {message}"),"severity":1,"range":Range::new(Position::new(1,11),Position::new(1,44))}]));
-    lsp.insert("child/main.crn".into(),json!([{"message":prefix_message,"severity":1,"range":assignment(22)},{"message":message,"severity":severity,"range":Range::new(Position::new(2,2),Position::new(2,end))}]));
+    lsp.insert("child/main.crn".into(),json!([{"message":standalone_message,"severity":1,"range":assignment(22)},{"message":message,"severity":severity,"range":Range::new(Position::new(2,2),Position::new(2,end))}]));
     let actual = fixture.observation().await;
     assert_eq!(
         actual,
@@ -693,6 +743,8 @@ async fn r1_awaiting_prefix_keeps_both_siblings() {
         "Type mismatch: expected String, got Int",
     ];
     let prefix_message = "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply";
+    let standalone_message = "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated";
+
     let mut lsp = fixture
         .files
         .iter()
@@ -700,7 +752,7 @@ async fn r1_awaiting_prefix_keeps_both_siblings() {
         .collect::<serde_json::Map<_, _>>();
     lsp.insert("main.crn".into(),json!(messages.iter().map(|message|json!({"message":format!("mock.test.resource.<pending>: {message}"),"severity":1,"range":Range::new(Position::new(1,11),Position::new(1,44))})).collect::<Vec<_>>()));
     lsp.insert("child/main.crn".into(),json!([
-        {"message":prefix_message,"severity":1,"range":assignment(22)},
+        {"message":standalone_message,"severity":1,"range":assignment(22)},
         {"message":messages[0],"severity":1,"range":Range::new(Position::new(2,2),Position::new(2,11))},
         {"message":messages[1],"severity":2,"range":Range::new(Position::new(3,2),Position::new(3,9))}
     ]));
@@ -1052,6 +1104,18 @@ async fn assert_wording_fixture(fixture: Fixture, case: &str, dependencies: &str
             },
         );
     }
+    if authored != "main.crn" {
+        let before = inventory[authored].clone();
+        let after = fixture.standalone_editor_findings(authored);
+        if before != after {
+            println!(
+                "C4461_EXPECTATION_CHANGE={} {}",
+                std::thread::current().name().unwrap_or("unnamed"),
+                json!({"file":authored,"before":before,"after":after})
+            );
+        }
+        inventory.insert(authored.into(), after);
+    }
     if matches!(case, "loop_coalesce" | "loop_coalesce_reversed") {
         // Main's existing style hint also appears on the map type constructor.
         // Keep the entire per-file inventory while changing only the prefix finding.
@@ -1152,7 +1216,7 @@ async fn w_loop_over_upstream_export_inherits_kind() {
 }
 
 #[tokio::test]
-async fn w_module_argument_keeps_caller_kind_and_owner() {
+async fn w_module_argument_separates_caller_kind_from_standalone_formal() {
     w_assert(
         "caller_module",
         "'net.first', which is not resolved when names are generated",
@@ -1253,7 +1317,7 @@ async fn r4_module_and_upstream_share_one_clause() {
     .await;
 }
 
-macro_rules! r4_main_case {
+macro_rules! r4_captured_case {
     ($test:ident, $case:literal) => {
         #[tokio::test]
         async fn $test() {
@@ -1266,26 +1330,44 @@ macro_rules! r4_main_case {
             assert_eq!(
                 r4_fixture($case).observation().await,
                 expected,
-                "main-captured text, JSON locations/counts and diagnostics in every file"
+                "captured validate text, JSON locations/counts and each standalone/caller LSP inventory"
             );
         }
     };
 }
-r4_main_case!(r4_field_deferred_matches_main, "field_deferred");
-r4_main_case!(r4_field_literal_matches_main, "field_literal");
-r4_main_case!(r4_index_argument_matches_main, "index_argument");
-r4_main_case!(r4_builtin_argument_matches_main, "builtin_argument");
-r4_main_case!(
-    r4_user_function_argument_matches_main,
+r4_captured_case!(
+    r4_field_deferred_uses_standalone_module_analysis,
+    "field_deferred"
+);
+r4_captured_case!(
+    r4_field_literal_uses_standalone_module_analysis,
+    "field_literal"
+);
+r4_captured_case!(
+    r4_index_argument_uses_standalone_module_analysis,
+    "index_argument"
+);
+r4_captured_case!(
+    r4_builtin_argument_uses_standalone_module_analysis,
+    "builtin_argument"
+);
+r4_captured_case!(
+    r4_user_function_argument_uses_standalone_module_analysis,
     "user_function_argument"
 );
-r4_main_case!(r4_alias_field_argument_matches_main, "alias_field_argument");
-r4_main_case!(r4_forwarded_field_matches_main, "forwarded_field");
-r4_main_case!(
+r4_captured_case!(
+    r4_alias_field_argument_uses_standalone_module_analysis,
+    "alias_field_argument"
+);
+r4_captured_case!(
+    r4_forwarded_field_uses_standalone_module_analysis,
+    "forwarded_field"
+);
+r4_captured_case!(
     r4_loop_argument_literal_matches_main,
     "loop_argument_literal"
 );
-r4_main_case!(
+r4_captured_case!(
     r4_loop_argument_deferred_matches_main,
     "loop_argument_deferred"
 );
@@ -1309,7 +1391,7 @@ async fn r4_authored_resource_expression_uses_name_generation_clause() {
     .await;
 }
 
-r4_main_case!(r4_known_resource_literal_matches_main, "literal_attr");
+r4_captured_case!(r4_known_resource_literal_matches_main, "literal_attr");
 
 #[tokio::test]
 async fn r4_distinct_dependency_sets_at_one_call_stay_distinct() {
@@ -1331,7 +1413,7 @@ async fn r4_caller_literal_input_uses_name_generation_clause() {
     .await;
 }
 
-r4_main_case!(
+r4_captured_case!(
     r4_known_forward_literal_matches_main,
     "forward_literal_attr"
 );
@@ -1425,11 +1507,17 @@ option_c_case!(
 option_c_case!(option_c_let_alias_is_declaration_owned, "b3_alias");
 option_c_case!(option_c_nested_forwarding_is_declaration_owned, "b3_nested");
 option_c_case!(
-    option_c_three_modules_agree_in_every_file,
+    option_c_three_modules_keep_caller_and_standalone_findings,
     "b1_three_modules"
 );
-option_c_case!(option_c_resource_hop_deferred_agrees, "b2_hop_deferred");
-option_c_case!(option_c_resource_hop_literal_agrees, "b2_hop_literal");
+option_c_case!(
+    option_c_resource_hop_deferred_uses_standalone_module_analysis,
+    "b2_hop_deferred"
+);
+option_c_case!(
+    option_c_resource_hop_literal_uses_standalone_module_analysis,
+    "b2_hop_literal"
+);
 
 #[tokio::test]
 async fn option_c_field_access_is_declaration_owned() {
@@ -1461,3 +1549,6 @@ async fn option_c_parenthesized_argument_is_declaration_owned() {
 
 #[path = "deferred_prefix_diagnostics/r7b.rs"]
 mod r7b;
+
+#[path = "deferred_prefix_diagnostics/r10.rs"]
+mod r10;

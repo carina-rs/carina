@@ -955,94 +955,17 @@ impl std::ops::Deref for DiagnosticRun<'_> {
 }
 
 impl DiagnosticRun<'_> {
-    /// Prefix values are judged in the loaded configuration, even when only a
-    /// module buffer is open. This is the ordinary expanded graph, with no
-    /// argument walk, call-owned finding, or per-call publication policy.
-    fn configuration_prefixes(
-        &self,
-        doc: &Document,
-    ) -> Option<PrefixCanonicalized<'_, carina_core::parser::ModuleResolvedParsedFile>> {
-        let scope = self.directory_providers.as_ref()?;
-        if doc.source_file().parent().map(PathIdentity::new)
-            == Some(PathIdentity::new(&scope.directory))
-        {
-            return None;
-        }
-        let base = carina_core::paths::ResolvedPath::new(&scope.directory).ok()?;
-        let current = carina_core::paths::ResolvedPath::new(doc.source_file()).ok()?;
-        let overrides = carina_core::config_loader::SourceOverrides::try_from_entries(
-            std::iter::once((current, doc.text())).chain(
-                self.open_sources
-                    .iter()
-                    .filter(|(path, _)| path != doc.source_file())
-                    .filter_map(|(path, text)| {
-                        carina_core::paths::ResolvedPath::new(path)
-                            .ok()
-                            .map(|path| (path, text.to_string()))
-                    }),
-            ),
-        )
-        .ok()?
-        .tracking_reads();
-        let mut merged = self.parse_merged_with_buffer(&base, &overrides).ok()?;
-        let directory = Arc::clone(&merged.directory);
-        let tree =
-            carina_core::parser::AnalysisTree::try_from_file(directory.parsed.parsed()).ok()?;
-        let (exports, _) = self
-            .resolve_diagnostic_upstream_exports(&base, &tree, &overrides)
-            .ok()?;
-        let mut validation =
-            carina_core::validation::ConversionValidation::for_directory(&directory.parsed);
-        self.resolve_merged_modules(
-            &mut merged,
-            &tree,
-            &base,
-            &exports,
-            &overrides,
-            &mut validation,
-        );
-        let checks::MergedModuleResolution::Expanded { graph } = merged.module_resolution else {
-            return None;
-        };
-        let authored_directory = doc.source_file().parent().map(PathIdentity::new);
-        if !graph
-            .parser_binding_metadata
-            .syntax()
-            .expressions()
-            .roots()
-            .iter()
-            .any(|expression| {
-                expression
-                    .location()
-                    .file()
-                    .path()
-                    .parent()
-                    .map(PathIdentity::new)
-                    == authored_directory
-            })
-        {
-            return None;
-        }
-        // Keep analyzed texts for authored ranges and dirty-buffer protection.
-        *self.analysis_sources.borrow_mut() = overrides;
-        Some(canonicalize_file_prefixes(
-            *graph,
-            &self.schemas,
-            SuffixSource::Preview,
-        ))
-    }
-
     /// One publication seam for deferred prefixes: use the authored key only,
     /// never a module-call projection. Non-prefix findings retain their routes.
     fn publish_deferred_prefixes(
         &self,
         doc: &Document,
-        findings: &[carina_core::identifier::DeferredPrefixFinding],
+        publication: carina_core::identifier::DeferredPrefixPublication<'_>,
         sources: &carina_core::config_loader::SourceOverrides,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
         let configuration_sources = self.analysis_sources.borrow();
-        for finding in findings {
+        for finding in publication.findings() {
             let Some(location) = finding.location() else {
                 continue;
             };
@@ -3022,25 +2945,14 @@ impl DiagnosticRun<'_> {
             if let Some(configuration) = &expanded_configuration {
                 publish_prefix_rejections(doc, configuration, &mut diagnostics);
             }
-            let configuration_prefixes = if pre_expansion_configuration.has_pending_companions()
-                || expanded_configuration
-                    .as_ref()
-                    .is_some_and(|configuration| configuration.has_pending_companions())
-            {
-                self.configuration_prefixes(doc)
-            } else {
-                None
-            };
-            let deferred = configuration_prefixes
+            // Every document publishes from its own directory analysis. This
+            // includes that directory's imported children when expansion succeeds;
+            // a module buffer never selects an outer caller graph for prefixes.
+            let prefix_publication = expanded_configuration
                 .as_ref()
-                .map(|configuration| configuration.deferred_findings())
-                .or_else(|| {
-                    expanded_configuration
-                        .as_ref()
-                        .map(|configuration| configuration.deferred_findings())
-                })
-                .unwrap_or_else(|| pre_expansion_configuration.deferred_findings());
-            self.publish_deferred_prefixes(doc, deferred, &overrides, &mut diagnostics);
+                .map(|configuration| configuration.deferred_prefix_publication())
+                .unwrap_or_else(|| pre_expansion_configuration.deferred_prefix_publication());
+            self.publish_deferred_prefixes(doc, prefix_publication, &overrides, &mut diagnostics);
             let resource_diagnostics_start = diagnostics.len();
             if let Some(authored_tree) = &authored_tree {
                 for resource in authored_tree

@@ -11,8 +11,8 @@ pub use diagnostics::{
 };
 pub use prefix::{
     AwaitingPrefixArguments, CanonicalAnalysisTree, CanonicalAttributeValues, CanonicalResource,
-    MatchedResourceProjection, ModuleResolvedFileRead, PrefixAdmitted, PrefixCanonicalized,
-    PrefixFileRead, PrefixObligations, ResourceProjection, SuffixSource,
+    DeferredPrefixPublication, MatchedResourceProjection, ModuleResolvedFileRead, PrefixAdmitted,
+    PrefixCanonicalized, PrefixFileRead, PrefixObligations, ResourceProjection, SuffixSource,
     canonicalize_file_prefixes,
 };
 pub(crate) use prefix::{CanonicalSchemaInputs, CanonicalSchemaResource};

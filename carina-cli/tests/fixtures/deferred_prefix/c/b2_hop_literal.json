@@ -1,8 +1,5 @@
 {
-  "text": "Validating...\n\u2713 4 resources validated successfully.\n  \u2022 mock.test.resource.src\n  \u2022 mock.test.resource.instance.r\n  \u2022 mock.test.resource.instance.mock_test_resource_5f919d16\n  \u2022 _virtual.instance\n\u26a0 Unused let binding 'src'. Consider using an anonymous resource instead.\n",
-  "text_exit": 0,
   "json": {
-    "status": "ok",
     "resource_count": 4,
     "resources": [
       "mock.test.resource.src",
@@ -10,24 +7,25 @@
       "mock.test.resource.instance.mock_test_resource_5f919d16",
       "_virtual.instance"
     ],
+    "status": "ok",
     "warnings": [
       {
-        "message": "Unused let binding 'src'",
-        "severity": "warning",
         "code": null,
         "location": {
           "file": "lets.crn",
           "range": {
-            "start": {
-              "line": 1,
-              "column": 5
-            },
             "end": {
-              "line": 1,
-              "column": 8
+              "column": 8,
+              "line": 1
+            },
+            "start": {
+              "column": 5,
+              "line": 1
             }
           }
         },
+        "message": "Unused let binding 'src'",
+        "severity": "warning",
         "type": "unused_binding"
       }
     ]
@@ -37,7 +35,22 @@
   "lsp": {
     "backend.crn": [],
     "child/arguments.crn": [],
-    "child/main.crn": [],
+    "child/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'r.name', which is not resolved when names are generated",
+        "range": {
+          "end": {
+            "character": 22,
+            "line": 4
+          },
+          "start": {
+            "character": 2,
+            "line": 4
+          }
+        },
+        "severity": 1
+      }
+    ],
     "lets.crn": [
       {
         "message": "Unused let binding 'src'. Consider using an anonymous resource instead.",
@@ -56,5 +69,7 @@
     ],
     "main.crn": [],
     "providers.crn": []
-  }
+  },
+  "text": "Validating...\n✓ 4 resources validated successfully.\n  • mock.test.resource.src\n  • mock.test.resource.instance.r\n  • mock.test.resource.instance.mock_test_resource_5f919d16\n  • _virtual.instance\n⚠ Unused let binding 'src'. Consider using an anonymous resource instead.\n",
+  "text_exit": 0
 }
