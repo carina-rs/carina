@@ -7207,6 +7207,92 @@ fn previous_secret_hash_grafted_leaf_under_opaque_ancestor_keeps_whole_hash() {
 }
 
 #[test]
+fn previous_secret_hash_opaque_ancestor_with_desired_secret_sibling_is_protected() {
+    use carina_core::schema::{LeafPath, LeafPathSegment};
+
+    let public = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let protected = |value: Value| Value::Deferred(DeferredValue::Secret(Box::new(value).into()));
+    let map = |retained, other, changing: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("retained".into(), retained),
+            ("other".into(), other),
+            ("changing".into(), public(changing)),
+        ])))
+    };
+    let marker = "fixture-secret-4570";
+    for nested in [false, true] {
+        let wrap = |value| {
+            if nested {
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "nested".into(),
+                    value,
+                )])))
+            } else {
+                value
+            }
+        };
+        let previous_tags = PersistedValue::encode_desired_value(
+            &wrap(protected(map(
+                public(marker),
+                public("old-other"),
+                "before",
+            ))),
+            None,
+        )
+        .unwrap();
+        let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+            .unwrap()
+            .with_attribute("tags", previous_tags.as_json().clone());
+        let resource = resolved(
+            &Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+                "tags",
+                wrap(map(public("public"), protected(public(marker)), "after")),
+            ),
+        );
+        let state: State = State::existing(
+            resource.id.clone(),
+            HashMap::from([(
+                "tags".into(),
+                wrap(map(public(marker), public(marker), "after")),
+            )]),
+        )
+        .with_identifier("sink-id");
+        let mut grafted = Vec::new();
+        if nested {
+            grafted.push(LeafPathSegment::MapKey("nested".into()));
+        }
+        grafted.push(LeafPathSegment::MapKey("retained".into()));
+        let request = AcceptedRequest::update_with_grafted_leaves_for_test(
+            &[("tags", vec![LeafPath::from_segments(grafted)])],
+            &[],
+        );
+        let final_desired =
+            FinalDesiredValues::for_test([(resource.id.clone(), resource.attributes.clone())]);
+        for witness in [None, Some(&final_desired)] {
+            let row = ResourceState::from_provider_state_with_final_desired(
+                &resource,
+                &state,
+                Some(&existing),
+                None,
+                RowBasis::Applied(&request),
+                witness,
+                None,
+                &exact_comparison_context(),
+            )
+            .expect("an accepted update with masked descendants must remain writable");
+            assert!(
+                row.persisted_attributes().unwrap().encoded_value("tags") == Some(&previous_tags),
+                "an opaque ancestor must keep its whole hash when a descendant is already masked"
+            );
+            assert!(
+                !serde_json::to_string(&row).unwrap().contains(marker),
+                "written row must not contain secret plaintext"
+            );
+        }
+    }
+}
+
+#[test]
 fn previous_secret_hash_wholly_ignored_key_is_protected() {
     let public = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
     let previous = PersistedValue::encode_desired_value(
@@ -7234,25 +7320,29 @@ fn previous_secret_hash_wholly_ignored_key_is_protected() {
     .with_identifier("sink-id");
     // A wholly ignored key is absent from the accepted patch.
     let request = AcceptedRequest::update_for_test(&["other"], &[]);
-    let row = ResourceState::from_provider_state_with_final_desired(
-        &resource,
-        &state,
-        Some(&existing),
-        None,
-        RowBasis::Applied(&request),
-        None,
-        None,
-        &exact_comparison_context(),
-    )
-    .unwrap();
-    let attributes = row.persisted_attributes().unwrap();
-    assert!(attributes.get("computed").unwrap().secret_hash().is_some());
-    assert!(
-        !serde_json::to_string(&row)
-            .unwrap()
-            .contains("fixture-secret-4570"),
-        "unsent key must not expose its previous secret"
-    );
+    let final_desired =
+        FinalDesiredValues::for_test([(resource.id.clone(), resource.attributes.clone())]);
+    for witness in [None, Some(&final_desired)] {
+        let row = ResourceState::from_provider_state_with_final_desired(
+            &resource,
+            &state,
+            Some(&existing),
+            None,
+            RowBasis::Applied(&request),
+            witness,
+            None,
+            &exact_comparison_context(),
+        )
+        .unwrap();
+        let attributes = row.persisted_attributes().unwrap();
+        assert!(attributes.get("computed").unwrap().secret_hash().is_some());
+        assert!(
+            !serde_json::to_string(&row)
+                .unwrap()
+                .contains("fixture-secret-4570"),
+            "unsent key must not expose its previous secret"
+        );
+    }
 }
 
 #[test]
@@ -7841,7 +7931,7 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
 }
 
 #[test]
-fn deposed_encoders_return_unavailable_secret_errors() {
+fn deposed_encoders_keep_opaque_previous_hash_above_masked_subtree() {
     use carina_core::resource::{ConcreteValue, Resource, SnapshotValue};
     let resource = resolved(&Resource::with_provider(
         "mock",
@@ -7878,13 +7968,11 @@ fn deposed_encoders_return_unavailable_secret_errors() {
             Some(&previous),
         ),
     ] {
-        let error = result.expect_err("unavailable material must be returned, not panic");
-        assert!(matches!(error, ResourceStateEncodingError::Serialization(
-            SerializationError::UnavailableSecret(ref error)
-        ) if error.path() == "(secret)"));
-        for rendered in [error.to_string(), format!("{error:?}")] {
-            assert!(!rendered.contains("nested"), "{rendered}");
-        }
+        let stored = result.expect("an opaque previous hash must cover masked descendants");
+        assert!(
+            stored.as_persisted().get("password") == previous.get("password"),
+            "both deposed writeback paths must retain the previous whole hash"
+        );
     }
 }
 

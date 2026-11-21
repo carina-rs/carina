@@ -156,6 +156,56 @@ fn ignored_map_leaf_beside_desired_secret_keeps_previous_secret_hash() {
 }
 
 #[test]
+fn ignored_map_leaf_under_opaque_hash_beside_desired_secret_remains_writable() {
+    let scenario = Scenario::new(
+        "test.resource",
+        "name = 'sink'\ntags = secret({ retained = '__MARKER__' changing = 'before' })",
+    );
+    scenario.run(&["init", "."]);
+    scenario.run(&["apply", "--auto-approve", "--parallelism=1", "."]);
+    let before = scenario.attributes();
+    assert!(
+        before["tags"][PERSISTED_SECRET_KEY].is_string(),
+        "the authored secret map must start as one opaque hash"
+    );
+
+    scenario.write(
+        "name = 'sink'\ntags = { retained = 'public' other = secret('__MARKER__') changing = 'after' }\n\
+         directives { ignore_changes = [tags[\"retained\"]] }",
+    );
+    let plan = scenario.run(&["plan", "."]);
+    assert!(
+        plan.contains("Plan: 0 to add, 1 to change, 0 to destroy."),
+        "the sibling change must produce exactly one Update:\n{plan}"
+    );
+    scenario.run(&["apply", "--auto-approve", "--parallelism=1", "."]);
+    let after = scenario.attributes();
+    assert!(
+        after["tags"] == before["tags"],
+        "writeback must retain the opaque hash when a descendant is already masked"
+    );
+
+    let provider: Value = serde_json::from_slice(
+        &fs::read(scenario.project.path().join("provider-state.json")).unwrap(),
+    )
+    .unwrap();
+    let provider_tags = &provider["states"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|row| row["name"] == "sink")
+        .expect("provider sink row")["tags"];
+    assert!(
+        provider_tags["changing"] == "after",
+        "the provider must have accepted the sibling update"
+    );
+    assert!(
+        provider_tags["retained"].as_str() == Some(scenario.marker.as_str()),
+        "the accepted update must graft the ignored observed leaf"
+    );
+}
+
+#[test]
 fn ignored_nested_struct_leaf_in_sent_attribute_keeps_previous_secret_hash() {
     assert_ignored_leaf_protected(
         "budgets.Budget",
@@ -218,10 +268,6 @@ fn ignored_list_subtree_without_alignment_keeps_whole_hash_on_next_plan() {
         assert!(
             plan.contains("storage_class: 'visible-member'") && plan.contains("1 to change"),
             "the new public list must remain visible after removing the ignore:\n{plan}"
-        );
-        eprintln!(
-            "refresh={refresh}: previous whole unit shown as secret: {}",
-            plan.contains("(secret)")
         );
     }
 }
