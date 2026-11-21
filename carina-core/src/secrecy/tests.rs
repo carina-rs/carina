@@ -50,6 +50,948 @@ fn attribute(report: &SecrecyReport, binding: &str, name: &str) -> Evidence {
         .clone()
 }
 
+const WAIT_ALIAS_TARGET: &str = r#"
+let seed = mock.test.Resource { name = "visible" comment = secret("canary") }
+"#;
+const WAIT_ALIAS_CONSUMER: &str = r#"
+let ready = wait seed { until = seed.enabled == true }
+let sink = mock.test.Resource {
+  name = "sink"
+  tags = { private = ready.comment public = ready.name }
+}
+"#;
+
+fn assert_wait_alias_evidence(report: &SecrecyReport) {
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(
+        !report.is_pending(),
+        "wait alias left the file pending: {report:?}"
+    );
+    assert!(report.admitted().is_some(), "{report:?}");
+    assert_eq!(report.rows.len(), 2, "waits must not add managed rows");
+    assert_eq!(
+        attribute(report, "sink", "tags"),
+        Evidence::Map(
+            BTreeMap::from([
+                ("private".into(), Evidence::Leaf(Secrecy::Secret)),
+                ("public".into(), Evidence::Leaf(Secrecy::Public)),
+            ])
+            .into()
+        )
+    );
+}
+
+#[test]
+fn wait_alias_preserves_target_secrecy_in_single_file() {
+    assert_wait_alias_evidence(&report(&format!(
+        "{WAIT_ALIAS_TARGET}{WAIT_ALIAS_CONSUMER}"
+    )));
+}
+
+#[test]
+fn wait_alias_preserves_target_secrecy_across_sibling_files() {
+    let directory = tempfile::tempdir().unwrap();
+    for (name, source) in [
+        ("providers.crn", "provider mock {}\n"),
+        ("main.crn", WAIT_ALIAS_TARGET),
+        ("wait.crn", WAIT_ALIAS_CONSUMER),
+    ] {
+        std::fs::write(directory.path().join(name), source).unwrap();
+    }
+    let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let file = crate::config_loader::parse_directory(&path, &context()).unwrap();
+    assert_wait_alias_evidence(&secrecy_report(file.parsed(), &schemas()));
+}
+
+#[test]
+fn wait_alias_with_unresolved_target_stays_pending() {
+    let report = report(
+        r#"
+let ready = wait missing { until = missing.enabled == true }
+let sink = mock.test.Resource { name = "sink" comment = ready.comment }
+"#,
+    );
+    assert!(
+        report.is_pending(),
+        "unresolved wait target was admitted: {report:?}"
+    );
+    assert!(report.admitted().is_none(), "{report:?}");
+}
+
+#[test]
+fn wait_alias_target_attribute_reports_its_own_mixed_finding() {
+    let report = report(
+        r#"
+let seed = mock.test.Resource { name = "seed" comment = secret("canary") ?? "public" }
+let ready = wait seed { until = seed.comment == "ready" }
+let sink = mock.test.Resource { name = "sink" comment = ready.name }
+"#,
+    );
+    assert_eq!(report.findings().len(), 1, "{report:?}");
+    assert_eq!(
+        report.findings()[0].message(),
+        "Attribute 'comment': ?? alternatives mix secret and public values; all alternatives must be secret or all public."
+    );
+    assert!(report.admitted().is_none(), "{report:?}");
+}
+
+#[test]
+fn wait_alias_secret_attribute_still_reports_mixed_coalesce_with_public_until() {
+    let report = report(&format!(
+        "{WAIT_ALIAS_TARGET}\n\
+         let ready = wait seed {{ until = seed.enabled == true }}\n\
+         let sink = mock.test.Resource {{ name = 'sink' comment = ready.comment ?? 'public' }}"
+    ));
+    assert_eq!(report.findings().len(), 1, "{report:?}");
+    assert_eq!(
+        report.findings()[0].cause(),
+        &DerivationError::MixedAlternatives(MixedAlternatives {
+            operator: Alternatives::Coalesce
+        })
+    );
+}
+
+#[test]
+fn wait_alias_public_attribute_does_not_inherit_secret_until_evidence() {
+    assert_public_wait_attribute_matches_direct_reference("'p'", 0);
+}
+
+#[test]
+fn wait_alias_public_attribute_mixed_with_secret_matches_direct_reference() {
+    assert_public_wait_attribute_matches_direct_reference("secret('z')", 1);
+}
+
+fn assert_public_wait_attribute_matches_direct_reference(alternative: &str, findings: usize) {
+    let target = "let seed = mock.test.Resource { name = 'seed' comment = secret('x') }\n";
+    let wait = "let ready = wait seed { until = seed.comment == 'x' }\n";
+    for directory in [false, true] {
+        let layout = if directory {
+            "directory"
+        } else {
+            "single file"
+        };
+        let derive = |reference: &str| {
+            let consumer = format!(
+                "let sink = mock.test.Resource {{ name = 'sink' comment = {reference} ?? {alternative} }}\n"
+            );
+            if directory {
+                wait_alias_directory_report(
+                    &[
+                        ("providers.crn", "provider mock {}\n"),
+                        ("resources.crn", target),
+                        ("wait.crn", wait),
+                        ("main.crn", &consumer),
+                    ],
+                    false,
+                )
+            } else {
+                report(&format!("{target}{wait}{consumer}"))
+            }
+        };
+        let alias = derive("ready.name");
+        let direct = derive("seed.name");
+        assert_eq!(alias.findings().len(), findings, "{layout}");
+        assert_eq!(alias.findings().len(), direct.findings().len(), "{layout}");
+        for (alias, direct) in alias.findings().iter().zip(direct.findings()) {
+            assert_eq!(alias.cause(), direct.cause(), "{layout}");
+            assert_eq!(
+                alias.cause(),
+                &DerivationError::MixedAlternatives(MixedAlternatives {
+                    operator: Alternatives::Coalesce
+                }),
+                "{layout}"
+            );
+        }
+        assert_eq!(alias.is_pending(), direct.is_pending(), "{layout}");
+        assert_eq!(
+            alias.admitted().is_some(),
+            direct.admitted().is_some(),
+            "{layout}"
+        );
+        assert_eq!(alias.admitted().is_some(), findings == 0, "{layout}");
+        if findings == 0 {
+            assert!(!alias.is_pending(), "{layout}");
+            for report in [&alias, &direct] {
+                assert_eq!(
+                    attribute(report, "sink", "comment"),
+                    Evidence::Leaf(Secrecy::Public),
+                    "{layout}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn wait_alias_until_rejects_inline_coalesce_and_interpolation() {
+    // Until's RHS must be a closed scalar; neither spelling reaches secrecy derivation.
+    for (predicate, interpolation) in [
+        ("seed.name == (secret('canary') ?? 'public')", false),
+        ("seed.name == \"${secret('canary') ?? 'public'}\"", true),
+    ] {
+        let source = format!("{WAIT_ALIAS_TARGET}let ready = wait seed {{ until = {predicate} }}");
+        let error =
+            crate::parser::parse_file(&source, std::path::Path::new("secrecy.crn"), &context())
+                .expect_err("until only accepts a closed RHS");
+        let mut detail = &error;
+        loop {
+            match detail {
+                crate::parser::ParseError::Located { error, .. } => detail = error,
+                crate::parser::ParseError::AtElement(finding) => detail = finding.detail(),
+                _ => break,
+            }
+        }
+        if interpolation {
+            assert!(
+                matches!(
+                    detail,
+                    crate::parser::ParseError::InterpolationInConstraintString {
+                        kind: crate::parser::ConstraintStringPosition::WaitCondition,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+            assert_eq!(
+                error.diagnostic_message(),
+                "interpolation is not supported in a `wait` condition"
+            );
+        } else {
+            let crate::parser::ParseError::ProtectedFile(failure) = detail else {
+                panic!("expected protected syntax error, got {error:?}");
+            };
+            assert!(matches!(
+                failure.kind(),
+                crate::parser::ParseFailureKind::Syntax
+            ));
+            assert_eq!(failure.range().start_line, 3);
+            assert_eq!(
+                failure.range().start_column,
+                source.lines().nth(2).unwrap().find("??").unwrap() + 1
+            );
+        }
+    }
+}
+
+fn assert_wait_alias_pending(report: &SecrecyReport) {
+    assert!(report.is_pending(), "{report:?}");
+    assert!(report.admitted().is_none(), "{report:?}");
+    assert!(report.findings().is_empty(), "{report:?}");
+}
+
+#[test]
+fn wait_alias_invalid_backward_chain_stays_pending_without_following_another_wait() {
+    let report = report(&format!(
+        "{WAIT_ALIAS_TARGET}\n\
+         let first = wait seed {{ until = seed.enabled == true }}\n\
+         let ready = wait first {{ until = first.enabled == true }}\n\
+         let sink = mock.test.Resource {{ name = 'sink' comment = ready.comment }}"
+    ));
+    assert_wait_alias_pending(&report);
+}
+
+#[test]
+fn wait_alias_invalid_forward_chain_stays_pending() {
+    let report = report(&format!(
+        "{WAIT_ALIAS_TARGET}\n\
+         let ready = wait first {{ until = first.enabled == true }}\n\
+         let first = wait seed {{ until = seed.enabled == true }}\n\
+         let sink = mock.test.Resource {{ name = 'sink' comment = ready.comment }}"
+    ));
+    assert_wait_alias_pending(&report);
+}
+
+#[test]
+fn wait_alias_to_deferred_for_never_admits_public_evidence_for_a_secret_target() {
+    let file = parsed(
+        r#"
+let seed = mock.test.Resource { name = "seed" }
+let targets = for key, value in seed.tags {
+  mock.test.Resource { name = key comment = secret("canary") }
+}
+let ready = wait targets { until = targets.enabled == true }
+let sink = mock.test.Resource { name = "sink" comment = ready.comment }
+"#,
+    );
+    assert_eq!(file.deferred_for_phase.expressions.len(), 1);
+    assert_wait_alias_pending(&secrecy_report(&file, &schemas()));
+}
+
+#[test]
+fn wait_alias_to_deferred_if_never_admits_public_evidence_for_a_secret_target() {
+    let file = parsed(
+        r#"
+arguments { enabled: Bool }
+let conditional = if enabled {
+  mock.test.Resource { name = "conditional" comment = secret("canary") }
+}
+let ready = wait conditional { until = conditional.enabled == true }
+let sink = mock.test.Resource { name = "sink" comment = ready.comment }
+"#,
+    );
+    assert_eq!(file.deferred_module_ifs.len(), 1);
+    assert_wait_alias_pending(&secrecy_report(&file, &schemas()));
+}
+
+#[test]
+fn wait_alias_to_data_source_uses_observed_evidence_instead_of_query_secrecy() {
+    let mut schemas = schemas();
+    schemas.insert(
+        "mock",
+        Schema::new("test.Resource")
+            .as_data_source()
+            .attribute(Attribute::optional("comment", Type::string()).build())
+            .attribute(Attribute::provider_populated("enabled", Type::bool()).build())
+            .validate()
+            .unwrap(),
+    );
+    let file = parsed(
+        r#"
+let lookup = read mock.test.Resource { comment = secret("query") }
+let ready = wait lookup { until = lookup.enabled == true }
+let sink = mock.test.Resource { name = "sink" comment = ready.comment tags = { direct = lookup.comment } }
+"#,
+    );
+    let report = secrecy_report(&file, &schemas);
+    // Provider observations are Public even when their query input is Secret.
+    assert_eq!(
+        attribute(&report, "sink", "comment"),
+        Evidence::Leaf(Secrecy::Public)
+    );
+    assert_eq!(
+        attribute(&report, "sink", "tags"),
+        Evidence::Map(BTreeMap::from([("direct".into(), Evidence::Leaf(Secrecy::Public))]).into())
+    );
+}
+
+fn wait_alias_directory_report(files: &[(&str, &str)], expand_modules: bool) -> SecrecyReport {
+    let directory = tempfile::tempdir().unwrap();
+    for (name, source) in files {
+        let path = directory.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, source).unwrap();
+    }
+    let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let context = context();
+    let schemas = schemas();
+    let root = crate::config_loader::parse_directory(&path, &context).unwrap();
+    if expand_modules {
+        let expanded =
+            crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                crate::module_resolver::resolve_modules_with_providerless_config(
+                    root, &path, session, &schemas,
+                )
+                .unwrap()
+            });
+        crate::config_loader::load_buffer_configuration(&expanded, &schemas, &context)
+            .judged()
+            .secrecy()
+            .clone()
+    } else {
+        secrecy_report(root.parsed(), &schemas)
+    }
+}
+
+#[test]
+fn wait_retained_target_binding_survives_expansion_and_address_rewriting() {
+    let leaf = "arguments { label: String }\nlet seed = mock.test.Resource { name = label comment = 'plain' }\nlet ready = wait seed { until = seed.name == 'ready' }\nattributes { out = ready.comment }\n";
+    let cases = vec![
+        (
+            "root",
+            1,
+            vec![(
+                "main.crn",
+                "let seed = mock.test.Resource { name = 'seed' comment = 'plain' }\nlet ready = wait seed { until = seed.name == 'seed' }\n",
+            )],
+        ),
+        (
+            "module",
+            1,
+            vec![
+                (
+                    "main.crn",
+                    "let m = use { source = './leaf' }\nlet instance = m { label = 'module' }\n",
+                ),
+                ("leaf/main.crn", leaf),
+            ],
+        ),
+        (
+            "nested-module",
+            1,
+            vec![
+                (
+                    "main.crn",
+                    "let m = use { source = './outer' }\nlet instance = m {}\n",
+                ),
+                (
+                    "outer/main.crn",
+                    "arguments { unused: String = 'plain' }\nlet m = use { source = '../leaf' }\nlet nested = m { label = 'nested' }\nattributes { out = nested.out }\n",
+                ),
+                ("leaf/main.crn", leaf),
+            ],
+        ),
+        (
+            "for-body-module",
+            2,
+            vec![
+                (
+                    "main.crn",
+                    "let m = use { source = './leaf' }\nlet instances = for label in ['a', 'b'] { m { label = label } }\n",
+                ),
+                ("leaf/main.crn", leaf),
+            ],
+        ),
+    ];
+    for (case, count, files) in cases {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        for (name, source) in files {
+            let path = directory.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source).unwrap();
+        }
+        let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let context = context();
+        let schemas = schemas();
+        let parsed = crate::config_loader::parse_directory(&path, &context)
+            .unwrap_or_else(|_| panic!("{case}: directory parse rejected"));
+        let expanded =
+            crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                crate::module_resolver::resolve_modules_with_providerless_config(
+                    parsed, &path, session, &schemas,
+                )
+                .unwrap_or_else(|_| panic!("{case}: module expansion rejected"))
+            });
+        let configured =
+            crate::config_loader::load_buffer_configuration(&expanded, &schemas, &context);
+        let judged = configured.judged();
+        let file = judged.file();
+        assert_eq!(file.wait_bindings.len(), count, "{case}: wait count");
+        for wait in &file.wait_bindings {
+            let mut definition = judged
+                .report()
+                .secrecy_definition(&wait.binding)
+                .unwrap_or_else(|| panic!("{case}: retained Wait definition missing"));
+            while matches!(
+                definition.secrecy_kind(),
+                ExprKind::Alias | ExprKind::Parens | ExprKind::Definition
+            ) && definition.secrecy_children().len() == 1
+            {
+                definition = &definition.secrecy_children()[0];
+            }
+            assert!(
+                matches!(definition.secrecy_kind(), ExprKind::Wait),
+                "{case}: root is not Wait"
+            );
+            let target = definition
+                .secrecy_children()
+                .first()
+                .unwrap_or_else(|| panic!("{case}: Wait has no first operand"));
+            let ExprKind::Binding {
+                binding,
+                authored_binding: _,
+            } = target.secrecy_kind()
+            else {
+                panic!("{case}: Wait target is not a retained binding");
+            };
+            assert_eq!(
+                binding, &wait.target,
+                "{case}: retained/metadata address mismatch"
+            );
+            assert!(
+                file.iter_all_resources()
+                    .any(|resource| resource.binding_address() == Some(binding)),
+                "{case}: target address has no declared resource owner"
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WaitCollisionOwner {
+    Upstream,
+    Argument,
+    ModuleOutput,
+    PlainLet,
+    Resource,
+}
+
+impl WaitCollisionOwner {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Upstream => "upstream",
+            Self::Argument => "argument",
+            Self::ModuleOutput => "module-output",
+            Self::PlainLet => "plain-let",
+            Self::Resource => "resource",
+        }
+    }
+}
+
+fn wait_owner_class_files(
+    owner: WaitCollisionOwner,
+    target_collision: bool,
+    owner_after: bool,
+    ordinary_reference: bool,
+) -> Vec<(String, String)> {
+    let name = if target_collision { "seed" } else { "ready" };
+    let owner_file = if owner_after {
+        "z_owner.crn"
+    } else {
+        "a_owner.crn"
+    };
+    let mut files = vec![("providers.crn".into(), "provider mock {}\n".into())];
+    let prefix = if owner == WaitCollisionOwner::Argument {
+        "module/"
+    } else {
+        ""
+    };
+    if owner == WaitCollisionOwner::Argument {
+        files.push(("main.crn".into(), format!("let m = use {{ source = './module' }}\nlet instance = m {{ {name} = {{ name = 'seed' comment = 'public' }} }}\n")));
+    }
+    files.push((
+        format!("{prefix}resources.crn"),
+        "let seed = mock.test.Resource { name = 'seed' comment = secret('s') }\n".into(),
+    ));
+    let ready = if ordinary_reference && !target_collision {
+        "let ready = seed\n"
+    } else {
+        "let ready = wait seed { until = seed.comment == 'ready' }\n"
+    };
+    let read = if ordinary_reference && target_collision {
+        "seed"
+    } else {
+        "ready"
+    };
+    files.push((format!("{prefix}main.crn"), format!("{ready}let sink = mock.test.Resource {{ name = 'sink' comment = {read}.comment ?? 'public' }}\n")));
+    let declaration = match owner {
+        WaitCollisionOwner::Upstream => {
+            files.push((
+                "upstream/main.crn".into(),
+                "exports { name: String = 'seed' comment: String = 'public' }\n".into(),
+            ));
+            format!("let {name} = upstream_state {{ source = './upstream' }}\n")
+        }
+        WaitCollisionOwner::Argument => format!("arguments {{ {name}: map(String) }}\n"),
+        WaitCollisionOwner::ModuleOutput => {
+            files.push((
+                "owner/main.crn".into(),
+                "attributes { name = 'seed' comment = 'public' }\n".into(),
+            ));
+            format!("let m = use {{ source = './owner' }}\nlet {name} = m {{}}\n")
+        }
+        WaitCollisionOwner::PlainLet => {
+            format!("let {name} = {{ name = 'seed' comment = 'public' }}\n")
+        }
+        WaitCollisionOwner::Resource => {
+            format!("let {name} = mock.test.Resource {{ name = 'owner' comment = 'public' }}\n")
+        }
+    };
+    files.push((format!("{prefix}{owner_file}"), declaration));
+    files
+}
+
+fn wait_owner_class_observation(
+    directory: &std::path::Path,
+    files: &[(String, String)],
+) -> Result<SecrecyReport, String> {
+    for (name, source) in files {
+        let path = directory.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, source).unwrap();
+    }
+    let path = crate::paths::ResolvedPath::new(directory).unwrap();
+    let context = context();
+    let schemas = schemas();
+    let parsed = crate::config_loader::parse_directory(&path, &context)
+        .map_err(|error| error.to_string())?;
+    let expanded = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        crate::module_resolver::resolve_modules_with_providerless_config(
+            parsed, &path, session, &schemas,
+        )
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(
+        crate::config_loader::load_buffer_configuration(&expanded, &schemas, &context)
+            .judged()
+            .secrecy()
+            .clone(),
+    )
+}
+
+#[test]
+fn wait_owner_order_class_matches_ordinary_reference_for_every_owner_and_file_order() {
+    let mut mismatches = Vec::new();
+    for owner in [
+        WaitCollisionOwner::Upstream,
+        WaitCollisionOwner::Argument,
+        WaitCollisionOwner::ModuleOutput,
+        WaitCollisionOwner::PlainLet,
+        WaitCollisionOwner::Resource,
+    ] {
+        for target in [true, false] {
+            for after in [false, true] {
+                let cell = format!(
+                    "{}-{}-{}",
+                    owner.label(),
+                    if target { "target" } else { "alias" },
+                    if after { "after" } else { "before" }
+                );
+                let directory = tempfile::tempdir().unwrap();
+                let wait = wait_owner_class_observation(
+                    directory.path(),
+                    &wait_owner_class_files(owner, target, after, false),
+                );
+                let ordinary = wait_owner_class_observation(
+                    directory.path(),
+                    &wait_owner_class_files(owner, target, after, true),
+                );
+                match (wait, ordinary) {
+                    (Ok(wait), Ok(ordinary)) => {
+                        let equal = wait.findings().len() == ordinary.findings().len()
+                            && wait
+                                .findings()
+                                .iter()
+                                .zip(ordinary.findings())
+                                .all(|(a, b)| a.cause() == b.cause());
+                        // In both upstream-target orders, the selected owner is
+                        // non-managed: waiting on it is Pending (class iv), while
+                        // the ordinary upstream reference is Public and admitted.
+                        let state_matches = if owner == WaitCollisionOwner::Upstream && target {
+                            wait.is_pending()
+                                && wait.admitted().is_none()
+                                && !ordinary.is_pending()
+                                && ordinary.admitted().is_some()
+                        } else {
+                            wait.is_pending() == ordinary.is_pending()
+                                && wait.admitted().is_some() == ordinary.admitted().is_some()
+                        };
+                        if !equal || !state_matches {
+                            mismatches.push(format!(
+                                "{cell}: findings equal={equal}, pending wait/direct={}/{}, admitted wait/direct={}/{}",
+                                wait.is_pending(), ordinary.is_pending(),
+                                wait.admitted().is_some(), ordinary.admitted().is_some()
+                            ));
+                        }
+                    }
+                    (Err(wait), Err(ordinary)) => {
+                        let equal =
+                            owner == WaitCollisionOwner::Argument && target && wait == ordinary;
+                        if !equal {
+                            mismatches.push(cell);
+                        }
+                    }
+                    _ => {
+                        mismatches.push(cell);
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "owner order differs for cells: {mismatches:?}"
+    );
+}
+
+#[test]
+fn wait_target_upstream_collision_preserves_main_owner_precedence() {
+    let report = wait_alias_directory_report(
+        &[
+            (
+                "resources.crn",
+                "provider mock {}\nlet seed = mock.test.Resource { name = 'seed' comment = secret('s') }\n",
+            ),
+            (
+                "a_up.crn",
+                "let seed = upstream_state { source = './upstream' }\n",
+            ),
+            (
+                "main.crn",
+                "let ready = wait seed { until = seed.name == 'seed' }\nmock.test.Resource { name = 'sink' comment = ready.comment ?? 'public' }\n",
+            ),
+            (
+                "upstream/main.crn",
+                "exports { name: String = 'seed' comment: String = 'public' }\n",
+            ),
+        ],
+        false,
+    );
+    assert_eq!(
+        report.findings().len(),
+        0,
+        "the upstream owner must prevent a resource-secret mixing finding"
+    );
+}
+
+fn wait_alias_collision_report(resource_comment: &str, seed_comment: &str) -> SecrecyReport {
+    wait_alias_directory_report(
+        &[
+            (
+                "resources.crn",
+                &format!(
+                    "provider mock {{}}\nlet seed = mock.test.Resource {{ name = 'seed' comment = {seed_comment} }}\n"
+                ),
+            ),
+            (
+                "a.crn",
+                &format!(
+                    "let other = mock.test.Resource {{ name = 'other' comment = {resource_comment} }}\n"
+                ),
+            ),
+            (
+                "main.crn",
+                "let other = wait seed { until = seed.name == 'seed' }\nlet sink = mock.test.Resource { name = 'sink' comment = other.comment ?? 'public' }\n",
+            ),
+        ],
+        false,
+    )
+}
+
+#[test]
+fn wait_alias_collision_keeps_the_declared_secret_resource() {
+    let report = wait_alias_collision_report("secret('canary')", "'plain'");
+    assert_eq!(report.findings().len(), 1, "{report:?}");
+    assert_eq!(report.findings()[0].attribute(), "comment");
+    assert!(
+        report.findings()[0]
+            .location()
+            .file()
+            .path()
+            .ends_with("main.crn")
+    );
+    assert_eq!(report.findings()[0].location().span().start_line(), 2);
+}
+
+#[test]
+fn wait_alias_collision_keeps_the_declared_public_resource() {
+    let report = wait_alias_collision_report("'plain'", "secret('canary')");
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert_eq!(
+        attribute(&report, "sink", "comment"),
+        Evidence::Leaf(Secrecy::Public)
+    );
+}
+
+fn assert_wait_collision_finding(report: &SecrecyReport) {
+    assert_eq!(report.findings().len(), 1, "{report:?}");
+    let finding = &report.findings()[0];
+    assert_eq!(finding.attribute(), "comment");
+    assert!(finding.location().file().path().ends_with("main.crn"));
+    assert_eq!(finding.location().span().start_line(), 2);
+    assert_eq!(finding.location().span().start_column(), 60);
+    assert_eq!(
+        finding.cause(),
+        &DerivationError::MixedAlternatives(MixedAlternatives {
+            operator: Alternatives::Coalesce
+        })
+    );
+}
+
+const WAIT_COLLISION_RESOURCES: &str =
+    "provider mock {}\nlet seed = mock.test.Resource { name = \"seed\" comment = \"plain\" }\n";
+const WAIT_COLLISION_CONSUMER: &str = "let other = wait seed { until = seed.name == \"seed\" }\nmock.test.Resource { name = \"sink\" comment = other.comment ?? \"public\" }\n";
+
+#[test]
+fn wait_alias_collision_keeps_module_output_before_wait_definition() {
+    let report = wait_alias_directory_report(
+        &[
+            (
+                "a.crn",
+                "let m = use { source = './m' }\nlet other = m {}\n",
+            ),
+            ("resources.crn", WAIT_COLLISION_RESOURCES),
+            ("main.crn", WAIT_COLLISION_CONSUMER),
+            ("m/main.crn", "attributes { comment = secret(\"s\") }\n"),
+        ],
+        true,
+    );
+    assert_wait_collision_finding(&report);
+}
+
+#[test]
+fn wait_alias_collision_keeps_last_literal_definition_after_wait() {
+    let report = wait_alias_directory_report(
+        &[
+            ("z.crn", "let other = { comment = secret(\"s\") }\n"),
+            ("resources.crn", WAIT_COLLISION_RESOURCES),
+            ("main.crn", WAIT_COLLISION_CONSUMER),
+        ],
+        false,
+    );
+    assert_wait_collision_finding(&report);
+}
+
+#[test]
+fn wait_alias_collision_keeps_last_wait_definition_after_literal() {
+    let report = wait_alias_directory_report(
+        &[
+            ("a.crn", "let other = { comment = secret(\"s\") }\n"),
+            ("resources.crn", WAIT_COLLISION_RESOURCES),
+            ("main.crn", WAIT_COLLISION_CONSUMER),
+        ],
+        false,
+    );
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert_eq!(report.rows.len(), 2);
+    assert!(
+        report
+            .rows
+            .values()
+            .all(|row| row.attributes.get("comment") == Some(&Evidence::Leaf(Secrecy::Public))),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn wait_alias_unreferenced_valid_until_keeps_structural_evidence() {
+    let report = report(
+        "let seed = mock.test.Resource { name = 'seed' }\n\
+         let ready = wait seed { until = seed.name == 'seed' }\n",
+    );
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(!report.is_pending(), "{report:?}");
+    assert!(report.admitted().is_some(), "{report:?}");
+    assert_eq!(
+        attribute(&report, "seed", "name"),
+        Evidence::Leaf(Secrecy::Public)
+    );
+}
+
+fn wait_alias_duplicate_wait_report(first: &str, last: &str) -> SecrecyReport {
+    wait_alias_directory_report(
+        &[
+            (
+                "resources.crn",
+                "provider mock {}\nlet s = mock.test.Resource { name = 's' comment = secret('s') }\nlet p = mock.test.Resource { name = 'p' comment = 'plain' }\n",
+            ),
+            (
+                "a.crn",
+                &format!("let other = wait {first} {{ until = {first}.name == '{first}' }}\n"),
+            ),
+            (
+                "z.crn",
+                &format!("let other = wait {last} {{ until = {last}.name == '{last}' }}\n"),
+            ),
+            (
+                "main.crn",
+                "let sink = mock.test.Resource { name = 'sink' comment = other.comment ?? 'public' }\n",
+            ),
+        ],
+        false,
+    )
+}
+
+#[test]
+fn wait_alias_duplicate_waits_use_last_public_target() {
+    let report = wait_alias_duplicate_wait_report("s", "p");
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert_eq!(
+        attribute(&report, "sink", "comment"),
+        Evidence::Leaf(Secrecy::Public)
+    );
+}
+
+#[test]
+fn wait_alias_duplicate_waits_use_last_secret_target() {
+    let report = wait_alias_duplicate_wait_report("p", "s");
+    assert_eq!(report.findings().len(), 1, "{report:?}");
+    let finding = &report.findings()[0];
+    assert!(finding.location().file().path().ends_with("main.crn"));
+    assert_eq!(finding.location().span().start_line(), 1);
+    assert_eq!(finding.location().span().start_column(), 71);
+    assert_eq!(
+        finding.cause(),
+        &DerivationError::MixedAlternatives(MixedAlternatives {
+            operator: Alternatives::Coalesce
+        })
+    );
+}
+
+#[test]
+fn wait_alias_module_instances_keep_argument_evidence_and_finding_locations() {
+    let consumers = "let t1 = mock.test.Resource { name = 't1' comment = r1.out ?? 'public' }\n\
+                     let t2 = mock.test.Resource { name = 't2' comment = r2.out ?? 'public' }\n";
+    let report = wait_alias_directory_report(
+        &[
+            ("providers.crn", "provider mock {}\n"),
+            (
+                "main.crn",
+                "let m = use { source = './module' }\nlet r1 = m { label = secret('s') }\nlet r2 = m { label = 'plain' }\n",
+            ),
+            ("consumers.crn", consumers),
+            ("module/arguments.crn", "arguments { label: String }\n"),
+            (
+                "module/resources.crn",
+                "let seed = mock.test.Resource { name = 'seed' comment = label }\n",
+            ),
+            (
+                "module/main.crn",
+                "let ready = wait seed { until = seed.name == 'seed' }\nattributes { out = ready.comment }\n",
+            ),
+        ],
+        true,
+    );
+    assert_eq!(
+        attribute(&report, "r1.seed", "comment"),
+        Evidence::Leaf(Secrecy::Secret)
+    );
+    assert_eq!(
+        attribute(&report, "r2.seed", "comment"),
+        Evidence::Leaf(Secrecy::Public)
+    );
+    assert_eq!(
+        attribute(&report, "t2", "comment"),
+        Evidence::Leaf(Secrecy::Public)
+    );
+    assert_eq!(report.findings().len(), 1, "{report:?}");
+    let finding = &report.findings()[0];
+    assert_eq!(finding.attribute(), "comment");
+    assert!(finding.location().file().path().ends_with("consumers.crn"));
+    assert_eq!(finding.location().span().start_line(), 1);
+    assert_eq!(
+        finding.location().span().start_column(),
+        consumers.find("??").unwrap() + 1
+    );
+}
+
+#[test]
+fn wait_alias_literal_target_is_pending() {
+    assert_wait_alias_pending(&report(
+        "let value = { name = 'plain' out = secret('s') }\n\
+         let ready = wait value { until = value.name == 'plain' }\n\
+         let sink = mock.test.Resource { comment = ready.out ?? 'public' }\n",
+    ));
+}
+
+#[test]
+fn wait_alias_module_call_target_is_pending() {
+    let report = wait_alias_directory_report(
+        &[
+            ("providers.crn", "provider mock {}\n"),
+            (
+                "main.crn",
+                "let m = use { source = './module' }\nlet value = m {}\nlet ready = wait value { until = value.out == 'plain' }\nlet sink = mock.test.Resource { comment = ready.out ?? 'public' }\n",
+            ),
+            (
+                "module/main.crn",
+                "arguments { unused: String = 'unused' }\nattributes { out = secret('s') }\n",
+            ),
+        ],
+        true,
+    );
+    assert_wait_alias_pending(&report);
+}
+
+#[test]
+fn wait_alias_upstream_target_is_pending() {
+    assert_wait_alias_pending(&report(
+        "let value = upstream_state { source = './upstream' }\n\
+         let ready = wait value { until = value.x == 'plain' }\n\
+         let sink = mock.test.Resource { comment = ready.x ?? secret('s') }\n",
+    ));
+}
+
 // The stack covers parse-time knowledge classification of nested user-function calls (#4481), not the secrecy walk.
 fn with_parser_stack(test: impl FnOnce() + Send + 'static) {
     std::thread::Builder::new()
