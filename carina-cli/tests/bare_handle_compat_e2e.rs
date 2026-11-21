@@ -226,12 +226,12 @@ fn keyed_loop_missing_keys_keep_the_plain_error_in_every_position() {
     for (kind, source, _) in LOOP_READER_CASES.into_iter().take(2) {
         let fixture = loop_reader_fixture(source);
         for (position, expression) in loop_reader_positions("children['zzz'].name") {
-            let output = validate_loop_reader(fixture.path(), position, &expression);
-            let text = output_text(&output);
-            assert!(!output.status.success(), "{kind}, {position}: {text}");
-            assert!(
-                text.contains("Undefined identifier `children.zzz`. Did you mean `children.a`?"),
-                "{kind}, {position}: {text}"
+            write_loop_reader(fixture.path(), position, &expression);
+            let (errors, _) = validate_diagnostic_messages(fixture.path());
+            assert_eq!(
+                errors,
+                vec!["Undefined identifier `children.zzz`. Did you mean `children.a`?"],
+                "{kind}, {position}"
             );
         }
     }
@@ -279,7 +279,7 @@ fn keyed_loop_whole_groups_stay_rejected_as_values() {
 fn keyed_loop_group_directory_diagnostic_lists() {
     let fixture = loop_reader_fixture(LOOP_READER_CASES[0].1);
     let bare_group = "'children' is a for binding, not a value; reference an instance attribute, e.g. 'children['key'].<attribute>'";
-    let coalesce = "coalesce default type `Map` does not match left type `keyed loop group`";
+    let coalesce = "coalesce default type `map` does not match left type `keyed loop group`";
     let unused_key = "for-loop binding 'k' is unused. Rename to '_' to suppress this warning.";
     let mut actual = Vec::new();
     let mut expected = Vec::new();

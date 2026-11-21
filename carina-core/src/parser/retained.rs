@@ -4280,8 +4280,15 @@ mod judgement {
                 .unwrap_or_else(|_| {
                     self.value_shape()
                         .map(|shape| match shape {
+                            ValueShape::String => "string".into(),
+                            ValueShape::Int => "int".into(),
+                            ValueShape::Float => "float".into(),
+                            ValueShape::Bool => "bool".into(),
+                            ValueShape::Duration => "duration".into(),
+                            ValueShape::List => "list".into(),
+                            ValueShape::Map => "map".into(),
                             ValueShape::KeyedGroup => "keyed loop group".into(),
-                            shape => format!("{shape:?}"),
+                            ValueShape::Handle => "handle".into(),
                         })
                         .unwrap_or_else(|| "value-dependent expression".into())
                 })
@@ -6906,7 +6913,7 @@ mod judgement {
                     } else if let Some(definition) = self.expressions.definitions.get(name) {
                         InferredExpr::from(&self.judge(definition))
                     } else {
-                        value_dependent("binding has no authored definition")
+                        ordinary(Ok(TypeExpr::String), true).with_kind(|_| InferredKind::Literal)
                     }
                 }
                 ExprKind::Reference {

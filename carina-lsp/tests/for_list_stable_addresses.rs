@@ -60,7 +60,7 @@ fn keyed_loop_group_directory_diagnostic_lists() {
         std::fs::write(directory.path().join(file), source).unwrap();
     }
     let bare_group = "'children' is a for binding, not a value; reference an instance attribute, e.g. 'children['key'].<attribute>'";
-    let coalesce = "coalesce default type `Map` does not match left type `keyed loop group`";
+    let coalesce = "coalesce default type `map` does not match left type `keyed loop group`";
     let mut actual = Vec::new();
     let mut expected = Vec::new();
     for (position, other, exports, file, errors) in [
@@ -97,7 +97,11 @@ fn keyed_loop_group_directory_diagnostic_lists() {
             "",
             "exports { out = children ?? {} }\n",
             "exports.crn",
-            vec![bare_group],
+            // The extra LSP-only coalesce diagnostic predates #4580.
+            vec![
+                bare_group,
+                "coalesce default type `map` does not match left type `String`",
+            ],
         ),
     ] {
         std::fs::write(directory.path().join("other.crn"), other).unwrap();

@@ -567,7 +567,10 @@ fn for_value_keys_reader_pending_mixed_alternatives_characterization() {
         None,
     );
     let error = file.unwrap_err().to_string();
-    assert!(error.contains("cannot apply access .comment"), "{error}");
+    assert!(
+        error.contains("cannot apply access .comment to keyed loop group"),
+        "{error}"
+    );
     assert!(!error.contains("canary"));
 
     let loop_source = "let children = for item in ['comment'] { mock.test.Resource { comment = secret('canary') name = secret('name canary') } }\nlet other = mock.test.Resource { comment = children.comment.name }\n";

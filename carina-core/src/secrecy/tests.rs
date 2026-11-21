@@ -50,6 +50,37 @@ fn attribute(report: &SecrecyReport, binding: &str, name: &str) -> Evidence {
         .clone()
 }
 
+#[test]
+fn bare_enum_shorthand_stays_public() {
+    let file = parsed("let vpc = mock.test.Vpc { instance_tenancy = dedicated }");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        Schema::new("test.Vpc")
+            .attribute(
+                Attribute::optional(
+                    "instance_tenancy",
+                    Type::enum_(
+                        crate::schema::enum_identity("InstanceTenancy", Some("mock.test.Vpc")),
+                        Some(vec!["dedicated".into()]),
+                        vec![],
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let report = secrecy_report(&file, &schemas);
+    assert_eq!(
+        attribute(&report, "vpc", "instance_tenancy"),
+        Evidence::Leaf(Secrecy::Public)
+    );
+    assert!(report.admitted().is_some(), "{report:?}");
+}
+
 // The stack covers parse-time knowledge classification of nested user-function calls (#4481), not the secrecy walk.
 fn with_parser_stack(test: impl FnOnce() + Send + 'static) {
     std::thread::Builder::new()
