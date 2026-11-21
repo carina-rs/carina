@@ -61,6 +61,19 @@ pub(crate) enum FunctionTypePosition<'a> {
     Return,
 }
 
+impl fmt::Display for FunctionTypePosition<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parameter(name) => write!(f, "parameter '{name}'"),
+            Self::Return => f.write_str("return value"),
+        }
+    }
+}
+
+// Pending wording review; kept separate so replacing the advice changes one place.
+const UNKNOWN_FUNCTION_TYPE_ADVICE: &str =
+    "Pass a value known at validate, or give the argument a type that proves it fits.";
+
 /// Only type/source metadata reaches this formatter, never an argument value.
 pub(crate) fn format_function_type_promise_error(
     function: &str,
@@ -84,18 +97,24 @@ pub(crate) fn format_function_type_promise_error(
         None if matches!(subject, "its value") => format!("the body's type is {source_type}"),
         None => format!("{subject} has type {source_type}"),
     };
-    let export_repair = if untyped_export.is_some() {
-        ", or declare the export's type"
+    let advice = if source_type == "unknown" || source_type == declared.to_string() {
+        if untyped_export.is_some() {
+            "Pass a value known at validate, or declare the export's type.".into()
+        } else {
+            UNKNOWN_FUNCTION_TYPE_ADVICE.into()
+        }
     } else {
-        ""
-    };
-    let repair_type = if source_type == "unknown" {
-        "String"
-    } else {
-        source_type
+        let export_repair = if untyped_export.is_some() {
+            ", or declare the export's type"
+        } else {
+            ""
+        };
+        format!(
+            "Pass a value known at validate, or declare {repair} as {source_type} and let the resource attribute that receives it check the value{export_repair}."
+        )
     };
     format!(
-        "function '{function}': {position} is declared as {declared}, but {source}, so validate cannot prove it fits. Pass a value known at validate, or declare {repair} as {repair_type} and let the resource attribute that receives it check the value{export_repair}."
+        "function '{function}': {position} is declared as {declared}, but {source}, so validate cannot prove it fits. {advice}"
     )
 }
 

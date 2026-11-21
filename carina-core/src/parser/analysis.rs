@@ -981,13 +981,6 @@ impl<B: BindingAddress> AnalysisValueReference<B> {
     }
 }
 
-pub(crate) struct FunctionValidationValue<'a, P: ValueKind, B: BindingAddress> {
-    pub value: &'a Value<P, B>,
-    pub expected: Option<&'a super::TypeExpr>,
-    pub context: Option<String>,
-    pub check_return: bool,
-}
-
 /// A deferred iterable validated together with its parser-owned provenance.
 pub struct AnalysisForRef<'a, P: ValueKind, B: BindingAddress> {
     site: super::DeferredForSite<'a, P, B>,
@@ -1988,9 +1981,7 @@ pub struct AnalysisTree<
         Vec<std::collections::HashMap<super::AttributeKey, DeclarationLocation>>,
     upstream_states: Vec<Located<&'a super::UpstreamState<B>>>,
     value_references: Vec<AnalysisValueReference<B>>,
-    validation_values: Vec<Located<FunctionValidationValue<'a, P, B>>>,
     iterables: Vec<AnalysisForRef<'a, P, B>>,
-    functions: &'a indexmap::IndexMap<String, super::UserFunction<B>>,
     module_calls: &'a [super::ModuleCall<P, B>],
     binding_names: std::collections::HashSet<String>,
     module_definition: bool,
@@ -2660,15 +2651,12 @@ where
                 })
             })
             .collect::<Result<_, AnalysisTreeError>>()?;
-        let mut validation_values = Vec::new();
         let mut reference_sites: std::collections::HashSet<_> = value_references
             .iter()
             .map(|value| value.reference().location().clone())
             .collect();
-        let mut add_value = |location: &DeclarationLocation,
-                             value: &'a Value<P, B>,
-                             expected,
-                             context|
+        let mut add_value = |_location: &DeclarationLocation,
+                             value: &'a Value<P, B>|
          -> Result<(), AnalysisTreeError> {
             let mut references = Vec::new();
             collect_value_references(
@@ -2682,15 +2670,6 @@ where
                     .into_iter()
                     .filter(|value| reference_sites.insert(value.reference().location().clone())),
             );
-            validation_values.push(Located::new(
-                location.clone(),
-                FunctionValidationValue {
-                    value,
-                    expected,
-                    context,
-                    check_return: false,
-                },
-            ));
             Ok(())
         };
         let value_location =
@@ -2720,8 +2699,6 @@ where
                 add_value(
                     value_location(DeclarationKind::Argument, &parameter.name)?,
                     value,
-                    Some(&parameter.static_type),
-                    Some(format!("argument '{}' default", parameter.name)),
                 )?;
             }
         }
@@ -2736,8 +2713,6 @@ where
                 add_value(
                     record.value_location().expect("validated attribute value"),
                     value,
-                    parameter.static_type.as_ref(),
-                    Some(format!("attribute '{}'", parameter.name)),
                 )?;
             }
         }
@@ -2752,18 +2727,11 @@ where
                 add_value(
                     record.value_location().expect("validated export value"),
                     value,
-                    parameter.type_expr_opt(),
-                    Some(format!("export '{}'", parameter.name())),
                 )?;
             }
         }
         for (name, value) in &file.variables {
-            add_value(
-                value_location(DeclarationKind::Binding, name)?,
-                value,
-                None,
-                None,
-            )?;
+            add_value(value_location(DeclarationKind::Binding, name)?, value)?;
         }
         for call in &file.module_calls {
             for (name, value) in call.arguments() {
@@ -2772,8 +2740,6 @@ where
                         .argument_value_location(name)
                         .unwrap_or_else(|| call.id().declaration_location()),
                     value.walker_value(),
-                    None,
-                    None,
                 )?;
             }
         }
@@ -2800,17 +2766,12 @@ where
                 .chain(provider.default_tags.values())
                 .chain(provider.unresolved_attributes.values())
             {
-                add_value(header.location(), value, None, None)?;
+                add_value(header.location(), value)?;
             }
         }
         if let Some(backend) = &file.backend {
             for value in backend.attributes.values() {
-                add_value(
-                    backend_location.expect("validated backend"),
-                    value,
-                    None,
-                    None,
-                )?;
+                add_value(backend_location.expect("validated backend"), value)?;
             }
         }
         for state in &file.state_blocks {
@@ -2820,7 +2781,7 @@ where
                         element: "state import".into(),
                     })
                 })?;
-                add_value(location, id, None, None)?;
+                add_value(location, id)?;
             }
         }
         Ok(Self {
@@ -2842,9 +2803,7 @@ where
             provider_attribute_locations,
             upstream_states,
             value_references,
-            validation_values,
             iterables,
-            functions: &file.user_functions,
             module_calls: &file.module_calls,
             module_definition: !file.arguments.is_empty() || !file.attribute_params.is_empty(),
             root_configuration: file.backend.is_some() || !file.providers.is_empty(),
@@ -3094,89 +3053,6 @@ where
 
     fn try_from(file: &'a File<E, P, T, D, B>) -> Result<Self, Self::Error> {
         Self::try_from_file(file)
-    }
-}
-
-impl<D, B: BindingAddress, E> AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>
-where
-    D: DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-{
-    pub(crate) fn visit_function_values(
-        &self,
-        visit: &mut impl FnMut(Located<FunctionValidationValue<'_, ParserPlaceholder, B>>),
-    ) {
-        for resource in self.resources() {
-            for value in resource.attributes().values() {
-                visit(Located::new(
-                    resource.location().clone(),
-                    FunctionValidationValue {
-                        value,
-                        expected: None,
-                        context: None,
-                        check_return: false,
-                    },
-                ));
-            }
-        }
-        for input in &self.validation_values {
-            visit(Located::new(
-                input.location().clone(),
-                FunctionValidationValue {
-                    value: input.value,
-                    expected: input.expected,
-                    context: input.context.clone(),
-                    check_return: false,
-                },
-            ));
-        }
-        for function in self.functions.values() {
-            let location = self
-                .syntax
-                .declarations()
-                .iter()
-                .find(|record| {
-                    record.kind() == crate::config_loader::DeclarationKind::UserFunction
-                        && record.name() == function.name
-                })
-                .expect("validated function declaration")
-                .location();
-            for parameter in &function.params {
-                if let Some(value) = &parameter.default {
-                    visit(Located::new(
-                        location.clone(),
-                        FunctionValidationValue {
-                            value,
-                            expected: parameter.param_type.as_ref(),
-                            context: Some(format!(
-                                "function '{}': parameter '{}' default",
-                                function.name, parameter.name
-                            )),
-                            check_return: false,
-                        },
-                    ));
-                }
-            }
-            for (_, value, _) in &function.local_lets {
-                visit(Located::new(
-                    location.clone(),
-                    FunctionValidationValue {
-                        value,
-                        expected: None,
-                        context: None,
-                        check_return: false,
-                    },
-                ));
-            }
-            visit(Located::new(
-                location.clone(),
-                FunctionValidationValue {
-                    value: &function.body.value,
-                    expected: function.return_type.as_ref(),
-                    context: Some(format!("function '{}': return value", function.name)),
-                    check_return: true,
-                },
-            ));
-        }
     }
 }
 

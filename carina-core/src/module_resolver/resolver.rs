@@ -367,10 +367,7 @@ impl ResidualModuleResolutionError {
                 .any(|error| match error {
                     crate::validation::ExpansionBoundaryReferenceError::ModuleCall(_error) => true,
                     crate::validation::ExpansionBoundaryReferenceError::Attribute(_message)
-                    | crate::validation::ExpansionBoundaryReferenceError::Export(_message)
-                    | crate::validation::ExpansionBoundaryReferenceError::Function(_message) => {
-                        false
-                    }
+                    | crate::validation::ExpansionBoundaryReferenceError::Export(_message) => false,
                 })
                 .then_some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::UnknownArgument {
@@ -2700,7 +2697,7 @@ mod type_resolution_policy_tests {
     fn non_call_reference_error_is_retained_without_module_call_routing() {
         let error = ResidualModuleResolutionError::new(
             ModuleError::ReferenceType(
-                crate::validation::ExpansionBoundaryReferenceErrors::function_for_test(
+                crate::validation::ExpansionBoundaryReferenceErrors::attribute_for_test(
                     "module call 'is only user-authored diagnostic text'",
                 ),
             ),

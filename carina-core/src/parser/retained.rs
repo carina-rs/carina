@@ -1312,15 +1312,18 @@ impl<'a, E, D, B: BindingAddress> JudgedFile<'a, E, D, B> {
         &self,
         bindings: &crate::binding_index::BindingIndex<'_, B>,
     ) -> Vec<Located<crate::static_type::InferenceError>> {
-        function_promises::check(
+        let mut findings = self.report().function_findings().to_vec();
+        for finding in function_promises::check(
             self.file.parser_binding_metadata.syntax().expressions(),
             self.report(),
             bindings,
             true,
-        )
-        .into_iter()
-        .map(|finding| finding.diagnostic)
-        .collect()
+        ) {
+            if !findings.contains(&finding.diagnostic) {
+                findings.push(finding.diagnostic);
+            }
+        }
+        findings
     }
     pub(crate) fn into_file(self) -> super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
         self.file
@@ -1381,15 +1384,9 @@ pub(crate) fn judge_configuration<
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     prepare_slots(file, schemas);
-    let mut report = judge_expressions(file, schemas, config);
     let bindings = crate::binding_index::BindingIndex::from_parsed(file, schemas, config);
-    let promises = function_promises::check(
-        file.parser_binding_metadata.syntax().expressions(),
-        &report,
-        &bindings,
-        false,
-    );
-    report.record_function_promises(promises, &bindings);
+    let mut report =
+        judgement::judge_expressions_with_bindings(file, schemas, config, Some(&bindings));
     for parameter in &file.export_params {
         if let (Some(sink), Some(location)) =
             (parameter.type_expr_opt(), parameter.value_location())
@@ -3533,7 +3530,7 @@ mod judgement {
                 conversions: edges.sources(),
             }
         }
-        fn failed(&self) -> bool {
+        pub(crate) fn failed(&self) -> bool {
             self.data.failed()
         }
         pub(crate) fn statically_checked(&self) -> bool {
@@ -5404,6 +5401,9 @@ mod judgement {
         pub fn findings(&self) -> &[Located<InferenceError>] {
             &self.findings
         }
+        pub(super) fn function_findings(&self) -> &[Located<InferenceError>] {
+            &self.function_errors
+        }
         /// Keep a rejected call invalid in aliases and containing expressions,
         /// just as a rejection discovered during the authored walk would be.
         pub(super) fn record_function_promises(
@@ -5486,22 +5486,6 @@ mod judgement {
                     reject(expression, finding);
                 }
             }
-            // Resource snapshots carry the same node evidence, with a distinct
-            // instance anchor. Refresh them before slots attach their reports.
-            let mut snapshots = HashMap::new();
-            let mut updated = self.clone();
-            updated.resource_reports = Arc::default();
-            updated.use_roots = Arc::default();
-            for snapshot in Arc::make_mut(&mut self.resource_reports).values_mut() {
-                *snapshot = snapshots
-                    .entry(snapshot.instance.clone())
-                    .or_insert_with(|| {
-                        let mut updated = updated.clone();
-                        updated.instance = snapshot.instance.clone();
-                        Arc::new(updated)
-                    })
-                    .clone();
-            }
         }
         pub(crate) fn first_function_error(&self) -> Option<super::super::ParseError> {
             first_error(&self.function_errors)
@@ -5512,13 +5496,16 @@ mod judgement {
     }
 
     fn first_error(findings: &[Located<InferenceError>]) -> Option<super::super::ParseError> {
-        findings.first().map(|finding| {
-            super::super::ParseError::InvalidExpression {
-                line: finding.location().span().start_line(),
-                message: finding.detail().to_string(),
-            }
-            .at(finding.location())
-        })
+        findings
+            .iter()
+            .find(|finding| !finding.detail().is_function_type_promise())
+            .map(|finding| {
+                super::super::ParseError::InvalidExpression {
+                    line: finding.location().span().start_line(),
+                    message: finding.detail().to_string(),
+                }
+                .at(finding.location())
+            })
     }
 
     pub fn judge_expressions<
@@ -5531,6 +5518,24 @@ mod judgement {
         file: &super::super::File<E, P, T, D, B>,
         schemas: &crate::schema::SchemaRegistry,
         config: &super::super::ProviderContext,
+    ) -> ExpressionReport<B>
+    where
+        D: super::super::DeferredForPhaseTraversal<P, T, B>,
+    {
+        judge_expressions_with_bindings(file, schemas, config, None)
+    }
+
+    pub(super) fn judge_expressions_with_bindings<
+        E,
+        P: crate::resource::PlaceholderKind,
+        T: crate::resource::PlaceholderKind,
+        D,
+        B: BindingAddress,
+    >(
+        file: &super::super::File<E, P, T, D, B>,
+        schemas: &crate::schema::SchemaRegistry,
+        config: &super::super::ProviderContext,
+        function_bindings: Option<&crate::binding_index::BindingIndex<'_, B>>,
     ) -> ExpressionReport<B>
     where
         D: super::super::DeferredForPhaseTraversal<P, T, B>,
@@ -5729,6 +5734,11 @@ mod judgement {
                 root.environment = environment.clone();
                 root
             }));
+        }
+        // Record failures once before resource snapshots share this evidence.
+        if let Some(bindings) = function_bindings {
+            let promises = super::function_promises::check(expressions, &report, bindings, false);
+            report.record_function_promises(promises, bindings);
         }
         let mut snapshots = HashMap::new();
         for (id, previous) in expressions.report.resource_reports.iter() {
@@ -6349,9 +6359,8 @@ mod judgement {
                 }
                 Err(SinkRejection::Ordinary(error)) => error,
             };
-            // Keep conversion placement checks above. Ordinary unknown values
-            // need the completed source index at the shared promise pass.
-            if !expression.concrete() {
+            if crate::validation::admission::static_judgement::type_needs_schema(sink, self.config)
+            {
                 return None;
             }
             let error = match error {

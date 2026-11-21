@@ -4,7 +4,10 @@
 use crate::binding_index::{BindingIndex, ResolvedRefType};
 use crate::parser::{ProviderContext, TypeExpr};
 use crate::resource::BindingAddress;
-use crate::schema::{TypeInSchema, assignability::AssignmentRelation};
+use crate::schema::{
+    MismatchTypeNames, TypeInSchema,
+    assignability::{AssignmentRelation, ReferenceAssignment},
+};
 use crate::static_type::StaticTypeResolutionError;
 
 pub(crate) enum StaticAssignmentSource<'a> {
@@ -23,7 +26,7 @@ pub(crate) enum StaticAssignmentVerdict {
 
 #[derive(Debug)]
 pub(crate) enum StaticAssignmentError {
-    Mismatch,
+    Mismatch(MismatchTypeNames),
     Resolution(StaticTypeResolutionError),
 }
 
@@ -63,10 +66,21 @@ pub(crate) fn judge_static_assignment<B: BindingAddress>(
         return Ok(NeedsLocal);
     };
     let sink = expected.assignment_sink(&config.custom_types);
-    let relation = match source {
-        StaticAssignmentSource::Reference(source) => source
-            .reference_assignment(sink, |ty| ty.static_assignment_to(sink))
-            .map_err(|_| Mismatch)?,
+    let (relation, types) = match source {
+        StaticAssignmentSource::Reference(source) => {
+            let mut relations = Vec::new();
+            for ty in source.constraints() {
+                let relation = ty.reference_relation_to(sink);
+                if relation.is_mismatch() {
+                    return Err(Mismatch(MismatchTypeNames::for_types(*sink, ty)));
+                }
+                relations.push(relation);
+            }
+            (
+                ReferenceAssignment::all(relations),
+                source.mismatch_type_names(*sink),
+            )
+        }
         StaticAssignmentSource::Expression(source) => {
             if type_needs_schema(source, config) {
                 return Ok(NeedsSchema);
@@ -75,24 +89,31 @@ pub(crate) fn judge_static_assignment<B: BindingAddress>(
             let Some(source) = super::super::lift_type_expr(&source) else {
                 return Ok(NeedsLocal);
             };
-            return classify(TypeInSchema::schemaless(&source).static_assignment_to(sink));
+            let source = TypeInSchema::schemaless(&source);
+            return classify(
+                source.reference_relation_to(sink),
+                MismatchTypeNames::for_types(*sink, source),
+            );
         }
         StaticAssignmentSource::Unknown => return Ok(NeedsLocal),
         StaticAssignmentSource::SchemaUnavailable => return Ok(NeedsSchema),
     };
-    classify(relation)
+    classify(relation, types)
 }
 
 fn classify(
-    relation: AssignmentRelation<'_>,
+    relation: ReferenceAssignment<'_>,
+    types: MismatchTypeNames,
 ) -> Result<StaticAssignmentVerdict, StaticAssignmentError> {
     use StaticAssignmentVerdict::{NeedsLocal, NeedsSchema, Proven};
-    match relation {
-        AssignmentRelation::Assignable => Ok(Proven),
-        AssignmentRelation::NeedsLocal(None) => Ok(NeedsLocal),
+    let proven = relation.type_proven();
+    match relation.for_destination() {
+        AssignmentRelation::Assignable | AssignmentRelation::NeedsLocal(None) => {
+            Ok(if proven { Proven } else { NeedsLocal })
+        }
         AssignmentRelation::NeedsLocal(Some(_)) | AssignmentRelation::Unchecked(_) => {
             Ok(NeedsSchema)
         }
-        AssignmentRelation::Mismatch => Err(StaticAssignmentError::Mismatch),
+        AssignmentRelation::Mismatch => Err(StaticAssignmentError::Mismatch(types)),
     }
 }

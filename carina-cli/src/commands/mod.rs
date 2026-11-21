@@ -927,6 +927,8 @@ fn validate_and_resolve_configuration<'s>(
         expression_report
             .findings()
             .iter()
+            // Value-dependent promises wait for the completed source index.
+            .filter(|finding| !finding.detail().is_function_type_promise())
             .cloned()
             .map(|finding| AppError::ExpressionType(Box::new(finding))),
     );
@@ -1323,14 +1325,11 @@ fn validate_and_resolve_configuration<'s>(
     let promise_findings = configuration
         .judged()
         .function_type_promise_findings(&bindings);
-    if !promise_findings.is_empty() {
-        errors.extend(
-            promise_findings
-                .into_iter()
-                .map(|finding| AppError::ExpressionType(Box::new(finding))),
-        );
-        return Err(ValidationStopped::existing(errors));
-    }
+    errors.extend(
+        promise_findings
+            .into_iter()
+            .map(|finding| AppError::ExpressionType(Box::new(finding))),
+    );
     if let Err(ref_errors) = carina_core::validation::validate_export_param_ref_types_with_bindings(
         parsed.export_params,
         &bindings,

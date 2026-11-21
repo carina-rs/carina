@@ -1663,7 +1663,7 @@ fn every_boundary_admits_same_identity_member_restrictions() {
     let snapshot = snapshot(vec![("p", vec![member(1, 128, None), member(1, 64, None)])]);
     let context = snapshot.provider_context().as_provider_context();
     let mut parsed = crate::parser::parse(
-        "let source = p.Values {}\nlet target = p.Values { value1 = source.value0 }\nattributes { name: aws.iam.Role.Name = source.value0 }\nexports { name: aws.iam.Role.Name = source.value0 }\nfn result(): aws.iam.Role.Name { source.value0 }\n",
+        "let source = p.Values {}\nlet target = p.Values { value1 = source.value0 }\nattributes { name: aws.iam.Role.Name = source.value0 }\nexports { name: aws.iam.Role.Name = source.value0 }\nfn result(): aws.iam.Role.Name { source.value0 }\nlet result_value = result()\n",
         context,
     ).unwrap();
     deferred_types::with_session_for_test(snapshot.provider_context(), |session| {
@@ -1673,7 +1673,6 @@ fn every_boundary_admits_same_identity_member_restrictions() {
     let narrow = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 1), "p");
     parsed.attribute_params[0].static_type = Some(narrow.clone());
     parsed.export_params[0].static_type = Some(narrow.clone());
-    parsed.user_functions.get_mut("result").unwrap().return_type = Some(narrow);
     let parsed = inference::apply_inference(parsed, snapshot.schema_registry(), context);
     let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
     validate_resource_ref_types(
@@ -1690,7 +1689,12 @@ fn every_boundary_admits_same_identity_member_restrictions() {
     .expect("same-identity resource reference defers its local constraints");
     validate_attribute_param_ref_types_with_bindings(&parsed.attribute_params, &bindings).unwrap();
     validate_export_param_ref_types_with_bindings(&parsed.export_params, &bindings).unwrap();
-    validate_user_function_ref_types_with_bindings(&parsed, &bindings).unwrap();
+    super::tests::validate_function_promises_for_test(
+        &parsed,
+        &bindings,
+        snapshot.schema_registry(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -1701,7 +1705,7 @@ fn function_reads_ignore_slot_members_and_coalesce_keeps_destination_checks() {
     )]);
     let context = snapshot.provider_context().as_provider_context();
     let mut parsed = crate::parser::parse(
-        "attributes { name: aws.iam.Role.Name = 'VALID' }\n",
+        "let source = p.Values {}\nfn result(): aws.iam.Role.Name { source.value0 }\nattributes { name: aws.iam.Role.Name = result() }\n",
         context,
     )
     .unwrap();
@@ -1712,12 +1716,13 @@ fn function_reads_ignore_slot_members_and_coalesce_keeps_destination_checks() {
     let wide = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p");
     let narrow = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 1), "p");
     parsed.attribute_params[0].static_type = Some(narrow.clone());
-    parsed.attribute_params[0].value = Some(crate::parser::BoundaryExpression::Value(
-        typed_function_result(wide.clone()),
-    ));
     let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
-    validate_user_function_ref_types_with_bindings(&parsed, &bindings)
-        .expect("function value types contain identity bounds only");
+    super::tests::validate_function_promises_for_test(
+        &parsed,
+        &bindings,
+        snapshot.schema_registry(),
+    )
+    .expect("function value types contain identity bounds only");
 
     let value = Value::Deferred(crate::resource::DeferredValue::Coalesce {
         value: Box::new(typed_function_result(narrow)),
@@ -2335,7 +2340,7 @@ fn every_annotation_sink_admits_identity_before_member_containment() {
     let snapshot = snapshot(vec![("p", vec![member(1, 128, None), member(1, 64, None)])]);
     let context = snapshot.provider_context().as_provider_context();
     let mut parsed = crate::parser::parse(
-        "let source = p.Values {}\nattributes { name: aws.iam.Role.Name = source.value0 }\nexports { name: aws.iam.Role.Name = source.value0 }\nfn result(): aws.iam.Role.Name { source.value0 }\nfn take(x: aws.iam.Role.Name) { x }\nlet accepted = take(source.value0)\n", context,
+        "let source = p.Values {}\nattributes { name: aws.iam.Role.Name = source.value0 }\nexports { name: aws.iam.Role.Name = source.value0 }\nfn result(): aws.iam.Role.Name { source.value0 }\nlet result_value = result()\nfn take(x: aws.iam.Role.Name) { x }\nlet accepted = take(source.value0)\n", context,
     ).unwrap();
     deferred_types::with_session_for_test(snapshot.provider_context(), |session| {
         resolve_file_type_exprs_report(&mut parsed, session, None)
@@ -2347,8 +2352,12 @@ fn every_annotation_sink_admits_identity_before_member_containment() {
         .expect("attribute member must defer");
     validate_export_param_ref_types_with_bindings(&parsed.export_params, &bindings)
         .expect("export member must defer");
-    validate_user_function_ref_types_with_bindings(&parsed, &bindings)
-        .expect("function members must defer");
+    super::tests::validate_function_promises_for_test(
+        &parsed,
+        &bindings,
+        snapshot.schema_registry(),
+    )
+    .expect("function members must defer");
     let bounded = super::named_annotation_tests::snapshot(vec![("p", vec![string(1, 64, None)])]);
     let narrow = annotation(&bounded);
     let mut functions = crate::parser::parse(

@@ -104,6 +104,13 @@ impl<'a> IdentityLeaf<'a> {
             Self::Unloaded(unloaded) => Some(unloaded.identity()),
         }
     }
+
+    fn needs_value_for_widening(self) -> bool {
+        match self {
+            Self::Scalar(binding) => binding.callback().is_some() || binding.annotation().is_some(),
+            Self::Enum(_) | Self::Unloaded(_) => true,
+        }
+    }
 }
 
 fn identity_leaf<R: PatternForm>(kind: &AttrTypeKind<R>) -> Option<IdentityLeaf<'_>> {
@@ -619,9 +626,6 @@ fn scalar_value_obligation<'result, C: AssignmentCheck>(
     }
 }
 
-/// One nominal scalar rule for declaration compatibility and reference admission.
-/// Reference sources carry their identity and length here without changing the
-/// wire-scalar rules for identity-less String or Reference destinations.
 fn identity_pattern_implies<R: PatternForm>(
     source: TypeInSchema<'_, R>,
     sink: TypeInSchema<'_, R>,
@@ -637,6 +641,9 @@ fn identity_pattern_implies<R: PatternForm>(
     target.is_none() || pattern(source) == target
 }
 
+/// One nominal scalar rule for declaration compatibility and reference admission.
+/// Reference sources carry their identity and length here without changing the
+/// wire-scalar rules for identity-less String or Reference destinations.
 fn scalar_identity_assignment<'source, 'sink, R: PatternForm, C: AssignmentCheck>(
     source_type: TypeInSchema<'source, R>,
     source_identity: &TypeIdentity,
@@ -663,17 +670,20 @@ where
         if disjoint || ((!same_identity || check.requires_identity_containment()) && !identity_fits)
         {
             TypeAssignability::Mismatch.into()
-        } else if check.static_evidence()
-            && identity_fits
-            && !scalar_value_constraints(sink.ty, sink_refs)
-                .is_some_and(|constraints| constraints.has_member_constraints)
-            && identity_pattern_implies(source_type, sink.ty)
-        {
-            TypeAssignability::Assignable.into()
         } else {
-            check
+            let obligation = check
                 .destination_obligation(true, same_identity)
-                .expect("identified scalars retain their destination value check")
+                .expect("identified scalars retain their destination value check");
+            if same_identity
+                && identity_fits
+                && !scalar_value_constraints(sink.ty, sink_refs)
+                    .is_some_and(|constraints| constraints.has_member_constraints)
+                && identity_pattern_implies(source_type, sink.ty)
+            {
+                obligation.value_proven()
+            } else {
+                obligation
+            }
         },
     ])
 }
@@ -799,9 +809,6 @@ impl<'s> AssignmentRelation<'s> {
 trait AssignmentCheck: Copy {
     type Result<'s>: AssignmentResult<'s>;
     fn identified_only(self) -> bool;
-    fn static_evidence(self) -> bool {
-        false
-    }
     /// Identified scalar declarations and widening retain identity-bound
     /// containment; reference admission can discharge same-identity overlap.
     /// Anonymous scalar pairs use overlap-or-defer in both Full check modes.
@@ -814,6 +821,12 @@ trait AssignmentCheck: Copy {
 }
 
 trait AssignmentResult<'s>: From<TypeAssignability<'s>> {
+    fn value_proven(self) -> Self {
+        self
+    }
+    fn value_needed(self) -> Self {
+        self
+    }
     fn from_bool(value: bool) -> Self {
         if value {
             TypeAssignability::Assignable.into()
@@ -863,12 +876,67 @@ impl<'s> AssignmentResult<'s> for TypeAssignability<'s> {
     }
 }
 
-impl<'s> AssignmentResult<'s> for AssignmentRelation<'s> {
+/// One reference verdict carries both type proof and the existing destination
+/// obligation. Projecting the latter never grants a resolved-value proof.
+#[derive(Debug)]
+pub(crate) struct ReferenceAssignment<'s> {
+    destination: AssignmentRelation<'s>,
+    proven: bool,
+}
+
+impl<'s> ReferenceAssignment<'s> {
+    pub(crate) fn type_proven(&self) -> bool {
+        self.proven
+    }
+    pub(crate) fn is_mismatch(&self) -> bool {
+        matches!(self.destination, AssignmentRelation::Mismatch)
+    }
+    pub(crate) fn for_destination(self) -> AssignmentRelation<'s> {
+        self.destination
+    }
+    pub(crate) fn all(results: impl IntoIterator<Item = Self>) -> Self {
+        let mut proven = true;
+        let destination = AssignmentRelation::all(results.into_iter().map(|result| {
+            proven &= result.proven;
+            result.destination
+        }));
+        Self {
+            destination,
+            proven,
+        }
+    }
+}
+
+impl<'s> From<TypeAssignability<'s>> for ReferenceAssignment<'s> {
+    fn from(result: TypeAssignability<'s>) -> Self {
+        Self {
+            proven: matches!(result, TypeAssignability::Assignable),
+            destination: result.into(),
+        }
+    }
+}
+
+impl<'s> AssignmentResult<'s> for ReferenceAssignment<'s> {
+    fn value_proven(mut self) -> Self {
+        self.proven = true;
+        self
+    }
+    fn value_needed(mut self) -> Self {
+        self.proven = false;
+        self
+    }
     fn all(results: impl IntoIterator<Item = Self>) -> Self {
         Self::all(results)
     }
     fn any(results: impl IntoIterator<Item = Self>) -> Self {
-        Self::any(results)
+        let results: Vec<_> = results.into_iter().collect();
+        let proven = results.iter().any(|result| result.proven);
+        let destination =
+            AssignmentRelation::any(results.into_iter().map(|result| result.destination));
+        Self {
+            destination,
+            proven,
+        }
     }
 }
 
@@ -904,27 +972,25 @@ impl AssignmentCheck for DeclaredAssignmentCheck {
 enum ReferenceAssignmentCheck {
     Full,
     IdentifiedLeaves,
-    /// Classify type proof without attaching a destination's value obligation.
-    StaticEvidence,
 }
 
 impl AssignmentCheck for ReferenceAssignmentCheck {
-    type Result<'s> = AssignmentRelation<'s>;
+    type Result<'s> = ReferenceAssignment<'s>;
     fn identified_only(self) -> bool {
         matches!(self, Self::IdentifiedLeaves)
     }
     fn requires_identity_containment(self) -> bool {
-        matches!(self, Self::StaticEvidence)
-    }
-    fn static_evidence(self) -> bool {
-        matches!(self, Self::StaticEvidence)
+        false
     }
     fn destination_obligation<'s>(
         self,
         scalar: bool,
         same_identity: bool,
     ) -> Option<Self::Result<'s>> {
-        (scalar || same_identity).then_some(AssignmentRelation::NeedsLocal(None))
+        (scalar || same_identity).then_some(ReferenceAssignment {
+            destination: AssignmentRelation::NeedsLocal(None),
+            proven: false,
+        })
     }
 }
 
@@ -1023,28 +1089,22 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     where
         'source: 'query,
     {
-        let source: TypeInSchema<'query, R> = self;
-        source.assignment_on_paths(
-            sink,
-            ReferenceAssignmentCheck::Full,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        )
+        self.reference_relation_to(sink).for_destination()
     }
 
     /// The reference relation also judges expression-type evidence. This
     /// classifies proof without authorizing placement or a local value check.
-    pub(crate) fn static_assignment_to<'query>(
+    pub(crate) fn reference_relation_to<'query>(
         self,
         sink: AssignmentSink<'query, R>,
-    ) -> AssignmentRelation<'query>
+    ) -> ReferenceAssignment<'query>
     where
         'source: 'query,
     {
         let source: TypeInSchema<'query, R> = self;
         source.assignment_on_paths(
             sink,
-            ReferenceAssignmentCheck::StaticEvidence,
+            ReferenceAssignmentCheck::Full,
             &mut Vec::new(),
             &mut Vec::new(),
         )
@@ -1059,12 +1119,14 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         'source: 'query,
     {
         let source: TypeInSchema<'query, R> = self;
-        source.assignment_on_paths(
-            sink,
-            ReferenceAssignmentCheck::IdentifiedLeaves,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        )
+        source
+            .assignment_on_paths(
+                sink,
+                ReferenceAssignmentCheck::IdentifiedLeaves,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .for_destination()
     }
 
     fn assignment_on_paths<'sink, C: AssignmentCheck>(
@@ -1108,25 +1170,23 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             && let Some(target_identity) = identity_leaf(&target.attr.kind)
         {
             if !scalar {
-                if check.static_evidence()
-                    && same_identity
+                // Preserve the destination verdict before annotating its proof.
+                let empty = source_constraints
+                    .is_some_and(|bounds| bounds.provably_disjoint(bounds))
+                    || target.attr.has_empty_scalar_intersection();
+                let result = if empty {
+                    Mismatch.into()
+                } else if same_identity
                     && source_constraints
                         .zip(target_constraints)
                         .is_some_and(|(source, target)| source.contained_by(target))
                     && !scalar_value_constraints(right.ty, sink_refs)
                         .is_some_and(|constraints| constraints.has_member_constraints)
                 {
-                    source_refs.truncate(source.restore_len);
-                    sink_refs.truncate(target.restore_len);
-                    return Assignable.into();
-                }
-                // Keep main's same-identity reference deferral for Float,
-                // Enum and unloaded leaves. Strict declaration checks still
-                // use their existing kind/base/range rules below.
-                let empty = source_constraints
-                    .is_some_and(|bounds| bounds.provably_disjoint(bounds))
-                    || target.attr.has_empty_scalar_intersection();
-                let result = if empty { Mismatch.into() } else { obligation };
+                    obligation.value_proven()
+                } else {
+                    obligation
+                };
                 source_refs.truncate(source.restore_len);
                 sink_refs.truncate(target.restore_len);
                 return result;
@@ -1145,9 +1205,6 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             return result;
         }
         let result = match (&source.attr.kind, &target.attr.kind) {
-            (String { .. }, StringLiteralSet { .. }) if check.static_evidence() => check
-                .destination_obligation(true, false)
-                .expect("literal membership needs a value"),
             (_, _)
                 if source_constraints.is_some_and(|bounds| bounds.provably_disjoint(bounds))
                     || target.attr.has_empty_scalar_intersection() =>
@@ -1943,6 +2000,18 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 sink_refs,
             ),
         };
+        // Keep recursive union proofs; broad sources still need membership or
+        // validator evidence. The destination verdict is preserved verbatim.
+        let result = if (matches!(target.attr.kind, StringLiteralSet { .. })
+            && !matches!(source.attr.kind, StringLiteralSet { .. } | Union(_)))
+            || (!same_identity
+                && identity_leaf(&target.attr.kind)
+                    .is_some_and(IdentityLeaf::needs_value_for_widening))
+        {
+            result.value_needed()
+        } else {
+            result
+        };
         source_refs.truncate(source.restore_len);
         sink_refs.truncate(target.restore_len);
         result
@@ -2016,12 +2085,14 @@ mod tests {
             TypeAssignability::Mismatch
         );
         assert!(matches!(
-            TypeInSchema::schemaless(&source).assignment_on_paths(
-                sink,
-                ReferenceAssignmentCheck::Full,
-                &mut Vec::new(),
-                &mut Vec::new(),
-            ),
+            TypeInSchema::schemaless(&source)
+                .assignment_on_paths(
+                    sink,
+                    ReferenceAssignmentCheck::Full,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                )
+                .for_destination(),
             AssignmentRelation::NeedsLocal(None)
         ));
     }
@@ -2103,12 +2174,14 @@ mod tests {
                 .with_authority(&catalog, SinkAuthority::Owner(&owner));
             assert!(
                 matches!(
-                    TypeInSchema::schemaless(&source).assignment_on_paths(
-                        sink,
-                        ReferenceAssignmentCheck::Full,
-                        &mut Vec::new(),
-                        &mut Vec::new(),
-                    ),
+                    TypeInSchema::schemaless(&source)
+                        .assignment_on_paths(
+                            sink,
+                            ReferenceAssignmentCheck::Full,
+                            &mut Vec::new(),
+                            &mut Vec::new(),
+                        )
+                        .for_destination(),
                     AssignmentRelation::NeedsLocal(_)
                 ),
                 "source member bounds describe its slot, not the read value"
@@ -2150,12 +2223,14 @@ mod tests {
                 expected,
                 "member range {range:?}"
             );
-            let reference = TypeInSchema::schemaless(&source).assignment_on_paths(
-                sink,
-                ReferenceAssignmentCheck::Full,
-                &mut Vec::new(),
-                &mut Vec::new(),
-            );
+            let reference = TypeInSchema::schemaless(&source)
+                .assignment_on_paths(
+                    sink,
+                    ReferenceAssignmentCheck::Full,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                )
+                .for_destination();
             assert_eq!(
                 matches!(reference, AssignmentRelation::NeedsLocal(_)),
                 expected
@@ -2169,12 +2244,14 @@ mod tests {
             Some((Some(200), Some(300))),
         );
         assert!(matches!(
-            TypeInSchema::schemaless(&disjoint).assignment_on_paths(
-                sink,
-                ReferenceAssignmentCheck::Full,
-                &mut Vec::new(),
-                &mut Vec::new(),
-            ),
+            TypeInSchema::schemaless(&disjoint)
+                .assignment_on_paths(
+                    sink,
+                    ReferenceAssignmentCheck::Full,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                )
+                .for_destination(),
             AssignmentRelation::Mismatch
         ));
         let overlapping = AttributeType::refined_int(
@@ -2270,12 +2347,14 @@ mod tests {
                 declared
             );
             assert!(matches!(
-                TypeInSchema::schemaless(&source).assignment_on_paths(
-                    sink,
-                    ReferenceAssignmentCheck::Full,
-                    &mut Vec::new(),
-                    &mut Vec::new()
-                ),
+                TypeInSchema::schemaless(&source)
+                    .assignment_on_paths(
+                        sink,
+                        ReferenceAssignmentCheck::Full,
+                        &mut Vec::new(),
+                        &mut Vec::new()
+                    )
+                    .for_destination(),
                 AssignmentRelation::NeedsLocal(None)
             ));
         }
@@ -2352,12 +2431,14 @@ mod tests {
         let sink = TypeInSchema::schemaless(&target)
             .with_authority(&catalog, SinkAuthority::Owner(&owner));
         assert!(matches!(
-            TypeInSchema::schemaless(&source).assignment_on_paths(
-                sink,
-                ReferenceAssignmentCheck::Full,
-                &mut Vec::new(),
-                &mut Vec::new()
-            ),
+            TypeInSchema::schemaless(&source)
+                .assignment_on_paths(
+                    sink,
+                    ReferenceAssignmentCheck::Full,
+                    &mut Vec::new(),
+                    &mut Vec::new()
+                )
+                .for_destination(),
             AssignmentRelation::NeedsLocal(None)
         ));
     }
@@ -2372,12 +2453,14 @@ mod tests {
         let sink = TypeInSchema::schemaless(&target)
             .with_authority(&catalog, SinkAuthority::Owner(&owner));
         assert!(matches!(
-            TypeInSchema::schemaless(&source).assignment_on_paths(
-                sink,
-                ReferenceAssignmentCheck::Full,
-                &mut Vec::new(),
-                &mut Vec::new()
-            ),
+            TypeInSchema::schemaless(&source)
+                .assignment_on_paths(
+                    sink,
+                    ReferenceAssignmentCheck::Full,
+                    &mut Vec::new(),
+                    &mut Vec::new()
+                )
+                .for_destination(),
             AssignmentRelation::NeedsLocal(None)
         ));
     }
@@ -2394,12 +2477,14 @@ mod tests {
         let sink = TypeInSchema::schemaless(&source)
             .with_authority(&catalog, SinkAuthority::Owner(&owner));
         assert!(matches!(
-            TypeInSchema::schemaless(&source).assignment_on_paths(
-                sink,
-                ReferenceAssignmentCheck::Full,
-                &mut Vec::new(),
-                &mut Vec::new()
-            ),
+            TypeInSchema::schemaless(&source)
+                .assignment_on_paths(
+                    sink,
+                    ReferenceAssignmentCheck::Full,
+                    &mut Vec::new(),
+                    &mut Vec::new()
+                )
+                .for_destination(),
             AssignmentRelation::NeedsLocal(None)
         ));
     }
@@ -2444,12 +2529,14 @@ mod tests {
                 TypeAssignability::Mismatch
             );
             assert!(matches!(
-                TypeInSchema::schemaless(&source).assignment_on_paths(
-                    sink,
-                    ReferenceAssignmentCheck::Full,
-                    &mut Vec::new(),
-                    &mut Vec::new()
-                ),
+                TypeInSchema::schemaless(&source)
+                    .assignment_on_paths(
+                        sink,
+                        ReferenceAssignmentCheck::Full,
+                        &mut Vec::new(),
+                        &mut Vec::new()
+                    )
+                    .for_destination(),
                 AssignmentRelation::Mismatch
             ));
         }
@@ -2510,22 +2597,21 @@ mod tests {
                         .with_authority(&catalog, SinkAuthority::Owner(&owner))
                 };
                 assert!(matches!(
-                    TypeInSchema::schemaless(&source).assignment_on_paths(
-                        sink(&overlap),
-                        mode,
-                        &mut Vec::new(),
-                        &mut Vec::new()
-                    ),
+                    TypeInSchema::schemaless(&source)
+                        .assignment_on_paths(sink(&overlap), mode, &mut Vec::new(), &mut Vec::new())
+                        .for_destination(),
                     AssignmentRelation::NeedsLocal(None)
                 ));
                 for destination in [&disjoint, &widening] {
                     assert!(matches!(
-                        TypeInSchema::schemaless(&source).assignment_on_paths(
-                            sink(destination),
-                            mode,
-                            &mut Vec::new(),
-                            &mut Vec::new()
-                        ),
+                        TypeInSchema::schemaless(&source)
+                            .assignment_on_paths(
+                                sink(destination),
+                                mode,
+                                &mut Vec::new(),
+                                &mut Vec::new()
+                            )
+                            .for_destination(),
                         AssignmentRelation::Mismatch
                     ));
                     assert_eq!(
@@ -2628,12 +2714,14 @@ mod tests {
         let source = TypeInSchema::schemaless(&source);
         assert_eq!(source.assignment_to(sink), TypeAssignability::Mismatch);
         assert!(matches!(
-            source.assignment_on_paths(
-                sink,
-                ReferenceAssignmentCheck::Full,
-                &mut Vec::new(),
-                &mut Vec::new()
-            ),
+            source
+                .assignment_on_paths(
+                    sink,
+                    ReferenceAssignmentCheck::Full,
+                    &mut Vec::new(),
+                    &mut Vec::new()
+                )
+                .for_destination(),
             AssignmentRelation::Mismatch
         ));
         assert_eq!(
@@ -2642,12 +2730,14 @@ mod tests {
             "original evidence rechecks must skip anonymous bounds"
         );
         assert!(matches!(
-            source.assignment_on_paths(
-                sink,
-                ReferenceAssignmentCheck::IdentifiedLeaves,
-                &mut Vec::new(),
-                &mut Vec::new()
-            ),
+            source
+                .assignment_on_paths(
+                    sink,
+                    ReferenceAssignmentCheck::IdentifiedLeaves,
+                    &mut Vec::new(),
+                    &mut Vec::new()
+                )
+                .for_destination(),
             AssignmentRelation::Assignable
         ));
     }
@@ -2822,12 +2912,14 @@ mod tests {
             TypeAssignability::Assignable,
             "original evidence rechecks must skip anonymous leaves"
         );
-        let reference = TypeInSchema::schemaless(source).assignment_on_paths(
-            sink,
-            ReferenceAssignmentCheck::Full,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        );
+        let reference = TypeInSchema::schemaless(source)
+            .assignment_on_paths(
+                sink,
+                ReferenceAssignmentCheck::Full,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .for_destination();
         assert!(
             matches!(
                 (&reference, expected),
@@ -2840,12 +2932,14 @@ mod tests {
             target.scalar_diagnostic_name(),
         );
         assert!(matches!(
-            TypeInSchema::schemaless(source).assignment_on_paths(
-                sink,
-                ReferenceAssignmentCheck::IdentifiedLeaves,
-                &mut Vec::new(),
-                &mut Vec::new(),
-            ),
+            TypeInSchema::schemaless(source)
+                .assignment_on_paths(
+                    sink,
+                    ReferenceAssignmentCheck::IdentifiedLeaves,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                )
+                .for_destination(),
             AssignmentRelation::Assignable
         ));
     }

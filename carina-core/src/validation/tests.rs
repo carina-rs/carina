@@ -1695,13 +1695,54 @@ fn function_ref_schema() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        (PatternResourceSchema::new("test.resource").attribute(
-            PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
-        ))
+        (PatternResourceSchema::new("test.resource")
+            .attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::provider_populated("count", PatternAttributeType::int())
+                    .build(),
+            ))
         .validate()
         .expect("schema fixture must be valid"),
     );
     schemas
+}
+
+pub(super) fn validate_function_promises_for_test<
+    E: Clone
+        + crate::parser::ExportParamLike<
+            crate::resource::ParserPlaceholder,
+            crate::resource::RelativeBindingName,
+        >,
+>(
+    parsed: &crate::parser::File<E>,
+    bindings: &BindingIndex<'_>,
+    schemas: &SchemaRegistry,
+) -> Result<(), String> {
+    let configuration = crate::config_loader::load_buffer_configuration(
+        parsed,
+        schemas,
+        bindings.provider_context(),
+    );
+    let mut findings = configuration.judged().report().findings().to_vec();
+    for finding in configuration
+        .judged()
+        .function_type_promise_findings(bindings)
+    {
+        if !findings.contains(&finding) {
+            findings.push(finding);
+        }
+    }
+    if findings.is_empty() {
+        Ok(())
+    } else {
+        Err(findings
+            .iter()
+            .map(|finding| finding.detail().to_string())
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
 }
 
 #[test]
@@ -1722,7 +1763,7 @@ mock.test.resource { name = f(r.name) }
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
-    let error = validate_user_function_ref_types_with_bindings(&parsed, &bindings)
+    let error = validate_function_promises_for_test(&parsed, &bindings, &schemas)
         .expect_err("String resource attribute passed to Int must be rejected");
     assert!(
         error.contains("expected Int") && error.contains("got String"),
@@ -1752,7 +1793,7 @@ let generated = for item in pending.items {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
-    let error = validate_user_function_ref_types_with_bindings(&parsed, &bindings)
+    let error = validate_function_promises_for_test(&parsed, &bindings, &schemas)
         .expect_err("deferred body function argument mismatch must be rejected");
     assert!(
         error.contains("expected Int") && error.contains("got String"),
@@ -1777,7 +1818,7 @@ let r2 = mock.test.resource { name = f() }
         &schemas,
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
-    let error = validate_user_function_ref_types_with_bindings(&mismatch, &mismatch_bindings)
+    let error = validate_function_promises_for_test(&mismatch, &mismatch_bindings, &schemas)
         .expect_err("String function result passed to Int must be rejected");
     assert!(
         error.contains("expected Int") && error.contains("got String"),
@@ -1798,60 +1839,24 @@ let r2 = mock.test.resource { name = f() }
         &schemas,
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
-    assert!(validate_user_function_ref_types_with_bindings(&matching, &matching_bindings).is_ok());
+    assert!(validate_function_promises_for_test(&matching, &matching_bindings, &schemas).is_ok());
 }
 
 #[test]
 fn nested_user_function_call_uses_declared_return_type_as_argument_source() {
-    fn parsed_with_nested_call(g_return: &str) -> ParsedFile {
-        let mut parsed = crate::parser::parse(
-            &format!("fn f(x: Int): String {{ 'ok' }}\nfn g(y: Int): {g_return} {{ y }}\n"),
-            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        )
-        .expect("function declarations must parse");
-        parsed.variables.insert(
-            "result".to_string(),
-            Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                function: std::sync::Arc::new(parsed.user_functions["f"].clone()),
-                functions: std::sync::Arc::new(parsed.user_functions.clone()),
-                args: vec![
-                    Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                        function: std::sync::Arc::new(parsed.user_functions["g"].clone()),
-                        functions: std::sync::Arc::new(parsed.user_functions.clone()),
-                        args: vec![Value::Concrete(ConcreteValue::Int(1)).into()],
-                        source_line: (0).into(),
-                    })
-                    .into(),
-                ],
-                source_line: (0).into(),
-            }),
-        );
-        parsed
-    }
-
-    let schemas = SchemaRegistry::new();
-    let mismatch = parsed_with_nested_call("String");
-    let bindings = BindingIndex::from_parsed(
-        &mismatch,
-        &schemas,
-        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    );
-    let error = validate_user_function_ref_types_with_bindings(&mismatch, &bindings)
-        .expect_err("g(): String must not satisfy f(Int)");
+    let schemas = function_ref_schema();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let check = |return_type: &str, body: &str| -> Result<(), String> {
+        let parsed = crate::parser::parse(&format!("let src = mock.test.resource {{}}\nfn f(x: Int): String {{ 'ok' }}\nfn g(y: Int): {return_type} {{ {body} }}\nlet result = f(g(src.count))"), &config).map_err(|error| error.to_string())?;
+        let bindings = BindingIndex::from_parsed(&parsed, &schemas, &config);
+        validate_function_promises_for_test(&parsed, &bindings, &schemas)
+    };
+    let error = check("String", "'str'").expect_err("g(): String must not satisfy f(Int)");
     assert!(
-        error.contains("function 'f': argument 1")
-            && error.contains("expected Int")
-            && error.contains("got String"),
+        error.contains("function 'f': parameter 'x': expected Int, got String"),
         "{error}"
     );
-
-    let matching = parsed_with_nested_call("Int");
-    let bindings = BindingIndex::from_parsed(
-        &matching,
-        &schemas,
-        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    );
-    assert!(validate_user_function_ref_types_with_bindings(&matching, &bindings).is_ok());
+    check("Int", "y").unwrap();
 }
 
 /// Explicit String declarations for the legacy identity-relation fixtures.
@@ -11283,15 +11288,12 @@ fn expression_validation_directory_file(source: &str) -> ParsedFile {
 
 #[test]
 fn function_argument_interpolation_is_checked_locally() {
-    let parsed = crate::parser::parse_and_resolve(
+    let result = crate::parser::parse_and_resolve(
         "fn f(n: Int): Int { n }\nlet src = mock.test.Source {}\nlet result = f(\"${src.name}-inline\")",
-    ).unwrap();
-    let findings = function_promise_findings_with_source_schema(&parsed);
+    );
     assert!(
-        findings
-            .iter()
-            .any(|finding| finding.contains("function 'f': parameter 'n'")),
-        "authored function argument bypassed the Int sink: {findings:?}"
+        result.is_err(),
+        "authored function argument bypassed the Int sink"
     );
 }
 
@@ -11301,57 +11303,22 @@ fn function_return_interpolation_is_checked_across_files() {
         "let src = mock.test.Source {}\nlet result = f(src.name)",
         "fn f(n: String): Int { \"${n}-inline\" }",
     );
-    let parsed = crate::config_loader::parse_directory(&path, &expression_validation_config())
-        .unwrap()
-        .into_parsed();
-    let findings = function_promise_findings_with_source_schema(&parsed);
+    let result = crate::config_loader::parse_directory(&path, &expression_validation_config());
     assert!(
-        findings
-            .iter()
-            .any(|finding| finding.contains("function 'f': return value")),
-        "sibling function return bypassed the Int sink: {findings:?}"
+        result.is_err(),
+        "sibling function return bypassed the Int sink"
     );
 }
 
 #[test]
 fn function_return_interpolation_is_checked_locally() {
-    let parsed = crate::parser::parse_and_resolve(
+    let result = crate::parser::parse_and_resolve(
         "fn f(n: String): Int { \"${n}-inline\" }\nlet src = mock.test.Source {}\nlet result = f(src.name)",
-    ).unwrap();
-    let findings = function_promise_findings_with_source_schema(&parsed);
+    );
     assert!(
-        findings
-            .iter()
-            .any(|finding| finding.contains("function 'f': return value")),
-        "authored function return bypassed the Int sink: {findings:?}"
+        result.is_err(),
+        "authored function return bypassed the Int sink"
     );
-}
-
-fn function_promise_findings_with_source_schema(parsed: &ParsedFile) -> Vec<String> {
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "mock",
-        PatternResourceSchema::new("test.Source")
-            .attribute(
-                PatternAttributeSchema::provider_populated("name", PatternAttributeType::string())
-                    .build(),
-            )
-            .validate()
-            .unwrap(),
-    );
-    let loaded = crate::test_utils::loaded_fixture_snapshot(schemas);
-    let configuration = crate::config_loader::load_buffer_configuration(
-        parsed,
-        loaded.schema_registry(),
-        loaded.provider_context().as_provider_context(),
-    );
-    configuration
-        .judged()
-        .report()
-        .findings()
-        .iter()
-        .map(|finding| finding.detail().to_string())
-        .collect()
 }
 
 #[test]

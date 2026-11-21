@@ -2629,12 +2629,6 @@ impl DiagnosticRun<'_> {
                     ..Default::default()
                 }),
             }
-            diagnostics.extend(self.check_user_function_ref_types(
-                doc,
-                preferred_tree,
-                &binding_index,
-                expression_report,
-            ));
             let expanded_compositions = expanded_graph.map(|graph| graph.compositions.as_slice());
             let resolver_constraint_findings = match merged_result.as_ref() {
                 Some(result) => match &result.module_resolution {

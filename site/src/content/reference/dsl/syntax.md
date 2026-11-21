@@ -461,17 +461,8 @@ awscc.ec2.Vpc {
 }
 ```
 
-Declared parameter and return types are promises checked at `validate`: known
-values are checked directly; unknown values must have a type that proves the
-promise. Unknown returns use the body's type with each parameter as its
-declared type. Unavailable provider schemas keep the check pending. A broad
-`String` cannot prove `'dev' | 'prod'`; the error says `validate cannot prove it
-fits` and suggests a known value or a broader declaration. An upstream export
-without a declared type also fails this check.
-
 See [Expressions](/reference/dsl/expressions/) for function definitions and
-[type promises](/guides/functions/#type-promises-at-validate) for the error and
-repair guidance.
+[function type promises](/guides/functions/#type-promises-at-validate) for annotation validation.
 
 ## Require Statement
 

@@ -671,7 +671,9 @@ type each bullet names; read that type's rustdoc for the details.
   `check_resolved_constraints_at`; unknown values must be proven by the shared
   admission reference relation, and `NeedsLocal` or missing source types reject
   at validate. Unknown returns reuse the body's judgement with parameters as
-  their declared types; unavailable provider schemas defer. Member String
+  their declared types; nested-call verdicts are reused for relevant unknown
+  outer arguments. Definite mismatches remain declaration errors, including
+  unused functions; unavailable schemas and upstream loads defer. Member String
   failures retain their pattern/length category and member label; identity
   failures run first.
   Int-to-Float widening between identified scalars uses identity-bound containment

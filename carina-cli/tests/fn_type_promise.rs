@@ -3,6 +3,9 @@
 #[path = "support/fn_type_promise.rs"]
 mod fixture;
 
+#[path = "fn_type_promise/review_round1.rs"]
+mod review_round1;
+
 use carina_cli::commands::validate::{ValidateDiagnostics, validate_diagnostics_with_factories};
 use carina_cli::wiring::LoadedProviderFactory;
 use carina_core::paths::ResolvedPath;
@@ -65,51 +68,66 @@ fn assert_accepted(directory: &Directory) {
     );
 }
 
-fn assert_rule3(directory: &Directory, position: Position, declared: &str, actual: &str) {
+fn assert_message(directory: &Directory, expected: &str) {
+    assert_messages(directory, &[expected]);
+}
+
+fn assert_messages(directory: &Directory, expected: &[&str]) {
     let diagnostics = validate(directory);
-    let errors = messages(&diagnostics);
-    let message = errors
-        .iter()
-        .find(|message| message.contains(position.context()))
-        .copied()
-        .unwrap_or_else(|| {
-            panic!(
-                "expected rule 3 at {}; validate returned: {}",
-                position.context(),
-                diagnostics.json
-            )
-        });
-    // Every unknown-value failure names the declared position and source type.
-    assert!(message.contains("at validate"), "{message}");
-    for part in if declared == ENVIRONMENT {
-        vec!["dev", "prod"]
-    } else {
-        vec![declared]
-    } {
+    assert_eq!(messages(&diagnostics), expected, "{}", diagnostics.json);
+    for error in diagnostics.json["errors"].as_array().unwrap() {
+        let location = &error["location"];
         assert!(
-            message.contains(part),
-            "missing declared type {part}: {message}"
+            location["file"]
+                .as_str()
+                .is_some_and(|file| file.ends_with("main.crn")),
+            "call-site diagnostic must retain its file: {error}"
         );
+        assert!(location["range"].is_object(), "{error}");
     }
-    assert!(
-        message.contains(actual),
-        "missing source type {actual}: {message}"
+}
+
+fn assert_mismatch(directory: &Directory, position: Position, declared: &str, actual: &str) {
+    assert_message(
+        directory,
+        &format!("{}: expected {declared}, got {actual}", position.context()),
     );
-    assert_eq!(message.split(". ").count(), 2, "{message}");
-    let error = diagnostics.json["errors"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|error| error["message"].as_str() == Some(message))
-        .unwrap();
-    let location = &error["location"];
-    assert!(
-        location["file"]
-            .as_str()
-            .is_some_and(|file| file.ends_with("main.crn")),
-        "call-site diagnostic must retain its file: {error}"
+}
+
+fn assert_rule3(directory: &Directory, position: Position, declared: &str, actual: &str) {
+    let evidence = match (position, actual) {
+        (Position::Parameter, "no declared type") => {
+            "its argument comes from upstream export 'upstream.untyped', which has no declared type"
+                .to_owned()
+        }
+        (Position::Return, "no declared type") => {
+            "its value comes from upstream export 'upstream.untyped', which has no declared type"
+                .to_owned()
+        }
+        (Position::Parameter, _) => format!("its argument has type {actual}"),
+        (Position::Return, _) => format!("the body's type is {actual}"),
+    };
+    let repair = if actual == "no declared type" {
+        "Pass a value known at validate, or declare the export's type.".to_owned()
+    } else if actual == "unknown" || actual == declared {
+        "Pass a value known at validate, or give the argument a type that proves it fits."
+            .to_owned()
+    } else {
+        let position = match position {
+            Position::Parameter => "parameter",
+            Position::Return => "return type",
+        };
+        format!(
+            "Pass a value known at validate, or declare the {position} as {actual} and let the resource attribute that receives it check the value."
+        )
+    };
+    assert_message(
+        directory,
+        &format!(
+            "{} is declared as {declared}, but {evidence}, so validate cannot prove it fits. {repair}",
+            position.context()
+        ),
     );
-    assert!(location["range"].is_object(), "{error}");
 }
 
 fn case_directory(
@@ -157,6 +175,18 @@ fn case_directory(
 
 macro_rules! rule3_case {
     ($name:ident, $scope:expr, $position:expr, $ty:expr, $setup:expr, $expression:expr, $actual:expr) => {
+        rule3_case!(
+            $name,
+            $scope,
+            $position,
+            $ty,
+            $setup,
+            $expression,
+            $actual,
+            assert_rule3
+        );
+    };
+    ($name:ident, $scope:expr, $position:expr, $ty:expr, $setup:expr, $expression:expr, $actual:expr, $check:ident) => {
         #[test]
         fn $name() {
             let directory = case_directory($scope, $position, $ty, $setup, $expression);
@@ -166,7 +196,7 @@ macro_rules! rule3_case {
                 } else {
                     $actual
                 };
-            assert_rule3(&directory, $position, $ty, actual);
+            $check(&directory, $position, $ty, actual);
         }
     };
 }
@@ -207,7 +237,8 @@ macro_rules! rule3_matrix {
             "test.Name",
             "",
             "src.identifier",
-            "String"
+            "String",
+            assert_mismatch
         );
         rule3_case!(
             any_lookup,
@@ -216,7 +247,7 @@ macro_rules! rule3_matrix {
             "String",
             "",
             "lookup({ env = src.identifier }, 'env', 'dev')",
-            "type"
+            "unknown"
         );
         #[test]
         fn deferred_loop_element() {
@@ -291,7 +322,8 @@ macro_rules! rule3_compositions {
             "Int",
             "",
             "upstream.typed",
-            "String"
+            "String",
+            assert_mismatch
         );
         rule3_case!(
             untyped_upstream_int,
@@ -318,7 +350,8 @@ macro_rules! rule3_compositions {
             "test.Name",
             "let found = read test.Lookup { query = 'find' }\n",
             "found.value",
-            "String"
+            "String",
+            assert_mismatch
         );
         rule3_case!(
             provider_upstream,
@@ -327,7 +360,8 @@ macro_rules! rule3_compositions {
             "test.Name",
             "",
             "upstream.typed",
-            "String"
+            "String",
+            assert_mismatch
         );
     };
 }
@@ -394,7 +428,7 @@ macro_rules! rule2_matrix {
             directory.write_source(&format!(
                 "{SOURCE}fn promise(value: String): test.Name {{ value }}\ntest.Sink {{ name = 'sink' value = promise(src.typed_name) }}\n"
             ));
-            assert_rule3(&directory, Position::Return, "test.Name", "String");
+            assert_mismatch(&directory, Position::Return, "test.Name", "String");
         }
         #[test]
         fn int_to_int() {
@@ -500,7 +534,12 @@ fn known_case(scope: Scope, position: Position, shape: &str, accepted: bool) {
 
 fn known_provider_literal(scope: Scope, position: Position, accepted: bool) {
     let expression = if accepted { "'allowed'" } else { "'other'" };
-    let directory = case_directory(scope, position, "test.Name", "", expression);
+    let directory = Directory::new(scope);
+    directory.write_source(&format!(
+        "{}{SOURCE}{}",
+        position.declaration("test.Name"),
+        position.sink("test.Name", expression),
+    ));
     if accepted {
         assert_accepted(&directory);
     } else {
@@ -707,7 +746,7 @@ mod tp1_per_call {
     }
 }
 
-fn lsp_validate_parity(scope: Scope, position: Position) {
+fn lsp_errors(directory: &Directory) -> Vec<tower_lsp::lsp_types::Diagnostic> {
     use std::sync::Arc;
 
     use carina_core::{
@@ -716,8 +755,6 @@ fn lsp_validate_parity(scope: Scope, position: Position) {
     use carina_lsp::{document::Document, test_support::Diagnostics};
     use tower_lsp::lsp_types::DiagnosticSeverity;
 
-    let directory = case_directory(scope, position, ENVIRONMENT, "", "src.identifier");
-    let cli = validate(&directory);
     let loaded = loaded_provider_snapshot_from_factories(
         Arc::new(vec![Box::new(PromiseFactory) as Box<dyn ProviderFactory>]),
         SchemaRegistry::new(),
@@ -730,11 +767,17 @@ fn lsp_validate_parity(scope: Scope, position: Position) {
         path.clone(),
         Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
     );
-    let lsp: Vec<_> = engine
+    engine
         .analyze(&document, Some(&path))
         .into_iter()
         .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
-        .collect();
+        .collect()
+}
+
+fn lsp_validate_parity(scope: Scope, position: Position) {
+    let directory = case_directory(scope, position, ENVIRONMENT, "", "src.identifier");
+    let cli = validate(&directory);
+    let lsp = lsp_errors(&directory);
     assert_eq!(lsp.len(), 1, "LSP must reject the call: {lsp:#?}");
     assert_eq!(messages(&cli), [lsp[0].message.as_str()], "{}", cli.json);
     assert_eq!(
@@ -742,6 +785,23 @@ fn lsp_validate_parity(scope: Scope, position: Position) {
         u64::from(lsp[0].range.start.line) + 1,
         "CLI and LSP must point to the same authored call"
     );
+}
+
+#[test]
+fn tp3_lsp_validate_nested_promise_and_schema_error_parity() {
+    let directory = Directory::new(Scope::Root);
+    directory.write_source(&format!(
+        "{SOURCE}fn inner(y: {ENVIRONMENT}): String {{ 'ok' }}\nfn outer(x: String): String {{ inner(x) }}\nlet sink = test.Sink {{ name = 'sink' value = outer(src.identifier) }}\nlet other = test.Sink {{ name = 'other' bogus = 1 }}\n"
+    ));
+    let cli = validate(&directory);
+    let lsp = lsp_errors(&directory);
+    assert_eq!(messages(&cli).len(), 2, "{}", cli.json);
+    assert_eq!(lsp.len(), 2, "{lsp:#?}");
+    let mut cli_messages = messages(&cli);
+    cli_messages.sort();
+    let mut lsp_messages: Vec<_> = lsp.iter().map(|error| error.message.as_str()).collect();
+    lsp_messages.sort();
+    assert_eq!(cli_messages, lsp_messages, "{}", cli.json);
 }
 
 #[test]
@@ -822,7 +882,19 @@ mod tp1_handle_returns {
         directory.write_source(&format!(
             "{SOURCE}fn promise(value: test.Thing): {declared} {{ value.identifier }}\ntest.Sink {{ name = 'sink' {attribute} = promise(src) }}\n"
         ));
-        assert_rule3(&directory, Position::Return, declared, "String");
+        if matches!(scope, Scope::Module) && declared == "list(String)" {
+            // Main's template preflight reports both the invalid declaration
+            // and the independent reference mismatch at this resource sink.
+            assert_messages(
+                &directory,
+                &[
+                    "function 'promise': return value: expected list(String), got String",
+                    "Type mismatch: expected List<String>, got String (from src.identifier)",
+                ],
+            );
+        } else {
+            assert_mismatch(&directory, Position::Return, declared, "String");
+        }
     }
 
     #[test]
@@ -906,7 +978,7 @@ fn tp2_approved_untyped_export_diagnostic() {
     assert_eq!(
         messages(&validate(&directory)),
         [
-            "function 'pick': parameter 'x' is declared as 'dev' | 'prod', but its argument comes from upstream export 'orgs.untyped', which has no declared type, so validate cannot prove it fits. Pass a value known at validate, or declare the parameter as String and let the resource attribute that receives it check the value, or declare the export's type."
+            "function 'pick': parameter 'x' is declared as 'dev' | 'prod', but its argument comes from upstream export 'orgs.untyped', which has no declared type, so validate cannot prove it fits. Pass a value known at validate, or declare the export's type."
         ]
     );
 }

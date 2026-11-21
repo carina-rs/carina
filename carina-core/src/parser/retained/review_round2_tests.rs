@@ -2,29 +2,12 @@ use super::*;
 
 fn function_validation(source: &str) -> Vec<String> {
     let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    let parsed =
-        super::super::parse_file(source, Path::new("function-default.crn"), &catalog).unwrap();
-    let mut schemas = crate::schema::SchemaRegistry::new();
-    schemas.insert(
-        "mock",
-        crate::schema::ResourceSchema::new("Source")
-            .attribute(
-                crate::schema::AttributeSchema::provider_populated(
-                    "count",
-                    crate::schema::AttributeType::int(),
-                )
-                .build(),
-            )
-            .attribute(
-                crate::schema::AttributeSchema::provider_populated(
-                    "name",
-                    crate::schema::AttributeType::string(),
-                )
-                .build(),
-            )
-            .validate()
-            .unwrap(),
-    );
+    let parsed = match super::super::parse_file(source, Path::new("function-default.crn"), &catalog)
+    {
+        Ok(parsed) => parsed,
+        Err(error) => return vec![error.to_string()],
+    };
+    let schemas = crate::schema::SchemaRegistry::new();
     let configuration =
         crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
     configuration
@@ -38,9 +21,7 @@ fn function_validation(source: &str) -> Vec<String> {
 
 #[test]
 fn function_default_cannot_replace_an_invalid_body() {
-    let errors = function_validation(
-        "fn f(a: Int, s: String = 'x'): String { a }\nlet src = mock.Source {}\nlet result = f(src.count)",
-    );
+    let errors = function_validation("fn f(a: Int, s: String = 'x'): String { a }");
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(
         errors[0].contains("function 'f': return value"),
@@ -50,10 +31,53 @@ fn function_default_cannot_replace_an_invalid_body() {
 
 #[test]
 fn function_default_cannot_reject_a_valid_body() {
-    let errors = function_validation(
-        "fn tag(env: String, n: Int = 3): String { \"${env}\" }\nlet src = mock.Source {}\nlet result = tag(src.name)",
-    );
+    let errors = function_validation(r#"fn tag(env: String, n: Int = 3): String { "${env}" }"#);
     assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn tp3_bare_handle_return_keeps_binding_diagnostic_ownership() {
+    let mut schemas = crate::schema::SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        crate::schema::ResourceSchema::new("Thing")
+            .attribute(
+                crate::schema::AttributeSchema::optional(
+                    "name",
+                    crate::schema::AttributeType::string(),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let snapshot = crate::test_utils::loaded_fixture_snapshot(schemas);
+    let catalog = snapshot.provider_context().as_provider_context();
+    let parsed = super::super::parse_file(
+        "fn identity(r: test.Thing): String { r }",
+        Path::new("handle.crn"),
+        &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let raw = judge_expressions(&parsed, snapshot.schema_registry(), catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        &parsed,
+        snapshot.schema_registry(),
+        catalog,
+    );
+    let messages = |report: &ExpressionReport| {
+        report
+            .findings()
+            .iter()
+            .map(|finding| finding.detail().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        configuration.judged().report().findings().is_empty(),
+        "bare handles belong to binding validation; authored: {:?}; with promises: {:?}",
+        messages(&raw),
+        messages(configuration.judged().report())
+    );
 }
 
 #[test]

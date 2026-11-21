@@ -700,6 +700,7 @@ pub struct BindingIndex<'a, B: BindingAddress = RelativeBindingName> {
     session: Option<&'a dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     entries: HashMap<String, BindingEntry<'a, B>>,
     known_names: std::collections::HashSet<String>,
+    unavailable_upstreams: std::collections::HashSet<String>,
     resource_handles: HashMap<String, AttributeType>,
     /// Handle outputs are deliberately not inserted into a live composition
     /// until the expanded-graph seam can resolve them to complete resource
@@ -707,7 +708,6 @@ pub struct BindingIndex<'a, B: BindingAddress = RelativeBindingName> {
     /// keep this index-only view keyed by the visible composition binding.
     pending_composition_handles: HashMap<B, HashMap<String, crate::parser::ResourceTypePath>>,
     registry: &'a SchemaRegistry,
-    user_functions: &'a indexmap::IndexMap<String, crate::parser::UserFunction<B>>,
 }
 
 impl<'a, B: BindingAddress> BindingIndex<'a, B> {
@@ -827,6 +827,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     {
         let mut entries = HashMap::new();
         let mut known_names = std::collections::HashSet::new();
+        let mut unavailable_upstreams = std::collections::HashSet::new();
         let mut resource_handles = HashMap::new();
         let mut pending_composition_handles: HashMap<
             B,
@@ -1056,6 +1057,8 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
                     .or_insert(BindingEntry {
                         target: BindingTarget::UpstreamState(exports),
                     });
+            } else {
+                unavailable_upstreams.insert(upstream.binding.to_string());
             }
         }
         Self {
@@ -1064,10 +1067,10 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
             session: None,
             entries,
             known_names,
+            unavailable_upstreams,
             resource_handles,
             pending_composition_handles,
             registry,
-            user_functions: &parsed.user_functions,
         }
     }
 
@@ -1077,6 +1080,10 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
 
     pub(crate) fn provider_context(&self) -> &crate::parser::ProviderContext {
         &self.provider_context
+    }
+
+    pub(crate) fn upstream_is_unavailable(&self, name: &str) -> bool {
+        self.unavailable_upstreams.contains(name)
     }
 
     /// Consume assignment with this index's provider authority. Loaded paths
@@ -1125,10 +1132,6 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         ty: &crate::parser::TypeExpr,
     ) -> Result<crate::parser::TypeExpr, crate::static_type::StaticTypeResolutionError> {
         crate::parser::resolve_type_expr_from_schemas(ty, self.schemas, &self.provider_context)
-    }
-
-    pub(crate) fn user_function(&self, name: &str) -> Option<&'a crate::parser::UserFunction<B>> {
-        self.user_functions.get(name)
     }
 
     /// Resolve the static type of one complete reference path.

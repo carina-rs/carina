@@ -146,13 +146,20 @@ checks the value. Otherwise its type must prove that it fits the declaration;
 a broad `String` cannot prove a literal union or a provider's refined string
 type. An upstream export without a declared type cannot prove a promise either.
 Unknown results of built-ins typed as `Any`, such as `lookup`, also need value evidence.
-Unavailable provider schemas leave the check pending.
+Unavailable provider schemas or failed upstream loads leave the promise check pending.
+Definite type mismatches and invalid annotations remain declaration errors,
+including in unused functions.
 
 For an unknown return value, Carina types the body once with each parameter's
 declared type. For example, `fn pick(x: String): 'dev' | 'prod' { x }` accepts
 `pick('dev')`, but rejects `pick(src.identifier)` when `src.identifier` is an
 unknown `String`. Declaring `x` with a narrower type supplies the corresponding
 return evidence. An untyped parameter supplies no type evidence for the return.
+
+Calls inside a function body use the enclosing function's declared parameter
+types, once per declaration. A non-proving nested call is reported at each outer
+call whose relevant argument is unknown. An unused outer function does not
+trigger that rule-3 finding.
 
 For `fn pick(x: 'dev' | 'prod'): String { x }`, passing that unknown `String`
 produces:
