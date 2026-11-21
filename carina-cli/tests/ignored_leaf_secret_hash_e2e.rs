@@ -124,6 +124,54 @@ fn assert_ignored_leaf_protected(
 }
 
 #[test]
+fn refresh_retained_map_leaf_beside_desired_secret_keeps_previous_hash_until_apply() {
+    let scenario = Scenario::new(
+        "test.resource",
+        "name = 'sink'\ntags = { other = secret('__MARKER__-other') retained = secret('__MARKER__') }",
+    );
+    scenario.run(&["init", "."]);
+    scenario.run(&["apply", "--auto-approve", "--parallelism=1", "."]);
+    let before = scenario.attributes();
+    for leaf in ["other", "retained"] {
+        assert!(
+            before["tags"][leaf][PERSISTED_SECRET_KEY].is_string(),
+            "both initial secret leaves must be hashes"
+        );
+    }
+
+    scenario
+        .write("name = 'sink'\ntags = { other = secret('__MARKER__-other') retained = 'public' }");
+    scenario.run(&["state", "refresh", "."]);
+    let refreshed = scenario.attributes();
+    assert!(
+        refreshed["tags"]["retained"] == before["tags"]["retained"],
+        "refresh must keep the previous retained leaf hash until an accepted write"
+    );
+    assert!(
+        refreshed["tags"]["other"][PERSISTED_SECRET_KEY].is_string(),
+        "refresh must keep the desired secret sibling hashed"
+    );
+    let plan = scenario.run(&["plan", "."]);
+    assert!(
+        plan.contains("Plan: 0 to add, 1 to change, 0 to destroy."),
+        "the public edit must still require one Update after refresh:\n{plan}"
+    );
+
+    scenario.run(&["apply", "--auto-approve", "--parallelism=1", "."]);
+    let applied = scenario.attributes();
+    assert!(
+        applied["tags"]["retained"] == "public",
+        "an accepted public write must release the previous leaf hash"
+    );
+    assert!(
+        applied["tags"]["other"][PERSISTED_SECRET_KEY].is_string(),
+        "the desired secret sibling must remain hashed after apply"
+    );
+    let plan = scenario.run(&["plan", "."]);
+    assert!(plan.contains("No changes."), "{plan}");
+}
+
+#[test]
 fn ignored_map_leaf_in_sent_attribute_keeps_previous_secret_hash() {
     assert_ignored_leaf_protected(
         "test.resource",

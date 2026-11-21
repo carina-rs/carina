@@ -6850,6 +6850,143 @@ fn previous_secret_hash_unsent_update_requires_provider_equality() {
     }
 }
 
+fn previous_secret_hash_desired_secret_sibling_fixture(
+    observed_retained: &str,
+) -> (
+    ResolvedResource,
+    PersistedAttributes,
+    SelectedStateAttributes,
+) {
+    let public = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let protected =
+        |text: &str| Value::Deferred(DeferredValue::Secret(Box::new(public(text)).into()));
+    let previous_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("other".into(), protected("fixture-secret-4570-other")),
+        ("retained".into(), protected("fixture-secret-4570")),
+    ])));
+    let previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "tags".into(),
+        PersistedValue::encode_desired_value(&previous_tags, None).unwrap(),
+    )]))
+    .unwrap();
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+            "tags",
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                ("other".into(), protected("fixture-secret-4570-other")),
+                ("retained".into(), public("public")),
+            ]))),
+        ),
+    );
+    let observed = BTreeMap::from([(
+        "tags".into(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("other".into(), public("fixture-secret-4570-other")),
+            ("retained".into(), public(observed_retained)),
+        ]))),
+    )]);
+    let selected =
+        SelectedStateAttributes::from_provider_values_lossy(&observed, None, &[]).unwrap();
+    (resource, previous, selected)
+}
+
+fn assert_retained_leaf_beside_desired_secret_is_protected(
+    selected: SelectedStateAttributes,
+    previous: &PersistedAttributes,
+    observed_retained: &str,
+) {
+    let (attributes, _) = selected.finish().unwrap();
+    let tags = attributes.encoded_value("tags").unwrap().as_json();
+    let previous_tags = previous.encoded_value("tags").unwrap().as_json();
+    assert!(
+        tags["retained"][carina_core::value::PERSISTED_SECRET_KEY].is_string(),
+        "an unsent leaf beside a desired secret must remain hashed"
+    );
+    if observed_retained == "fixture-secret-4570" {
+        assert!(
+            tags["retained"] == previous_tags["retained"],
+            "unchanged observed material must reuse the previous leaf hash"
+        );
+    }
+    assert!(
+        tags["other"] == previous_tags["other"],
+        "the desired secret sibling must keep its hash"
+    );
+    assert!(
+        !serde_json::to_string(&attributes)
+            .unwrap()
+            .contains("fixture-secret-4570"),
+        "written attributes must not contain secret plaintext"
+    );
+}
+
+fn assert_protect_observation_retained_leaf_beside_desired_secret(has_final_desired: bool) {
+    // Even an observed public leaf matching desired cannot release its hash
+    // while the containing key still holds a desired secret.
+    for observed_retained in ["fixture-secret-4570", "public"] {
+        let (resource, previous, selected) =
+            previous_secret_hash_desired_secret_sibling_fixture(observed_retained);
+        let final_desired = FinalDesiredAttributes::for_test(resource.attributes.clone());
+        let selected = selected
+            .protect_observation(
+                &resource,
+                Some(&previous),
+                has_final_desired.then_some(&final_desired),
+                None,
+                Some(desired_value_comparison_for_test(None)),
+            )
+            .unwrap();
+        assert_retained_leaf_beside_desired_secret_is_protected(
+            selected,
+            &previous,
+            observed_retained,
+        );
+    }
+}
+
+#[test]
+fn protect_observation_retained_leaf_beside_desired_secret_with_final_desired_keeps_previous_secret_hash()
+ {
+    assert_protect_observation_retained_leaf_beside_desired_secret(true);
+}
+
+#[test]
+fn protect_observation_retained_leaf_beside_desired_secret_without_final_desired_keeps_previous_secret_hash()
+ {
+    assert_protect_observation_retained_leaf_beside_desired_secret(false);
+}
+
+#[test]
+fn previous_secret_hash_unsent_update_beside_desired_secret_keeps_retained_leaf() {
+    for observed_retained in ["fixture-secret-4570", "public"] {
+        for has_final_desired in [false, true] {
+            let (resource, previous, selected) =
+                previous_secret_hash_desired_secret_sibling_fixture(observed_retained);
+            let final_desired = FinalDesiredAttributes::for_test(resource.attributes.clone());
+            let request = AcceptedRequest::update_for_test(&["other_attribute"], &[]);
+            let selected = selected
+                .protect_for_resource(
+                    &resource,
+                    PreviousSecretHashAuthority::AcceptedWrite {
+                        previous: &previous,
+                        request: &request,
+                        request_attributes: Cow::Borrowed(&resource.attributes),
+                        final_desired: has_final_desired.then_some(&final_desired),
+                    },
+                    None,
+                    true,
+                    Some(desired_value_comparison_for_test(None)),
+                )
+                .unwrap();
+            assert_retained_leaf_beside_desired_secret_is_protected(
+                selected,
+                &previous,
+                observed_retained,
+            );
+        }
+    }
+}
+
 fn previous_secret_hash_sent_map_row() -> ResourceState {
     let public = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
     let protected =

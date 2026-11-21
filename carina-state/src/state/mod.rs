@@ -117,7 +117,7 @@ impl DesiredKey {
     }
 }
 
-/// Desired-secret masking allows only additional grafted-leaf protection.
+/// Whether desired-secret masking has already protected the provider value.
 #[derive(Clone, Copy)]
 enum PreviousSecretHashInput<'a> {
     ProviderValue(Option<&'a PersistedValue>),
@@ -311,10 +311,14 @@ impl SelectedStateAttributes {
         }
         let provider_value = match input {
             PreviousSecretHashInput::ProviderValue(value) => value,
-            // Public siblings have already been selected for this key. Only
-            // grafted leaves above can add previous protection to that value.
+            // Only accepted public writes above can release previous leaf
+            // hashes. Otherwise merge them into the already-masked value.
             PreviousSecretHashInput::DesiredSecretsMasked => {
-                return PreviousSecretHashDecision::Release;
+                return if matches!(authority, PreviousSecretHashAuthority::None) {
+                    PreviousSecretHashDecision::Release
+                } else {
+                    PreviousSecretHashDecision::Protect
+                };
             }
         };
         let final_desired = match authority {
