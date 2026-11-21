@@ -13,7 +13,9 @@ use crate::validation::admission::static_judgement::{
     StaticAssignmentError, StaticAssignmentSource, StaticAssignmentVerdict,
     judge_static_assignment, type_needs_schema,
 };
-use crate::validation::typecheck::{FunctionTypePosition, format_function_type_promise_error};
+use crate::validation::typecheck::{
+    FunctionTypePosition, FunctionTypeSource, format_function_type_promise_error,
+};
 use std::collections::BTreeSet;
 
 struct Source {
@@ -44,12 +46,16 @@ impl Source {
         }
     }
 
-    fn label(&self) -> String {
-        self.reference
-            .as_ref()
-            .map(ResolvedRefType::display_type_name)
-            .or_else(|| self.ty.as_ref().map(ToString::to_string))
-            .unwrap_or_else(|| "unknown".into())
+    fn diagnostic_source(&self) -> FunctionTypeSource<'_> {
+        if let Some(export) = self.untyped_export.as_deref() {
+            FunctionTypeSource::UntypedExport(export)
+        } else if let Some(reference) = &self.reference {
+            FunctionTypeSource::Typed(reference.display_type_name())
+        } else if let Some(ty) = &self.ty {
+            FunctionTypeSource::Typed(ty.to_string())
+        } else {
+            FunctionTypeSource::Unknown
+        }
     }
 }
 
@@ -220,8 +226,7 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
                     name,
                     position,
                     ty,
-                    &source.label(),
-                    source.untyped_export.as_deref(),
+                    source.diagnostic_source(),
                 ),
             }),
         }

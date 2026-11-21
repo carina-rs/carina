@@ -152,13 +152,13 @@ fn tp3_definite_parameter_mismatch_keeps_main_text() {
 }
 
 #[test]
-fn tp3_unknown_source_has_placeholder_advice() {
+fn tp3_unknown_source_has_approved_advice() {
     assert_eq!(
         mock_messages(
             "fn f(x: String): String { x }\nmock.test.resource { name = f(lookup({ env = src.computed }, 'env', 'dev')) }"
         ),
         [
-            "function 'f': parameter 'x' is declared as String, but its argument has type unknown, so validate cannot prove it fits. Pass a value known at validate, or give the argument a type that proves it fits."
+            "function 'f': parameter 'x' is declared as String, but its argument has no known type, so validate cannot prove it fits. Pass a value known at validate, or give the argument a type that proves it fits."
         ]
     );
 }

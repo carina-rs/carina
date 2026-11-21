@@ -70,51 +70,58 @@ impl fmt::Display for FunctionTypePosition<'_> {
     }
 }
 
-// Pending wording review; kept separate so replacing the advice changes one place.
 const UNKNOWN_FUNCTION_TYPE_ADVICE: &str =
     "Pass a value known at validate, or give the argument a type that proves it fits.";
+
+pub(crate) enum FunctionTypeSource<'a> {
+    Typed(String),
+    Unknown,
+    UntypedExport(&'a str),
+}
 
 /// Only type/source metadata reaches this formatter, never an argument value.
 pub(crate) fn format_function_type_promise_error(
     function: &str,
     position: FunctionTypePosition<'_>,
     declared: &TypeExpr,
-    source_type: &str,
-    untyped_export: Option<&str>,
+    source: FunctionTypeSource<'_>,
 ) -> String {
-    let (position, subject, repair) = match position {
-        FunctionTypePosition::Parameter(name) => (
-            format!("parameter '{name}'"),
-            "its argument",
-            "the parameter",
-        ),
-        FunctionTypePosition::Return => ("return value".into(), "its value", "the return type"),
+    let (subject, repair) = match position {
+        FunctionTypePosition::Parameter(_) => ("its argument", "the parameter"),
+        FunctionTypePosition::Return => ("its value", "the return type"),
     };
-    let source = match untyped_export {
-        Some(export) => {
+    let evidence = match (&source, position) {
+        (FunctionTypeSource::Unknown, FunctionTypePosition::Parameter(_)) => {
+            "its argument has no known type".into()
+        }
+        (FunctionTypeSource::Unknown, FunctionTypePosition::Return) => {
+            "the body has no known type".into()
+        }
+        (FunctionTypeSource::Typed(ty), FunctionTypePosition::Parameter(_)) => {
+            format!("its argument has type {ty}")
+        }
+        (FunctionTypeSource::Typed(ty), FunctionTypePosition::Return) => {
+            format!("the body's type is {ty}")
+        }
+        (FunctionTypeSource::UntypedExport(export), _) => {
             format!("{subject} comes from upstream export '{export}', which has no declared type")
         }
-        None if matches!(subject, "its value") => format!("the body's type is {source_type}"),
-        None => format!("{subject} has type {source_type}"),
     };
-    let advice = if source_type == "unknown" || source_type == declared.to_string() {
-        if untyped_export.is_some() {
+    let advice = match source {
+        FunctionTypeSource::Unknown => UNKNOWN_FUNCTION_TYPE_ADVICE.into(),
+        FunctionTypeSource::UntypedExport(_) => {
             "Pass a value known at validate, or declare the export's type.".into()
-        } else {
+        }
+        // A named reference can retain a value check even for its own type.
+        FunctionTypeSource::Typed(ty) if ty == declared.to_string() => {
             UNKNOWN_FUNCTION_TYPE_ADVICE.into()
         }
-    } else {
-        let export_repair = if untyped_export.is_some() {
-            ", or declare the export's type"
-        } else {
-            ""
-        };
-        format!(
-            "Pass a value known at validate, or declare {repair} as {source_type} and let the resource attribute that receives it check the value{export_repair}."
-        )
+        FunctionTypeSource::Typed(ty) => format!(
+            "Pass a value known at validate, or declare {repair} as {ty} and let the resource attribute that receives it check the value."
+        ),
     };
     format!(
-        "function '{function}': {position} is declared as {declared}, but {source}, so validate cannot prove it fits. {advice}"
+        "function '{function}': {position} is declared as {declared}, but {evidence}, so validate cannot prove it fits. {advice}"
     )
 }
 
@@ -1447,6 +1454,34 @@ fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
 /// Directional compatibility for a declared source flowing into a declared sink.
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn function_promise_unknown_parameter_text() {
+        use super::*;
+        assert_eq!(
+            format_function_type_promise_error(
+                "f",
+                FunctionTypePosition::Parameter("x"),
+                &TypeExpr::String,
+                FunctionTypeSource::Unknown,
+            ),
+            "function 'f': parameter 'x' is declared as String, but its argument has no known type, so validate cannot prove it fits. Pass a value known at validate, or give the argument a type that proves it fits."
+        );
+    }
+
+    #[test]
+    fn function_promise_unknown_return_text() {
+        use super::*;
+        assert_eq!(
+            format_function_type_promise_error(
+                "f",
+                FunctionTypePosition::Return,
+                &TypeExpr::String,
+                FunctionTypeSource::Unknown,
+            ),
+            "function 'f': return value is declared as String, but the body has no known type, so validate cannot prove it fits. Pass a value known at validate, or give the argument a type that proves it fits."
+        );
+    }
+
     #[test]
     fn round2_2_embedded_causes_do_not_repeat_in_source_chains() {
         use super::*;

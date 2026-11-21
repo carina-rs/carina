@@ -1659,6 +1659,31 @@ fn enum_resource_binding_mismatch_keeps_the_exact_enum_name() {
 }
 
 #[test]
+fn tp5_named_reference_keeps_nonredundant_advice() {
+    let snapshot = snapshot(vec![(
+        "p",
+        vec![DraftType::reference(identity(), None, None)],
+    )]);
+    let context = snapshot.provider_context().as_provider_context();
+    let parsed = crate::parser::parse(
+        "let source = p.Values {}\nfn f(x: aws.iam.Role.Name): String { 'accepted' }\nlet result = f(source.value0)\n",
+        context,
+    ).unwrap();
+    let parsed = inference::apply_inference(parsed, snapshot.schema_registry(), context);
+    let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
+    let errors = super::tests::validate_function_promises_for_test(
+        &parsed,
+        &bindings,
+        snapshot.schema_registry(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        errors,
+        "function 'f': parameter 'x' is declared as aws.iam.Role.Name, but its argument has type aws.iam.Role.Name, so validate cannot prove it fits. Pass a value known at validate, or give the argument a type that proves it fits."
+    );
+}
+
+#[test]
 fn every_boundary_admits_same_identity_member_restrictions() {
     let snapshot = snapshot(vec![("p", vec![member(1, 128, None), member(1, 64, None)])]);
     let context = snapshot.provider_context().as_provider_context();

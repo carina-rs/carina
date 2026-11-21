@@ -107,6 +107,8 @@ fn assert_rule3(directory: &Directory, position: Position, declared: &str, actua
             "its value comes from upstream export 'upstream.untyped', which has no declared type"
                 .to_owned()
         }
+        (Position::Parameter, "unknown") => "its argument has no known type".to_owned(),
+        (Position::Return, "unknown") => "the body has no known type".to_owned(),
         (Position::Parameter, _) => format!("its argument has type {actual}"),
         (Position::Return, _) => format!("the body's type is {actual}"),
     };
