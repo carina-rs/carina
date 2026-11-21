@@ -117,6 +117,13 @@ impl DesiredKey {
     }
 }
 
+/// Desired-secret masking allows only additional grafted-leaf protection.
+#[derive(Clone, Copy)]
+enum PreviousSecretHashInput<'a> {
+    ProviderValue(Option<&'a PersistedValue>),
+    DesiredSecretsMasked,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreviousSecretHashDecision<'a> {
     Release,
@@ -278,42 +285,48 @@ impl SelectedStateAttributes {
     fn decide_previous_secret_hash<'a>(
         authority: &'a PreviousSecretHashAuthority<'_>,
         key: &str,
-        provider_value: Option<&PersistedValue>,
+        input: PreviousSecretHashInput<'_>,
         comparison: Option<DesiredValueComparison<'_>>,
     ) -> PreviousSecretHashDecision<'a> {
+        if let PreviousSecretHashAuthority::AcceptedWrite {
+            request,
+            request_attributes,
+            ..
+        } = authority
+            && (matches!(input, PreviousSecretHashInput::DesiredSecretsMasked)
+                || DesiredKey::from_attributes(request_attributes, key) == DesiredKey::KnownPublic)
+        {
+            match request.kind() {
+                AcceptedRequestKind::Create => return PreviousSecretHashDecision::Release,
+                AcceptedRequestKind::Update { sent, removed: _ } => {
+                    if let Some(sent) = sent.get(key) {
+                        return if sent.grafted_leaves().is_empty() {
+                            PreviousSecretHashDecision::Release
+                        } else {
+                            PreviousSecretHashDecision::ProtectLeaves(sent.grafted_leaves())
+                        };
+                    }
+                }
+            }
+        }
+        let provider_value = match input {
+            PreviousSecretHashInput::ProviderValue(value) => value,
+            // Public siblings have already been selected for this key. Only
+            // grafted leaves above can add previous protection to that value.
+            PreviousSecretHashInput::DesiredSecretsMasked => {
+                return PreviousSecretHashDecision::Release;
+            }
+        };
         let final_desired = match authority {
             PreviousSecretHashAuthority::None => return PreviousSecretHashDecision::Release,
             PreviousSecretHashAuthority::AllPreviouslyHashedKeys(_) => {
                 return PreviousSecretHashDecision::Protect;
             }
-            PreviousSecretHashAuthority::AcceptedWrite {
-                request,
-                request_attributes,
-                final_desired,
-                ..
-            } => {
-                if DesiredKey::from_attributes(request_attributes, key) == DesiredKey::KnownPublic {
-                    match request.kind() {
-                        AcceptedRequestKind::Create => return PreviousSecretHashDecision::Release,
-                        AcceptedRequestKind::Update {
-                            sent,
-                            removed: _removed,
-                        } => {
-                            if let Some(sent) = sent.get(key) {
-                                return if sent.grafted_leaves().is_empty() {
-                                    PreviousSecretHashDecision::Release
-                                } else {
-                                    PreviousSecretHashDecision::ProtectLeaves(sent.grafted_leaves())
-                                };
-                            }
-                        }
-                    }
-                }
-                match final_desired {
-                    Some(desired) => *desired,
-                    None => return PreviousSecretHashDecision::Protect,
-                }
-            }
+            PreviousSecretHashAuthority::AcceptedWrite { final_desired, .. } => match final_desired
+            {
+                Some(desired) => *desired,
+                None => return PreviousSecretHashDecision::Protect,
+            },
             PreviousSecretHashAuthority::MatchingFinalDesiredValue { desired, .. } => *desired,
         };
         let desired_attributes = final_desired.attributes();
@@ -356,26 +369,25 @@ impl SelectedStateAttributes {
         };
         let keys = previous.keys().cloned().collect::<Vec<_>>();
         for key in keys {
-            if protected_secret_keys.contains(&key)
-                || (self.write_only_keys.contains(&key) && !self.retained_write_only.contains(&key))
-            {
+            if self.write_only_keys.contains(&key) && !self.retained_write_only.contains(&key) {
                 continue;
             }
             let Some(previous_value) = previous.encoded_value(&key) else {
                 continue;
             };
-            let previous_value = match Self::decide_previous_secret_hash(
-                authority,
-                &key,
-                self.encoded.get(&key),
-                comparison,
-            ) {
-                PreviousSecretHashDecision::Release => continue,
-                PreviousSecretHashDecision::Protect => Cow::Borrowed(previous_value),
-                PreviousSecretHashDecision::ProtectLeaves(leaves) => Cow::Owned(
-                    restrict_previous_secret_hashes_to_leaves(previous_value, leaves)?,
-                ),
+            let input = if protected_secret_keys.contains(&key) {
+                PreviousSecretHashInput::DesiredSecretsMasked
+            } else {
+                PreviousSecretHashInput::ProviderValue(self.encoded.get(&key))
             };
+            let previous_value =
+                match Self::decide_previous_secret_hash(authority, &key, input, comparison) {
+                    PreviousSecretHashDecision::Release => continue,
+                    PreviousSecretHashDecision::Protect => Cow::Borrowed(previous_value),
+                    PreviousSecretHashDecision::ProtectLeaves(leaves) => Cow::Owned(
+                        restrict_previous_secret_hashes_to_leaves(previous_value, leaves)?,
+                    ),
+                };
             let Some(masked) = merge_previous_secret_hashes_into_provider_value(
                 &previous_value,
                 self.encoded.get(&key),

@@ -1651,27 +1651,32 @@ pub(crate) fn plan_update_patch<S, P: StateValueLeaf>(
             .attributes
             .get(key)
             .map(crate::resource::state_value_snapshot);
-        let sent_value = value
-            .map(|value| {
+        let (sent_value, leaves) = match value {
+            Some(value) => {
                 let (value, leaves) =
                     ignore_changes.with_observed_readable_leaves(key, value, observed.as_ref());
-                if !leaves.is_empty() {
-                    grafted.insert(key.clone(), leaves);
-                }
-                value.to_value_at(format!("{}.{}", to.id, key))
-            })
-            .transpose()?;
-        match (sent_value, in_from) {
-            (Some(value), false) => ops.push(PatchOp::Add {
+                (
+                    Some(value.to_value_at(format!("{}.{}", to.id, key))?),
+                    leaves,
+                )
+            }
+            None => (None, Vec::new()),
+        };
+        let op = match (sent_value, in_from) {
+            (Some(value), false) => PatchOp::Add {
                 key: key.clone(),
                 value,
-            }),
-            (Some(value), true) => ops.push(PatchOp::Replace {
+            },
+            (Some(value), true) => PatchOp::Replace {
                 key: key.clone(),
                 value,
-            }),
-            (None, true) => ops.push(PatchOp::Remove { key: key.clone() }),
-            (None, false) => {}
+            },
+            (None, true) => PatchOp::Remove { key: key.clone() },
+            (None, false) => continue,
+        };
+        ops.push(op);
+        if !leaves.is_empty() {
+            grafted.insert(key.clone(), leaves);
         }
     }
 

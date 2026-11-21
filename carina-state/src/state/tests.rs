@@ -6841,7 +6841,7 @@ fn previous_secret_hash_unsent_update_requires_provider_equality() {
                     final_desired: Some(&FinalDesiredAttributes::for_test(attributes.clone())),
                 },
                 "computed",
-                Some(&provider),
+                PreviousSecretHashInput::ProviderValue(Some(&provider)),
                 Some(desired_value_comparison_for_test(None)),
             ),
             expected,
@@ -6922,6 +6922,90 @@ fn previous_secret_hash_grafted_leaf_in_sent_map_is_protected() {
         "written row must not contain ignored secret plaintext"
     );
     assert!(tags["changing"] == "after", "sent sibling remains public");
+}
+
+#[test]
+fn previous_secret_hash_grafted_leaf_with_desired_secret_sibling_is_protected() {
+    use carina_core::schema::{LeafPath, LeafPathSegment};
+
+    let public = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let protected =
+        |text: &str| Value::Deferred(DeferredValue::Secret(Box::new(public(text)).into()));
+    let marker = "fixture-secret-4570";
+    let previous_tags = PersistedValue::encode_desired_value(
+        &Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("retained".into(), protected(marker)),
+            ("released".into(), protected(marker)),
+            ("changing".into(), public("before")),
+        ]))),
+        None,
+    )
+    .unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("tags", previous_tags.as_json().clone());
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+            "tags",
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                ("retained".into(), public("public")),
+                ("other".into(), protected(marker)),
+                ("released".into(), public("public")),
+                ("changing".into(), public("after")),
+            ]))),
+        ),
+    );
+    let state: State = State::existing(
+        resource.id.clone(),
+        HashMap::from([(
+            "tags".into(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                ("retained".into(), public(marker)),
+                ("other".into(), public(marker)),
+                ("released".into(), public("public")),
+                ("changing".into(), public("after")),
+            ]))),
+        )]),
+    )
+    .with_identifier("sink-id");
+    let request = AcceptedRequest::update_with_grafted_leaves_for_test(
+        &[(
+            "tags",
+            vec![LeafPath::from_segments([LeafPathSegment::MapKey(
+                "retained".into(),
+            )])],
+        )],
+        &[],
+    );
+    let row = ResourceState::from_provider_state_with_final_desired(
+        &resource,
+        &state,
+        Some(&existing),
+        None,
+        RowBasis::Applied(&request),
+        None,
+        None,
+        &exact_comparison_context(),
+    )
+    .unwrap();
+    let attributes = row.persisted_attributes().unwrap();
+    let tags = attributes.encoded_value("tags").unwrap().as_json();
+    assert!(
+        tags["retained"] == previous_tags.as_json()["retained"],
+        "grafted leaf must keep its previous hash beside a desired secret"
+    );
+    assert!(
+        tags["other"][carina_core::value::PERSISTED_SECRET_KEY].is_string(),
+        "desired secret sibling must remain protected"
+    );
+    assert!(
+        tags["released"] == "public" && tags["changing"] == "after",
+        "public sent leaves must not inherit previous hash protection"
+    );
+    assert!(
+        !serde_json::to_string(&row).unwrap().contains(marker),
+        "written row must not contain secret plaintext"
+    );
 }
 
 #[test]
@@ -7353,7 +7437,7 @@ fn previous_secret_hash_decision_matrix() {
                 let decision = SelectedStateAttributes::decide_previous_secret_hash(
                     &authority,
                     "computed",
-                    provider.as_ref(),
+                    PreviousSecretHashInput::ProviderValue(provider.as_ref()),
                     Some(desired_value_comparison_for_test(None)),
                 );
                 let release = if applied {
@@ -7371,7 +7455,7 @@ fn previous_secret_hash_decision_matrix() {
                     SelectedStateAttributes::decide_previous_secret_hash(
                         &PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous),
                         "computed",
-                        provider.as_ref(),
+                        PreviousSecretHashInput::ProviderValue(provider.as_ref()),
                         Some(desired_value_comparison_for_test(None)),
                     ),
                     PreviousSecretHashDecision::Protect,

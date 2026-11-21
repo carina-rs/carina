@@ -87,7 +87,7 @@ fn assert_ignored_leaf_protected(
     edited: &str,
     retained: &str,
     changing: &str,
-) {
+) -> Value {
     let scenario = Scenario::new(resource_type, initial);
     scenario.run(&["init", "."]);
     scenario.run(&["apply", "--auto-approve", "--parallelism=1", "."]);
@@ -120,6 +120,7 @@ fn assert_ignored_leaf_protected(
             "the ignored leaf must not produce another update:\n{plan}"
         );
     }
+    after
 }
 
 #[test]
@@ -131,6 +132,26 @@ fn ignored_map_leaf_in_sent_attribute_keeps_previous_secret_hash() {
          directives { ignore_changes = [tags[\"retained\"]] }",
         "/tags/retained",
         "/tags/changing",
+    );
+}
+
+#[test]
+fn ignored_map_leaf_beside_desired_secret_keeps_previous_secret_hash() {
+    let after = assert_ignored_leaf_protected(
+        "test.resource",
+        "name = 'sink'\ntags = { retained = secret('__MARKER__') released = secret('__MARKER__') changing = 'before' }",
+        "name = 'sink'\ntags = { retained = 'public' other = secret('__MARKER__') released = 'public' changing = 'after' }\n\
+         directives { ignore_changes = [tags[\"retained\"]] }",
+        "/tags/retained",
+        "/tags/changing",
+    );
+    assert!(
+        after["tags"]["other"][PERSISTED_SECRET_KEY].is_string(),
+        "desired secret sibling must remain protected"
+    );
+    assert!(
+        after["tags"]["released"] == "public",
+        "a public sent leaf must release its previous hash"
     );
 }
 
