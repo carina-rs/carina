@@ -55,6 +55,50 @@ pub(crate) fn admit_function_expression(
     .map_err(|error| error.map_ordinary(Into::into))
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum FunctionTypePosition<'a> {
+    Parameter(&'a str),
+    Return,
+}
+
+/// Only type/source metadata reaches this formatter, never an argument value.
+pub(crate) fn format_function_type_promise_error(
+    function: &str,
+    position: FunctionTypePosition<'_>,
+    declared: &TypeExpr,
+    source_type: &str,
+    untyped_export: Option<&str>,
+) -> String {
+    let (position, subject, repair) = match position {
+        FunctionTypePosition::Parameter(name) => (
+            format!("parameter '{name}'"),
+            "its argument",
+            "the parameter",
+        ),
+        FunctionTypePosition::Return => ("return value".into(), "its value", "the return type"),
+    };
+    let source = match untyped_export {
+        Some(export) => {
+            format!("{subject} comes from upstream export '{export}', which has no declared type")
+        }
+        None if matches!(subject, "its value") => format!("the body's type is {source_type}"),
+        None => format!("{subject} has type {source_type}"),
+    };
+    let export_repair = if untyped_export.is_some() {
+        ", or declare the export's type"
+    } else {
+        ""
+    };
+    let repair_type = if source_type == "unknown" {
+        "String"
+    } else {
+        source_type
+    };
+    format!(
+        "function '{function}': {position} is declared as {declared}, but {source}, so validate cannot prove it fits. Pass a value known at validate, or declare {repair} as {repair_type} and let the resource attribute that receives it check the value{export_repair}."
+    )
+}
+
 /// Provider authority available to internal value-checking pipelines.
 ///
 /// Construction is crate-private: loaded paths retain the opaque production

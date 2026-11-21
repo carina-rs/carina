@@ -622,7 +622,23 @@ fn scalar_value_obligation<'result, C: AssignmentCheck>(
 /// One nominal scalar rule for declaration compatibility and reference admission.
 /// Reference sources carry their identity and length here without changing the
 /// wire-scalar rules for identity-less String or Reference destinations.
+fn identity_pattern_implies<R: PatternForm>(
+    source: TypeInSchema<'_, R>,
+    sink: TypeInSchema<'_, R>,
+) -> bool {
+    let pattern = |ty: TypeInSchema<'_, R>| match &ty.attr.kind {
+        AttrTypeKind::String { identity_layer, .. } => {
+            identity_layer.pattern.as_ref().map(AsRef::as_ref).cloned()
+        }
+        AttrTypeKind::Reference { pattern, .. } => pattern.as_ref().map(AsRef::as_ref).cloned(),
+        _ => None,
+    };
+    let target = pattern(sink);
+    target.is_none() || pattern(source) == target
+}
+
 fn scalar_identity_assignment<'source, 'sink, R: PatternForm, C: AssignmentCheck>(
+    source_type: TypeInSchema<'source, R>,
     source_identity: &TypeIdentity,
     source_constraints: Option<NominalScalarConstraints>,
     sink: AssignmentSink<'sink, R>,
@@ -647,6 +663,13 @@ where
         if disjoint || ((!same_identity || check.requires_identity_containment()) && !identity_fits)
         {
             TypeAssignability::Mismatch.into()
+        } else if check.static_evidence()
+            && identity_fits
+            && !scalar_value_constraints(sink.ty, sink_refs)
+                .is_some_and(|constraints| constraints.has_member_constraints)
+            && identity_pattern_implies(source_type, sink.ty)
+        {
+            TypeAssignability::Assignable.into()
         } else {
             check
                 .destination_obligation(true, same_identity)
@@ -676,6 +699,7 @@ where
             source_length,
             target_binding,
         } => scalar_identity_assignment(
+            source,
             source_identity,
             Some(NominalScalarConstraints::String(source_length)),
             sink,
@@ -775,6 +799,9 @@ impl<'s> AssignmentRelation<'s> {
 trait AssignmentCheck: Copy {
     type Result<'s>: AssignmentResult<'s>;
     fn identified_only(self) -> bool;
+    fn static_evidence(self) -> bool {
+        false
+    }
     /// Identified scalar declarations and widening retain identity-bound
     /// containment; reference admission can discharge same-identity overlap.
     /// Anonymous scalar pairs use overlap-or-defer in both Full check modes.
@@ -877,6 +904,8 @@ impl AssignmentCheck for DeclaredAssignmentCheck {
 enum ReferenceAssignmentCheck {
     Full,
     IdentifiedLeaves,
+    /// Classify type proof without attaching a destination's value obligation.
+    StaticEvidence,
 }
 
 impl AssignmentCheck for ReferenceAssignmentCheck {
@@ -885,7 +914,10 @@ impl AssignmentCheck for ReferenceAssignmentCheck {
         matches!(self, Self::IdentifiedLeaves)
     }
     fn requires_identity_containment(self) -> bool {
-        false
+        matches!(self, Self::StaticEvidence)
+    }
+    fn static_evidence(self) -> bool {
+        matches!(self, Self::StaticEvidence)
     }
     fn destination_obligation<'s>(
         self,
@@ -1000,6 +1032,24 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         )
     }
 
+    /// The reference relation also judges expression-type evidence. This
+    /// classifies proof without authorizing placement or a local value check.
+    pub(crate) fn static_assignment_to<'query>(
+        self,
+        sink: AssignmentSink<'query, R>,
+    ) -> AssignmentRelation<'query>
+    where
+        'source: 'query,
+    {
+        let source: TypeInSchema<'query, R> = self;
+        source.assignment_on_paths(
+            sink,
+            ReferenceAssignmentCheck::StaticEvidence,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+    }
+
     pub(crate) fn identified_reference_assignment_to<'query, B: crate::resource::BindingAddress>(
         self,
         sink: AssignmentSink<'query, R>,
@@ -1058,6 +1108,18 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             && let Some(target_identity) = identity_leaf(&target.attr.kind)
         {
             if !scalar {
+                if check.static_evidence()
+                    && same_identity
+                    && source_constraints
+                        .zip(target_constraints)
+                        .is_some_and(|(source, target)| source.contained_by(target))
+                    && !scalar_value_constraints(right.ty, sink_refs)
+                        .is_some_and(|constraints| constraints.has_member_constraints)
+                {
+                    source_refs.truncate(source.restore_len);
+                    sink_refs.truncate(target.restore_len);
+                    return Assignable.into();
+                }
                 // Keep main's same-identity reference deferral for Float,
                 // Enum and unloaded leaves. Strict declaration checks still
                 // use their existing kind/base/range rules below.
@@ -1070,6 +1132,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 return result;
             }
             let result = scalar_identity_assignment(
+                left,
                 source_identity,
                 source_constraints,
                 right,
@@ -1082,6 +1145,9 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             return result;
         }
         let result = match (&source.attr.kind, &target.attr.kind) {
+            (String { .. }, StringLiteralSet { .. }) if check.static_evidence() => check
+                .destination_obligation(true, false)
+                .expect("literal membership needs a value"),
             (_, _)
                 if source_constraints.is_some_and(|bounds| bounds.provably_disjoint(bounds))
                     || target.attr.has_empty_scalar_intersection() =>
@@ -1882,6 +1948,9 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         result
     }
 }
+
+#[cfg(test)]
+mod static_evidence_tests;
 
 #[cfg(test)]
 mod tests {

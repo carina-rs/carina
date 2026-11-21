@@ -1317,6 +1317,20 @@ fn validate_and_resolve_configuration<'s>(
         &imported_module_signatures,
         enriched_context,
     );
+    let configuration = resolved_config
+        .canonicalized()
+        .judge(enriched_context.catalog());
+    let promise_findings = configuration
+        .judged()
+        .function_type_promise_findings(&bindings);
+    if !promise_findings.is_empty() {
+        errors.extend(
+            promise_findings
+                .into_iter()
+                .map(|finding| AppError::ExpressionType(Box::new(finding))),
+        );
+        return Err(ValidationStopped::existing(errors));
+    }
     if let Err(ref_errors) = carina_core::validation::validate_export_param_ref_types_with_bindings(
         parsed.export_params,
         &bindings,
@@ -1366,9 +1380,6 @@ fn validate_and_resolve_configuration<'s>(
                 enriched_context.catalog(),
             ),
         );
-        let configuration = resolved_config
-            .canonicalized()
-            .judge(enriched_context.catalog());
         let admission_warnings = crate::wiring::resource_admission_report_in_run(
             ctx,
             configuration.judged(),

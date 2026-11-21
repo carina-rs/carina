@@ -172,6 +172,12 @@ fn known_builtin_results_retain_invalid_operand_accesses() {
 
 fn source_schema_report(source: &str) -> (crate::parser::ParsedFile, ExpressionReport) {
     let parsed = crate::parser::parse_and_resolve(source).unwrap();
+    let schemas = source_schemas();
+    let report = judge_expressions(&parsed, &schemas, &config());
+    (parsed, report)
+}
+
+fn source_schemas() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
@@ -182,8 +188,7 @@ fn source_schema_report(source: &str) -> (crate::parser::ParsedFile, ExpressionR
             .validate()
             .unwrap(),
     );
-    let report = judge_expressions(&parsed, &schemas, &config());
-    (parsed, report)
+    schemas
 }
 
 #[test]
@@ -563,9 +568,13 @@ fn deferred_reads_have_resource_evidence() {
 
 #[test]
 fn folded_function_calls_keep_argument_failure_evidence() {
-    let (_, report) = source_schema_report(
+    let parsed = crate::parser::parse_and_resolve(
         "fn choose(n: Int): String { 'selected' }\nlet src = mock.test.Source {}\nlet result = choose(src.name)",
-    );
+    ).unwrap();
+    let schemas = source_schemas();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config());
+    let report = configuration.judged().report();
     let result = report.binding(&RelativeBindingName::new("result")).unwrap();
     assert!(
         admit_expression(result, &TypeExpr::String).is_err(),

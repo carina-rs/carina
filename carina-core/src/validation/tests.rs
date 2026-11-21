@@ -11283,12 +11283,15 @@ fn expression_validation_directory_file(source: &str) -> ParsedFile {
 
 #[test]
 fn function_argument_interpolation_is_checked_locally() {
-    let result = crate::parser::parse_and_resolve(
+    let parsed = crate::parser::parse_and_resolve(
         "fn f(n: Int): Int { n }\nlet src = mock.test.Source {}\nlet result = f(\"${src.name}-inline\")",
-    );
+    ).unwrap();
+    let findings = function_promise_findings_with_source_schema(&parsed);
     assert!(
-        result.is_err(),
-        "authored function argument bypassed the Int sink"
+        findings
+            .iter()
+            .any(|finding| finding.contains("function 'f': parameter 'n'")),
+        "authored function argument bypassed the Int sink: {findings:?}"
     );
 }
 
@@ -11298,22 +11301,57 @@ fn function_return_interpolation_is_checked_across_files() {
         "let src = mock.test.Source {}\nlet result = f(src.name)",
         "fn f(n: String): Int { \"${n}-inline\" }",
     );
-    let result = crate::config_loader::parse_directory(&path, &expression_validation_config());
+    let parsed = crate::config_loader::parse_directory(&path, &expression_validation_config())
+        .unwrap()
+        .into_parsed();
+    let findings = function_promise_findings_with_source_schema(&parsed);
     assert!(
-        result.is_err(),
-        "sibling function return bypassed the Int sink"
+        findings
+            .iter()
+            .any(|finding| finding.contains("function 'f': return value")),
+        "sibling function return bypassed the Int sink: {findings:?}"
     );
 }
 
 #[test]
 fn function_return_interpolation_is_checked_locally() {
-    let result = crate::parser::parse_and_resolve(
+    let parsed = crate::parser::parse_and_resolve(
         "fn f(n: String): Int { \"${n}-inline\" }\nlet src = mock.test.Source {}\nlet result = f(src.name)",
-    );
+    ).unwrap();
+    let findings = function_promise_findings_with_source_schema(&parsed);
     assert!(
-        result.is_err(),
-        "authored function return bypassed the Int sink"
+        findings
+            .iter()
+            .any(|finding| finding.contains("function 'f': return value")),
+        "authored function return bypassed the Int sink: {findings:?}"
     );
+}
+
+fn function_promise_findings_with_source_schema(parsed: &ParsedFile) -> Vec<String> {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Source")
+            .attribute(
+                PatternAttributeSchema::provider_populated("name", PatternAttributeType::string())
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let loaded = crate::test_utils::loaded_fixture_snapshot(schemas);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        parsed,
+        loaded.schema_registry(),
+        loaded.provider_context().as_provider_context(),
+    );
+    configuration
+        .judged()
+        .report()
+        .findings()
+        .iter()
+        .map(|finding| finding.detail().to_string())
+        .collect()
 }
 
 #[test]

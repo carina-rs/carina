@@ -2429,6 +2429,30 @@ impl DiagnosticRun<'_> {
                 binding_use_report,
                 export_value_bindings,
             } = validation_inputs;
+            let promise_findings = expanded_validation_inputs.as_ref().map_or_else(
+                || {
+                    pre_expansion_configuration
+                        .judged()
+                        .function_type_promise_findings(&binding_index)
+                },
+                |inputs| {
+                    inputs
+                        .configuration
+                        .judged()
+                        .function_type_promise_findings(&inputs.binding_index)
+                },
+            );
+            for finding in promise_findings {
+                if let Some(diagnostic) = render_merged(
+                    doc,
+                    &finding,
+                    DiagnosticSeverity::ERROR,
+                    finding.detail().to_string(),
+                ) && !diagnostics.contains(&diagnostic)
+                {
+                    diagnostics.push(diagnostic);
+                }
+            }
             // Validate non-resource declarations authored in the open file,
             // even when no typed resource sink consumes them. Binding and
             // schema authority remains directory-wide, while source anchoring

@@ -774,6 +774,12 @@ where
     ) -> Vec<crate::parser::Located<crate::validation::IntegerArithmeticTypeFinding>> {
         crate::validation::check_file_integer_arithmetic_values(&self.file, bindings)
     }
+    pub fn function_type_promise_findings(
+        &self,
+        bindings: &crate::binding_index::BindingIndex<'_, B>,
+    ) -> Vec<crate::parser::Located<crate::static_type::InferenceError>> {
+        self.file.function_type_promise_findings(bindings)
+    }
     pub fn judged(&self) -> &Self {
         self
     }

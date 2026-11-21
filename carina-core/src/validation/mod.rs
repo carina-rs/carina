@@ -7276,15 +7276,9 @@ pub(crate) fn validate_expansion_boundary_ref_types_with_bindings<
         .into_iter()
         .map(|error| ExpansionBoundaryReferenceError::ModuleCall(Box::new(error))),
     );
-    if let Err(message) =
-        validate_user_function_ref_types_inner(parsed, bindings, UnknownReferencePolicy::Defer)
-    {
-        errors.extend(
-            message
-                .lines()
-                .map(|line| ExpansionBoundaryReferenceError::Function(line.to_string())),
-        );
-    }
+    // Function promises need the completed upstream index and expanded call
+    // projections. Their core pass runs at that boundary, rather than
+    // treating a declaration's unknown body as a call here.
 
     if errors.is_empty() {
         Ok(())

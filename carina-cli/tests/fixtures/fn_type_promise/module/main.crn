@@ -1,0 +1,2 @@
+let child = use { source = './child' }
+child {}

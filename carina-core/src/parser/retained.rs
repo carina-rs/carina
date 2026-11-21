@@ -71,6 +71,7 @@ pub(crate) use conversion::check as check_conversion;
 pub use conversion::{ConversionJudgement, TemplateDeferral};
 
 mod cursor;
+mod function_promises;
 pub use cursor::{
     AuthoredCursor, AuthoredSlots, AuthoredUse, CompletenessReport, EdgeRole, ExpansionInstanceId,
     JudgedNodeRef, JudgedSlot, NoAuthoredEvidence, NodeId, ProjectedPhase, ProjectionGeneration,
@@ -1305,6 +1306,22 @@ impl<'a, E, D, B: BindingAddress> JudgedFile<'a, E, D, B> {
     pub fn schemas(&self) -> &'a crate::schema::SchemaRegistry {
         self.schemas
     }
+    /// Check unknown function-boundary values using the completed source index.
+    /// The authored judge has already typed each body with declared parameters.
+    pub fn function_type_promise_findings(
+        &self,
+        bindings: &crate::binding_index::BindingIndex<'_, B>,
+    ) -> Vec<Located<crate::static_type::InferenceError>> {
+        function_promises::check(
+            self.file.parser_binding_metadata.syntax().expressions(),
+            self.report(),
+            bindings,
+            true,
+        )
+        .into_iter()
+        .map(|finding| finding.diagnostic)
+        .collect()
+    }
     pub(crate) fn into_file(self) -> super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
         self.file
     }
@@ -1365,6 +1382,14 @@ pub(crate) fn judge_configuration<
 {
     prepare_slots(file, schemas);
     let mut report = judge_expressions(file, schemas, config);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(file, schemas, config);
+    let promises = function_promises::check(
+        file.parser_binding_metadata.syntax().expressions(),
+        &report,
+        &bindings,
+        false,
+    );
+    report.record_function_promises(promises, &bindings);
     for parameter in &file.export_params {
         if let (Some(sink), Some(location)) =
             (parameter.type_expr_opt(), parameter.value_location())
@@ -5379,6 +5404,105 @@ mod judgement {
         pub fn findings(&self) -> &[Located<InferenceError>] {
             &self.findings
         }
+        /// Keep a rejected call invalid in aliases and containing expressions,
+        /// just as a rejection discovered during the authored walk would be.
+        pub(super) fn record_function_promises(
+            &mut self,
+            findings: Vec<super::function_promises::Finding>,
+            bindings: &crate::binding_index::BindingIndex<'_, B>,
+        ) {
+            if findings.is_empty() {
+                return;
+            }
+            let mut failures = HashMap::new();
+            for finding in findings {
+                failures
+                    .entry(finding.node)
+                    .or_insert_with(|| finding.diagnostic.clone());
+                if !self.findings.contains(&finding.diagnostic) {
+                    Arc::make_mut(&mut self.findings).push(finding.diagnostic.clone());
+                }
+                if !self.function_errors.contains(&finding.diagnostic) {
+                    Arc::make_mut(&mut self.function_errors).push(finding.diagnostic);
+                }
+            }
+            // The authored judge records nodes after their syntax/binding
+            // dependencies. Reuse that order; no body is judged a second time.
+            for (key, node) in self.syntax_nodes.iter() {
+                let inherited = node
+                    .children
+                    .iter()
+                    .find_map(|child| {
+                        failures
+                            .get(&(child.authored.location.instance.clone(), child.node_id()))
+                            .cloned()
+                    })
+                    .or_else(|| {
+                        let binding = match &node.kind {
+                            ExprKind::Binding(binding) => binding,
+                            ExprKind::Reference { binding, .. }
+                                if !bindings.is_declared(binding.as_str()) =>
+                            {
+                                binding
+                            }
+                            _ => return None,
+                        };
+                        let definition = self.definitions.get(binding)?;
+                        failures
+                            .get(&(
+                                definition.authored.location.instance.clone(),
+                                definition.node_id(),
+                            ))
+                            .cloned()
+                    });
+                if let Some(finding) = inherited {
+                    failures.entry(key.clone()).or_insert(finding);
+                }
+            }
+            let reject = |expression: &mut JudgedExpr, finding: &Located<InferenceError>| {
+                expression.mark_failed(finding.detail().clone(), FailureOwner::Reported);
+                expression.data_mut().boundary_owner = Some(Arc::new(finding.location().clone()));
+            };
+            #[allow(clippy::iter_over_hash_type)]
+            // commutative: copy failures to independent entries without emitting diagnostics.
+            for (key, finding) in &failures {
+                if let Some(expression) = Arc::make_mut(&mut self.nodes).get_mut(key) {
+                    reject(expression, finding);
+                }
+                if let Some(node) = self.syntax_nodes.get(key)
+                    && let Some(expression) =
+                        Arc::make_mut(&mut self.expressions).get_mut(&node.location)
+                {
+                    reject(expression, finding);
+                }
+            }
+            for (name, expression) in Arc::make_mut(&mut self.bindings) {
+                if let Some(definition) = self.definitions.get(name)
+                    && let Some(finding) = failures.get(&(
+                        definition.authored.location.instance.clone(),
+                        definition.node_id(),
+                    ))
+                {
+                    reject(expression, finding);
+                }
+            }
+            // Resource snapshots carry the same node evidence, with a distinct
+            // instance anchor. Refresh them before slots attach their reports.
+            let mut snapshots = HashMap::new();
+            let mut updated = self.clone();
+            updated.resource_reports = Arc::default();
+            updated.use_roots = Arc::default();
+            for snapshot in Arc::make_mut(&mut self.resource_reports).values_mut() {
+                *snapshot = snapshots
+                    .entry(snapshot.instance.clone())
+                    .or_insert_with(|| {
+                        let mut updated = updated.clone();
+                        updated.instance = snapshot.instance.clone();
+                        Arc::new(updated)
+                    })
+                    .clone();
+            }
+        }
         pub(crate) fn first_function_error(&self) -> Option<super::super::ParseError> {
             first_error(&self.function_errors)
         }
@@ -6225,6 +6349,11 @@ mod judgement {
                 }
                 Err(SinkRejection::Ordinary(error)) => error,
             };
+            // Keep conversion placement checks above. Ordinary unknown values
+            // need the completed source index at the shared promise pass.
+            if !expression.concrete() {
+                return None;
+            }
             let error = match error {
                 crate::validation::typecheck::FunctionExpressionError::Annotation(error) => {
                     let mut failed = declared(
