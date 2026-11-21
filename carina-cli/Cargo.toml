@@ -57,6 +57,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-
 tokio-util = "0.7"
 
 [dev-dependencies]
+proc-macro2 = "1"
+syn = { version = "3", features = ["full", "visit"] }
 carina-provider-protocol = { path = "../carina-provider-protocol" }
 argon2 = "0.5"
 async-trait = "0.1"

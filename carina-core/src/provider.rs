@@ -1906,16 +1906,6 @@ impl Serialize for PersistedAttributes {
     }
 }
 
-/// Which existing state hashes may classify provider plaintext as secret.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreviousSecretHashAuthority<'a> {
-    None,
-    /// Protect every key that already contains a stored secret hash.
-    AllPreviouslyHashedKeys(&'a PersistedAttributes),
-    /// Protect stored hashes only for keys absent from the desired resource.
-    OnlyKeysAbsentFromDesired(&'a PersistedAttributes),
-}
-
 /// Select the saved-plan hash for an attribute, falling back to the current
 /// state's hash when the plan did not capture one.
 pub fn previous_hash<'a>(

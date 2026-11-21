@@ -2792,6 +2792,7 @@ async fn run_apply_locked_owned(
             capture_live_apply_plan_for_test(&runtime, execution_plan)?;
             let crate::wiring::PostExpansionApplyResources {
                 resolved: resolved_resources,
+                final_desired,
                 paired_unresolved: paired_unresolved_resources,
                 unresolved_by_resolved_id,
                 bindings,
@@ -3018,7 +3019,8 @@ async fn run_apply_locked_owned(
                     None,
                     provider.as_ref(),
                 )?
-                .with_reference_evidence(Some(plan.references().clone())),
+                .with_reference_evidence(Some(plan.references().clone()))
+                .with_final_desired(final_desired),
             );
             let saver = start_apply_state_saver(
                 state_file.into_file(),

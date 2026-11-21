@@ -1,6 +1,16 @@
 use super::*;
 use crate::provider_text_fixtures::*;
 mod provider_text_secret_redaction;
+
+fn desired_value_comparison_for_test(
+    schema: Option<&ResourceSchema>,
+) -> DesiredValueComparison<'_> {
+    DesiredValueComparison {
+        schema,
+        context: exact_comparison_context().schema(),
+    }
+}
+
 use carina_core::resource::Directives;
 use carina_core::resource::{
     DeferredValue, PendingReRead, ReReadReason, ResolvedDependencies, SnapshotLeaf,
@@ -574,12 +584,15 @@ fn resource_state_from_provider_state_for_resource_and_schema_for_test<
     row_basis: RowBasis<'_>,
     preferred_hashes: Option<&PersistedAttributes>,
 ) -> Result<ResourceState, ResourceStateEncodingError> {
-    ResourceState::from_provider_state_for_resource_and_schema(
+    let final_desired =
+        FinalDesiredValues::for_test([(resource.id.clone(), resource.attributes.clone())]);
+    ResourceState::from_provider_state_with_final_desired(
         resource,
         state,
         existing,
         schema,
         row_basis,
+        Some(&final_desired),
         preferred_hashes,
         &exact_comparison_context(),
     )
@@ -592,11 +605,14 @@ fn resource_state_from_observation_for_test<S: Clone>(
     schema: Option<&carina_core::schema::CompiledResourceSchema>,
     preferred_hashes: Option<&PersistedAttributes>,
 ) -> Result<ResourceState, ResourceStateEncodingError> {
-    ResourceState::from_observation(
+    let final_desired =
+        FinalDesiredValues::for_test([(resource.id.clone(), resource.attributes.clone())]);
+    ResourceState::from_observation_with_final_desired(
         resource,
         identified,
         existing,
         schema,
+        Some(&final_desired),
         preferred_hashes,
         &exact_comparison_context(),
     )
@@ -6615,6 +6631,767 @@ fn test_from_provider_state_secret_stored_as_hash() {
 }
 
 #[test]
+fn applied_previous_secret_hash_authority_requires_known_public_desired() {
+    use carina_core::resource::{
+        ApplyTimeUnknown, AuthoredAccessPath, FunctionArgument, InterpolationPart,
+    };
+
+    let old = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("old".into()))).into(),
+    ));
+    let previous_value = PersistedValue::encode_desired_value(&old, None).unwrap();
+    let secret_attributes = IndexMap::from([(
+        "computed".to_owned(),
+        Value::Concrete(ConcreteValue::List(vec![old])),
+    )]);
+    assert_eq!(
+        DesiredKey::from_attributes(&secret_attributes, "computed"),
+        DesiredKey::NotKnownPublic,
+        "a concrete container with a known Secret payload is not public"
+    );
+    let previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "computed".to_owned(),
+        previous_value,
+    )]))
+    .unwrap();
+    let provider_material = Value::Concrete(ConcreteValue::String("provider-current".into()));
+    let provider_value = PersistedValue::encode_desired_value(&provider_material, None).unwrap();
+    let reference = Value::Deferred(DeferredValue::ResourceRef {
+        path: AuthoredAccessPath::with_fields("src", "tags", vec!["nested".into()])
+            .resolve_root_for_test(),
+    });
+    let deferred = [
+        ("reference", reference.clone()),
+        (
+            "binding",
+            Value::Deferred(DeferredValue::BindingRef {
+                binding: absolute_binding_address_for_test("src"),
+            }),
+        ),
+        (
+            "unknown",
+            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
+                PendingReRead::incomplete("pending".to_owned()),
+            ))),
+        ),
+        (
+            "call",
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: carina_core::builtins::BuiltinFunction::lower,
+                args: vec![FunctionArgument::from_value(reference.clone())],
+                source_line: 1.into(),
+            }),
+        ),
+        (
+            "nested reference",
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "items".to_owned(),
+                Value::Concrete(ConcreteValue::List(vec![reference])),
+            )]))),
+        ),
+        (
+            "literal interpolation remains deferred",
+            Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Literal("public".into()),
+            ])),
+        ),
+        (
+            "literal coalesce remains deferred",
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(Value::Concrete(ConcreteValue::String("public".into()))),
+                default: Box::new(Value::Concrete(ConcreteValue::String("default".into()))),
+            }),
+        ),
+    ];
+    let public = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "items".to_owned(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("public".into()),
+        )])),
+    )])));
+    let cases = [
+        ("absent", None, true),
+        ("known public tree", Some(public), false),
+        (
+            "plain literal",
+            Some(Value::Concrete(ConcreteValue::String("public".into()))),
+            false,
+        ),
+        (
+            "empty list",
+            Some(Value::Concrete(ConcreteValue::List(vec![]))),
+            false,
+        ),
+        (
+            "empty map",
+            Some(Value::Concrete(ConcreteValue::Map(IndexMap::new()))),
+            false,
+        ),
+    ]
+    .into_iter()
+    .chain(
+        deferred
+            .into_iter()
+            .map(|(label, value)| (label, Some(value), true)),
+    );
+    for (label, desired, protected) in cases {
+        let expected_desired_key = match desired.as_ref() {
+            None => DesiredKey::Absent,
+            Some(_) if protected => DesiredKey::NotKnownPublic,
+            Some(_) => DesiredKey::KnownPublic,
+        };
+        let mut resource = Resource::with_provider("mock", "test.resource", "sink", None);
+        if let Some(desired) = desired {
+            resource = resource.with_attribute("computed", desired);
+        }
+        let mut source = Resource::with_provider("mock", "test.resource", "src", None);
+        source.binding = Some(absolute_binding_address_for_test("src"));
+        let resource = ResolvedResource::collect_resolved([source, resource])
+            .expect("desired references resolve to the source resource")
+            .remove(1);
+        assert_eq!(
+            DesiredKey::from_attributes(&resource.attributes, "computed"),
+            expected_desired_key,
+            "{label}: classify the entire desired value tree"
+        );
+        let request = AcceptedRequest::update_for_test(&["computed"], &[]);
+        for (authority, protected) in [
+            (PreviousSecretHashAuthority::None, false),
+            (
+                PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&previous),
+                true,
+            ),
+            (
+                PreviousSecretHashAuthority::AcceptedWrite {
+                    previous: &previous,
+                    request: &request,
+                    request_attributes: Cow::Borrowed(&resource.attributes),
+                    final_desired: None,
+                },
+                protected,
+            ),
+        ] {
+            let selected = SelectedStateAttributes {
+                encoded: BTreeMap::from([("computed".to_owned(), provider_value.clone())]),
+                write_only_keys: HashSet::new(),
+                retained_write_only: HashSet::new(),
+            }
+            .protect_for_resource(
+                &resource,
+                authority,
+                None,
+                true,
+                Some(desired_value_comparison_for_test(None)),
+            )
+            .expect("protect provider material");
+            let stored = selected
+                .encoded
+                .get("computed")
+                .expect("computed remains stored");
+            if protected {
+                let stored = stored.decode().expect("provider value decodes");
+                assert!(
+                    stored.secret_hash().is_some(),
+                    "{label}: only accepted KnownPublic values release previous hashes"
+                );
+                assert!(
+                    stored.verify_secret(&provider_material).unwrap(),
+                    "{label}: hash describes current provider material"
+                );
+            } else {
+                assert!(
+                    stored == &provider_value,
+                    "{label}: unprotected provider material remains public"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn previous_secret_hash_unsent_update_requires_provider_equality() {
+    let attributes = IndexMap::from([(
+        "computed".to_owned(),
+        Value::Concrete(ConcreteValue::String("public".into())),
+    )]);
+    let old = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+    ));
+    let previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "computed".into(),
+        PersistedValue::encode_desired_value(&old, None).unwrap(),
+    )]))
+    .unwrap();
+    let request = AcceptedRequest::update_for_test(&["other"], &[]);
+    for (provider, expected) in [
+        ("different", PreviousSecretHashDecision::Protect),
+        ("public", PreviousSecretHashDecision::Release),
+    ] {
+        let provider = PersistedValue::encode_desired_value(
+            &Value::Concrete(ConcreteValue::String(provider.into())),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            SelectedStateAttributes::decide_previous_secret_hash(
+                &PreviousSecretHashAuthority::AcceptedWrite {
+                    previous: &previous,
+                    request: &request,
+                    request_attributes: Cow::Borrowed(&attributes),
+                    final_desired: Some(&FinalDesiredAttributes::for_test(attributes.clone())),
+                },
+                "computed",
+                Some(&provider),
+                Some(desired_value_comparison_for_test(None)),
+            ),
+            expected,
+            "an unsent key has no accepted-write release witness",
+        );
+    }
+}
+
+#[test]
+fn previous_secret_hash_decision_matrix() {
+    use carina_core::resource::{AuthoredAccessPath, FunctionArgument, InterpolationPart};
+    let reference = Value::Deferred(DeferredValue::ResourceRef {
+        path: AuthoredAccessPath::with_fields("src", "computed", vec![]).resolve_root_for_test(),
+    });
+    let call = Value::Deferred(DeferredValue::FunctionCall {
+        name: carina_core::builtins::BuiltinFunction::lower,
+        args: vec![FunctionArgument::from_value(reference.clone())],
+        source_line: 1.into(),
+    });
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+    ));
+    let previous_value = PersistedValue::encode_desired_value(&secret, None).unwrap();
+    let previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "computed".to_owned(),
+        previous_value.clone(),
+    )]))
+    .unwrap();
+    let plain = PersistedValue::encode_desired_value(
+        &Value::Concrete(ConcreteValue::String("public".into())),
+        None,
+    )
+    .unwrap();
+    let retained_hash = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("public".into()))).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let public_map = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "leaf".into(),
+        Value::Concrete(ConcreteValue::String("public".into())),
+    )])));
+    let nested_previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "computed".to_owned(),
+        PersistedValue::encode_desired_value(
+            &Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "hidden".into(),
+                    Value::Deferred(DeferredValue::Secret(
+                        Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+                    )),
+                ),
+                (
+                    "public".into(),
+                    Value::Concrete(ConcreteValue::String("public".into())),
+                ),
+            ]))),
+            None,
+        )
+        .unwrap(),
+    )]))
+    .unwrap();
+    let cases = [
+        ("absent", None, Some(plain.clone()), false, false),
+        (
+            "known public equal",
+            Some(Value::Concrete(ConcreteValue::String("public".into()))),
+            Some(plain.clone()),
+            true,
+            true,
+        ),
+        (
+            "known public different",
+            Some(Value::Concrete(ConcreteValue::String("different".into()))),
+            Some(plain.clone()),
+            true,
+            false,
+        ),
+        (
+            "reference",
+            Some(reference.clone()),
+            Some(plain.clone()),
+            false,
+            false,
+        ),
+        (
+            "retained call",
+            Some(call.clone()),
+            Some(plain.clone()),
+            false,
+            false,
+        ),
+        ("secret", Some(secret), Some(plain.clone()), false, false),
+        (
+            "map with reference leaf",
+            Some(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "leaf".into(),
+                reference.clone(),
+            )])))),
+            Some(PersistedValue::encode_desired_value(&public_map, None).unwrap()),
+            false,
+            false,
+        ),
+        (
+            "list with deferred interpolation",
+            Some(Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
+                DeferredValue::Interpolation(vec![InterpolationPart::Literal("public".into())]),
+            )]))),
+            Some(
+                PersistedValue::encode_desired_value(
+                    &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                        ConcreteValue::String("public".into()),
+                    )])),
+                    None,
+                )
+                .unwrap(),
+            ),
+            false,
+            false,
+        ),
+        (
+            "map with one secret leaf",
+            Some(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "leaf".into(),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String("public".into()))).into(),
+                )),
+            )])))),
+            Some(PersistedValue::encode_desired_value(&public_map, None).unwrap()),
+            false,
+            false,
+        ),
+        (
+            "whole public map equal",
+            Some(public_map.clone()),
+            Some(PersistedValue::encode_desired_value(&public_map, None).unwrap()),
+            true,
+            true,
+        ),
+        (
+            "retained write-only hash has no plaintext",
+            Some(Value::Concrete(ConcreteValue::String("public".into()))),
+            Some(retained_hash),
+            true,
+            false,
+        ),
+        (
+            "omitted public literal",
+            Some(Value::Concrete(ConcreteValue::String("public".into()))),
+            None,
+            true,
+            false,
+        ),
+        ("omitted reference", Some(reference), None, false, false),
+        ("omitted call", Some(call), None, false, false),
+    ];
+    let request = AcceptedRequest::update_for_test(&["computed"], &[]);
+    for previous in [&previous, &nested_previous] {
+        for (label, desired, provider, applied_release, read_release) in &cases {
+            let attributes = desired
+                .clone()
+                .into_iter()
+                .map(|v| ("computed".to_owned(), v))
+                .collect::<IndexMap<_, _>>();
+            if *label == "list with deferred interpolation" {
+                assert_eq!(
+                    DesiredKey::from_attributes(&attributes, "computed"),
+                    DesiredKey::NotKnownPublic
+                );
+            }
+            let final_desired = FinalDesiredAttributes::for_test(attributes.clone());
+            for (basis, applied) in [("applied", true), ("carried", false), ("imported", false)] {
+                let authority = if applied {
+                    PreviousSecretHashAuthority::AcceptedWrite {
+                        previous,
+                        request: &request,
+                        request_attributes: Cow::Borrowed(&attributes),
+                        final_desired: Some(&final_desired),
+                    }
+                } else {
+                    PreviousSecretHashAuthority::MatchingFinalDesiredValue {
+                        previous,
+                        desired: &final_desired,
+                    }
+                };
+                let decision = SelectedStateAttributes::decide_previous_secret_hash(
+                    &authority,
+                    "computed",
+                    provider.as_ref(),
+                    Some(desired_value_comparison_for_test(None)),
+                );
+                let release = if applied {
+                    *applied_release
+                } else {
+                    *read_release
+                };
+                let expected = if release {
+                    PreviousSecretHashDecision::Release
+                } else {
+                    PreviousSecretHashDecision::Protect
+                };
+                assert_eq!(decision, expected, "{basis}, {label}");
+                assert_eq!(
+                    SelectedStateAttributes::decide_previous_secret_hash(
+                        &PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous),
+                        "computed",
+                        provider.as_ref(),
+                        Some(desired_value_comparison_for_test(None)),
+                    ),
+                    PreviousSecretHashDecision::Protect,
+                    "a bare previous map never grants equality release",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn previous_secret_hash_carried_imported_release_uses_only_final_desired() {
+    let resource = Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+        "computed",
+        Value::Concrete(ConcreteValue::String("authored".into())),
+    );
+    let resource = resolved(&resource);
+    let public = Value::Concrete(ConcreteValue::String("public".into()));
+    let previous = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", previous.as_json().clone());
+    let state: State = State::existing(
+        resource.id.clone(),
+        HashMap::from([("computed".into(), public.clone())]),
+    )
+    .with_identifier("sink-id");
+    let desired = FinalDesiredValues::for_test([(
+        resource.id.clone(),
+        IndexMap::from([("computed".into(), public.clone())]),
+    )]);
+    for basis in [RowBasis::Carried, RowBasis::Imported] {
+        for witness in [None, Some(&desired)] {
+            let row = ResourceState::from_provider_state_with_final_desired(
+                &resource,
+                &state,
+                Some(&existing),
+                None,
+                basis,
+                witness,
+                None,
+                &exact_comparison_context(),
+            )
+            .unwrap();
+            let stored = row.persisted_attributes().unwrap().get("computed").unwrap();
+            assert_eq!(
+                stored.secret_hash().is_some(),
+                witness.is_none(),
+                "authored desired cannot grant equality release; final desired can"
+            );
+        }
+    }
+}
+
+#[test]
+fn previous_secret_hash_unsent_update_uses_final_plan_desired() {
+    let resource = Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+        "computed",
+        Value::Concrete(ConcreteValue::String("apply-normalized".into())),
+    );
+    let resource = resolved(&resource);
+    let public = Value::Concrete(ConcreteValue::String("public".into()));
+    let previous = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", previous.as_json().clone());
+    let state: State = State::existing(
+        resource.id.clone(),
+        HashMap::from([("computed".into(), public.clone())]),
+    )
+    .with_identifier("sink-id");
+    let desired = FinalDesiredValues::for_test([(
+        resource.id.clone(),
+        IndexMap::from([("computed".into(), public)]),
+    )]);
+    let request = AcceptedRequest::update_for_test(&["other"], &[]);
+    let row = ResourceState::from_provider_state_with_final_desired(
+        &resource,
+        &state,
+        Some(&existing),
+        None,
+        RowBasis::Applied(&request),
+        Some(&desired),
+        None,
+        &exact_comparison_context(),
+    )
+    .unwrap();
+    assert!(
+        row.persisted_attributes()
+            .unwrap()
+            .get("computed")
+            .unwrap()
+            .secret_hash()
+            .is_none(),
+        "an unsent key uses final plan desired for equality, not an apply projection"
+    );
+}
+
+#[test]
+fn observation_previous_secret_hashes_without_final_desired_always_protect() {
+    let resource = Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+        "computed",
+        Value::Concrete(ConcreteValue::String("public".into())),
+    );
+    let previous_value = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "computed".into(),
+        previous_value,
+    )]))
+    .unwrap();
+    let public = Value::Concrete(ConcreteValue::String("public".into()));
+    let selected = SelectedStateAttributes {
+        encoded: BTreeMap::from([(
+            "computed".into(),
+            PersistedValue::encode_desired_value(&public, None).unwrap(),
+        )]),
+        write_only_keys: HashSet::new(),
+        retained_write_only: HashSet::new(),
+    }
+    .protect_observation(
+        &resolved(&resource),
+        Some(&previous),
+        None,
+        None,
+        Some(desired_value_comparison_for_test(None)),
+    )
+    .unwrap();
+    let stored = selected.encoded["computed"].decode().unwrap();
+    assert!(stored.secret_hash().is_some());
+    assert!(stored.verify_secret(&public).unwrap());
+}
+
+#[test]
+fn previous_secret_hash_is_kept_when_provider_omits_reference_or_call() {
+    use carina_core::resource::{AuthoredAccessPath, FunctionArgument};
+    let reference = Value::Deferred(DeferredValue::ResourceRef {
+        path: AuthoredAccessPath::with_fields("src", "computed", vec![]).resolve_root_for_test(),
+    });
+    let call = Value::Deferred(DeferredValue::FunctionCall {
+        name: carina_core::builtins::BuiltinFunction::lower,
+        args: vec![FunctionArgument::from_value(reference.clone())],
+        source_line: 1.into(),
+    });
+    let previous_value = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", previous_value.as_json().clone());
+    for desired in [reference, call] {
+        let mut source = Resource::with_provider("mock", "test.resource", "src", None);
+        source.binding = Some(absolute_binding_address_for_test("src"));
+        let resource = Resource::with_provider("mock", "test.resource", "sink", None)
+            .with_attribute("computed", desired);
+        let resource = ResolvedResource::collect_resolved([source, resource])
+            .unwrap()
+            .remove(1);
+        let provider: State =
+            State::existing(resource.id.clone(), BTreeMap::new()).with_identifier("sink-id");
+        for basis in [RowBasis::Carried, RowBasis::Imported] {
+            let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
+                &resource,
+                &provider,
+                Some(&existing),
+                None,
+                basis,
+                None,
+            )
+            .unwrap();
+            assert!(
+                row.persisted_attributes()
+                    .unwrap()
+                    .encoded_value("computed")
+                    == Some(&previous_value),
+                "an omitted deferred key keeps the previous hash"
+            );
+        }
+    }
+}
+
+#[test]
+fn retained_write_only_previous_hash_cannot_prove_plaintext_equality() {
+    let resource = Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+        "computed",
+        Value::Concrete(ConcreteValue::String("public".into())),
+    );
+    let previous_value = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("public".into()))).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "computed".into(),
+        previous_value.clone(),
+    )]))
+    .unwrap();
+    let selected = SelectedStateAttributes {
+        encoded: BTreeMap::from([("computed".into(), previous_value.clone())]),
+        write_only_keys: HashSet::from(["computed".into()]),
+        retained_write_only: HashSet::from(["computed".into()]),
+    }
+    .protect_for_resource(
+        &resolved(&resource),
+        PreviousSecretHashAuthority::MatchingFinalDesiredValue {
+            previous: &previous,
+            desired: &FinalDesiredAttributes::for_test(resource.attributes.clone()),
+        },
+        None,
+        true,
+        Some(desired_value_comparison_for_test(None)),
+    )
+    .unwrap();
+    assert!(selected.encoded.get("computed") == Some(&previous_value));
+}
+
+#[test]
+fn observation_previous_secret_hashes_release_only_equal_public_values() {
+    use carina_core::provider::{
+        AppliedIdentifier, AppliedState, CreateFailureKind, HostCreateObservation,
+        HostIdentifiedCreate, Observation, PendingToken, ProviderError, ReadOutcome,
+    };
+
+    // Observations cannot accept an accepted-write authority.
+    type ObservationProtection = fn(
+        SelectedStateAttributes,
+        &ResolvedResource<()>,
+        Option<&PersistedAttributes>,
+        Option<&FinalDesiredAttributes>,
+        Option<&PersistedAttributes>,
+        Option<DesiredValueComparison<'_>>,
+    ) -> Result<SelectedStateAttributes, SerializationError>;
+    const _: ObservationProtection = SelectedStateAttributes::protect_observation::<()>;
+
+    let resource = Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+        "computed",
+        Value::Concrete(ConcreteValue::String("public".into())),
+    );
+    let previous_value = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", previous_value.as_json().clone());
+    for (persisted, equal) in [(false, false), (false, true), (true, false), (true, true)] {
+        let provider_value = if equal { "public" } else { "provider-current" };
+        let identifier = AppliedIdentifier::new("sink-id").unwrap();
+        let observed = || {
+            AppliedState::new(
+                resource.id.clone(),
+                identifier.as_str(),
+                HashMap::from([(
+                    "computed".to_owned(),
+                    Value::Concrete(ConcreteValue::String(provider_value.into())),
+                )]),
+            )
+            .unwrap()
+        };
+        let identified = if persisted {
+            let pending = create_attempt_for_test(resource.id.clone())
+                .issued(identifier.clone(), Sent::AllRequestAttributes)
+                .pending(PendingToken::new("pending"), 1)
+                .persist(
+                    PersistedAttributes::default(),
+                    PersistedAttributes::default(),
+                );
+            HostIdentifiedCreate::from_in_flight_for_test(
+                pending,
+                identifier.clone(),
+                HostCreateObservation::Observed(observed()),
+            )
+        } else {
+            let failure = create_attempt_for_test(resource.id.clone())
+                .issued(identifier.clone(), Sent::AllRequestAttributes)
+                .identifier_reported(
+                    Observation::Read(ReadOutcome::found(observed())),
+                    ProviderError::internal("synthetic post-create finishing failure"),
+                );
+            match failure.into_host_for_test().into_kind() {
+                CreateFailureKind::IdentifierReported { identified, .. } => identified,
+                _ => panic!("fixture must produce an identifier-reported create"),
+            }
+        };
+        let row = resource_state_from_observation_for_test(
+            &resolved(&resource),
+            &identified,
+            Some(&existing),
+            None,
+            None,
+        )
+        .unwrap();
+        let stored = row.persisted_attributes().unwrap().get("computed").unwrap();
+        assert!(
+            stored.secret_hash().is_some() != equal,
+            "observation (persisted={persisted}, equal={equal}) releases only equal public values"
+        );
+        if equal {
+            assert!(
+                stored
+                    == Value::Concrete(ConcreteValue::String(provider_value.into())).to_snapshot()
+            );
+        } else {
+            assert!(
+                stored
+                    .verify_secret(&Value::Concrete(ConcreteValue::String(
+                        provider_value.into()
+                    )))
+                    .unwrap()
+            );
+        }
+    }
+}
+
+#[test]
 fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
@@ -6693,7 +7470,7 @@ fn deposed_encoders_return_unavailable_secret_errors() {
             &resource,
             None,
             &attributes,
-            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&previous),
+            Some(&previous),
         ),
     ] {
         let error = result.expect_err("unavailable material must be returned, not panic");
@@ -6724,7 +7501,7 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
         &resolved(&resource),
         None,
         &attrs,
-        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
+        Some(&existing),
     )
     .expect("deposed attributes must encode");
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
@@ -7631,7 +8408,7 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
         &resolved(&resource),
         None,
         &attrs,
-        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
+        Some(&existing),
     )
     .expect("deposed attributes must encode");
 
@@ -7640,49 +8417,77 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
 }
 
 #[test]
-fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
-    use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
-
-    let resource = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
-        "password",
-        Value::Concrete(ConcreteValue::String("plain-secret".into())),
+fn from_provider_state_imported_demotion_releases_only_equal_public_value() {
+    let resource = Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+        "computed",
+        Value::Concrete(ConcreteValue::String("public".into())),
     );
-    let existing = ResourceState::try_applied("db.Instance", "main", "awscc", "db-old")
-        .expect("fixture identifier is non-empty")
-        .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
-    let provider_state: carina_core::resource::State = ProviderState {
-        id: resource.id.clone(),
-        identifier: Some("db-old".to_string()),
-        attributes: [(
-            "password".to_string(),
-            Value::Concrete(ConcreteValue::String("plain-secret".into())),
-        )]
-        .into_iter()
-        .collect(),
-        exists: true,
-        dependency_bindings: Default::default(),
-
-        partial_read: None,
-    };
-
-    let rs = resource_state_from_provider_state_for_resource_and_schema_for_test(
-        &resolved(&resource),
-        &provider_state,
-        Some(&existing),
-        None,
-        RowBasis::Imported,
-        None,
-    )
-    .expect("provider state should serialize");
-
-    assert_eq!(
-        persisted_json_attribute(
-            rs.persisted_attributes()
-                .expect("provider row has persisted attributes"),
-            "password",
-        ),
-        Some(serde_json::json!("plain-secret"))
-    );
+    let old = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+    ));
+    let previous_value = PersistedValue::encode_desired_value(&old, None).unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", previous_value.as_json().clone());
+    for equal in [false, true] {
+        let material = if equal { "public" } else { "provider-current" };
+        let provider: State = State::existing(
+            resource.id.clone(),
+            HashMap::from([(
+                "computed".into(),
+                Value::Concrete(ConcreteValue::String(material.into())),
+            )]),
+        )
+        .with_identifier("sink-id");
+        let imported = resource_state_from_provider_state_for_resource_and_schema_for_test(
+            &resolved(&resource),
+            &provider,
+            Some(&existing),
+            None,
+            RowBasis::Imported,
+            None,
+        )
+        .unwrap();
+        let stored = imported
+            .persisted_attributes()
+            .unwrap()
+            .get("computed")
+            .unwrap();
+        assert!(
+            stored.secret_hash().is_some() != equal,
+            "Imported releases iff the public value is equal"
+        );
+        if equal {
+            assert!(
+                stored == Value::Concrete(ConcreteValue::String(material.into())).to_snapshot()
+            );
+        } else {
+            assert!(
+                stored
+                    .verify_secret(&Value::Concrete(ConcreteValue::String(material.into())))
+                    .unwrap()
+            );
+        }
+        let request = AcceptedRequest::update_for_test(&["computed"], &[]);
+        let applied = resource_state_from_provider_state_for_resource_and_schema_for_test(
+            &resolved(&resource),
+            &provider,
+            Some(&imported),
+            None,
+            RowBasis::Applied(&request),
+            None,
+        )
+        .unwrap();
+        assert!(
+            applied
+                .persisted_attributes()
+                .unwrap()
+                .get("computed")
+                .unwrap()
+                == Value::Concrete(ConcreteValue::String(material.into())).to_snapshot(),
+            "accepted public writes release even a different provider value"
+        );
+    }
 }
 
 #[test]
@@ -7934,7 +8739,7 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         &resolved(&resource),
         None,
         &attrs,
-        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
+        Some(&existing),
     )
     .expect("deposed attributes must encode");
     let stored_json = state_json_from_persisted_attributes(stored.as_persisted());
@@ -7963,7 +8768,7 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         &resolved(&resource),
         None,
         &attrs,
-        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&second_existing),
+        Some(&second_existing),
     )
     .expect("deposed attributes must encode");
     assert_eq!(
@@ -7993,7 +8798,7 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
         &resolved(&resource),
         None,
         &attrs,
-        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
+        Some(&existing),
     )
     .expect("deposed attributes must encode");
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
@@ -8061,7 +8866,7 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
         &resolved(&resource),
         None,
         &attrs,
-        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
+        Some(&existing),
     )
     .expect("deposed attributes must encode");
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
@@ -9358,6 +10163,285 @@ async fn observation_load_keeps_the_state_json_error_source() {
 }
 
 #[test]
+fn previous_secret_hash_omitted_public_value_keeps_root_and_nested_hashes() {
+    let string = |raw: &str| Value::Concrete(ConcreteValue::String(raw.into()));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string("prior")).into()));
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None)
+            .with_attribute("computed", string("public")),
+    );
+    let provider: State =
+        State::existing(resource.id.clone(), BTreeMap::new()).with_identifier("sink-id");
+    let request = AcceptedRequest::update_for_test(&["other"], &[]);
+    for previous in [
+        secret.clone(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("hidden".into(), secret),
+            ("public".into(), string("public")),
+        ]))),
+    ] {
+        let previous = PersistedValue::encode_desired_value(&previous, None).unwrap();
+        let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+            .unwrap()
+            .with_attribute("computed", previous.as_json().clone());
+        for basis in [
+            RowBasis::Carried,
+            RowBasis::Imported,
+            RowBasis::Applied(&request),
+        ] {
+            let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
+                &resource,
+                &provider,
+                Some(&existing),
+                None,
+                basis,
+                None,
+            )
+            .unwrap();
+            assert!(
+                row.persisted_attributes()
+                    .unwrap()
+                    .encoded_value("computed")
+                    == Some(&previous),
+                "a missing provider value cannot prove equality to a public literal"
+            );
+        }
+    }
+}
+
+#[test]
+fn deposed_public_desired_cannot_release_previous_secret_hash() {
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+            "computed",
+            Value::Concrete(ConcreteValue::String("public".into())),
+        ),
+    );
+    let old = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+    ));
+    let previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "computed".into(),
+        PersistedValue::encode_desired_value(&old, None).unwrap(),
+    )]))
+    .unwrap();
+    let attributes: BTreeMap<String, Value> = BTreeMap::from([(
+        "computed".into(),
+        Value::Concrete(ConcreteValue::String("public".into())),
+    )]);
+    let stored = ResourceState::deposed_attributes_without_previous(
+        &resource,
+        None,
+        &attributes,
+        Some(&previous),
+    )
+    .unwrap();
+    assert!(
+        stored
+            .as_persisted()
+            .get("computed")
+            .unwrap()
+            .secret_hash()
+            .is_some()
+    );
+}
+
+#[test]
+fn previous_secret_hash_carried_float_uses_fresh_plan_numeric_comparison() {
+    let desired = Value::Concrete(ConcreteValue::Int(1));
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None)
+            .with_attribute("computed", desired.clone()),
+    );
+    let old = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(Box::new(desired.clone()).into())),
+        None,
+    )
+    .unwrap();
+    let previous = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", old.as_json().clone());
+    let schema = PatternResourceSchema::new("test.resource")
+        .attribute(
+            PatternAttributeSchema::optional("computed", PatternAttributeType::float()).build(),
+        )
+        .validate()
+        .unwrap();
+    let provider: State = State::existing(
+        resource.id.clone(),
+        HashMap::from([(
+            "computed".into(),
+            Value::Concrete(ConcreteValue::Float(1.0.try_into().unwrap())),
+        )]),
+    )
+    .with_identifier("sink-id");
+    let final_desired = FinalDesiredValues::for_test([(
+        resource.id.clone(),
+        IndexMap::from([("computed".into(), desired)]),
+    )]);
+    let row = ResourceState::from_provider_state_with_final_desired(
+        &resource,
+        &provider,
+        Some(&previous),
+        Some(schema.as_schema()),
+        RowBasis::Carried,
+        Some(&final_desired),
+        None,
+        &exact_comparison_context(),
+    )
+    .unwrap();
+    assert!(
+        row.persisted_attributes()
+            .unwrap()
+            .get("computed")
+            .unwrap()
+            .secret_hash()
+            .is_none(),
+        "the same typed Int/Float equality as a fresh plan must release the hash"
+    );
+}
+
+#[test]
+fn previous_secret_hash_release_follows_fresh_plan_comparison() {
+    use PreviousSecretHashDecision::{Protect, Release};
+    let string = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let list = |items: &[&str]| {
+        Value::Concrete(ConcreteValue::List(
+            items.iter().map(|text| string(text)).collect(),
+        ))
+    };
+    let desired_map = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "name".into(),
+        string("public"),
+    )])));
+    let provider_map = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("name".into(), string("public")),
+        ("defaulted".into(), string("default")),
+    ])));
+    let map_type = PatternAttributeType::struct_(
+        "Config",
+        vec![
+            PatternStructField::optional("name", PatternAttributeType::string()).build(),
+            PatternStructField::optional("defaulted", PatternAttributeType::string()).build(),
+        ],
+    );
+    let cases = [
+        (
+            "identical public string",
+            string("public"),
+            string("public"),
+            Some(PatternAttributeType::string()),
+            Release,
+        ),
+        (
+            "genuinely different public string",
+            string("public"),
+            string("different"),
+            Some(PatternAttributeType::string()),
+            Protect,
+        ),
+        (
+            "ordered reordered list",
+            list(&["public", "other"]),
+            list(&["other", "public"]),
+            Some(PatternAttributeType::list(PatternAttributeType::string())),
+            Protect,
+        ),
+        (
+            "unordered reordered list",
+            list(&["public", "other"]),
+            list(&["other", "public"]),
+            Some(PatternAttributeType::unordered_list(
+                PatternAttributeType::string(),
+            )),
+            Release,
+        ),
+        // The differ's existing schemaless list comparison is an unordered multiset.
+        (
+            "schemaless reordered list",
+            list(&["public", "other"]),
+            list(&["other", "public"]),
+            None,
+            Release,
+        ),
+        (
+            "Int for Float slot",
+            Value::Concrete(ConcreteValue::Int(1)),
+            Value::Concrete(ConcreteValue::Float(1.0.try_into().unwrap())),
+            Some(PatternAttributeType::float()),
+            Release,
+        ),
+        // Command-path measurements pin these two as unequal at the state seam.
+        (
+            "Duration versus persisted number",
+            Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60))),
+            Value::Concrete(ConcreteValue::Int(60)),
+            Some(PatternAttributeType::duration()),
+            Protect,
+        ),
+        (
+            "non-empty provider-defaulted field",
+            desired_map,
+            provider_map,
+            Some(map_type),
+            Protect,
+        ),
+    ];
+    for (label, desired, material, attr_type, expected) in cases {
+        let resource = resolved(
+            &Resource::with_provider("mock", "test.resource", "sink", None)
+                .with_attribute("computed", desired),
+        );
+        let schema = attr_type.map(|attr_type| {
+            PatternResourceSchema::new("test.resource")
+                .attribute(PatternAttributeSchema::optional("computed", attr_type).build())
+                .validate()
+                .unwrap()
+        });
+        let previous = PersistedValue::encode_desired_value(
+            &Value::Deferred(DeferredValue::Secret(Box::new(string("prior")).into())),
+            None,
+        )
+        .unwrap();
+        let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+            .unwrap()
+            .with_attribute("computed", previous.as_json().clone());
+        let provider: State = State::existing(
+            resource.id.clone(),
+            HashMap::from([("computed".into(), material)]),
+        )
+        .with_identifier("sink-id");
+        let desired =
+            FinalDesiredValues::for_test([(resource.id.clone(), resource.attributes.clone())]);
+        for basis in [RowBasis::Carried, RowBasis::Imported] {
+            let row = ResourceState::from_provider_state_with_final_desired(
+                &resource,
+                &provider,
+                Some(&existing),
+                schema.as_ref().map(|schema| schema.as_schema()),
+                basis,
+                Some(&desired),
+                None,
+                &exact_comparison_context(),
+            )
+            .unwrap();
+            let released = row
+                .persisted_attributes()
+                .unwrap()
+                .get("computed")
+                .unwrap()
+                .secret_hash()
+                .is_none();
+            assert_eq!(
+                released,
+                expected == Release,
+                "{label}, {basis:?}: release follows the fresh-plan comparison"
+            );
+        }
+    }
+}
+
+#[test]
 fn current_state_round_trips_instance_variants() {
     let json = serde_json::json!({
         "version": StateFile::CURRENT_VERSION,
@@ -9487,4 +10571,81 @@ fn current_state_preserves_write_only_partial_and_deposed_fields() {
         serde_json::to_value(state).unwrap(),
         serde_json::to_value(reloaded).unwrap()
     );
+}
+
+#[test]
+fn previous_secret_hash_release_uses_prepared_final_comparison() {
+    use carina_core::validation::admission::final_input::FinalPlanInputs;
+
+    let desired = Value::Concrete(ConcreteValue::Int(1));
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None)
+            .with_attribute("computed", desired.clone()),
+    );
+    let schema = PatternResourceSchema::new("test.resource")
+        .attribute(
+            PatternAttributeSchema::optional("computed", PatternAttributeType::float()).build(),
+        )
+        .validate()
+        .unwrap();
+    let mut schemas = carina_core::schema::SchemaRegistry::new();
+    schemas.insert("mock", schema.clone());
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let final_desired = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            // This production constructor attaches Some(resource, references),
+            // unlike FinalDesiredValues::for_test's observation fallback.
+            FinalPlanInputs::admit_for_test(
+                vec![resource.clone()],
+                vec![],
+                &schemas,
+                &bindings,
+                session,
+            )
+            .unwrap()
+            .desired_values(&carina_core::references::prepare_empty_for_tests())
+        },
+    );
+    let old = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(Box::new(desired).into())),
+        None,
+    )
+    .unwrap();
+    let previous = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", old.as_json().clone());
+    for basis in [RowBasis::Carried, RowBasis::Imported] {
+        for (number, protected) in [(1.0, false), (2.0, true)] {
+            let provider: State = State::existing(
+                resource.id.clone(),
+                HashMap::from([(
+                    "computed".into(),
+                    Value::Concrete(ConcreteValue::Float(number.try_into().unwrap())),
+                )]),
+            )
+            .with_identifier("sink-id");
+            let row = ResourceState::from_provider_state_with_final_desired(
+                &resource,
+                &provider,
+                Some(&previous),
+                Some(schema.as_schema()),
+                basis,
+                Some(&final_desired),
+                None,
+                &exact_comparison_context(),
+            )
+            .unwrap();
+            assert_eq!(
+                row.persisted_attributes()
+                    .unwrap()
+                    .get("computed")
+                    .unwrap()
+                    .secret_hash()
+                    .is_some(),
+                protected,
+                "prepared comparison must release typed equality and protect inequality"
+            );
+        }
+    }
 }

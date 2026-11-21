@@ -2334,7 +2334,7 @@ mod provider_config_tests {
                             ResolvedResource::resolve_with_schemas(candidate.into(), &schemas)
                                 .unwrap();
                         let result =
-                            crate::validation::admission::final_input::FinalPlanInputs::admit(
+                            crate::validation::admission::final_input::FinalPlanInputs::admit_for_test(
                                 vec![resolved],
                                 vec![],
                                 &schemas,
@@ -2398,14 +2398,15 @@ mod provider_config_tests {
             crate::validation::deferred_types::with_session_for_test(
                 &crate::parser::LoadedProviderContext::empty_for_test(),
                 |session| {
-                    let error = crate::validation::admission::final_input::FinalPlanInputs::admit(
-                        resources,
-                        vec![ResolvedDataSource::new(data.into_provider_data_source())],
-                        &schemas,
-                        &ResolvedBindings::default(),
-                        session,
-                    )
-                    .unwrap_err();
+                    let error =
+                        crate::validation::admission::final_input::FinalPlanInputs::admit_for_test(
+                            resources,
+                            vec![ResolvedDataSource::new(data.into_provider_data_source())],
+                            &schemas,
+                            &ResolvedBindings::default(),
+                            session,
+                        )
+                        .unwrap_err();
                     assert_eq!(error.findings().len(), 3, "{error:?}");
                     let message = diagnostic(&error);
                     for name in ["first", "second", "lookup"] {

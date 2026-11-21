@@ -75,6 +75,15 @@ use carina_provider_protocol::FiniteF64;
 use indexmap::IndexMap;
 use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
 
+/// A whole value is public only when every node is concrete and none is Secret.
+/// Reuse the runtime knowledge proof rather than maintaining another walker.
+pub fn is_known_public(value: &Value) -> bool {
+    !crate::value::contains_secret(value)
+        && value
+            .knowledge(&KnowledgeContext::validation())
+            .is_ok_and(|proof| matches!(proof.into_classification(), Classification::Known(_)))
+}
+
 #[cfg(test)]
 mod decision_contract {
     use super::*;

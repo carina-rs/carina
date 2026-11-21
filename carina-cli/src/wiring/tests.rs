@@ -15122,6 +15122,7 @@ mod resolved_value_constraint_gate {
             &data_source_origins,
         )
         .await
+        .map(|_| ())
         .map_err(into_plan_errors)
     }
 
@@ -15231,6 +15232,7 @@ mod resolved_value_constraint_gate {
                 &[],
             )
             .await
+            .map(|_| ())
             .map_err(into_plan_errors)
     }
 

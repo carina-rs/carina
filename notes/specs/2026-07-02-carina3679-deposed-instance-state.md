@@ -350,16 +350,24 @@ read-normalization pipeline as current-row refresh (hydration of
 provider-unreturned attributes, enum-shape lifting), so consecutive
 refreshes of an unchanged remote converge.
 
-Secret handling on refresh writes is governed by a typed authority the
-serialization seam requires from every caller. For a deposed generation
+Secret handling on refresh writes is governed by a private typed authority
+selected inside the serialization seam. For a deposed generation
 the previously stored secret hashes are unconditionally authoritative:
 any leaf (top-level or nested) whose stored value is a secret hash is
 re-hashed from the provider's fresh value, never replaced by plaintext
 — the generation is a snapshot of the old instance, so the current
 config's secret declarations say nothing about it. For a current row,
-stored-hash authority applies only to keys absent from the desired
-resource, so an explicit secret-to-plain demotion in config converges
-instead of re-hashing forever. Nested containers merge per leaf:
+a stored hash is released only for an accepted write that actually sent
+the key and whose resolved desired value is wholly known and public, or when the
+whole final desired value from shared plan preparation is known and public and
+the fresh plan's schema-aware comparison finds it equal to the provider
+plaintext at the serialization seam. This final value includes reference resolution, canonicalization,
+provider normalization and default tags. Writers without final plan inputs keep
+previous hashes. Observations can use only the equality condition;
+deposed and orphan writers retain unconditional protection. If the
+provider omits a desired-present top-level key that is not released,
+the previous hash is kept, including for a public literal. Protected nested
+containers merge per leaf:
 provider values are adopted for non-secret leaves (omissions are
 observed as removals); a hash leaf whose provider counterpart is
 missing is retained (write-only hydration ambiguity); a list whose
