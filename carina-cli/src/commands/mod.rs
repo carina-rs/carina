@@ -686,15 +686,17 @@ pub(crate) fn validate_and_resolve_errors_inner<'s>(
         duplicate_declarations,
         name_resolution,
     );
-    for warning in report.warnings {
-        match warning {
-            ConfigurationWarning::Dependency(warning) => eprintln!("warning: {warning}"),
-            ConfigurationWarning::Provider(warning) => {
-                crate::commands::validate::print_provider_type_warning(&warning)
+    access.publish_warnings(|| {
+        for warning in report.warnings {
+            match warning {
+                ConfigurationWarning::Dependency(warning) => eprintln!("warning: {warning}"),
+                ConfigurationWarning::Provider(warning) => {
+                    crate::commands::validate::print_provider_type_warning(&warning)
+                }
+                ConfigurationWarning::Parser(_) => {}
             }
-            ConfigurationWarning::Parser(_) => {}
         }
-    }
+    });
     report.result
 }
 

@@ -1,5 +1,7 @@
 //! State file structures for persisting infrastructure state
 
+use std::borrow::Cow;
+
 use carina_core::binding_index::SecretPreservingAttributes;
 use carina_core::differ::{ComparisonContext, Orphan, ReferenceEquality};
 use carina_core::effect::{MoveAuthority, ReleaseListKeysEffect};
@@ -9,7 +11,6 @@ use carina_core::name_override::NameOverrideSource;
 pub use carina_core::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use carina_core::parser::StateBlockAddress;
 use carina_core::plan::ReplacementPreviousAttributesForStateWriteback;
-pub use carina_core::provider::PreviousSecretHashAuthority;
 use carina_core::provider::{
     AppliedIdentifier, EmptyAppliedIdentifier, HostCreateObservation, HostIdentifiedCreate,
     InFlightCreate, InFlightPersistence, NestedWriteOnlyRecord, PersistedAttributes,
@@ -20,6 +21,7 @@ use carina_core::provider::{
 pub use carina_core::resource::DeposedKey;
 #[cfg(test)]
 use carina_core::resource::Resource;
+use carina_core::resource::knowledge::is_known_public;
 use carina_core::resource::{
     AbsoluteBindingAddress, ConcreteValue, Current, DataSource, PartialReadMarker, PendingReRead,
     PersistedDestroyDependencies, PersistedDirectives, ResolvedResource, ResolvedResourceId,
@@ -30,11 +32,13 @@ use carina_core::schema::{
     CompiledResourceSchema as ResourceSchema, FieldName, SchemaKind, SchemaRegistry,
     schema_write_only_keys,
 };
+use carina_core::validation::admission::final_input::{FinalDesiredAttributes, FinalDesiredValues};
 use carina_core::value::{
     PersistedExportValue, PersistedValue, SerializationError, contains_unredacted_secret,
     merge_secrets_into_observation_json, merge_secrets_into_provider_json,
     union_secret_shapes_after_resolution,
 };
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -69,6 +73,54 @@ fn recorded_write_only_keys(
     keys.extend(orphan_recorded.iter().cloned());
     keys.retain(|key| attributes.contains_key(key));
     keys
+}
+
+// Release authority is private to the row serialization seam. Public row
+// writers receive previous attributes and cannot choose a releasing policy.
+enum PreviousSecretHashAuthority<'a> {
+    None,
+    AllPreviouslyHashedKeys(&'a PersistedAttributes),
+    MatchingFinalDesiredValue {
+        previous: &'a PersistedAttributes,
+        desired: &'a FinalDesiredAttributes,
+    },
+    AcceptedWrite {
+        previous: &'a PersistedAttributes,
+        request: &'a AcceptedRequest,
+        request_attributes: Cow<'a, IndexMap<String, Value>>,
+        final_desired: Option<&'a FinalDesiredAttributes>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct DesiredValueComparison<'a> {
+    schema: Option<&'a ResourceSchema>,
+    context: carina_core::differ::ComparisonSchema<'a>,
+}
+
+/// Whether desired provides a fully concrete public value for an attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesiredKey {
+    Absent,
+    KnownPublic,
+    NotKnownPublic,
+}
+
+impl DesiredKey {
+    fn from_attributes(attributes: &IndexMap<String, Value>, key: &str) -> Self {
+        // Known proofs can contain protected Secret nodes; exclude those too.
+        match attributes.get(key) {
+            None => Self::Absent,
+            Some(value) if is_known_public(value) => Self::KnownPublic,
+            Some(_) => Self::NotKnownPublic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviousSecretHashDecision {
+    Release,
+    Protect,
 }
 
 /// Provider values selected for a state row before secret protection.
@@ -205,34 +257,89 @@ impl SelectedStateAttributes {
         }
     }
 
-    fn authority_attributes(
-        authority: PreviousSecretHashAuthority<'_>,
-    ) -> Option<&PersistedAttributes> {
+    fn authority_attributes<'a>(
+        authority: &'a PreviousSecretHashAuthority<'_>,
+    ) -> Option<&'a PersistedAttributes> {
         match authority {
             PreviousSecretHashAuthority::None => None,
             PreviousSecretHashAuthority::AllPreviouslyHashedKeys(attributes)
-            | PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired(attributes) => {
-                Some(attributes)
+            | PreviousSecretHashAuthority::MatchingFinalDesiredValue {
+                previous: attributes,
+                ..
             }
+            | PreviousSecretHashAuthority::AcceptedWrite {
+                previous: attributes,
+                ..
+            } => Some(attributes),
         }
     }
 
-    fn authority_protects_key(
-        authority: PreviousSecretHashAuthority<'_>,
-        key_is_desired: bool,
-    ) -> bool {
-        match authority {
-            PreviousSecretHashAuthority::None => false,
-            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(_) => true,
-            PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired(_) => !key_is_desired,
+    fn decide_previous_secret_hash(
+        authority: &PreviousSecretHashAuthority<'_>,
+        key: &str,
+        provider_value: Option<&PersistedValue>,
+        comparison: Option<DesiredValueComparison<'_>>,
+    ) -> PreviousSecretHashDecision {
+        let final_desired = match authority {
+            PreviousSecretHashAuthority::None => return PreviousSecretHashDecision::Release,
+            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(_) => {
+                return PreviousSecretHashDecision::Protect;
+            }
+            PreviousSecretHashAuthority::AcceptedWrite {
+                request,
+                request_attributes,
+                final_desired,
+                ..
+            } => {
+                if DesiredKey::from_attributes(request_attributes, key) == DesiredKey::KnownPublic
+                    && match request.kind() {
+                        AcceptedRequestKind::Create => true,
+                        AcceptedRequestKind::Update { sent, .. } => sent.contains(key),
+                    }
+                {
+                    return PreviousSecretHashDecision::Release;
+                }
+                match final_desired {
+                    Some(desired) => *desired,
+                    None => return PreviousSecretHashDecision::Protect,
+                }
+            }
+            PreviousSecretHashAuthority::MatchingFinalDesiredValue { desired, .. } => *desired,
+        };
+        let desired_attributes = final_desired.attributes();
+        if DesiredKey::from_attributes(desired_attributes, key) != DesiredKey::KnownPublic {
+            return PreviousSecretHashDecision::Protect;
+        }
+        // Decode through the existing state projection. A retained hash has no
+        // plaintext projection and cannot prove equality to a final public value.
+        // Neither comparison operand nor projection error leaves this seam.
+        let provider_plaintext = provider_value
+            .and_then(PersistedValue::decode)
+            .and_then(|value| value.to_value_at(key).ok());
+        if provider_plaintext
+            .as_ref()
+            .zip(comparison)
+            .is_some_and(|(provider, comparison)| {
+                carina_core::differ::public_final_desired_matches_provider(
+                    provider,
+                    final_desired,
+                    key,
+                    comparison.schema,
+                    &comparison.context,
+                )
+            })
+        {
+            PreviousSecretHashDecision::Release
+        } else {
+            PreviousSecretHashDecision::Protect
         }
     }
 
     fn protect_previous_secret_hashes(
         &mut self,
-        authority: PreviousSecretHashAuthority<'_>,
-        mut is_desired_key: impl FnMut(&str) -> bool,
+        authority: &PreviousSecretHashAuthority<'_>,
         protected_secret_keys: &mut HashSet<String>,
+        comparison: Option<DesiredValueComparison<'_>>,
     ) -> Result<(), SerializationError> {
         let Some(previous) = Self::authority_attributes(authority) else {
             return Ok(());
@@ -240,7 +347,12 @@ impl SelectedStateAttributes {
         let keys = previous.keys().cloned().collect::<Vec<_>>();
         for key in keys {
             if protected_secret_keys.contains(&key)
-                || !Self::authority_protects_key(authority, is_desired_key(&key))
+                || Self::decide_previous_secret_hash(
+                    authority,
+                    &key,
+                    self.encoded.get(&key),
+                    comparison,
+                ) == PreviousSecretHashDecision::Release
                 || (self.write_only_keys.contains(&key) && !self.retained_write_only.contains(&key))
             {
                 continue;
@@ -267,6 +379,7 @@ impl SelectedStateAttributes {
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
         preferred_hashes: Option<&PersistedAttributes>,
         strict_desired: bool,
+        comparison: Option<DesiredValueComparison<'_>>,
     ) -> Result<Self, SerializationError> {
         let mut protected_secret_keys = HashSet::new();
         for (key, desired_value) in &resource.attributes {
@@ -280,7 +393,7 @@ impl SelectedStateAttributes {
             }
             let previous = previous_hash(
                 preferred_hashes,
-                Self::authority_attributes(previous_hash_authority),
+                Self::authority_attributes(&previous_hash_authority),
                 key,
             );
             let masked = match self.encoded.get(key).cloned() {
@@ -310,9 +423,9 @@ impl SelectedStateAttributes {
             }
         }
         self.protect_previous_secret_hashes(
-            previous_hash_authority,
-            |key| resource.attributes.contains_key(key),
+            &previous_hash_authority,
             &mut protected_secret_keys,
+            comparison,
         )?;
         Ok(self)
     }
@@ -320,8 +433,10 @@ impl SelectedStateAttributes {
     fn protect_observation<S>(
         mut self,
         resource: &ResolvedResource<S>,
-        previous_hash_authority: PreviousSecretHashAuthority<'_>,
+        previous_attributes: Option<&PersistedAttributes>,
+        final_desired: Option<&FinalDesiredAttributes>,
         preferred_hashes: Option<&PersistedAttributes>,
+        comparison: Option<DesiredValueComparison<'_>>,
     ) -> Result<Self, SerializationError> {
         let mut protected_secret_keys = HashSet::new();
         for (key, desired_value) in &resource.attributes {
@@ -331,11 +446,7 @@ impl SelectedStateAttributes {
             let Some(observed_or_sent_value) = self.encoded.get(key).cloned() else {
                 continue;
             };
-            let previous = previous_hash(
-                preferred_hashes,
-                Self::authority_attributes(previous_hash_authority),
-                key,
-            );
+            let previous = previous_hash(preferred_hashes, previous_attributes, key);
             let masked = merge_secrets_into_observation_json(
                 desired_value,
                 &observed_or_sent_value,
@@ -347,9 +458,17 @@ impl SelectedStateAttributes {
 
         let present_keys = self.encoded.keys().cloned().collect::<HashSet<_>>();
         self.protect_previous_secret_hashes(
-            previous_hash_authority,
-            |key| resource.attributes.contains_key(key),
+            &match (previous_attributes, final_desired) {
+                (Some(previous), Some(desired)) => {
+                    PreviousSecretHashAuthority::MatchingFinalDesiredValue { previous, desired }
+                }
+                (Some(previous), None) => {
+                    PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous)
+                }
+                (None, _) => PreviousSecretHashAuthority::None,
+            },
             &mut protected_secret_keys,
+            comparison,
         )?;
         self.encoded.retain(|key, _| present_keys.contains(key));
         Ok(self)
@@ -360,9 +479,9 @@ impl SelectedStateAttributes {
         previous: &PersistedAttributes,
     ) -> Result<Self, SerializationError> {
         self.protect_previous_secret_hashes(
-            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous),
-            |_| false,
+            &PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous),
             &mut HashSet::new(),
+            None,
         )?;
         Ok(self)
     }
@@ -409,6 +528,16 @@ pub enum RowBasis<'a> {
     /// live pending removals at any authored depth from known prior metadata.
     /// Ambiguous list-element removals remain whole-value comparisons.
     Carried,
+}
+
+/// Provenance of a row rebuilt from provider material. An observation never
+/// carries an accepted request; only the provider branch has a RowBasis.
+pub enum ResourceStateWrite<'a> {
+    Provider {
+        state: &'a SnapshotState,
+        basis: RowBasis<'a>,
+    },
+    Observation(&'a HostIdentifiedCreate),
 }
 
 #[derive(Debug, Clone)]
@@ -2010,6 +2139,7 @@ impl DeposedInstance {
             PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&self.attributes),
             None,
             false,
+            None,
         )?;
         let (selected, _write_only_attributes) = selected.finish()?;
         Ok(DeposedAttributes(selected))
@@ -2693,11 +2823,14 @@ impl ResourceState {
         resource: &ResolvedResource<S>,
         schema: Option<&ResourceSchema>,
         attributes: &BTreeMap<String, Value<P>>,
-        previous_hash_authority: PreviousSecretHashAuthority<'_>,
+        previous_attributes: Option<&PersistedAttributes>,
     ) -> Result<DeposedAttributes, ResourceStateEncodingError> {
+        let previous_hash_authority = previous_attributes
+            .map(PreviousSecretHashAuthority::AllPreviouslyHashedKeys)
+            .unwrap_or(PreviousSecretHashAuthority::None);
         let selected =
             SelectedStateAttributes::from_provider_values_lossy(attributes, schema, &[])?
-                .protect_for_resource(resource, previous_hash_authority, None, false)?;
+                .protect_for_resource(resource, previous_hash_authority, None, false, None)?;
         let (selected, _write_only_attributes) = selected.finish()?;
         Ok(DeposedAttributes(selected))
     }
@@ -2708,14 +2841,17 @@ impl ResourceState {
         resource: &ResolvedResource<S>,
         schema: Option<&ResourceSchema>,
         previous: ReplacementPreviousAttributesForStateWriteback<'_>,
-        previous_hash_authority: PreviousSecretHashAuthority<'_>,
+        previous_attributes: Option<&PersistedAttributes>,
     ) -> Result<DeposedAttributes, ResourceStateEncodingError> {
+        let previous_hash_authority = previous_attributes
+            .map(PreviousSecretHashAuthority::AllPreviouslyHashedKeys)
+            .unwrap_or(PreviousSecretHashAuthority::None);
         let selected = SelectedStateAttributes::from_provider_values_lossy(
             previous.provider_attributes(),
             schema,
             &[],
         )?
-        .protect_for_resource(resource, previous_hash_authority, None, false)?;
+        .protect_for_resource(resource, previous_hash_authority, None, false, None)?;
         let (selected, _write_only_attributes) = selected.finish()?;
         Ok(DeposedAttributes(selected))
     }
@@ -2734,6 +2870,7 @@ impl ResourceState {
             PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&previous),
             None,
             false,
+            None,
         )?;
         let (selected, _write_only_attributes) = selected.finish()?;
         Ok(DeposedAttributes(selected))
@@ -2879,6 +3016,66 @@ impl ResourceState {
         preferred_hashes: Option<&PersistedAttributes>,
         comparison: &ComparisonContext<'_, R>,
     ) -> Result<Self, ResourceStateEncodingError> {
+        Self::from_observation_with_final_desired(
+            resource,
+            identified,
+            existing,
+            schema,
+            None,
+            preferred_hashes,
+            comparison,
+        )
+    }
+
+    /// Common row-write entry for consumers that hold optional final desired
+    /// evidence. The source preserves accepted-write versus observation authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_write_with_final_desired<S: Clone, R: ReferenceEquality>(
+        resource: &ResolvedResource<S>,
+        source: ResourceStateWrite<'_>,
+        existing: Option<&ResourceState>,
+        schema: Option<&ResourceSchema>,
+        final_desired: Option<&FinalDesiredValues>,
+        preferred_hashes: Option<&PersistedAttributes>,
+        comparison: &ComparisonContext<'_, R>,
+    ) -> Result<Self, ResourceStateEncodingError> {
+        match source {
+            ResourceStateWrite::Provider { state, basis } => {
+                Self::from_provider_state_with_final_desired(
+                    resource,
+                    state,
+                    existing,
+                    schema,
+                    basis,
+                    final_desired,
+                    preferred_hashes,
+                    comparison,
+                )
+            }
+            ResourceStateWrite::Observation(observed) => Self::from_observation_with_final_desired(
+                resource,
+                observed,
+                existing,
+                schema,
+                final_desired,
+                preferred_hashes,
+                comparison,
+            ),
+        }
+    }
+
+    /// Observations have no accepted-request authority. Only final plan
+    /// inputs can prove that a public desired value equals the observed value.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_observation_with_final_desired<S: Clone, R: ReferenceEquality>(
+        resource: &ResolvedResource<S>,
+        identified: &HostIdentifiedCreate,
+        existing: Option<&ResourceState>,
+        schema: Option<&ResourceSchema>,
+        final_desired: Option<&FinalDesiredValues>,
+        preferred_hashes: Option<&PersistedAttributes>,
+        comparison: &ComparisonContext<'_, R>,
+    ) -> Result<Self, ResourceStateEncodingError> {
         let applied_desired = identified
             .resolved_desired_attributes()
             .map(|attributes| resource_with_secret_shape_union(resource, attributes))
@@ -2927,13 +3124,15 @@ impl ResourceState {
         };
         let sent_keys_for_nested_write_only = sent_values.keys().cloned().collect::<Vec<_>>();
         selected.overlay_sent(&sent_values, &sent_write_only);
-        let previous_hash_authority = previous
-            .map(PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired)
-            .unwrap_or(PreviousSecretHashAuthority::None);
         let selected = selected.protect_observation(
             writeback_resource,
-            previous_hash_authority,
+            previous,
+            final_desired.and_then(|values| values.get(&resource.id)),
             preferred_hashes,
+            Some(DesiredValueComparison {
+                schema,
+                context: comparison.schema(),
+            }),
         )?;
         let (attributes, write_only_attributes) = selected.finish()?;
         let partial_read = identified
@@ -3134,7 +3333,8 @@ impl ResourceState {
     ///
     /// Provider attributes are serialized into state JSON, desired secret
     /// values are masked before storage, and previously-stored secret hashes
-    /// can protect keys removed from desired state. `row_basis` couples
+    /// protect any key not released by an accepted sent public value or by
+    /// known-public desired/provider equality. `row_basis` couples
     /// write-only and authoring provenance so a successful request cannot
     /// retain a stale authoring record. When `existing` is provided,
     /// protected/name override metadata and existing deposed generations are
@@ -3151,6 +3351,36 @@ impl ResourceState {
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
         row_basis: RowBasis<'_>,
+        preferred_hashes: Option<&PersistedAttributes>,
+        comparison: &ComparisonContext<'_, R>,
+    ) -> Result<Self, ResourceStateEncodingError> {
+        Self::from_provider_state_with_final_desired(
+            resource,
+            state,
+            existing,
+            schema,
+            row_basis,
+            None,
+            preferred_hashes,
+            comparison,
+        )
+    }
+
+    /// A carried/imported row can release only against the final desired side
+    /// produced by plan preparation. Without that witness it protects every
+    /// previous hash. Applied rows retain their accepted-request authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_provider_state_with_final_desired<
+        S: Clone,
+        R: ReferenceEquality,
+        P: StateValueLeaf,
+    >(
+        resource: &ResolvedResource<S>,
+        state: &State<P>,
+        existing: Option<&ResourceState>,
+        schema: Option<&ResourceSchema>,
+        row_basis: RowBasis<'_>,
+        final_desired: Option<&FinalDesiredValues>,
         preferred_hashes: Option<&PersistedAttributes>,
         comparison: &ComparisonContext<'_, R>,
     ) -> Result<Self, ResourceStateEncodingError> {
@@ -3251,15 +3481,51 @@ impl ResourceState {
             }
         }
 
-        let previous_hash_authority = existing
-            .and_then(ResourceState::persisted_attributes)
-            .map(PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired)
-            .unwrap_or(PreviousSecretHashAuthority::None);
+        let previous_hash_authority = match (previous, row_basis) {
+            (Some(previous), RowBasis::Applied(request)) => {
+                // Rule 1 reads only the accepted request projection and sent set.
+                // Rule 2 uses the final plan witness, including for unsent keys.
+                let request_attributes = match request.resolved_desired_attributes() {
+                    Some(attributes) => Cow::Owned(
+                        attributes
+                            .values()
+                            .iter()
+                            .map(|(key, value)| {
+                                value.to_value_at(key).map(|value| (key.clone(), value))
+                            })
+                            .collect::<Result<IndexMap<_, _>, _>>()
+                            .map_err(SerializationError::UnavailableSecret)?,
+                    ),
+                    // Bootstrap and fixture accepted requests already carry
+                    // a resolved writeback resource.
+                    None => Cow::Borrowed(&writeback_resource.attributes),
+                };
+                PreviousSecretHashAuthority::AcceptedWrite {
+                    previous,
+                    request,
+                    request_attributes,
+                    final_desired: final_desired.and_then(|values| values.get(&resource.id)),
+                }
+            }
+            (Some(previous), RowBasis::Carried | RowBasis::Imported) => {
+                match final_desired.and_then(|values| values.get(&resource.id)) {
+                    Some(desired) => {
+                        PreviousSecretHashAuthority::MatchingFinalDesiredValue { previous, desired }
+                    }
+                    None => PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous),
+                }
+            }
+            (None, _) => PreviousSecretHashAuthority::None,
+        };
         let selected = selected.protect_for_resource(
             writeback_resource,
             previous_hash_authority,
             preferred_hashes,
             true,
+            Some(DesiredValueComparison {
+                schema,
+                context: comparison.schema(),
+            }),
         )?;
         let (attributes, write_only_attributes) = selected.finish()?;
         let previous_nested_write_only = existing

@@ -6,6 +6,10 @@
 mod comparison;
 mod plan;
 
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub use comparison::public_hash_verification_count_for_test;
+
 use crate::resource::PersistedDirectives;
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -975,7 +979,7 @@ use crate::schema::CompiledAttributeType as AttributeType;
 pub use comparison::{
     AuthoringComparison, AuthoringEquality, ComparisonContext, ComparisonError, ComparisonSchema,
     ObservationComparison, ObservationEquality, PlanningComparison, PlanningEquality,
-    ReferenceEquality,
+    ReferenceEquality, public_final_desired_matches_provider,
 };
 
 #[cfg(any(test, feature = "test-utils"))]

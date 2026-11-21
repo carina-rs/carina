@@ -99,8 +99,8 @@ pub use lock::LockInfo;
 pub use state::{
     ApplyDecision, CurrentInstance, DeposedAttributes, DeposedInstance, DeposedKey,
     ImportTargetDisposition, LoadedOrphans, NameOverride, NotOutcomeUnknown, NotOutcomeUnknownKind,
-    ObservationStateAuthority, ObservedStateFile, OutcomeUnknownRow, PreviousSecretHashAuthority,
-    PublishedExports, ResourceState, ResourceStateEncodingError, RowBasis, StateFile, load_state,
+    ObservationStateAuthority, ObservedStateFile, OutcomeUnknownRow, PublishedExports,
+    ResourceState, ResourceStateEncodingError, ResourceStateWrite, RowBasis, StateFile, load_state,
     load_state_bytes, should_apply_override,
 };
 
