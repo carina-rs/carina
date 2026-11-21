@@ -3,7 +3,9 @@
 //! declared types, and each declaration's return and nested-call verdicts are cached once.
 
 use super::*;
-use crate::binding_index::{BindingIndex, BindingTarget, RefType, ResolvedRefType};
+use crate::binding_index::{
+    BindingIndex, BindingTarget, RefType, ResolvedBindings, ResolvedRefType,
+};
 use crate::resource::{AccessPath, DeferredValue, ReferencePathRef};
 use crate::static_type::{
     ConsumerExportStaticType, InferenceError, InferenceIssue, NotInferableReason, StaticType,
@@ -14,13 +16,14 @@ use crate::validation::admission::static_judgement::{
     judge_static_assignment, type_needs_schema,
 };
 use crate::validation::typecheck::{
-    FunctionTypePosition, FunctionTypeSource, format_function_type_promise_error,
+    FunctionTypePosition, FunctionTypeSource, WritableType, format_function_type_promise_error,
 };
 use std::collections::BTreeSet;
 
 struct Source {
     reference: Option<ResolvedRefType>,
     ty: Option<TypeExpr>,
+    constructed_string: bool,
     untyped_export: Option<String>,
     unavailable: bool,
     pending_substitution: bool,
@@ -39,6 +42,8 @@ impl Source {
             StaticAssignmentSource::SchemaUnavailable
         } else if let Some(reference) = &self.reference {
             StaticAssignmentSource::Reference(reference)
+        } else if self.constructed_string {
+            StaticAssignmentSource::ComputedString
         } else if let Some(ty) = &self.ty {
             StaticAssignmentSource::Expression(ty)
         } else {
@@ -50,9 +55,15 @@ impl Source {
         if let Some(export) = self.untyped_export.as_deref() {
             FunctionTypeSource::UntypedExport(export)
         } else if let Some(reference) = &self.reference {
-            FunctionTypeSource::Typed(reference.display_type_name())
+            FunctionTypeSource::Typed {
+                display: reference.display_type_name(),
+                writable: WritableType::reference(reference),
+            }
         } else if let Some(ty) = &self.ty {
-            FunctionTypeSource::Typed(ty.to_string())
+            FunctionTypeSource::Typed {
+                display: ty.to_string(),
+                writable: Some(WritableType::expression(ty)),
+            }
         } else {
             FunctionTypeSource::Unknown
         }
@@ -73,9 +84,9 @@ struct BodyFinding {
 
 #[derive(Default)]
 struct BodyVerdict {
-    result: Option<InferenceError>,
+    result: Option<BodyFinding>,
     nested: Vec<BodyFinding>,
-    unknown_capture: bool,
+    result_relevance: Relevance,
 }
 
 type DeclarationKey = (ExpressionInstance, String);
@@ -84,6 +95,7 @@ struct Evidence<'a, 'index, B: BindingAddress> {
     expressions: &'a Expressions<B>,
     report: &'a ExpressionReport<B>,
     bindings: &'a BindingIndex<'index, B>,
+    values: &'a ResolvedBindings<ParserPlaceholder, B>,
     complete_sources: bool,
     projections: HashMap<(ExpressionInstance, NodeId), &'a Value<ParserPlaceholder, B>>,
     definitions: HashSet<&'a str>,
@@ -94,6 +106,7 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
         expressions: &'a Expressions<B>,
         report: &'a ExpressionReport<B>,
         bindings: &'a BindingIndex<'index, B>,
+        values: &'a ResolvedBindings<ParserPlaceholder, B>,
         complete_sources: bool,
     ) -> Self {
         let mut projections = HashMap::new();
@@ -119,6 +132,7 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
             expressions,
             report,
             bindings,
+            values,
             complete_sources,
             projections,
             definitions: expressions
@@ -148,9 +162,20 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
         let Some(value) = self.projection(expression) else {
             return false;
         };
-        let value = value
-            .clone()
-            .map_bindings(&mut |binding| RelativeBindingName::new(binding.as_str()));
+        // Use the resolver's validation view, just like ordinary value checks.
+        // A configured literal remains known when reached through another resource.
+        let value = match crate::resolver::project_ref_value_status(
+            value,
+            self.values,
+            self.bindings.provider_context(),
+        ) {
+            Ok(
+                crate::resolver::ValueResolution::Present(value)
+                | crate::resolver::ValueResolution::Unknown(value),
+            ) => value,
+            _ => return false,
+        };
+        let value = value.map_bindings(&mut |binding| RelativeBindingName::new(binding.as_str()));
         let Ok(knowledge) =
             value.knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
         else {
@@ -387,6 +412,12 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
         let mut source = Source {
             reference: None,
             ty: judged.and_then(|judged| judged.static_type().ok()).cloned(),
+            constructed_string: judged.is_some_and(|judged| {
+                judged.static_type() == Ok(&TypeExpr::String)
+                    && judged
+                        .for_sink(&TypeExpr::String, bindings.provider_context())
+                        .is_single_string_construction()
+            }),
             untyped_export: None,
             unavailable: self.schema_unavailable(expression),
             pending_substitution: self
@@ -544,8 +575,14 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
             if let ExprKind::Call(name) = &node.kind
                 && let Some(verdict) = verdicts.get(&(node.location.instance.clone(), name.clone()))
             {
-                result.independent |= verdict.unknown_capture;
-                pending.extend(&node.children);
+                result.independent |= verdict.result_relevance.independent;
+                pending.extend(
+                    verdict
+                        .result_relevance
+                        .parameters
+                        .iter()
+                        .filter_map(|index| node.children.get(*index)),
+                );
                 continue;
             }
             result.independent |= node.children.is_empty();
@@ -614,7 +651,10 @@ fn body_verdict<B: BindingAddress>(
         && let Some(failure) = evidence.promise_error(body, ty, name, FunctionTypePosition::Return)
     {
         if failure.is_function_type_promise() {
-            verdict.result = Some(failure);
+            verdict.result = Some(BodyFinding {
+                error: failure,
+                relevance: Relevance::default(),
+            });
         } else {
             push_finding(findings, &body.authored, failure, evidence.report);
         }
@@ -644,13 +684,6 @@ fn body_verdict<B: BindingAddress>(
             continue;
         }
         let target = declarations[&callee];
-        let ExprKind::Function {
-            signature: target_signature,
-            ..
-        } = &target.kind
-        else {
-            unreachable!()
-        };
         for (argument, failure) in evidence.parameter_failures(target, call, true) {
             if failure.is_function_type_promise() {
                 let relevance = evidence.relevance(argument, &signature.parameter_nodes, verdicts);
@@ -669,13 +702,7 @@ fn body_verdict<B: BindingAddress>(
         };
         let mut nested = target_verdict.nested.clone();
         if let Some(failure) = &target_verdict.result {
-            nested.push(BodyFinding {
-                error: failure.clone(),
-                relevance: Relevance {
-                    parameters: (0..target_signature.parameters.len()).collect(),
-                    independent: target_verdict.unknown_capture,
-                },
-            });
+            nested.push(failure.clone());
         }
         for finding in nested {
             let mut relevance = Relevance {
@@ -697,9 +724,11 @@ fn body_verdict<B: BindingAddress>(
             }
         }
     }
-    verdict.unknown_capture = evidence
-        .relevance(body, &signature.parameter_nodes, verdicts)
-        .independent;
+    let relevance = evidence.relevance(body, &signature.parameter_nodes, verdicts);
+    verdict.result_relevance = relevance.clone();
+    if let Some(result) = &mut verdict.result {
+        result.relevance = relevance;
+    }
     visiting.remove(key);
     let verdict = Arc::new(verdict);
     verdicts.insert(key.clone(), verdict.clone());
@@ -710,9 +739,10 @@ pub(super) fn check<B: BindingAddress>(
     expressions: &Expressions<B>,
     report: &ExpressionReport<B>,
     bindings: &BindingIndex<'_, B>,
+    values: &ResolvedBindings<ParserPlaceholder, B>,
     complete_sources: bool,
 ) -> Vec<Finding> {
-    let evidence = Evidence::new(expressions, report, bindings, complete_sources);
+    let evidence = Evidence::new(expressions, report, bindings, values, complete_sources);
     let mut declarations = IndexMap::new();
     for node in report.syntax_nodes.values() {
         if let ExprKind::Function { name, .. } = &node.kind {
@@ -771,7 +801,7 @@ pub(super) fn check<B: BindingAddress>(
             push_finding(&mut findings, node, failure, report);
         }
         let verdict = &verdicts[&key];
-        for finding in &verdict.nested {
+        for finding in verdict.nested.iter().chain(verdict.result.iter()) {
             if finding.relevance.independent
                 || finding.relevance.parameters.iter().any(|index| {
                     argument(declaration, node, *index).is_some_and(|argument| {
@@ -781,15 +811,6 @@ pub(super) fn check<B: BindingAddress>(
             {
                 push_finding(&mut findings, node, finding.error.clone(), report);
             }
-        }
-        if !node
-            .children
-            .iter()
-            .any(|argument| evidence.source(argument).unavailable)
-            && !evidence.known(expression)
-            && let Some(failure) = &verdict.result
-        {
-            push_finding(&mut findings, node, failure.clone(), report);
         }
     }
     findings

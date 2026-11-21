@@ -257,7 +257,7 @@ fn render_analysis_resolution_error(
             doc,
             finding.as_ref(),
             DiagnosticSeverity::ERROR,
-            finding.detail().to_string(),
+            finding.detail().diagnostic_message(),
         ),
     }
 }

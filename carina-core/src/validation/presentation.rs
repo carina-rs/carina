@@ -349,6 +349,14 @@ impl<E: ValidationClientError> ConversionValidation<E> {
             OrdinaryFinding::Client(Box::new(error)),
         ));
     }
+    pub fn client_findings(&self) -> impl Iterator<Item = &E> {
+        self.ordinary
+            .iter()
+            .filter_map(|(_, finding)| match finding {
+                OrdinaryFinding::Client(error) => Some(error.as_ref()),
+                OrdinaryFinding::Resource(_) => None,
+            })
+    }
     pub fn fail(&mut self, error: E) -> OrdinaryFailure
     where
         E: ValidationClientFailure,
@@ -445,11 +453,20 @@ impl<E: ValidationClientError> ConversionValidation<E> {
     }
 
     pub fn ordinary_failure(&self) -> Option<OrdinaryFailure> {
+        self.ordinary_failure_where(|_| true)
+    }
+
+    /// Retain every finding while allowing a client to finish independent
+    /// checks before selected errors stop the pipeline. Resource errors always stop.
+    pub fn ordinary_failure_where(
+        &self,
+        mut stops: impl FnMut(&E) -> bool,
+    ) -> Option<OrdinaryFailure> {
         self.ordinary.iter().find_map(|(_, finding)| match finding {
             OrdinaryFinding::Resource(_) => Some(OrdinaryFailure { _private: () }),
             OrdinaryFinding::Client(error) => match error.kind() {
-                ClientFindingKind::Error => Some(OrdinaryFailure { _private: () }),
-                ClientFindingKind::Notice => None,
+                ClientFindingKind::Error if stops(error) => Some(OrdinaryFailure { _private: () }),
+                ClientFindingKind::Error | ClientFindingKind::Notice => None,
             },
         })
     }

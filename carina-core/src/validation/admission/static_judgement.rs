@@ -13,6 +13,8 @@ use crate::static_type::StaticTypeResolutionError;
 pub(crate) enum StaticAssignmentSource<'a> {
     Reference(&'a ResolvedRefType),
     Expression(&'a TypeExpr),
+    /// Authored interpolation or a string-producing builtin, without identity evidence.
+    ComputedString,
     Unknown,
     SchemaUnavailable,
 }
@@ -62,6 +64,7 @@ pub(crate) fn judge_static_assignment<B: BindingAddress>(
         return Ok(NeedsSchema);
     }
     let expected = super::super::resolve_type_expr(expected, config).map_err(Resolution)?;
+    let constructed_string_sink = expected.is_string_shaped() && expected != TypeExpr::String;
     let Some(expected) = super::super::lift_type_expr(&expected) else {
         return Ok(NeedsLocal);
     };
@@ -81,7 +84,17 @@ pub(crate) fn judge_static_assignment<B: BindingAddress>(
                 source.mismatch_type_names(*sink),
             )
         }
-        StaticAssignmentSource::Expression(source) => {
+        source @ (StaticAssignmentSource::Expression(_)
+        | StaticAssignmentSource::ComputedString) => {
+            // Constructed strings have the same deferred value admission used
+            // at attribute and module boundaries, including named string sinks.
+            if matches!(source, StaticAssignmentSource::ComputedString) && constructed_string_sink {
+                return Ok(NeedsLocal);
+            }
+            let source = match source {
+                StaticAssignmentSource::Expression(source) => source,
+                _ => &TypeExpr::String,
+            };
             if type_needs_schema(source, config) {
                 return Ok(NeedsSchema);
             }

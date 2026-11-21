@@ -1311,12 +1311,21 @@ impl<'a, E, D, B: BindingAddress> JudgedFile<'a, E, D, B> {
     pub fn function_type_promise_findings(
         &self,
         bindings: &crate::binding_index::BindingIndex<'_, B>,
-    ) -> Vec<Located<crate::static_type::InferenceError>> {
+    ) -> Vec<Located<crate::static_type::InferenceError>>
+    where
+        D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let values = crate::binding_index::ResolvedBindings::<ParserPlaceholder>::build_validation(
+            &self.file,
+            Clone::clone,
+            Clone::clone,
+        );
         let mut findings = self.report().function_findings().to_vec();
         for finding in function_promises::check(
             self.file.parser_binding_metadata.syntax().expressions(),
             self.report(),
             bindings,
+            &values,
             true,
         ) {
             if !findings.contains(&finding.diagnostic) {
@@ -1349,11 +1358,20 @@ where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     pub(crate) fn new(
-        mut file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         schemas: &'a crate::schema::SchemaRegistry,
         config: &super::ProviderContext,
     ) -> Self {
-        judge_configuration(&mut file, schemas, config);
+        Self::new_with_function_bindings(file, schemas, config, None)
+    }
+
+    pub(crate) fn new_with_function_bindings(
+        mut file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        schemas: &'a crate::schema::SchemaRegistry,
+        config: &super::ProviderContext,
+        bindings: Option<&crate::binding_index::BindingIndex<'_, B>>,
+    ) -> Self {
+        judge_configuration_in(&mut file, schemas, config, bindings);
         Self {
             file,
             schemas,
@@ -1383,10 +1401,35 @@ pub(crate) fn judge_configuration<
 ) where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
+    judge_configuration_in(file, schemas, config, None);
+}
+
+fn judge_configuration_in<E: super::ExportParamLike<ParserPlaceholder, B>, D, B: BindingAddress>(
+    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    schemas: &crate::schema::SchemaRegistry,
+    config: &super::ProviderContext,
+    function_bindings: Option<&crate::binding_index::BindingIndex<'_, B>>,
+) where
+    D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
     prepare_slots(file, schemas);
-    let bindings = crate::binding_index::BindingIndex::from_parsed(file, schemas, config);
-    let mut report =
-        judgement::judge_expressions_with_bindings(file, schemas, config, Some(&bindings));
+    let inferred = function_bindings
+        .is_none()
+        .then(|| crate::binding_index::BindingIndex::from_parsed(file, schemas, config));
+    let bindings = function_bindings
+        .or(inferred.as_ref())
+        .expect("function source index");
+    let values = crate::binding_index::ResolvedBindings::<ParserPlaceholder>::build_validation(
+        file,
+        Clone::clone,
+        Clone::clone,
+    );
+    let mut report = judgement::judge_expressions_with_bindings(
+        file,
+        schemas,
+        config,
+        Some((bindings, &values, function_bindings.is_some())),
+    );
     for parameter in &file.export_params {
         if let (Some(sink), Some(location)) =
             (parameter.type_expr_opt(), parameter.value_location())
@@ -5552,7 +5595,11 @@ mod judgement {
         file: &super::super::File<E, P, T, D, B>,
         schemas: &crate::schema::SchemaRegistry,
         config: &super::super::ProviderContext,
-        function_bindings: Option<&crate::binding_index::BindingIndex<'_, B>>,
+        function_bindings: Option<(
+            &crate::binding_index::BindingIndex<'_, B>,
+            &crate::binding_index::ResolvedBindings<ParserPlaceholder, B>,
+            bool,
+        )>,
     ) -> ExpressionReport<B>
     where
         D: super::super::DeferredForPhaseTraversal<P, T, B>,
@@ -5753,8 +5800,14 @@ mod judgement {
             }));
         }
         // Record failures once before resource snapshots share this evidence.
-        if let Some(bindings) = function_bindings {
-            let promises = super::function_promises::check(expressions, &report, bindings, false);
+        if let Some((bindings, values, complete_sources)) = function_bindings {
+            let promises = super::function_promises::check(
+                expressions,
+                &report,
+                bindings,
+                values,
+                complete_sources,
+            );
             report.record_function_promises(promises, bindings);
         }
         let mut snapshots = HashMap::new();

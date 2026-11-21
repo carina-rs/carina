@@ -927,8 +927,6 @@ fn validate_and_resolve_configuration<'s>(
         expression_report
             .findings()
             .iter()
-            // Value-dependent promises wait for the completed source index.
-            .filter(|finding| !finding.detail().is_function_type_promise())
             .cloned()
             .map(|finding| AppError::ExpressionType(Box::new(finding))),
     );
@@ -1042,7 +1040,10 @@ fn validate_and_resolve_configuration<'s>(
 
     // Independent root failures still collect expanded secrecy findings. The
     // resolver and its conversion channel are consumed once on either path.
-    let had_ordinary_failure = errors.ordinary_failure().is_some();
+    // A function promise is already reported, but must not hide independent
+    // resource schema findings by stopping successful expansion here.
+    let blocks_expansion = |error: &AppError| !matches!(error, AppError::ExpressionType(finding) if finding.detail().is_function_type_promise());
+    let had_ordinary_failure = errors.ordinary_failure_where(blocks_expansion).is_some();
     if had_ordinary_failure {
         // Dependency diagnostics are independent of unrelated argument-type
         // failures. The per-argument report preserves every sound result even
@@ -1106,7 +1107,7 @@ fn validate_and_resolve_configuration<'s>(
                 })?
                 .clone();
             extend_module_call_errors(errors, authored_module_call_findings);
-            if errors.ordinary_failure().is_some() {
+            if errors.ordinary_failure_where(blocks_expansion).is_some() {
                 return Err(ValidationStopped::existing(errors));
             }
             *graph
@@ -1321,15 +1322,20 @@ fn validate_and_resolve_configuration<'s>(
     );
     let configuration = resolved_config
         .canonicalized()
-        .judge(enriched_context.catalog());
+        .judge_with_function_bindings(enriched_context.catalog(), &bindings);
     let promise_findings = configuration
         .judged()
         .function_type_promise_findings(&bindings);
-    errors.extend(
-        promise_findings
-            .into_iter()
-            .map(|finding| AppError::ExpressionType(Box::new(finding))),
-    );
+    for finding in promise_findings {
+        if !errors.client_findings().any(|error| {
+            matches!(error, AppError::ExpressionType(existing)
+                if existing.detail() == finding.detail()
+                    && existing.location().file().path() == finding.location().file().path()
+                    && existing.location().span() == finding.location().span())
+        }) {
+            errors.push(AppError::ExpressionType(Box::new(finding)));
+        }
+    }
     if let Err(ref_errors) = carina_core::validation::validate_export_param_ref_types_with_bindings(
         parsed.export_params,
         &bindings,

@@ -9,6 +9,9 @@ mod review_round1;
 #[path = "fn_type_promise/module_body.rs"]
 mod module_body;
 
+#[path = "fn_type_promise/review_round2.rs"]
+mod review_round2;
+
 use carina_cli::commands::validate::{ValidateDiagnostics, validate_diagnostics_with_factories};
 use carina_cli::wiring::LoadedProviderFactory;
 use carina_core::paths::ResolvedPath;

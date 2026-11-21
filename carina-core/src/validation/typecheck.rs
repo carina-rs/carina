@@ -73,8 +73,24 @@ impl fmt::Display for FunctionTypePosition<'_> {
 const UNKNOWN_FUNCTION_TYPE_ADVICE: &str =
     "Pass a value known at validate, or give the argument a type that proves it fits.";
 
+/// Advice can name only a type with a DSL annotation spelling.
+pub(crate) struct WritableType(String);
+
+impl WritableType {
+    pub(crate) fn expression(ty: &TypeExpr) -> Self {
+        Self(ty.to_string())
+    }
+
+    pub(crate) fn reference(ty: &crate::binding_index::ResolvedRefType) -> Option<Self> {
+        ty.constraints().next()?.writable_type_name().map(Self)
+    }
+}
+
 pub(crate) enum FunctionTypeSource<'a> {
-    Typed(String),
+    Typed {
+        display: String,
+        writable: Option<WritableType>,
+    },
     Unknown,
     UntypedExport(&'a str),
 }
@@ -97,10 +113,10 @@ pub(crate) fn format_function_type_promise_error(
         (FunctionTypeSource::Unknown, FunctionTypePosition::Return) => {
             "the body has no known type".into()
         }
-        (FunctionTypeSource::Typed(ty), FunctionTypePosition::Parameter(_)) => {
+        (FunctionTypeSource::Typed { display: ty, .. }, FunctionTypePosition::Parameter(_)) => {
             format!("its argument has type {ty}")
         }
-        (FunctionTypeSource::Typed(ty), FunctionTypePosition::Return) => {
+        (FunctionTypeSource::Typed { display: ty, .. }, FunctionTypePosition::Return) => {
             format!("the body's type is {ty}")
         }
         (FunctionTypeSource::UntypedExport(export), _) => {
@@ -113,10 +129,15 @@ pub(crate) fn format_function_type_promise_error(
             "Pass a value known at validate, or declare the export's type.".into()
         }
         // A named reference can retain a value check even for its own type.
-        FunctionTypeSource::Typed(ty) if ty == declared.to_string() => {
-            UNKNOWN_FUNCTION_TYPE_ADVICE.into()
-        }
-        FunctionTypeSource::Typed(ty) => format!(
+        FunctionTypeSource::Typed { writable: None, .. } => UNKNOWN_FUNCTION_TYPE_ADVICE.into(),
+        FunctionTypeSource::Typed {
+            writable: Some(WritableType(ty)),
+            ..
+        } if ty == declared.to_string() => UNKNOWN_FUNCTION_TYPE_ADVICE.into(),
+        FunctionTypeSource::Typed {
+            writable: Some(WritableType(ty)),
+            ..
+        } => format!(
             "Pass a value known at validate, or declare {repair} as {ty} and let the resource attribute that receives it check the value."
         ),
     };

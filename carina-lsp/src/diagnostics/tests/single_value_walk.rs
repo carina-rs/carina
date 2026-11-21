@@ -227,7 +227,7 @@ fn issue_4276_function_container_uses_authored_findings() {
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
     assert_eq!(
         diagnostics[0].message,
-        "Invalid expression at line 1: length(): length() argument must be a List, Map, or String, got Int"
+        "length(): length() argument must be a List, Map, or String, got Int"
     );
     assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
     assert_eq!(
@@ -247,7 +247,7 @@ fn issue_4276_union_function_uses_authored_findings() {
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
     assert_eq!(
         diagnostics[0].message,
-        "Invalid expression at line 1: length(): length() argument must be a List, Map, or String, got Int"
+        "length(): length() argument must be a List, Map, or String, got Int"
     );
     assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
     assert_eq!(

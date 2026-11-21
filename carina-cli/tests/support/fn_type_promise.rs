@@ -203,6 +203,36 @@ impl ProviderFactory for PromiseFactory {
                 )
                 .validate()
                 .unwrap(),
+            ResourceSchema::new("Role")
+                .attribute(
+                    AttributeSchema::required("role_name", AttributeType::ref_("RoleName")).build(),
+                )
+                .attribute(AttributeSchema::optional("description", role_description()).build())
+                .attribute(
+                    AttributeSchema::provider_populated("arn", AttributeType::string()).build(),
+                )
+                .attribute(
+                    AttributeSchema::provider_populated(
+                        "computed_name",
+                        AttributeType::ref_("RoleName"),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    AttributeSchema::provider_populated("computed_description", role_description())
+                        .build(),
+                )
+                .with_def(
+                    "RoleName",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::from_dotted("test.RoleName")),
+                        Some(PatternSpec::new("[a-z-]+", PatternMatch::Full)),
+                        Some((Some(1), Some(64))),
+                        None,
+                    ),
+                )
+                .validate()
+                .unwrap(),
         ]
     }
 
@@ -215,4 +245,13 @@ impl ProviderFactory for PromiseFactory {
         )
         .unwrap()
     }
+}
+
+fn role_description() -> AttributeType {
+    AttributeType::refined_string(
+        None,
+        Some(PatternSpec::new(".*", PatternMatch::Full)),
+        Some((None, Some(1000))),
+        None,
+    )
 }

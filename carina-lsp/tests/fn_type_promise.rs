@@ -39,14 +39,9 @@ fn tp1_lsp_rule3_parameter_diagnostic_at_authored_call() {
         .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
         .collect();
     assert_eq!(errors.len(), 1, "{errors:#?}");
-    assert!(
-        errors[0]
-            .message
-            .contains("function 'promise': parameter 'value'"),
-        "{errors:#?}"
+    assert_eq!(
+        errors[0].message,
+        "function 'promise': parameter 'value' is declared as 'dev' | 'prod', but its argument has type String, so validate cannot prove it fits. Pass a value known at validate, or declare the parameter as String and let the resource attribute that receives it check the value."
     );
-    assert!(errors[0].message.contains("at validate"), "{errors:#?}");
-    assert!(errors[0].message.contains("String"), "{errors:#?}");
-    assert_eq!(errors[0].message.split(". ").count(), 2, "{errors:#?}");
     assert_eq!(errors[0].range.start.line, 2, "{errors:#?}");
 }

@@ -561,6 +561,11 @@ fn admit_validation_attributes_with_input<
                 Err(error) => return admission_findings(&mut Err::<Admission<K, P, B>, _>(error)),
             },
         };
+        if boundary.cursor.reported_function_promise() {
+            // Preserve presence and failure while the authored call owns its
+            // diagnostic; other attributes still receive their schema checks.
+            return crate::schema::ValueValidationFindings::default().retained_failure();
+        }
         boundary.declaration = declarations
             .and_then(|sources| sources.get(name))
             .map(|(name, source)| (name.as_str(), source));

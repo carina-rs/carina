@@ -2367,7 +2367,7 @@ impl ResolvedBindings<ParserPlaceholder> {
         )
     }
 
-    fn build_validation<E, B: BindingAddress, Out: BindingAddress, D>(
+    pub(crate) fn build_validation<E, B: BindingAddress, Out: BindingAddress, D>(
         parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         mut map_value: impl FnMut(&Value<ParserPlaceholder, B>) -> Value<ParserPlaceholder, Out>,
         mut map_binding: impl FnMut(&B) -> Out,
