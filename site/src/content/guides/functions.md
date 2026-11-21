@@ -161,6 +161,11 @@ types, once per declaration. A non-proving nested call is reported at each outer
 call whose relevant argument is unknown. An unused outer function does not
 trigger that rule-3 finding.
 
+Inside a module, unknown arguments use the types declared in that module's
+`arguments` block. For example, `env: 'dev' | 'prod'` proves `pick(env)` fits the
+same union even when the caller passes an unknown `String`. Known argument values
+still receive value checks. The caller-to-module boundary is checked separately.
+
 For `fn pick(x: 'dev' | 'prod'): String { x }`, passing that unknown `String`
 produces:
 

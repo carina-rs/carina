@@ -672,7 +672,8 @@ type each bullet names; read that type's rustdoc for the details.
   admission reference relation, and `NeedsLocal` or missing source types reject
   at validate. Unknown returns reuse the body's judgement with parameters as
   their declared types; nested-call verdicts are reused for relevant unknown
-  outer arguments. Definite mismatches remain declaration errors, including
+  outer arguments. Calls inside modules use the child's declared argument types
+  as evidence. Definite mismatches remain declaration errors, including
   unused functions; unavailable schemas and upstream loads defer. Member String
   failures retain their pattern/length category and member label; identity
   failures run first.

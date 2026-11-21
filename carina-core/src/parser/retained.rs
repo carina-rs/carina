@@ -4350,6 +4350,23 @@ mod judgement {
             return Ok(mode.value_check());
         }
         if let TypeExpr::Union(members) = sink {
+            // Function boundaries compare whole declared unions. Requiring
+            // the source union to fit a single destination arm loses proof.
+            if context == AdmissionContext::Function
+                && expression.requires_declared_assignment()
+                && ty.is_some_and(|actual| {
+                    matches!(
+                        crate::validation::typecheck::inferred_type_assignment(
+                            sink,
+                            actual,
+                            &config.custom_types,
+                        ),
+                        crate::schema::TypeAssignability::Assignable
+                    )
+                })
+            {
+                return Ok(mode.value_check());
+            }
             if expression.requires_declared_assignment()
                 && ty == Some(&TypeExpr::String)
                 && !members.is_empty()

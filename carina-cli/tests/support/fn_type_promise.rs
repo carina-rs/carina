@@ -88,8 +88,8 @@ impl Directory {
             "untyped" => "String",
             _ => panic!("unknown fixture export"),
         };
-        // Modules cannot declare upstream_state. Pass the root's expression
-        // through a module argument; its original type evidence must survive.
+        // Modules cannot declare upstream_state. The root passes its expression
+        // through an argument whose declared type supplies the child's evidence.
         std::fs::write(
             self.root.join("main.crn"),
             format!(

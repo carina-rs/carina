@@ -6,6 +6,9 @@ mod fixture;
 #[path = "fn_type_promise/review_round1.rs"]
 mod review_round1;
 
+#[path = "fn_type_promise/module_body.rs"]
+mod module_body;
+
 use carina_cli::commands::validate::{ValidateDiagnostics, validate_diagnostics_with_factories};
 use carina_cli::wiring::LoadedProviderFactory;
 use carina_core::paths::ResolvedPath;
@@ -193,6 +196,8 @@ macro_rules! rule3_case {
             let actual =
                 if matches!($position, Position::Return) && $expression == "upstream.untyped" {
                     "unknown"
+                } else if matches!($scope, Scope::Module) && $expression == "upstream.untyped" {
+                    "String"
                 } else {
                     $actual
                 };
@@ -385,24 +390,6 @@ mod tp1_rule3 {
         mod parameter {
             use super::*;
             rule3_matrix!(Scope::Module, Position::Parameter);
-            rule3_case!(
-                untyped_upstream_int,
-                Scope::Module,
-                Position::Parameter,
-                "Int",
-                "",
-                "upstream.untyped",
-                "no declared type"
-            );
-            rule3_case!(
-                untyped_upstream_list,
-                Scope::Module,
-                Position::Parameter,
-                "list(String)",
-                "",
-                "upstream.untyped",
-                "no declared type"
-            );
         }
         mod returns {
             use super::*;
@@ -498,6 +485,30 @@ mod tp1_rule2 {
         use super::*;
         rule2_matrix!(Scope::Module);
         rule2_scalar_variations!(module, Scope::Module);
+
+        #[test]
+        fn untyped_upstream_int() {
+            let directory = case_directory(
+                Scope::Module,
+                Position::Parameter,
+                "Int",
+                "",
+                "upstream.untyped",
+            );
+            assert_accepted(&directory);
+        }
+
+        #[test]
+        fn untyped_upstream_list() {
+            let directory = case_directory(
+                Scope::Module,
+                Position::Parameter,
+                "list(String)",
+                "",
+                "upstream.untyped",
+            );
+            assert_accepted(&directory);
+        }
     }
 }
 

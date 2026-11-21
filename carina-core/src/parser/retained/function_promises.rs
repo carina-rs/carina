@@ -336,6 +336,32 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
         false
     }
 
+    fn uses_module_argument(&self, expression: &ExprValue<ParserPlaceholder, B>) -> bool {
+        if matches!(
+            expression.authored.location.instance,
+            ExpressionInstance::Root
+        ) || self.expressions.arguments.is_empty()
+        {
+            return false;
+        }
+        let mut pending = vec![expression];
+        let mut visited = HashSet::new();
+        while let Some(expression) = pending.pop() {
+            let node = &expression.authored;
+            if !visited.insert((node.location.instance.clone(), node.id)) {
+                continue;
+            }
+            if let ExprKind::Binding(binding) | ExprKind::Reference { binding, .. } = &node.kind {
+                if self.expressions.arguments.contains_key(binding) {
+                    return true;
+                }
+                pending.extend(self.expressions.definitions.get(binding));
+            }
+            pending.extend(&node.children);
+        }
+        false
+    }
+
     fn source(&self, expression: &ExprValue<ParserPlaceholder, B>) -> Source {
         let expressions = self.expressions;
         let report = self.report;
@@ -373,6 +399,28 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
             .ty
             .as_ref()
             .is_some_and(|ty| type_needs_schema(ty, bindings.provider_context()));
+        // The authored judge already uses the child's declared argument type,
+        // including through aliases and accesses. A substituted projection is
+        // value evidence, not the caller's type or upstream-export provenance.
+        if self.uses_module_argument(expression) {
+            if let Some(value) = self.projection(expression) {
+                value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+                    source.unavailable |= reference
+                        .check(|path| {
+                            Ok::<_, InferenceError>(
+                                bindings.upstream_is_unavailable(path.binding())
+                                    || (bindings.references_resource_attribute(path.into())
+                                        && matches!(
+                                            bindings.ref_type(ReferencePathRef::Access(path)),
+                                            RefType::Unchecked | RefType::UnknownBinding { .. }
+                                        )),
+                            )
+                        })
+                        .unwrap_or(false);
+                });
+            }
+            return source;
+        }
         let authored_path = match &node.kind {
             ExprKind::Reference {
                 binding,

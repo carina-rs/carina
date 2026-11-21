@@ -380,7 +380,7 @@ fn secrecy_related_message(cause: &carina_core::secrecy::DerivationError, name: 
     format!("{description} in module instance '{name}'")
 }
 
-fn secrecy_range(
+fn authored_range(
     location: &carina_core::parser::DeclarationLocation,
     open_sources: &[(PathBuf, Arc<str>)],
     analyzed_sources: &carina_core::config_loader::SourceOverrides,
@@ -438,7 +438,7 @@ fn render_secrecy(
         )?
     } else {
         Diagnostic {
-            range: secrecy_range(authored, open_sources, analyzed_sources)?,
+            range: authored_range(authored, open_sources, analyzed_sources)?,
             severity: Some(DiagnosticSeverity::ERROR),
             source: Some("carina".into()),
             message,
@@ -455,7 +455,7 @@ fn render_secrecy(
             )
             .map(|diagnostic| diagnostic.range)
         } else {
-            secrecy_range(&call.location, open_sources, analyzed_sources)
+            authored_range(&call.location, open_sources, analyzed_sources)
         };
         // Missing or unmappable related text never suppresses the operator.
         diagnostic.related_information = range.and_then(|range| {
@@ -923,7 +923,7 @@ pub(super) struct DiagnosticRun<'a> {
     source_snapshot: Option<&'a carina_core::config_loader::SourceOverrides>,
     analysis_sources: &'a RefCell<carina_core::config_loader::SourceOverrides>,
     secrecy_causes: &'a RefCell<SecrecyCauses>,
-    routed_secrecy: &'a RefCell<BTreeMap<PathBuf, Vec<Diagnostic>>>,
+    routed_diagnostics: &'a RefCell<BTreeMap<PathBuf, Vec<Diagnostic>>>,
 }
 
 #[cfg(test)]
@@ -2395,7 +2395,7 @@ impl DiagnosticRun<'_> {
                             diagnostics.push(diagnostic);
                         }
                     } else {
-                        let mut routed = self.routed_secrecy.borrow_mut();
+                        let mut routed = self.routed_diagnostics.borrow_mut();
                         let findings = routed.entry(path).or_default();
                         if !findings
                             .iter()
@@ -2443,14 +2443,41 @@ impl DiagnosticRun<'_> {
                 },
             );
             for finding in promise_findings {
-                if let Some(diagnostic) = render_merged(
-                    doc,
-                    &finding,
-                    DiagnosticSeverity::ERROR,
-                    finding.detail().to_string(),
-                ) && !diagnostics.contains(&diagnostic)
+                let path = finding.location().file().path();
+                let diagnostic = if path == doc.source_file() {
+                    render_merged(
+                        doc,
+                        &finding,
+                        DiagnosticSeverity::ERROR,
+                        finding.detail().to_string(),
+                    )
+                } else if finding.detail().is_function_type_promise()
+                    && current_root_context
+                    && path.parent().map(PathIdentity::new) != root_directory
                 {
-                    diagnostics.push(diagnostic);
+                    authored_range(finding.location(), self.open_sources, &overrides).map(|range| {
+                        Diagnostic {
+                            range,
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            source: Some("carina".into()),
+                            message: finding.detail().to_string(),
+                            ..Default::default()
+                        }
+                    })
+                } else {
+                    None
+                };
+                let Some(diagnostic) = diagnostic else {
+                    continue;
+                };
+                let mut routed = self.routed_diagnostics.borrow_mut();
+                let destination = if path == doc.source_file() {
+                    &mut diagnostics
+                } else {
+                    routed.entry(path.to_path_buf()).or_default()
+                };
+                if !destination.contains(&diagnostic) {
+                    destination.push(diagnostic);
                 }
             }
             // Validate non-resource declarations authored in the open file,
@@ -3259,7 +3286,7 @@ impl DiagnosticEngine {
                     source_snapshot: None,
                     analysis_sources: &RefCell::default(),
                     secrecy_causes: &RefCell::default(),
-                    routed_secrecy: &RefCell::default(),
+                    routed_diagnostics: &RefCell::default(),
                 })
             },
         )
@@ -3293,7 +3320,7 @@ impl DiagnosticEngine {
         self.analyze_with_open_sources(raw, current_file_path, &open_sources)
     }
 
-    /// Analyze the current document and route instantiated secrecy findings to
+    /// Analyze the current document and route instantiated findings to
     /// their authored files. Dirty module buffers suppress routed findings.
     /// Results iterate in file-path order.
     pub fn analyze_document_set(
@@ -3383,7 +3410,7 @@ impl DiagnosticEngine {
         } else {
             doc
         };
-        let routed_secrecy = RefCell::default();
+        let routed_diagnostics = RefCell::default();
         let analysis_sources = RefCell::default();
         let secrecy_causes = RefCell::default();
         let terminal =
@@ -3395,11 +3422,11 @@ impl DiagnosticEngine {
                     source_snapshot: Some(&source_snapshot),
                     analysis_sources: &analysis_sources,
                     secrecy_causes: &secrecy_causes,
-                    routed_secrecy: &routed_secrecy,
+                    routed_diagnostics: &routed_diagnostics,
                 }
                 .collect_diagnostics(&doc, current_file_path)
             });
-        let mut report = routed_secrecy.into_inner();
+        let mut report = routed_diagnostics.into_inner();
         report.insert(
             raw.source_file().to_path_buf(),
             Self::publish_type_diagnostics(terminal, &doc),
