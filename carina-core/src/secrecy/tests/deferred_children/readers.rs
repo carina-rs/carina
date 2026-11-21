@@ -544,14 +544,31 @@ fn for_value_keys_reader_pending_keeps_runtime_redaction() {
 // Assert the current pending state; invert these expectations when carina#4579 is fixed.
 #[test]
 fn for_value_keys_reader_pending_mixed_alternatives_characterization() {
-    // The rejection of the read under `??` is carina#4580; invert it when fixed.
+    let (_directory, file, schemas, context) = reader_fixture(
+        "let children = for item in ['comment'] { mock.test.Resource { name = secret('name canary') } }\nlet other = mock.test.Resource { comment = children['comment'].name ?? 'public' }\n",
+        None,
+    );
+    let file = file.unwrap();
+    // The string-subscript read is accepted after #4580; its secrecy is
+    // still pending on #4579, just like the plain read below.
+    let pending = report(&file, &schemas, &context);
+    assert!(pending.is_pending(), "{pending:?}");
+    assert!(pending.findings().is_empty(), "{pending:?}");
+    assert!(!format!("{pending:?}").contains("canary"));
+    assert!(
+        resolve_owner(file, &schemas, &context)
+            .validated_secrecy()
+            .is_err()
+    );
+
+    // String subscripts select keyed children; field access remains invalid.
     let (_directory, file, _schemas, _context) = reader_fixture(
         "let children = for item in ['comment'] { mock.test.Resource { name = secret('name canary') } }\nlet other = mock.test.Resource { comment = children.comment.name ?? 'public' }\n",
         None,
     );
     let error = file.unwrap_err().to_string();
     assert!(
-        error.contains("cannot apply access .comment to list(mock.test.Resource)"),
+        error.contains("cannot apply access .comment to keyed loop group"),
         "{error}"
     );
     assert!(!error.contains("canary"));
