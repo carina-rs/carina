@@ -63,6 +63,170 @@ fn assert_validate_rejects(files: &[(&str, &str)], expected: &str, line: usize) 
     );
 }
 
+const LOOP_READER_CASES: [(&str, &str, &str); 3] = [
+    (
+        "map",
+        "let items = { a = 'x' }\nlet children = for k, v in items { mock.test.resource { name = v } }\n",
+        "children['a'].name",
+    ),
+    (
+        "value-keyed",
+        "let items = ['a']\nlet children = for item in items { mock.test.resource { name = item } }\n",
+        "children['a'].name",
+    ),
+    (
+        "indexed",
+        "let items = ['a']\nlet children = for (i, item) in items { mock.test.resource { name = item } }\n",
+        "children[0].name",
+    ),
+];
+
+fn loop_reader_fixture(source: &str) -> tempfile::TempDir {
+    let fixture = tempfile::tempdir().expect("temporary loop project");
+    for (file, contents) in [
+        ("main.crn", source),
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "backend.crn",
+            "backend local { path = 'carina.state.json' }\n",
+        ),
+        ("other.crn", ""),
+        ("exports.crn", "exports {}\n"),
+    ] {
+        write_file(fixture.path(), file, contents);
+    }
+    assert_success("carina init", &run(fixture.path(), &["init", "."]));
+    fixture
+}
+
+fn loop_reader_positions(reader: &str) -> [(&'static str, String); 8] {
+    [
+        ("plain", reader.into()),
+        ("single interpolation", format!("\"${{{reader}}}\"")),
+        ("coalesce", format!("{reader} ?? 'p'")),
+        ("if", format!("if true {{ {reader} }} else {{ 'p' }}")),
+        ("function argument", format!("upper({reader})")),
+        ("multipart interpolation", format!("\"x-${{{reader}}}\"")),
+        ("arithmetic", format!("\"${{length({reader}) + 1}}\"")),
+        ("export", format!("{reader} ?? 'p'")),
+    ]
+}
+
+fn validate_loop_reader(root: &Path, position: &str, expression: &str) -> Output {
+    let comment = if position == "export" {
+        "'other'"
+    } else {
+        expression
+    };
+    write_file(
+        root,
+        "other.crn",
+        &format!("let other = mock.test.resource {{ name = 'other' comment = {comment} }}\n"),
+    );
+    let export = if position == "export" {
+        expression
+    } else {
+        "other.name"
+    };
+    write_file(
+        root,
+        "exports.crn",
+        &format!("exports {{ out: String = {export} }}\n"),
+    );
+    run(root, &["validate", "."])
+}
+
+#[test]
+fn keyed_loop_readers_validate_in_every_position() {
+    let mut failures = Vec::new();
+    for (kind, source, reader) in LOOP_READER_CASES {
+        let fixture = loop_reader_fixture(source);
+        for (position, expression) in loop_reader_positions(reader) {
+            let output = validate_loop_reader(fixture.path(), position, &expression);
+            if !output.status.success() {
+                failures.push(format!("{kind}, {position}: {}", output_text(&output)));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn keyed_loop_invalid_reader_spellings_stay_rejected_in_every_position() {
+    for (kind, source, _) in LOOP_READER_CASES {
+        let fixture = loop_reader_fixture(source);
+        let invalid_subscript = if kind == "indexed" {
+            "children['a'].name"
+        } else {
+            "children[0].name"
+        };
+        for reader in ["children.a.name", invalid_subscript] {
+            for (position, expression) in loop_reader_positions(reader) {
+                let output = validate_loop_reader(fixture.path(), position, &expression);
+                assert!(
+                    !output.status.success(),
+                    "{kind}, {position}, {reader} unexpectedly passed: {}",
+                    output_text(&output)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn keyed_loop_missing_keys_keep_the_plain_error_in_every_position() {
+    for (kind, source, _) in LOOP_READER_CASES.into_iter().take(2) {
+        let fixture = loop_reader_fixture(source);
+        for (position, expression) in loop_reader_positions("children['zzz'].name") {
+            let output = validate_loop_reader(fixture.path(), position, &expression);
+            let text = output_text(&output);
+            assert!(!output.status.success(), "{kind}, {position}: {text}");
+            assert!(
+                text.contains("Undefined identifier `children.zzz`. Did you mean `children.a`?"),
+                "{kind}, {position}: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn keyed_loop_whole_groups_stay_rejected_as_values() {
+    for (kind, source, _) in LOOP_READER_CASES {
+        let fixture = loop_reader_fixture(source);
+        for (position, expression) in loop_reader_positions("children") {
+            let output = validate_loop_reader(fixture.path(), position, &expression);
+            let text = output_text(&output);
+            assert!(!output.status.success(), "{kind}, {position}: {text}");
+            assert!(
+                text.contains("is a for binding, not a value"),
+                "{kind}, {position}: {text}"
+            );
+        }
+        for (other, exports) in [
+            (
+                "for c in children { mock.test.resource { name = c.name } }",
+                "exports {}",
+            ),
+            ("let count = length(children)", "exports {}"),
+            ("", "exports { out = children }"),
+            ("", "exports { out: map(String) = children }"),
+        ] {
+            write_file(fixture.path(), "other.crn", other);
+            write_file(fixture.path(), "exports.crn", exports);
+            let output = run(fixture.path(), &["validate", "."]);
+            let text = output_text(&output);
+            assert!(
+                !output.status.success(),
+                "{kind}, {other}, {exports}: {text}"
+            );
+            assert!(
+                text.contains("is a for binding, not a value"),
+                "{kind}, {other}, {exports}: {text}"
+            );
+        }
+    }
+}
+
 #[test]
 fn validate_rejects_bare_resource_handles_in_value_positions() {
     for (source, binding, line) in [

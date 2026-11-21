@@ -42,6 +42,56 @@ fn checked_configuration(
 }
 
 #[test]
+fn keyed_loop_compound_reader_directory_diagnostics() {
+    let snapshot = Arc::new(snapshot());
+    let engine = DiagnosticEngine::new(Arc::clone(&snapshot), vec!["mock".into()]);
+    let directory = tempfile::tempdir().unwrap();
+    for (file, source) in [
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "backend.crn",
+            "backend local { path = 'carina.state.json' }\n",
+        ),
+        (
+            "main.crn",
+            "let items = { a = 'x' }\nlet children = for k, v in items { mock.test.resource { name = v } }\n",
+        ),
+        ("exports.crn", "exports { out: String = other.name }\n"),
+    ] {
+        std::fs::write(directory.path().join(file), source).unwrap();
+    }
+    let path = directory.path().join("other.crn");
+    for (reader, accepted) in [("children['a'].name", true), ("children.a.name", false)] {
+        let source = format!(
+            "let other = mock.test.resource {{ name = 'other' comment = {reader} ?? 'p' }}\n"
+        );
+        std::fs::write(&path, &source).unwrap();
+        let document = Document::new_with_path(
+            source,
+            path.clone(),
+            Arc::new(snapshot.provider_context().as_provider_context().clone()),
+        );
+        let diagnostics = engine.analyze(&document, Some(&path));
+        if accepted {
+            assert!(diagnostics.is_empty(), "{reader}: {diagnostics:#?}");
+        } else {
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+                        && diagnostic.message.contains("cannot apply access .a")
+                }),
+                "{reader}: {diagnostics:#?}"
+            );
+        }
+        assert_eq!(
+            checked_configuration(directory.path(), &snapshot).is_ok(),
+            accepted,
+            "{reader}"
+        );
+    }
+}
+
+#[test]
 fn for_value_keys_upstream_authored_diagnostic_parity() {
     let snapshot = Arc::new(snapshot());
     let engine = DiagnosticEngine::new(Arc::clone(&snapshot), vec!["mock".into()]);

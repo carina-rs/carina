@@ -187,6 +187,33 @@ fn source_schema_report(source: &str) -> (crate::parser::ParsedFile, ExpressionR
 }
 
 #[test]
+fn keyed_loop_groups_have_no_value_type_or_collection_sink() {
+    for source in [
+        "let items = { a = 'x' }\nlet children = for k, v in items { mock.test.Source { name = v } }",
+        "let items = ['a']\nlet children = for item in items { mock.test.Source { name = item } }",
+    ] {
+        let (_, report) = source_schema_report(source);
+        let group = report
+            .binding(&RelativeBindingName::new("children"))
+            .unwrap();
+        assert!(
+            group.static_type().is_err(),
+            "{source}: {:?}",
+            group.static_type()
+        );
+        for sink in [
+            TypeExpr::Map(Box::new(TypeExpr::String)),
+            TypeExpr::List(Box::new(TypeExpr::String)),
+            TypeExpr::Struct {
+                fields: vec![("a".into(), TypeExpr::String)],
+            },
+        ] {
+            assert!(admit_expression(group, &sink).is_err(), "{source}: {sink}");
+        }
+    }
+}
+
+#[test]
 fn single_reference_interpolation_preserves_child_judgement_and_literal_folding() {
     for definition in [
         "let x = src.name",
