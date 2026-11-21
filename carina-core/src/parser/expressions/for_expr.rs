@@ -14,7 +14,7 @@ use crate::parser::{
     DeferredForBody, DeferredForTarget, ModuleCall, ParseContext, ParseError, ParseWarning,
     ParsedDeferredForExpression, ParsedDeferredForIterableState, PreprocessedFile,
     ResourceParseTarget, Rule, SourceSpan, WarningKind, display_string_literal,
-    evaluate_static_value, first_inner, next_pair, parse_expression, parse_module_call,
+    evaluate_static_value, next_pair, parse_expression, parse_module_call,
     parse_read_resource_expr, parse_resource_for_target,
 };
 use crate::parser::{
@@ -59,33 +59,27 @@ fn parser_iterable<'s, 'a>(
     }
 }
 
-/// Binding pattern for a for expression
+/// Loop binding and child-address choice, selected by the retained syntax compiler.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ForBinding {
-    /// Simple: `for x in ...`
-    Simple(String),
     /// Indexed: `for (i, x) in ...`
     Indexed(String, String),
-    /// Map: `for k, v in ...`
-    Map(String, String),
+    /// Unbound `for x in ...`, with children addressed by position.
+    Positional(String),
+    /// Map-keyed: `for k, v in ...`
+    MapKeyed(String, String),
+    /// Let-bound `for x in ...`, with children addressed by value.
+    ValueKeyed(String),
 }
 
 impl ForBinding {
     /// Every binding name introduced by this pattern, in declaration order.
     pub fn names(&self) -> Vec<&str> {
         match self {
-            ForBinding::Simple(a) => vec![a.as_str()],
-            ForBinding::Indexed(a, b) | ForBinding::Map(a, b) => vec![a.as_str(), b.as_str()],
+            ForBinding::Positional(a) | ForBinding::ValueKeyed(a) => vec![a.as_str()],
+            ForBinding::Indexed(a, b) | ForBinding::MapKeyed(a, b) => vec![a.as_str(), b.as_str()],
         }
     }
-}
-
-/// Child-address policy decided by the retained syntax compiler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum LoopAddressing {
-    Indexed,
-    MapKeyed,
-    ValueKeyed,
 }
 
 /// Whether `name` appears in `text` as a whole identifier (not a substring
@@ -192,12 +186,14 @@ fn parse_deferred_for_body_template(
         }
     };
     match binding {
-        ForBinding::Simple(value) => bind_value(&mut template_ctx, value, LoopSlot::Value),
+        ForBinding::Positional(value) | ForBinding::ValueKeyed(value) => {
+            bind_value(&mut template_ctx, value, LoopSlot::Value)
+        }
         ForBinding::Indexed(index, value) => {
             bind_value(&mut template_ctx, index, LoopSlot::Index);
             bind_value(&mut template_ctx, value, LoopSlot::Value);
         }
-        ForBinding::Map(key, value) => {
+        ForBinding::MapKeyed(key, value) => {
             bind_value(&mut template_ctx, key, LoopSlot::Key);
             bind_value(&mut template_ctx, value, LoopSlot::Value);
         }
@@ -228,7 +224,6 @@ fn parse_deferred_for_body_template(
 fn record_deferred_for_expression(
     body_pair: pest::iterators::Pair<Rule>,
     binding: &ForBinding,
-    addressing: LoopAddressing,
     ctx: &mut ParseContext,
     target: &LoopParseTarget,
     preprocessed_file: &PreprocessedFile,
@@ -278,11 +273,9 @@ fn record_deferred_for_expression(
     }
     let mut parsed = ParsedDeferredForExpression::new(
         (None, line, span, header),
-        target.deferred_target(),
+        target.deferred_target(binding)?,
         iterable,
         iterable_state,
-        binding.clone(),
-        addressing,
         body,
     );
 
@@ -337,13 +330,37 @@ impl LoopParseTarget {
         }
     }
 
-    fn deferred_target(&self) -> DeferredForTarget<RelativeBindingName> {
-        match self {
-            Self::Bound(target) => DeferredForTarget::Bound(target.clone()),
+    fn deferred_target(
+        &self,
+        binding: &ForBinding,
+    ) -> Result<DeferredForTarget<RelativeBindingName>, ParseError> {
+        use crate::parser::{BoundLoopBinding, UnboundLoopBinding};
+        let mismatch = || ParseError::InternalError {
+            expected: "loop binding matching its declaration site".into(),
+            context: "deferred for expression".into(),
+        };
+        Ok(match self {
+            Self::Bound(target) => DeferredForTarget::Bound {
+                target: target.clone(),
+                binding: match binding {
+                    ForBinding::Indexed(i, v) => BoundLoopBinding::Indexed(i.clone(), v.clone()),
+                    ForBinding::MapKeyed(k, v) => BoundLoopBinding::MapKeyed(k.clone(), v.clone()),
+                    ForBinding::ValueKeyed(v) => BoundLoopBinding::ValueKeyed(v.clone()),
+                    ForBinding::Positional(_) => return Err(mismatch()),
+                },
+            },
             Self::Unbound(template) => DeferredForTarget::Unbound {
                 template: template.clone(),
+                binding: match binding {
+                    ForBinding::Indexed(i, v) => UnboundLoopBinding::Indexed(i.clone(), v.clone()),
+                    ForBinding::MapKeyed(k, v) => {
+                        UnboundLoopBinding::MapKeyed(k.clone(), v.clone())
+                    }
+                    ForBinding::Positional(v) => UnboundLoopBinding::Positional(v.clone()),
+                    ForBinding::ValueKeyed(_) => return Err(mismatch()),
+                },
             },
-        }
+        })
     }
 }
 
@@ -395,16 +412,15 @@ pub(crate) fn parse_for_expr(
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<(Vec<Resource>, Vec<DataSource>, Vec<ModuleCall>), ParseError> {
-    let addressing = ctx.for_addressing(&pair)?;
+    let binding = ctx.for_binding(&pair)?.clone();
     let for_line = pair.as_span().start_pos().line_col().0;
     let for_span = SourceSpan::from_pest(&pair, preprocessed_file);
     let declaration =
         crate::parser::DeclarationProvenance::from_pair(&pair, preprocessed_file, source_file);
     let mut inner = pair.into_inner();
 
-    // Parse the binding pattern
-    let binding_pair = next_pair(&mut inner, "for binding", "for expression")?;
-    let binding = parse_for_binding(binding_pair)?;
+    // Skip the pattern already compiled into the retained binding.
+    let _binding_pair = next_pair(&mut inner, "for binding", "for expression")?;
 
     // Parse the iterable expression
     let iterable_pair = next_pair(&mut inner, "iterable", "for expression")?;
@@ -503,7 +519,7 @@ pub(crate) fn parse_for_expr(
         .map_err(|error| ParseError::from_resolution(error.into(), for_line))?;
     let admission = match &target {
         LoopParseTarget::Bound(bound) => Some(crate::resource::admit_bound_for_addresses(
-            addressing,
+            &binding,
             bound,
             ClassifiedRef::from(&classified),
             crate::resource::ForAddressMoment::Parse,
@@ -533,16 +549,19 @@ pub(crate) fn parse_for_expr(
             let child = ForBodyTarget::Bound(member.address().clone());
             let mut iter_ctx = ctx.child_scope();
             match &binding {
-                ForBinding::Simple(value) | ForBinding::Indexed(_, value) => {
-                    if let ForBinding::Indexed(index, _) = &binding {
-                        bind(
-                            &mut iter_ctx,
-                            index,
-                            Value::Concrete(ConcreteValue::Int(
-                                member.index().expect("indexed binding"),
-                            )),
-                        );
-                    }
+                ForBinding::Indexed(index, _) => bind(
+                    &mut iter_ctx,
+                    index,
+                    Value::Concrete(ConcreteValue::Int(member.index().expect("indexed binding"))),
+                ),
+                ForBinding::Positional(_)
+                | ForBinding::ValueKeyed(_)
+                | ForBinding::MapKeyed(_, _) => {}
+            }
+            match &binding {
+                ForBinding::Positional(value)
+                | ForBinding::ValueKeyed(value)
+                | ForBinding::Indexed(_, value) => {
                     let metadata = match structural_handle_metadata.as_ref() {
                         Some(UnexpandedStructuralHandleMetadata::List(items)) => {
                             items.get(position).cloned().flatten()
@@ -560,7 +579,7 @@ pub(crate) fn parse_for_expr(
                         EvalValue::computed(member.value().clone(), metadata),
                     );
                 }
-                ForBinding::Map(key, value) => {
+                ForBinding::MapKeyed(key, value) => {
                     let member_key = member.key().expect("map binding");
                     bind(
                         &mut iter_ctx,
@@ -602,11 +621,10 @@ pub(crate) fn parse_for_expr(
         }
         return Ok((resources, data_sources, module_calls));
     }
-    match (&target, addressing, &binding, &iterable_for_expansion) {
+    match (&target, &binding, &iterable_for_expansion) {
         (
             LoopParseTarget::Unbound(template),
-            LoopAddressing::Indexed,
-            ForBinding::Simple(var),
+            ForBinding::Positional(var),
             ParserIterable::List(items),
         ) => {
             for (i, item) in items.iter().enumerate() {
@@ -649,7 +667,6 @@ pub(crate) fn parse_for_expr(
         }
         (
             LoopParseTarget::Unbound(template),
-            LoopAddressing::Indexed,
             ForBinding::Indexed(idx_var, val_var),
             ParserIterable::List(items),
         ) => {
@@ -698,8 +715,7 @@ pub(crate) fn parse_for_expr(
         }
         (
             LoopParseTarget::Unbound(template),
-            LoopAddressing::MapKeyed,
-            ForBinding::Map(key_var, val_var),
+            ForBinding::MapKeyed(key_var, val_var),
             ParserIterable::Map(map),
         ) => {
             // Sort keys for deterministic output
@@ -753,7 +769,14 @@ pub(crate) fn parse_for_expr(
         // replayed at plan/apply time. In particular, `ref ?? default` must
         // not collapse to the default before the reference snapshot is known
         // to be complete.
-        (_, _, _, ParserIterable::Deferred) => {
+        (
+            _,
+            ForBinding::Indexed(_, _)
+            | ForBinding::Positional(_)
+            | ForBinding::MapKeyed(_, _)
+            | ForBinding::ValueKeyed(_),
+            ParserIterable::Deferred,
+        ) => {
             let iterable_surface = match &iterable {
                 Value::Deferred(
                     DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument { .. })
@@ -770,7 +793,6 @@ pub(crate) fn parse_for_expr(
             record_deferred_for_expression(
                 body_pair.clone(),
                 &binding,
-                addressing,
                 ctx,
                 &target,
                 preprocessed_file,
@@ -788,7 +810,14 @@ pub(crate) fn parse_for_expr(
             )?;
             // Return empty — the for body produces zero concrete resources
         }
-        _ => {
+        (
+            _,
+            ForBinding::Indexed(_, _)
+            | ForBinding::Positional(_)
+            | ForBinding::MapKeyed(_, _)
+            | ForBinding::ValueKeyed(_),
+            _,
+        ) => {
             // Only an identifier token that was syntactically bare *and*
             // unbound may enter the deferred identifier-diagnostic path.
             // A String produced by indexing or a function result is data,
@@ -815,7 +844,6 @@ pub(crate) fn parse_for_expr(
                 record_deferred_for_expression(
                     body_pair.clone(),
                     &binding,
-                    addressing,
                     ctx,
                     &target,
                     preprocessed_file,
@@ -867,13 +895,17 @@ pub(crate) fn parse_for_expr(
                 }
             };
             let binding_type = match &binding {
-                ForBinding::Simple(var) => format!("`for {} in ...`", var),
+                ForBinding::Positional(var) | ForBinding::ValueKeyed(var) => {
+                    format!("`for {} in ...`", var)
+                }
                 ForBinding::Indexed(idx, val) => format!("`for {}, {} in ...`", idx, val),
-                ForBinding::Map(k, v) => format!("`for {}, {} in ...`", k, v),
+                ForBinding::MapKeyed(k, v) => format!("`for {}, {} in ...`", k, v),
             };
             let expected = match &binding {
-                ForBinding::Simple(_) | ForBinding::Indexed(_, _) => "list",
-                ForBinding::Map(_, _) => "map",
+                ForBinding::Positional(_)
+                | ForBinding::ValueKeyed(_)
+                | ForBinding::Indexed(_, _) => "list",
+                ForBinding::MapKeyed(_, _) => "map",
             };
             return Err(ParseError::InvalidExpression {
                 line: for_line,
@@ -886,51 +918,6 @@ pub(crate) fn parse_for_expr(
     }
 
     Ok((resources, data_sources, module_calls))
-}
-
-/// Parse a for binding pattern.
-///
-/// Each position accepts either an `identifier` or a `discard_pattern`
-/// (`_`). The text of the matched pair — either the identifier name or
-/// the literal `_` — is stored as the binding name. A `_` marker is not
-/// added to the parse-time scope and is exempt from the unused-binding
-/// warning; downstream code checks for `name == "_"` to enforce that.
-pub(crate) fn parse_for_binding(
-    pair: pest::iterators::Pair<Rule>,
-) -> Result<ForBinding, ParseError> {
-    let inner = first_inner(pair, "binding pattern", "for binding")?;
-    match inner.as_rule() {
-        Rule::for_simple_binding => {
-            let name = first_inner(inner, "identifier", "simple binding")?
-                .as_str()
-                .to_string();
-            Ok(ForBinding::Simple(name))
-        }
-        Rule::for_indexed_binding => {
-            let mut parts = inner.into_inner();
-            let idx = next_pair(&mut parts, "index variable", "indexed binding")?
-                .as_str()
-                .to_string();
-            let val = next_pair(&mut parts, "value variable", "indexed binding")?
-                .as_str()
-                .to_string();
-            Ok(ForBinding::Indexed(idx, val))
-        }
-        Rule::for_map_binding => {
-            let mut parts = inner.into_inner();
-            let key = next_pair(&mut parts, "key variable", "map binding")?
-                .as_str()
-                .to_string();
-            let val = next_pair(&mut parts, "value variable", "map binding")?
-                .as_str()
-                .to_string();
-            Ok(ForBinding::Map(key, val))
-        }
-        _ => Err(ParseError::InternalError {
-            expected: "for binding pattern".to_string(),
-            context: "for expression".to_string(),
-        }),
-    }
 }
 
 /// Parse the iterable part of a for expression

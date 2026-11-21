@@ -9,8 +9,7 @@ use carina_core::effect::{
     DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration, NonEmptyDeletes,
 };
 use carina_core::parser::{
-    BackendConfig, DeferredForExpression, ForBinding, ProviderConfig, ProviderContext,
-    SavedProviderConfigs,
+    BackendConfig, DeferredForExpression, ProviderConfig, ProviderContext, SavedProviderConfigs,
 };
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
@@ -278,6 +277,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         "for (_, opt) in cert.domain_validation_options".to_string(),
         carina_core::parser::DeferredForTarget::bound(
             carina_core::resource::absolute_binding_address_for_test("validation_records"),
+            carina_core::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
         )
         .expect("fixture binding is valid"),
         Value::<NoPlaceholder, RelativeBindingName>::resource_ref(
@@ -286,8 +286,6 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             Vec::new(),
         )
         .resolve_root_for_test(),
-        ForBinding::Indexed("_".into(), "opt".to_string()),
-        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
 

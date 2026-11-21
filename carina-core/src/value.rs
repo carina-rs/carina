@@ -14791,7 +14791,7 @@ mod tests {
     #[test]
     fn redact_secrets_in_deferred_create_redacts_and_rehydrates_template() {
         use crate::effect::Effect;
-        use crate::parser::{DeferredForExpression, ForBinding};
+        use crate::parser::DeferredForExpression;
         use crate::plan::Plan;
         use crate::resource::PathSegment;
 
@@ -14832,11 +14832,10 @@ mod tests {
                 "for (_, opt) in cert.domain_validation_options".to_string(),
                 crate::parser::DeferredForTarget::bound(
                     crate::resource::absolute_binding_address_for_test("validation_records"),
+                    crate::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
                 )
                 .expect("fixture binding is valid"),
                 Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-                ForBinding::Indexed("_".into(), "opt".to_string()),
-                crate::parser::LoopAddressing::Indexed,
                 template_resource,
             ),
         )));
@@ -14879,8 +14878,6 @@ mod tests {
                 payload.template.header.clone(),
                 payload.template.target().clone(),
                 payload.template.iterable.clone(),
-                payload.template.binding.clone(),
-                payload.template.addressing,
                 payload
                     .template
                     .template_resource()
@@ -14914,7 +14911,7 @@ mod tests {
     #[test]
     fn deferred_template_redaction_uses_template_resource_as_single_projection() {
         use crate::effect::Effect;
-        use crate::parser::{DeferredForExpression, ForBinding};
+        use crate::parser::DeferredForExpression;
 
         let secret = |plaintext: &str| {
             LoopValue::Deferred(LoopDeferredValue::Secret(
@@ -14936,11 +14933,10 @@ mod tests {
                 "for (_, opt) in cert.options".to_string(),
                 crate::parser::DeferredForTarget::bound(
                     crate::resource::absolute_binding_address_for_test("records"),
+                    crate::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
                 )
                 .expect("fixture binding is valid"),
                 Value::root_resource_ref("cert", "options", Vec::new()),
-                ForBinding::Indexed("_".into(), "opt".to_string()),
-                crate::parser::LoopAddressing::Indexed,
                 template_resource,
             ),
         )));
@@ -14984,7 +14980,7 @@ mod tests {
     #[test]
     fn deferred_template_preserves_display_only_projection_and_noops_without_placeholders() {
         use crate::effect::{DeferredCreatePayload, Effect};
-        use crate::parser::{DeferredForExpression, ForBinding};
+        use crate::parser::DeferredForExpression;
 
         let canonical =
             LoopValue::Concrete(crate::resource::ConcreteValue::String("canonical".into()));
@@ -15003,11 +14999,10 @@ mod tests {
             "for (_, child) in parent.children".to_string(),
             crate::parser::DeferredForTarget::bound(
                 crate::resource::absolute_binding_address_for_test("children"),
+                crate::parser::BoundLoopBinding::Indexed("_".into(), "child".to_string()),
             )
             .expect("fixture binding is valid"),
             Value::root_resource_ref("parent", "children", Vec::new()),
-            ForBinding::Indexed("_".into(), "child".to_string()),
-            crate::parser::LoopAddressing::Indexed,
             template_resource,
         );
         let effect = Effect::DeferredCreate(crate::test_support::compiled_loop(Box::new(

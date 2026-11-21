@@ -270,11 +270,10 @@ fn validation_deferred_for_expression() -> crate::parser::ExpandedDeferredForExp
         "for (_, opt) in cert.domain_validation_options".to_string(),
         crate::parser::DeferredForTarget::bound(
             crate::resource::absolute_binding_address_for_test("validation_records"),
+            crate::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
         )
         .expect("fixture binding is valid"),
         Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-        crate::parser::ForBinding::Indexed("_".into(), "opt".to_string()),
-        crate::parser::LoopAddressing::Indexed,
         template_resource,
     )
 }
@@ -13457,10 +13456,12 @@ async fn conflicting_deferred_case(
                     Some("main.crn".into()),
                     1,
                     "for _, opt in cert.domain_validation_options".into(),
-                    template.target().clone(),
+                    crate::parser::DeferredForTarget::bound(
+                        template.target().bound_binding_address().unwrap().clone(),
+                        crate::parser::BoundLoopBinding::MapKeyed("_".into(), "opt".into()),
+                    )
+                    .unwrap(),
                     template.iterable.clone(),
-                    crate::parser::ForBinding::Map("_".into(), "opt".into()),
-                    crate::parser::LoopAddressing::MapKeyed,
                     template.template_resource().as_resource().clone(),
                 );
                 let mut old = payload.deletes[0].clone();
@@ -14514,10 +14515,12 @@ async fn deferred_reversed_history(coexisting_child: bool) {
         None,
         1,
         "for (_, opt) in cert.domain_validation_options".into(),
-        crate::parser::DeferredForTarget::bound(absolute_binding("validation_records")).unwrap(),
+        crate::parser::DeferredForTarget::bound(
+            absolute_binding("validation_records"),
+            crate::parser::BoundLoopBinding::Indexed("_".into(), "opt".into()),
+        )
+        .unwrap(),
         Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-        crate::parser::ForBinding::Indexed("_".into(), "opt".into()),
-        crate::parser::LoopAddressing::Indexed,
         resource,
     );
     let gate = Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(

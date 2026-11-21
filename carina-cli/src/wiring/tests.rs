@@ -11098,11 +11098,12 @@ fn deferred_block_name_conflict_reports_materialized_template_address() {
         Some("main.crn".to_string()),
         4,
         "for (_, item) in pending.items".to_string(),
-        carina_core::parser::DeferredForTarget::bound(absolute_binding("rs"))
-            .expect("fixture binding is valid"),
+        carina_core::parser::DeferredForTarget::bound(
+            absolute_binding("rs"),
+            carina_core::parser::BoundLoopBinding::Indexed("_".into(), "item".to_string()),
+        )
+        .expect("fixture binding is valid"),
         Value::resource_ref("pending", "items", Vec::new()).resolve_root_for_test(),
-        carina_core::parser::ForBinding::Indexed("_".into(), "item".to_string()),
-        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
     let unresolved = carina_core::parser::ParsedFile::default();
@@ -12433,6 +12434,7 @@ fn deferred_template_binding_match_requires_single_numeric_index() {
     use carina_core::differ::binding_matches_deferred_template;
     let target = carina_core::parser::DeferredForTarget::bound(
         carina_core::resource::absolute_binding_address_for_test("validation_records"),
+        carina_core::parser::BoundLoopBinding::Indexed("_".into(), "record".into()),
     )
     .expect("fixture binding is valid");
     assert!(binding_matches_deferred_template(

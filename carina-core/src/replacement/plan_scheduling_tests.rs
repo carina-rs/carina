@@ -7,7 +7,7 @@ use crate::effect::{
 use crate::executor::{
     PlanSchedulerEndpoint, PlanSchedulerPhase, build_plan_scheduler_dependency_edges,
 };
-use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
+use crate::parser::{DeferredForExpression, DeferredForTarget};
 use crate::plan::{CreateBeforeDestroyError, Plan};
 use crate::provider::{AppliedIdentifier, CreateAttempt, PendingToken, Sent};
 use crate::resource::{
@@ -70,10 +70,12 @@ fn deferred_alias_requirement_is_rejected_before_materialization() {
             None,
             1,
             "for value in []".into(),
-            DeferredForTarget::bound(RootScope::new().resolve("children".into())).unwrap(),
+            DeferredForTarget::bound(
+                RootScope::new().resolve("children".into()),
+                crate::parser::BoundLoopBinding::ValueKeyed("value".into()),
+            )
+            .unwrap(),
             Value::Concrete(ConcreteValue::List(Vec::new())),
-            ForBinding::Simple("value".into()),
-            crate::parser::LoopAddressing::ValueKeyed,
             Resource::<_, LoopSlot>::with_provider("mock", "Child", "children", Some("new".into())),
         )
         .into_compiled();
@@ -150,10 +152,12 @@ fn read_gate_plan(bound: bool, generation: EffectGeneration) -> (Plan, ResolvedR
             None,
             1,
             "for value in lookup.values".into(),
-            DeferredForTarget::bound(RootScope::new().resolve("children".into())).unwrap(),
+            DeferredForTarget::bound(
+                RootScope::new().resolve("children".into()),
+                crate::parser::BoundLoopBinding::ValueKeyed("value".into()),
+            )
+            .unwrap(),
             Value::root_resource_ref("lookup", "values", Vec::new()),
-            ForBinding::Simple("value".into()),
-            crate::parser::LoopAddressing::ValueKeyed,
             Resource::<_, LoopSlot>::with_provider("mock", "Child", "children", None),
         )
         .into_compiled()
@@ -282,10 +286,12 @@ fn deferred_alias_requirement_preserves_sibling_orders_after_reload() {
         None,
         1,
         "for value in []".into(),
-        DeferredForTarget::bound(RootScope::new().resolve("children".into())).unwrap(),
+        DeferredForTarget::bound(
+            RootScope::new().resolve("children".into()),
+            crate::parser::BoundLoopBinding::ValueKeyed("value".into()),
+        )
+        .unwrap(),
         Value::Concrete(ConcreteValue::List(Vec::new())),
-        ForBinding::Simple("value".into()),
-        crate::parser::LoopAddressing::ValueKeyed,
         Resource::<_, LoopSlot>::with_provider("mock", "Child", "children", Some("new".into())),
     )
     .into_compiled();

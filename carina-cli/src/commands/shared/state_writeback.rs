@@ -2282,7 +2282,7 @@ mod apply_state_save_tests {
     use carina_core::differ::create_plan_for_test as create_plan;
     use carina_core::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes};
     use carina_core::explicit::ExplicitFields;
-    use carina_core::parser::{DeferredForExpression, ForBinding};
+    use carina_core::parser::DeferredForExpression;
     use carina_core::plan::Plan;
     use carina_core::provider::ProviderRouter;
     use carina_core::resource::{
@@ -2723,11 +2723,10 @@ mod apply_state_save_tests {
             "for (_, opt) in cert.domain_validation_options".to_string(),
             carina_core::parser::DeferredForTarget::bound(
                 carina_core::resource::absolute_binding_address_for_test("validation_records"),
+                carina_core::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
             )
             .expect("fixture binding is valid"),
             root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Indexed("_".into(), "opt".to_string()),
-            carina_core::parser::LoopAddressing::Indexed,
             // Comparison pre-resolution keys the materialized template by
             // provider instance and type before any runtime child exists.
             Resource::pending_with_provider("aws", "route53.Record", None),
@@ -5423,11 +5422,10 @@ mod apply_state_save_tests {
             "for (_, opt) in cert.domain_validation_options".to_string(),
             carina_core::parser::DeferredForTarget::bound(
                 carina_core::resource::absolute_binding_address_for_test("validation_records"),
+                carina_core::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
             )
             .expect("fixture binding is valid"),
             root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Indexed("_".into(), "opt".to_string()),
-            carina_core::parser::LoopAddressing::Indexed,
             Resource::with_provider("aws", "route53.Record", "validation_records", None)
                 .with_test_binding("validation_records"),
         );
@@ -5502,11 +5500,10 @@ mod apply_state_save_tests {
                 "for (_, opt) in cert.domain_validation_options".to_string(),
                 carina_core::parser::DeferredForTarget::bound(
                     carina_core::resource::absolute_binding_address_for_test("validation_records"),
+                    carina_core::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
                 )
                 .expect("fixture binding is valid"),
                 root_resource_ref("cert", "domain_validation_options", Vec::new()),
-                ForBinding::Indexed("_".into(), "opt".to_string()),
-                carina_core::parser::LoopAddressing::Indexed,
                 template_resource,
             )),
         )))

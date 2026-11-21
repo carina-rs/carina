@@ -192,7 +192,7 @@ impl PlanChangeSummary {
 #[cfg(test)]
 mod tests {
     use carina_core::effect::Effect;
-    use carina_core::parser::{ExpandedDeferredForExpression, ForBinding};
+    use carina_core::parser::ExpandedDeferredForExpression;
     use carina_core::plan::Plan;
     use carina_core::resource::{ConcreteValue, DataSource, ResolvedDataSource, Resource, Value};
 
@@ -206,11 +206,10 @@ mod tests {
             "for (_, item) in upstream.items".to_string(),
             carina_core::parser::DeferredForTarget::bound(
                 carina_core::resource::absolute_binding_address_for_test("widgets"),
+                carina_core::parser::BoundLoopBinding::Indexed("_".into(), "item".to_string()),
             )
             .expect("fixture binding is valid"),
             Value::resource_ref("upstream", "items", Vec::new()).resolve_root_for_test(),
-            ForBinding::Indexed("_".into(), "item".to_string()),
-            carina_core::parser::LoopAddressing::Indexed,
             Resource::new("test.Widget", "widgets"),
         )
     }

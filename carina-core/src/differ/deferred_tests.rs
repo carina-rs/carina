@@ -19,11 +19,12 @@ fn deferred_replace_test_template() -> crate::parser::DeferredForExpression {
         Some("main.crn".to_string()),
         12,
         "for (_, opt) in cert.domain_validation_options".to_string(),
-        crate::parser::DeferredForTarget::bound(absolute_binding("validation_records"))
-            .expect("fixture binding is valid"),
+        crate::parser::DeferredForTarget::bound(
+            absolute_binding("validation_records"),
+            crate::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
+        )
+        .expect("fixture binding is valid"),
         Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-        crate::parser::ForBinding::Indexed("_".into(), "opt".to_string()),
-        crate::parser::LoopAddressing::Indexed,
         template_resource,
     )
 }

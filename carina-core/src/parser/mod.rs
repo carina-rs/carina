@@ -106,8 +106,8 @@ pub use crate::resource::RelativeBindingName;
 pub use ast::{
     ArgumentOrigin, ArgumentParameter, AttributeParameter, AttributePath, AttributePathSegment,
     AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingScopeId,
-    BindingUseOwner, BoundDeferredTarget, BoundDeferredTargetError, BoundaryExpression,
-    CallExpansion, CompiledDeferredForExpression, ConsumerArgumentParameter,
+    BindingUseOwner, BoundDeferredTarget, BoundDeferredTargetError, BoundLoopBinding,
+    BoundaryExpression, CallExpansion, CompiledDeferredForExpression, ConsumerArgumentParameter,
     ConsumerAttributeParameter, DeferredForBody, DeferredForExpansionError, DeferredForExpression,
     DeferredForPhaseTraversal, DeferredForSite, DeferredForTarget, DeferredForTemplateAddress,
     DeferredForTemplateResource, ExpandedBackendConfig, ExpandedDeferredForExpression,
@@ -124,8 +124,8 @@ pub use ast::{
     ResourceMut, ResourceRef, ResourceTypePath, RootBindingResolvedFile,
     RootBindingResolvedInferredFile, RootBindingResolvedParsedFile, SavedDeferredForExpression,
     ShapeMismatch, SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TopLevelResourceRef,
-    TypeExpr, UntilPredicateAst, UpstreamState, UseStatement, UserFunction, UserFunctionBody,
-    ValidateExpr, ValidationBlock, WaitBinding,
+    TypeExpr, UnboundLoopBinding, UntilPredicateAst, UpstreamState, UseStatement, UserFunction,
+    UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding,
 };
 pub(crate) use ast::{
     BareBindingSource, DeclarationSource, DeferredForResourceExpressionError, ParsedBareBindingUse,
@@ -214,7 +214,7 @@ pub(crate) use blocks::resource::{
     parse_resource_for_target,
 };
 pub(crate) use context::{ParseContext, extract_key_string, first_inner, next_pair};
-pub use expressions::for_expr::{ForBinding, LoopAddressing};
+pub use expressions::for_expr::ForBinding;
 pub use expressions::validate_expr::CompareOp;
 pub(crate) use let_binding::{LetBindingKind, LetBindingRhs, if_structural_handle};
 pub(crate) use static_eval::{decide_if_condition, evaluate_static_value, is_static_eval};

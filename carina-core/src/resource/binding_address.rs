@@ -211,18 +211,23 @@ pub(crate) enum ForAdmissionFailure<B: BindingAddress> {
 /// obtaining child-address authority. Protection and knowledge failures are
 /// resolved here, before collection-shape dispatch at any consumer.
 pub(crate) fn admit_bound_for_addresses<P: super::PlaceholderKind, B: BindingAddress>(
-    addressing: crate::parser::LoopAddressing,
+    binding: &crate::parser::ForBinding,
     target: &crate::parser::BoundDeferredTarget<B>,
     members: super::knowledge::ClassifiedRef<'_, '_, P, B>,
     moment: ForAddressMoment,
 ) -> Result<ForAddressAdmission<P, B>, ForAdmissionFailure<B>> {
     use super::ConcreteValueRef;
     use super::knowledge::{ClassifiedRef, Phase};
-    use crate::parser::LoopAddressing;
+    use crate::parser::ForBinding;
     use ForAddressAdmission::{Admitted, Defer, Reject};
     let base = target.binding_address();
-    if addressing == LoopAddressing::ValueKeyed && members.is_protected() {
-        return Ok(Reject(ForKeyError::Protected));
+    match binding {
+        ForBinding::ValueKeyed(_) => {
+            if members.is_protected() {
+                return Ok(Reject(ForKeyError::Protected));
+            }
+        }
+        ForBinding::Indexed(_, _) | ForBinding::Positional(_) | ForBinding::MapKeyed(_, _) => {}
     }
     match members {
         ClassifiedRef::Pending(pending) => {
@@ -247,8 +252,8 @@ pub(crate) fn admit_bound_for_addresses<P: super::PlaceholderKind, B: BindingAdd
     };
     let shape =
         |expected| ForAdmissionFailure::Shape(crate::parser::ShapeMismatch::new(expected, got));
-    match addressing {
-        LoopAddressing::ValueKeyed => {
+    match binding {
+        ForBinding::ValueKeyed(_) => {
             enum Member<B: BindingAddress> {
                 Key(ValueKey, super::ValueString),
                 Pending(ForAddressDefer),
@@ -378,7 +383,7 @@ pub(crate) fn admit_bound_for_addresses<P: super::PlaceholderKind, B: BindingAdd
                     .collect(),
             ))
         }
-        LoopAddressing::Indexed => {
+        ForBinding::Indexed(_, _) | ForBinding::Positional(_) => {
             let items = if let Some(items) = members.list() {
                 items
                     .into_iter()
@@ -413,7 +418,7 @@ pub(crate) fn admit_bound_for_addresses<P: super::PlaceholderKind, B: BindingAdd
                     .collect(),
             ))
         }
-        LoopAddressing::MapKeyed => {
+        ForBinding::MapKeyed(_, _) => {
             let items = members.map().ok_or_else(|| shape("map"))?;
             let mut items: Vec<_> = items.into_iter().collect();
             items.sort_by_key(|(key, _)| *key);

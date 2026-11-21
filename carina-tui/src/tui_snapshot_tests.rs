@@ -7,7 +7,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 use carina_core::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes};
-use carina_core::parser::{DeferredForExpression, ForBinding};
+use carina_core::parser::DeferredForExpression;
 use carina_core::plan::Plan;
 use carina_core::resource::{
     AbsoluteBindingAddress, ConcreteValue, DeferredValue, Directives, LoopSlot, ModuleSource,
@@ -248,11 +248,10 @@ fn build_deferred_for_plan() -> Plan {
         "for (_, opt) in cert.domain_validation_options".to_string(),
         carina_core::parser::DeferredForTarget::bound(
             carina_core::resource::absolute_binding_address_for_test("validation_records"),
+            carina_core::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
         )
         .expect("fixture binding is valid"),
         root_ref("cert", "domain_validation_options"),
-        ForBinding::Indexed("_".into(), "opt".to_string()),
-        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
 
@@ -305,8 +304,6 @@ fn build_anonymous_deferred_for_plan() -> Plan {
         "for opt in cert.domain_validation_options".to_string(),
         target,
         root_ref("cert", "domain_validation_options"),
-        ForBinding::Simple("opt".to_string()),
-        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
 
@@ -331,11 +328,10 @@ fn build_deferred_replace_plan() -> Plan {
         "for (_, opt) in cert.domain_validation_options".to_string(),
         carina_core::parser::DeferredForTarget::bound(
             carina_core::resource::absolute_binding_address_for_test("validation_records"),
+            carina_core::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
         )
         .expect("fixture binding is valid"),
         root_ref("cert", "domain_validation_options"),
-        ForBinding::Indexed("_".into(), "opt".to_string()),
-        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
 

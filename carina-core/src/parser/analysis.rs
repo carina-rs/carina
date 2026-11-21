@@ -1005,8 +1005,8 @@ impl<'a, P: ValueKind, B: BindingAddress> AnalysisForRef<'a, P, B> {
     pub fn location(&self) -> &'a DeclarationLocation {
         self.location
     }
-    pub fn binding(&self) -> &'a super::ForBinding {
-        self.site.binding
+    pub fn binding(&self) -> super::ForBinding {
+        self.site.target.binding_pattern()
     }
     pub fn target(&self) -> &'a super::DeferredForTarget<B> {
         self.site.target
@@ -1624,7 +1624,7 @@ where
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    pub(crate) fn loop_binding(&self) -> Option<&'a super::ForBinding> {
+    pub(crate) fn loop_binding(&self) -> Option<super::ForBinding> {
         match self.resource {
             ResourceRef::Deferred { deferred, .. } => Some(D::deferred_binding(deferred)),
             _ => None,

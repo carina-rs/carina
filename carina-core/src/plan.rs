@@ -2354,7 +2354,6 @@ mod tests {
 
     #[test]
     fn plan_summary_records_deferred_adds() {
-        use crate::parser::ForBinding;
         let template_resource = Resource::new("aws.route53.RecordSet", "ignored");
         let deferred = crate::parser::DeferredForExpression::new(
             None,
@@ -2362,11 +2361,10 @@ mod tests {
             "for (_, opt) in cert.domain_validation_options".to_string(),
             crate::parser::DeferredForTarget::bound(
                 crate::resource::absolute_binding_address_for_test("validation_records"),
+                crate::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
             )
             .expect("fixture binding is valid"),
             Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Indexed("_".into(), "opt".to_string()),
-            crate::parser::LoopAddressing::Indexed,
             template_resource,
         );
         let mut plan = Plan::new();
@@ -2392,7 +2390,7 @@ mod tests {
     #[test]
     fn plan_summary_excludes_deferred_replace_from_totals() {
         use crate::effect::{DeferredReplaceDelete, NonEmptyDeletes};
-        use crate::parser::{ExpandedDeferredForExpression as DeferredForExpression, ForBinding};
+        use crate::parser::ExpandedDeferredForExpression as DeferredForExpression;
         use crate::resource::{Directives, ResourceId};
         let template_resource = Resource::new("aws.route53.RecordSet", "ignored");
         let template = DeferredForExpression::new(
@@ -2401,11 +2399,10 @@ mod tests {
             "for (_, opt) in cert.domain_validation_options".to_string(),
             crate::parser::DeferredForTarget::bound(
                 crate::resource::absolute_binding_address_for_test("validation_records"),
+                crate::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
             )
             .expect("fixture binding is valid"),
             Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Indexed("_".into(), "opt".to_string()),
-            crate::parser::LoopAddressing::Indexed,
             template_resource,
         );
         let deletes = (0..3)

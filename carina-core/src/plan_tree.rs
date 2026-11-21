@@ -107,7 +107,7 @@ pub fn deferred_for_display_name<
     let upstream_binding = template.binding_description();
     let note = format!("(N records after {upstream_binding} {verb})");
     match template.target() {
-        crate::parser::DeferredForTarget::Bound(target) => {
+        crate::parser::DeferredForTarget::Bound { target, .. } => {
             format!("{}[*] {note}", target.binding())
         }
         crate::parser::DeferredForTarget::Unbound { .. } => note,
@@ -687,7 +687,7 @@ mod tests {
     use super::*;
     use crate::effect::SchedulerKey;
     use crate::effect::{ChangedCreateOnly, DeferredReplaceDelete, NonEmptyDeletes};
-    use crate::parser::{ExpandedDeferredForExpression as DeferredForExpression, ForBinding};
+    use crate::parser::ExpandedDeferredForExpression as DeferredForExpression;
     use crate::plan::{Plan, ReplacementGroup};
     use crate::resource::{
         Directives, ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
@@ -822,14 +822,13 @@ mod tests {
             "for (_, x) in (up.items ?? fallback.items)".to_string(),
             crate::parser::DeferredForTarget::bound(
                 crate::resource::absolute_binding_address_for_test("children"),
+                crate::parser::BoundLoopBinding::Indexed("_".into(), "x".to_string()),
             )
             .expect("fixture binding is valid"),
             Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(Value::root_resource_ref("up", "items", Vec::new())),
                 default: Box::new(Value::root_resource_ref("fallback", "items", Vec::new())),
             }),
-            ForBinding::Indexed("_".into(), "x".to_string()),
-            crate::parser::LoopAddressing::Indexed,
             template_resource,
         );
 
@@ -1199,11 +1198,10 @@ mod tests {
             "for (_, opt) in cert.domain_validation_options".to_string(),
             crate::parser::DeferredForTarget::bound(
                 crate::resource::absolute_binding_address_for_test("validation_records"),
+                crate::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
             )
             .expect("fixture binding is valid"),
             Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Indexed("_".into(), "opt".to_string()),
-            crate::parser::LoopAddressing::Indexed,
             template_resource,
         );
 
@@ -1275,11 +1273,10 @@ mod tests {
             "for (_, opt) in cert.domain_validation_options".to_string(),
             crate::parser::DeferredForTarget::bound(
                 crate::resource::absolute_binding_address_for_test("validation_records"),
+                crate::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
             )
             .expect("fixture binding is valid"),
             Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Indexed("_".into(), "opt".to_string()),
-            crate::parser::LoopAddressing::Indexed,
             template_resource,
         );
 

@@ -2056,14 +2056,16 @@ mod tests {
             Some("main.crn".into()),
             4,
             "for name in orgs.accounts.names".into(),
-            crate::parser::DeferredForTarget::bound(absolute("children")).unwrap(),
+            crate::parser::DeferredForTarget::bound(
+                absolute("children"),
+                crate::parser::BoundLoopBinding::ValueKeyed("name".into()),
+            )
+            .unwrap(),
             crate::resource::ExpandedValue::root_resource_ref(
                 "orgs",
                 "accounts",
                 vec!["names".to_string()],
             ),
-            crate::parser::ForBinding::Simple("name".into()),
-            crate::parser::LoopAddressing::ValueKeyed,
             Resource::with_provider("mock", "test.resource", "child", None)
                 .with_absolute_binding(absolute("children")),
         );
@@ -2146,9 +2148,11 @@ mod for_value_keys_membership_tests {
 
     #[test]
     fn for_value_keys_deferred_old_index_rows() {
-        let target = crate::parser::DeferredForTarget::Bound(
-            crate::parser::BoundDeferredTarget::new(RelativeBindingName::new("rs")).unwrap(),
-        );
+        let target = crate::parser::DeferredForTarget::bound(
+            RelativeBindingName::new("rs"),
+            crate::parser::BoundLoopBinding::ValueKeyed("item".into()),
+        )
+        .unwrap();
         for binding in ["rs[0]", "rs.a", "rs['a.b']"] {
             assert!(crate::differ::binding_matches_deferred_template(
                 &RelativeBindingName::new(binding),

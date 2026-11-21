@@ -187,40 +187,56 @@ fn source_schema_report(source: &str) -> (crate::parser::ParsedFile, ExpressionR
 }
 
 #[test]
-fn loop_addressing_is_retained_for_bound_and_unbound_sites() {
-    use crate::parser::LoopAddressing;
+fn loop_binding_is_retained_for_bound_and_unbound_sites() {
+    use crate::parser::ForBinding;
     for (site, iterable, expected) in [
-        ("let children = for x", "['a']", LoopAddressing::ValueKeyed),
+        (
+            "let children = for x",
+            "['a']",
+            ForBinding::ValueKeyed("x".into()),
+        ),
         (
             "let children = for (i, x)",
             "['a']",
-            LoopAddressing::Indexed,
+            ForBinding::Indexed("i".into(), "x".into()),
         ),
         (
             "let children = for k, x",
             "{ a = 'x' }",
-            LoopAddressing::MapKeyed,
+            ForBinding::MapKeyed("k".into(), "x".into()),
         ),
-        ("for x", "['a']", LoopAddressing::Indexed),
-        ("for (i, x)", "['a']", LoopAddressing::Indexed),
-        ("for k, x", "{ a = 'x' }", LoopAddressing::MapKeyed),
+        ("for x", "['a']", ForBinding::Positional("x".into())),
+        (
+            "for (i, x)",
+            "['a']",
+            ForBinding::Indexed("i".into(), "x".into()),
+        ),
+        (
+            "for k, x",
+            "{ a = 'x' }",
+            ForBinding::MapKeyed("k".into(), "x".into()),
+        ),
     ] {
         let source = format!(
             "let items = {iterable}\n{site} in items {{ mock.test.Source {{ name = x }} }}"
         );
         let (_, report) = source_schema_report(&source);
-        let addressing: Vec<_> = report
+        let bindings: Vec<_> = report
             .authored_for_iterables(&report)
-            .map(|authored| authored.addressing)
+            .map(|authored| authored.binding)
             .collect();
-        assert_eq!(addressing, [expected], "{source}");
+        assert_eq!(bindings, [&expected], "{source}");
         if site.starts_with("let") {
             let group = report
                 .binding(&RelativeBindingName::new("children"))
                 .unwrap();
+            let list = match expected {
+                ForBinding::Indexed(_, _) | ForBinding::Positional(_) => true,
+                ForBinding::MapKeyed(_, _) | ForBinding::ValueKeyed(_) => false,
+            };
             assert_eq!(
                 matches!(group.static_type(), Ok(TypeExpr::List(_))),
-                expected == LoopAddressing::Indexed,
+                list,
                 "{source}"
             );
         }

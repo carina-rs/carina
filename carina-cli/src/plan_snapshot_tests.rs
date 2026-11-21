@@ -3505,7 +3505,7 @@ fn snapshot_composition_folding() {
 fn snapshot_top_level_sigil_alignment() {
     let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::effect::Effect;
-    use carina_core::parser::{DeferredForExpression, ForBinding};
+    use carina_core::parser::DeferredForExpression;
     use carina_core::plan::Plan;
     use carina_core::resource::{
         CallSite, DataSource, EphemeralId, ExpansionTrace, PersistentId, Resource, ResourceId,
@@ -3544,12 +3544,11 @@ fn snapshot_top_level_sigil_alignment() {
         "for (_, option) in cert.domain_validation_options".to_string(),
         carina_core::parser::DeferredForTarget::bound(
             carina_core::resource::absolute_binding_address_for_test("validation_records"),
+            carina_core::parser::BoundLoopBinding::Indexed("_".into(), "option".to_string()),
         )
         .expect("fixture binding is valid"),
         Value::resource_ref("cert", "domain_validation_options", Vec::new())
             .resolve_root_for_test(),
-        ForBinding::Indexed("_".into(), "option".to_string()),
-        carina_core::parser::LoopAddressing::Indexed,
         deferred_template,
     );
     let deferred_for_expressions = vec![deferred];

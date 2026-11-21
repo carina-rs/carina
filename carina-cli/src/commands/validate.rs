@@ -187,14 +187,14 @@ impl<B: BindingAddress> std::fmt::Display for ValidatedEntry<'_, B> {
                 line,
             } => {
                 let location = match target {
-                    carina_core::parser::DeferredForTarget::Bound(_) => match file {
+                    carina_core::parser::DeferredForTarget::Bound { .. } => match file {
                         Some(file) => format!("{file}:{line}"),
                         None => line.to_string(),
                     },
                     carina_core::parser::DeferredForTarget::Unbound { .. } => target.display_name(),
                 };
                 match target {
-                    carina_core::parser::DeferredForTarget::Bound(target) => write!(
+                    carina_core::parser::DeferredForTarget::Bound { target, .. } => write!(
                         f,
                         "{resource_type}.{} (deferred: {header} @ {location})",
                         target.template_address()

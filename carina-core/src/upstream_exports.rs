@@ -1228,7 +1228,7 @@ pub struct UpstreamForIterableShapeError {
 }
 
 /// Coarse classification of a `ForBinding` for cross-directory shape
-/// compatibility. `Simple`/`Indexed` both require a list; `Map` requires
+/// compatibility. `Positional`/`ValueKeyed`/`Indexed` require a list; `MapKeyed` requires
 /// a map. The full `ForBinding` is intentionally not stored here — the
 /// diagnostic only cares about the shape, not the variable names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1243,8 +1243,10 @@ impl ForIterableBindingKind {
     fn from_for_binding(binding: &crate::parser::ForBinding) -> Self {
         use crate::parser::ForBinding;
         match binding {
-            ForBinding::Simple(_) | ForBinding::Indexed(_, _) => ForIterableBindingKind::List,
-            ForBinding::Map(_, _) => ForIterableBindingKind::Map,
+            ForBinding::Positional(_) | ForBinding::ValueKeyed(_) | ForBinding::Indexed(_, _) => {
+                ForIterableBindingKind::List
+            }
+            ForBinding::MapKeyed(_, _) => ForIterableBindingKind::Map,
         }
     }
 
@@ -1349,7 +1351,7 @@ where
 {
     let mut errors: Vec<Located<UpstreamDiagnostic<UpstreamForIterableShapeError>>> = Vec::new();
     for deferred in parsed.for_iterables() {
-        let binding_kind = ForIterableBindingKind::from_for_binding(deferred.binding());
+        let binding_kind = ForIterableBindingKind::from_for_binding(&deferred.binding());
         for reference in deferred.result_references() {
             errors.extend(reference.collect_diagnostics(|path, errors| {
                 let Some(fields) = exports.get(path.binding_address()) else {

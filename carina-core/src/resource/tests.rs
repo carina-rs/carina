@@ -3345,7 +3345,7 @@ fn deserialized_unbound_loop_template_still_rejects_read_without_a_source_span()
             .expect("deferred fixture crosses the module-resolution seam")
         },
     );
-    let crate::parser::DeferredForTarget::Unbound { template } =
+    let crate::parser::DeferredForTarget::Unbound { template, .. } =
         parsed.deferred_for_expressions()[0].target()
     else {
         panic!("fixture must produce an unbound target")

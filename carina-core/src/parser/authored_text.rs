@@ -91,11 +91,13 @@ impl AuthoredExpressionText {
             normalized.as_str()
         };
         admitted.text = match binding {
-            super::ForBinding::Simple(value) => format!("for {value} in {surface}"),
+            super::ForBinding::Positional(value) | super::ForBinding::ValueKeyed(value) => {
+                format!("for {value} in {surface}")
+            }
             super::ForBinding::Indexed(index, value) => {
                 format!("for ({index}, {value}) in {surface}")
             }
-            super::ForBinding::Map(key, value) => format!("for {key}, {value} in {surface}"),
+            super::ForBinding::MapKeyed(key, value) => format!("for {key}, {value} in {surface}"),
         };
         iterable
     }

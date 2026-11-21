@@ -4169,7 +4169,7 @@ fn bound_deferred_template() -> carina_core::parser::DeferredForExpression {
     let template = parsed.deferred_for_expressions()[0].clone();
     assert!(matches!(
         template.target(),
-        carina_core::parser::DeferredForTarget::Bound(_)
+        carina_core::parser::DeferredForTarget::Bound { .. }
     ));
     template
 }

@@ -178,17 +178,22 @@ pub(crate) fn apply_postfix_path_segment(
         EvalValue::User(base) => base,
         EvalValue::UnexpandedStructuralHandle(handle) => {
             if let PathSegment::Subscript { index } = &step {
-                if matches!(
-                    handle.kind(),
-                    crate::eval_value::UnexpandedStructuralHandleKind::For(
-                        crate::parser::LoopAddressing::ValueKeyed
-                    )
-                ) && matches!(index, Subscript::Int { .. })
+                if let crate::eval_value::UnexpandedStructuralHandleKind::For(binding) =
+                    handle.kind()
                 {
-                    return Err(ParseError::ValueKeyedSubscript {
-                        span: location.span(),
+                    match binding {
+                        crate::parser::ForBinding::ValueKeyed(_) => {
+                            if matches!(index, Subscript::Int { .. }) {
+                                return Err(ParseError::ValueKeyedSubscript {
+                                    span: location.span(),
+                                }
+                                .at(location));
+                            }
+                        }
+                        crate::parser::ForBinding::Indexed(_, _)
+                        | crate::parser::ForBinding::Positional(_)
+                        | crate::parser::ForBinding::MapKeyed(_, _) => {}
                     }
-                    .at(location));
                 }
                 return Ok(EvalValue::from_value(
                     crate::resource::binding_address::BindingLookup::new(

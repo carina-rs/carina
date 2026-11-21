@@ -1102,7 +1102,7 @@ fn known_invalid_enum_is_failed_instead_of_pending() {
 
 #[test]
 fn deferred_template_retains_literal_guard_evidence() {
-    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
+    use crate::parser::{DeferredForExpression, DeferredForTarget};
     let schemas = registry(
         ResourceSchema::new("Review")
             .attribute(AttributeSchema::optional("enabled", AttributeType::bool()).build())
@@ -1132,11 +1132,10 @@ fn deferred_template_retains_literal_guard_evidence() {
                 DeferredForTarget::bound(
                     crate::resource::RootScope::new()
                         .resolve(crate::resource::RelativeBindingName::new("children")),
+                    crate::parser::BoundLoopBinding::ValueKeyed("item".into()),
                 )
                 .unwrap(),
                 Value::root_resource_ref("parent", "items", vec![]),
-                ForBinding::Simple("item".into()),
-                crate::parser::LoopAddressing::ValueKeyed,
                 Resource::with_provider("mock", "Review", "children", None)
                     .with_attribute("enabled", enabled.clone())
                     .with_attribute(

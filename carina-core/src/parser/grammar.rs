@@ -306,10 +306,12 @@ pub(crate) fn indexed_bound_loop_rewrite(source: &str) -> Option<std::borrow::Co
         .next()
         .filter(|pair| pair.as_rule() == Rule::for_expr)?;
     let binding = expression.into_inner().next().expect("for binding grammar");
-    let binding_form = super::expressions::for_expr::parse_for_binding(binding.clone()).ok()?;
-    let super::ForBinding::Simple(value) = binding_form else {
+    let pattern = binding.clone().into_inner().next()?;
+    if pattern.as_rule() != Rule::for_simple_binding {
         return Some(source.into());
-    };
+    }
+    let value = pattern.into_inner().next()?;
+    let value = value.as_str();
     let range = binding.as_span();
     let mut rewritten = source.to_string();
     rewritten.replace_range(

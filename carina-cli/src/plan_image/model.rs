@@ -843,7 +843,9 @@ fn resource_label(binding: Option<&str>, id: &ResourceId, module_label: Option<&
 
 fn deferred_label<S>(template: &carina_core::parser::CompiledDeferredForExpression<S>) -> String {
     match template.target() {
-        carina_core::parser::DeferredForTarget::Bound(target) => target.binding().to_string(),
+        carina_core::parser::DeferredForTarget::Bound { target, .. } => {
+            target.binding().to_string()
+        }
         carina_core::parser::DeferredForTarget::Unbound { .. } => {
             format!(
                 "{}.<pending> (deferred for at {})",
@@ -1141,7 +1143,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use carina_core::effect::{Effect, EffectGeneration};
-    use carina_core::parser::{DeferredForExpression, ForBinding};
+    use carina_core::parser::DeferredForExpression;
     use carina_core::plan::Plan;
     use carina_core::provider::AppliedIdentifier;
     use carina_core::resource::{
@@ -1581,11 +1583,10 @@ mod tests {
             "for item in literal".to_string(),
             carina_core::parser::DeferredForTarget::bound(
                 carina_core::resource::absolute_binding_address_for_test("widgets"),
+                carina_core::parser::BoundLoopBinding::ValueKeyed("item".to_string()),
             )
             .expect("fixture binding is valid"),
             Value::Concrete(ConcreteValue::String(ITERABLE_VALUE.into())),
-            ForBinding::Simple("item".to_string()),
-            carina_core::parser::LoopAddressing::ValueKeyed,
             Resource::new("test.Widget", "widgets"),
         );
         let effect = Effect::DeferredCreate(crate::test_support::compiled_loop(Box::new(template)));

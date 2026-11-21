@@ -5,7 +5,12 @@
   "resource_type": "mock.test.Child",
   "target": {
     "kind": "bound",
-    "binding": "children"
+    "target": {
+      "binding": "children"
+    },
+    "binding": {
+      "ValueKeyed": "item"
+    }
   },
   "iterable": {
     "ResourceRef": {
@@ -14,9 +19,6 @@
         "attribute": "items"
       }
     }
-  },
-  "binding": {
-    "Simple": "item"
   },
   "template_resource": {
     "id": {

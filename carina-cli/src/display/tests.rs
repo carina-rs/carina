@@ -1068,11 +1068,10 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
         "for (_, opt) in cert.domain_validation_options".to_string(),
         carina_core::parser::DeferredForTarget::bound(
             carina_core::resource::absolute_binding_address_for_test("validation_records"),
+            carina_core::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
         )
         .expect("fixture binding is valid"),
         root_resource_ref("cert", "domain_validation_options"),
-        carina_core::parser::ForBinding::Indexed("_".into(), "opt".to_string()),
-        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
 
@@ -1126,11 +1125,10 @@ fn deferred_validation_records_effect() -> Effect {
         "for (_, opt) in cert.domain_validation_options".to_string(),
         carina_core::parser::DeferredForTarget::bound(
             carina_core::resource::absolute_binding_address_for_test("validation_records"),
+            carina_core::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
         )
         .expect("fixture binding is valid"),
         root_resource_ref("cert", "domain_validation_options"),
-        carina_core::parser::ForBinding::Indexed("_".into(), "opt".to_string()),
-        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
 
@@ -1190,7 +1188,8 @@ fn format_effect_unbound_deferred_for_uses_the_source_identity() {
     assert!(matches!(
         deferred.target(),
         carina_core::parser::DeferredForTarget::Unbound {
-            template: _template
+            template: _template,
+            ..
         }
     ));
     let effect = Effect::DeferredCreate(crate::test_support::compiled_loop(Box::new(deferred)));

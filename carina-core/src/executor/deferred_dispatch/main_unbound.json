@@ -14,6 +14,9 @@
         "system_identity": "_loop_bc61ee8e5622fac9"
       },
       "legacy_base": "_items"
+    },
+    "binding": {
+      "Positional": "item"
     }
   },
   "iterable": {
@@ -23,9 +26,6 @@
         "attribute": "items"
       }
     }
-  },
-  "binding": {
-    "Simple": "item"
   },
   "template_resource": {
     "id": {

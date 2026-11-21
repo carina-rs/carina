@@ -152,7 +152,7 @@ let rs = for _, t in (src.tags ?? {}) {
                 deferred["template"]["template_resource"]["id"]["identity"].clone(),
             )
             .expect("deserialize saved template identity");
-            let DeferredForTarget::Bound(target) = target else {
+            let DeferredForTarget::Bound { target, .. } = target else {
                 panic!("saved deferred target must be bound")
             };
             assert_eq!(

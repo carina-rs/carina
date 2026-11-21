@@ -9,8 +9,7 @@ use carina_cli::commands::plan::{CurrentStateEntry, PlanFile, PlanFileContents};
 use carina_cli::wiring::{LoadedProviderFactory, ValidatedConfig};
 use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes};
 use carina_core::parser::{
-    BackendConfig, DeferredForExpression, ForBinding, ProviderConfig, ProviderContext,
-    SavedProviderConfigs,
+    BackendConfig, DeferredForExpression, ProviderConfig, ProviderContext, SavedProviderConfigs,
 };
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
@@ -344,6 +343,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         "for (_, opt) in cert.domain_validation_options".to_string(),
         carina_core::parser::DeferredForTarget::bound(
             carina_core::resource::absolute_binding_address_for_test("validation_records"),
+            carina_core::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
         )
         .expect("fixture binding is valid"),
         Value::<NoPlaceholder, RelativeBindingName>::resource_ref(
@@ -352,8 +352,6 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             Vec::new(),
         )
         .resolve_root_for_test(),
-        ForBinding::Indexed("_".into(), "opt".to_string()),
-        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
 

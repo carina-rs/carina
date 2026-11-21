@@ -2027,8 +2027,6 @@ fn parsed_deferred_resource(
         expression.target().clone(),
         expression.iterable.clone(),
         crate::parser::ParsedDeferredForIterableState::Deferred,
-        expression.binding.clone(),
-        expression.addressing,
         DeferredForBody::Resource(Box::new(expression.template_resource().clone())),
     )
 }
@@ -9225,7 +9223,7 @@ m { foo = 'x' }
 /// the PR-A → PR-B boundary.
 #[test]
 fn test_expand_module_call_propagates_deferred_for_expressions() {
-    use crate::parser::{DeferredForTarget, ForBinding};
+    use crate::parser::DeferredForTarget;
 
     let module = {
         let mut m = create_module_with_intra_refs();
@@ -9253,11 +9251,9 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                 None,
                 7,
                 "for _, opt in cert.domain_validation_options".to_string(),
-                DeferredForTarget::bound(RelativeBindingName::new("_domain_validation_options"))
+                DeferredForTarget::bound(RelativeBindingName::new("_domain_validation_options"), crate::parser::BoundLoopBinding::MapKeyed("_".to_string(), "opt".to_string()))
                     .expect("fixture binding is valid"),
                 Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-                ForBinding::Map("_".to_string(), "opt".to_string()),
-                crate::parser::LoopAddressing::MapKeyed,
                 Resource {
                     id: ResourceId::with_identity("route53.RecordSet", "placeholder"),
                     attributes: {
@@ -9391,7 +9387,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
 
 #[test]
 fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
-    use crate::parser::{DeferredForTarget, ForBinding};
+    use crate::parser::DeferredForTarget;
 
     let mut module = create_test_module_with_anonymous_resource();
     module.resources.clear();
@@ -9412,11 +9408,15 @@ fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
                 None,
                 1,
                 "for _, account in accounts.items".to_string(),
-                DeferredForTarget::bound(RelativeBindingName::new("assignments"))
-                    .expect("fixture binding is valid"),
+                DeferredForTarget::bound(
+                    RelativeBindingName::new("assignments"),
+                    crate::parser::BoundLoopBinding::MapKeyed(
+                        "_".to_string(),
+                        "account".to_string(),
+                    ),
+                )
+                .expect("fixture binding is valid"),
                 Value::resource_ref("accounts", "items", Vec::new()),
-                ForBinding::Map("_".to_string(), "account".to_string()),
-                crate::parser::LoopAddressing::MapKeyed,
                 Resource::pending_with_provider("awscc", "sso.Assignment", None),
             ),
         ));
@@ -9473,7 +9473,7 @@ fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
 /// never be prefixed with the callee's instance address.
 #[test]
 fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
-    use crate::parser::{DeferredForTarget, ForBinding};
+    use crate::parser::DeferredForTarget;
 
     let module = {
         let mut m = create_module_with_intra_refs();
@@ -9495,11 +9495,12 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                     None,
                     3,
                     "for _, a in accounts.list".to_string(),
-                    DeferredForTarget::bound(RelativeBindingName::new("_list"))
-                        .expect("fixture binding is valid"),
+                    DeferredForTarget::bound(
+                        RelativeBindingName::new("_list"),
+                        crate::parser::BoundLoopBinding::MapKeyed("_".to_string(), "a".to_string()),
+                    )
+                    .expect("fixture binding is valid"),
                     Value::resource_ref("accounts", "list", Vec::new()),
-                    ForBinding::Map("_".to_string(), "a".to_string()),
-                    crate::parser::LoopAddressing::MapKeyed,
                     Resource {
                         id: ResourceId::with_identity("sso.Assignment", "placeholder"),
                         attributes: HashMap::new().into_iter().collect(),
@@ -9658,7 +9659,7 @@ let r = registry {
     // carina#4109: because this loop has no `let` binding, its generated
     // resources stay anonymous; only the migration-only legacy base receives
     // the module-instance prefix.
-    let crate::parser::DeferredForTarget::Unbound { template } = d.target() else {
+    let crate::parser::DeferredForTarget::Unbound { template, .. } = d.target() else {
         panic!("unbound module loop must remain an unbound deferred target")
     };
     assert_eq!(

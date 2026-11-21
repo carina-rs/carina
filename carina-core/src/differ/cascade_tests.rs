@@ -1037,7 +1037,7 @@ fn binding_spelling_collision_does_not_link_apply_dag_to_anonymous_replace() {
 
 #[test]
 fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
-    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
+    use crate::parser::{DeferredForExpression, DeferredForTarget};
     use crate::resource::{LoopSlot, ModuleSource, ResolvedResource};
 
     let schemas = base_schemas(false);
@@ -1083,10 +1083,12 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
         Some("main.crn".to_string()),
         2,
         "for _, subnet in vpc.subnets".to_string(),
-        DeferredForTarget::bound(absolute_binding("subnets")).expect("fixture binding is valid"),
+        DeferredForTarget::bound(
+            absolute_binding("subnets"),
+            crate::parser::BoundLoopBinding::MapKeyed("_".to_string(), "subnet".to_string()),
+        )
+        .expect("fixture binding is valid"),
         ref_value("vpc", "subnets"),
-        ForBinding::Map("_".to_string(), "subnet".to_string()),
-        crate::parser::LoopAddressing::MapKeyed,
         template_resource,
     );
 
@@ -1195,21 +1197,12 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
 
 #[test]
 fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
-    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
+    use crate::parser::{BoundLoopBinding, DeferredForExpression, DeferredForTarget};
     use crate::resource::{LoopSlot, ModuleSource};
-    for (binding, addressing) in [
-        (
-            ForBinding::Indexed("_".into(), "vpc".into()),
-            crate::parser::LoopAddressing::Indexed,
-        ),
-        (
-            ForBinding::Indexed("vpc".into(), "value".into()),
-            crate::parser::LoopAddressing::Indexed,
-        ),
-        (
-            ForBinding::Map("key".into(), "vpc".into()),
-            crate::parser::LoopAddressing::MapKeyed,
-        ),
+    for binding in [
+        BoundLoopBinding::Indexed("_".into(), "vpc".into()),
+        BoundLoopBinding::Indexed("vpc".into(), "value".into()),
+        BoundLoopBinding::MapKeyed("key".into(), "vpc".into()),
     ] {
         let schemas = base_schemas(false);
         let (managed, unresolved) = vpc_resources(false);
@@ -1225,8 +1218,10 @@ fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
             crate::resource::apply_postfix_access(
                 crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
                     match &binding {
-                        ForBinding::Indexed(_, _) => LoopSlot::Index,
-                        ForBinding::Simple(_) | ForBinding::Map(_, _) => LoopSlot::Value,
+                        BoundLoopBinding::Indexed(_, _) => LoopSlot::Index,
+                        BoundLoopBinding::ValueKeyed(_) | BoundLoopBinding::MapKeyed(_, _) => {
+                            LoopSlot::Value
+                        }
                     },
                 )),
                 crate::resource::PathSegment::Field {
@@ -1241,10 +1236,8 @@ fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
             None,
             1,
             "for (_, vpc) in other.items".into(),
-            DeferredForTarget::bound(absolute_binding("subnets")).unwrap(),
+            DeferredForTarget::bound(absolute_binding("subnets"), binding).unwrap(),
             ref_value("other", "items"),
-            binding,
-            addressing,
             template,
         );
         let (schemas, provider) = crate::provider::comparison_fixture_for_test(
@@ -1300,7 +1293,7 @@ fn deferred_create_cbd_plan(
     target: crate::parser::DeferredForTarget,
     schemas: &SchemaRegistry,
 ) -> (Plan, ResourceId) {
-    use crate::parser::{DeferredForExpression, ForBinding};
+    use crate::parser::DeferredForExpression;
     use crate::resource::{LoopSlot, ModuleSource};
 
     let (managed, unresolved) = vpc_resources(false);
@@ -1324,8 +1317,6 @@ fn deferred_create_cbd_plan(
         format!("for (_, subnet) in {producer_binding}.subnets"),
         target,
         ref_value(producer_binding, "subnets"),
-        ForBinding::Indexed("_".into(), "subnet".into()),
-        crate::parser::LoopAddressing::Indexed,
         template,
     );
     let (schemas, provider) = crate::provider::comparison_fixture_for_test(
@@ -1374,7 +1365,11 @@ fn deferred_create_cbd_plan(
 fn planning_uses_retained_targets_for_both_cbd_and_deferred_effects() {
     let (plan, producer) = deferred_create_cbd_plan(
         "vpc",
-        crate::parser::DeferredForTarget::bound(absolute_binding("same_retained_target")).unwrap(),
+        crate::parser::DeferredForTarget::bound(
+            absolute_binding("same_retained_target"),
+            crate::parser::BoundLoopBinding::Indexed("_".into(), "subnet".into()),
+        )
+        .unwrap(),
         &base_schemas(false),
     );
     assert!(replacement_metadata(&plan, &producer).create_before_destroy);
@@ -1455,7 +1450,11 @@ fn unbound_deferred_for_promotes_replaced_producer_to_cbd() {
 fn module_scoped_deferred_for_promotes_its_prefixed_producer_to_cbd() {
     let (plan, id) = deferred_create_cbd_plan(
         "network.vpc",
-        crate::parser::DeferredForTarget::bound(absolute_binding("network.subnets")).unwrap(),
+        crate::parser::DeferredForTarget::bound(
+            absolute_binding("network.subnets"),
+            crate::parser::BoundLoopBinding::Indexed("_".into(), "subnet".into()),
+        )
+        .unwrap(),
         &base_schemas(false),
     );
     assert_deferred_create_cbd_is_acyclic(&plan, &id);
@@ -1465,7 +1464,11 @@ fn module_scoped_deferred_for_promotes_its_prefixed_producer_to_cbd() {
 fn deferred_create_without_prior_children_promotes_replaced_producer_to_cbd() {
     let (plan, id) = deferred_create_cbd_plan(
         "vpc",
-        crate::parser::DeferredForTarget::bound(absolute_binding("subnets")).unwrap(),
+        crate::parser::DeferredForTarget::bound(
+            absolute_binding("subnets"),
+            crate::parser::BoundLoopBinding::Indexed("_".into(), "subnet".into()),
+        )
+        .unwrap(),
         &base_schemas(false),
     );
     assert_deferred_create_cbd_is_acyclic(&plan, &id);
@@ -1492,7 +1495,11 @@ fn impossible_cbd_promotion_names_deferred_and_managed_dependents() {
     );
     let (deferred, _) = deferred_create_cbd_plan(
         "vpc",
-        crate::parser::DeferredForTarget::bound(absolute_binding("subnets")).unwrap(),
+        crate::parser::DeferredForTarget::bound(
+            absolute_binding("subnets"),
+            crate::parser::BoundLoopBinding::Indexed("_".into(), "subnet".into()),
+        )
+        .unwrap(),
         &schemas,
     );
     let (managed_vpc, unresolved_vpc) = vpc_resources(false);
@@ -1706,7 +1713,7 @@ fn resolve_cascade_targets(
 
 #[test]
 fn issue_4283_known_conflicting_child_cbd_rejected_before_parent_applies() {
-    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
+    use crate::parser::{DeferredForExpression, DeferredForTarget};
     use crate::resource::{LoopSlot, ModuleSource, ResolvedResource};
 
     let mut schemas = base_schemas(false);
@@ -1762,10 +1769,12 @@ fn issue_4283_known_conflicting_child_cbd_rejected_before_parent_applies() {
         Some("main.crn".to_string()),
         2,
         "for _, subnet in vpc.subnets".to_string(),
-        DeferredForTarget::bound(absolute_binding("subnets")).expect("fixture binding is valid"),
+        DeferredForTarget::bound(
+            absolute_binding("subnets"),
+            crate::parser::BoundLoopBinding::MapKeyed("_".to_string(), "subnet".to_string()),
+        )
+        .expect("fixture binding is valid"),
         ref_value("vpc", "subnets"),
-        ForBinding::Map("_".to_string(), "subnet".to_string()),
-        crate::parser::LoopAddressing::MapKeyed,
         template_resource,
     );
 

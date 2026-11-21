@@ -1444,7 +1444,7 @@ fn estimator_default_tags_are_checked_through_the_host_merge_for_unknown_maps() 
 fn estimator_deferred_template_uses_retained_literals_and_defers_loop_slots() {
     use crate::{
         effect::DeferredCreatePayload,
-        parser::{DeferredForExpression, DeferredForTarget, ForBinding},
+        parser::{DeferredForExpression, DeferredForTarget},
         plan::Plan,
     };
     let registry = target_registry();
@@ -1463,10 +1463,12 @@ fn estimator_deferred_template_uses_retained_literals_and_defers_loop_slots() {
             None,
             1,
             "for item in parent.items".into(),
-            DeferredForTarget::bound(binding("children")).unwrap(),
+            DeferredForTarget::bound(
+                binding("children"),
+                crate::parser::BoundLoopBinding::ValueKeyed("item".into()),
+            )
+            .unwrap(),
             Value::root_resource_ref("parent", "items", vec![]),
-            ForBinding::Simple("item".into()),
-            crate::parser::LoopAddressing::ValueKeyed,
             Resource::with_provider("mock", "Target", "children", None)
                 .with_attribute("name", expression),
         );

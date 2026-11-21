@@ -1880,11 +1880,12 @@ mod tests {
             None,
             1,
             "for value in upstream.items".into(),
-            crate::parser::DeferredForTarget::bound(RootScope::new().resolve("record".into()))
-                .unwrap(),
+            crate::parser::DeferredForTarget::bound(
+                RootScope::new().resolve("record".into()),
+                crate::parser::BoundLoopBinding::ValueKeyed("value".into()),
+            )
+            .unwrap(),
             Value::root_resource_ref("upstream", "items", vec![]),
-            crate::parser::ForBinding::Simple("value".into()),
-            crate::parser::LoopAddressing::ValueKeyed,
             Resource::new("test.Record", "record"),
         );
         let mut plan = crate::plan::Plan::new();
@@ -2881,11 +2882,10 @@ mod tests {
                         "for item in parent.values".into(),
                         crate::parser::DeferredForTarget::bound(
                             RootScope::new().resolve("records".into()),
+                            crate::parser::BoundLoopBinding::ValueKeyed("item".into()),
                         )
                         .unwrap(),
                         Value::root_resource_ref("parent", "values", Vec::new()),
-                        crate::parser::ForBinding::Simple("item".into()),
-                        crate::parser::LoopAddressing::ValueKeyed,
                         Resource::<_, crate::resource::LoopSlot>::new("test.Record", "records"),
                     )
                     .into_compiled();

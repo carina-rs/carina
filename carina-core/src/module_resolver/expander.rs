@@ -81,10 +81,10 @@ fn intra_module_binding_names(module: &ParsedFile) -> HashSet<RelativeBindingNam
                 .parsed_deferred_for_expressions()
                 .iter()
                 .filter_map(|deferred| match deferred.target() {
-                    crate::parser::DeferredForTarget::Bound(bound) => {
+                    crate::parser::DeferredForTarget::Bound { target: bound, .. } => {
                         Some(bound.binding_address().clone())
                     }
-                    crate::parser::DeferredForTarget::Unbound { template: _ } => None,
+                    crate::parser::DeferredForTarget::Unbound { .. } => None,
                 }),
         )
         .chain(
@@ -4067,13 +4067,16 @@ fn admit_module_argument_loops(
 ) -> Result<BTreeMap<usize, PreparedModuleForIterable>, ArgumentSubstitutionError> {
     let mut admitted = BTreeMap::new();
     for (index, deferred) in module.parsed_deferred_for_expressions().iter().enumerate() {
-        let crate::parser::DeferredForTarget::Bound(target) = deferred.target() else {
+        let crate::parser::DeferredForTarget::Bound { target, binding } = deferred.target() else {
             continue;
         };
-        if !matches!(&deferred.body, DeferredForBody::Resource(_))
-            || deferred.addressing != crate::parser::LoopAddressing::ValueKeyed
-        {
+        if !matches!(&deferred.body, DeferredForBody::Resource(_)) {
             continue;
+        }
+        match binding {
+            crate::parser::BoundLoopBinding::ValueKeyed(_) => {}
+            crate::parser::BoundLoopBinding::Indexed(_, _)
+            | crate::parser::BoundLoopBinding::MapKeyed(_, _) => continue,
         }
         let (iterable, origin) = resolve_module_for_iterable(deferred, resolver)?.into_parts();
         let location = deferred
@@ -4093,7 +4096,7 @@ fn admit_module_argument_loops(
             .clone()
             .map_bindings(&mut |binding| resolver.scope.resolve(binding));
         let members = match crate::resource::admit_bound_for_addresses(
-            deferred.addressing,
+            &deferred.target().binding_pattern(),
             &target,
             crate::resource::knowledge::ClassifiedRef::from(&classification),
             crate::resource::ForAddressMoment::Validation,
@@ -4160,8 +4163,6 @@ fn expand_parsed_deferred_for_expression(
         target,
         iterable,
         iterable_state,
-        binding,
-        addressing,
         body,
     } = deferred.parts();
     let instance_identity = ResourceIdentity::try_from(resolver.scope.key().to_string())
@@ -4171,16 +4172,23 @@ fn expand_parsed_deferred_for_expression(
         .map(|origin| origin.legacy_address().clone())
         .unwrap_or_else(|| LegacyLoopAddress::new(instance_identity.as_str()));
     let target = match target {
-        crate::parser::DeferredForTarget::Bound(bound) => {
-            let binding = resolver.resolve_declared_binding(bound.binding_address())?;
-            crate::parser::DeferredForTarget::Bound(
-                bound.clone().map_bindings(&mut |_relative| binding.clone()),
-            )
+        crate::parser::DeferredForTarget::Bound {
+            target: bound,
+            binding,
+        } => {
+            let address = resolver.resolve_declared_binding(bound.binding_address())?;
+            crate::parser::DeferredForTarget::Bound {
+                target: bound.clone().map_bindings(&mut |_relative| address.clone()),
+                binding: binding.clone(),
+            }
         }
-        crate::parser::DeferredForTarget::Unbound { template } => {
+        crate::parser::DeferredForTarget::Unbound { template, binding } => {
             let mut template = template.clone();
             template.prefix_for_module(&instance_identity, &legacy_parent);
-            crate::parser::DeferredForTarget::Unbound { template }
+            crate::parser::DeferredForTarget::Unbound {
+                template,
+                binding: binding.clone(),
+            }
         }
     };
     let iterable_state = if iterable_state.checks_scope()
@@ -4235,8 +4243,6 @@ fn expand_parsed_deferred_for_expression(
         target,
         iterable,
         iterable_state,
-        binding.clone(),
-        addressing,
         body,
     ))
 }

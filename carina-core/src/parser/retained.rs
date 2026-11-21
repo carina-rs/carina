@@ -674,7 +674,7 @@ pub(crate) enum ExprKind<B: BindingAddress> {
     },
     If,
     For {
-        addressing: super::LoopAddressing,
+        binding: super::ForBinding,
         iterable: super::AuthoredExpressionText,
     },
     Wait,
@@ -825,13 +825,7 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             },
             ExprKind::Sink { name } => ExprKind::Sink { name },
             ExprKind::If => ExprKind::If,
-            ExprKind::For {
-                addressing,
-                iterable,
-            } => ExprKind::For {
-                addressing,
-                iterable,
-            },
+            ExprKind::For { binding, iterable } => ExprKind::For { binding, iterable },
             ExprKind::Wait => ExprKind::Wait,
             ExprKind::Compose => ExprKind::Compose,
             ExprKind::DynamicAccess => ExprKind::DynamicAccess,
@@ -2058,12 +2052,12 @@ impl std::fmt::Debug for CapturedNodes {
     }
 }
 impl CapturedNodes {
-    pub(in crate::parser) fn for_addressing(
+    pub(in crate::parser) fn for_binding(
         &self,
         pair: &Pair<'_, Rule>,
-    ) -> Option<super::LoopAddressing> {
+    ) -> Option<&super::ForBinding> {
         match &self.get(&ParseNodeKey::of(pair))?.authored.kind {
-            ExprKind::For { addressing, .. } => Some(*addressing),
+            ExprKind::For { binding, .. } => Some(binding),
             _ => None,
         }
     }
@@ -2912,26 +2906,34 @@ fn compile_remaining_form(
         Rule::for_expr => {
             let mut parts = pair.clone().into_inner();
             let binding = parts.next().expect("loop binding");
-            let binding_form = super::expressions::for_expr::parse_for_binding(binding.clone())
-                .expect("retained loop binding follows the grammar");
-            let addressing = match binding_form {
-                super::ForBinding::Map(_, _) => super::LoopAddressing::MapKeyed,
-                super::ForBinding::Simple(_)
-                    if captures.bound_for_sites.contains(&ParseNodeKey::of(&pair)) =>
-                {
-                    super::LoopAddressing::ValueKeyed
+            let pattern = binding.into_inner().next().expect("loop pattern");
+            let names = pattern.clone().into_inner().collect::<Vec<_>>();
+            // The binding variant is the child-address decision. Only this syntax
+            // boundary combines the authored pattern with its let-bound site.
+            let binding = match pattern.as_rule() {
+                Rule::for_simple_binding => {
+                    let value = names[0].as_str().to_string();
+                    if captures.bound_for_sites.contains(&ParseNodeKey::of(&pair)) {
+                        super::ForBinding::ValueKeyed(value)
+                    } else {
+                        super::ForBinding::Positional(value)
+                    }
                 }
-                super::ForBinding::Simple(_) | super::ForBinding::Indexed(_, _) => {
-                    super::LoopAddressing::Indexed
-                }
+                Rule::for_indexed_binding => super::ForBinding::Indexed(
+                    names[0].as_str().to_string(),
+                    names[1].as_str().to_string(),
+                ),
+                Rule::for_map_binding => super::ForBinding::MapKeyed(
+                    names[0].as_str().to_string(),
+                    names[1].as_str().to_string(),
+                ),
+                _ => unreachable!("retained loop binding follows the grammar"),
             };
             let iterable_pair = parts.next().expect("loop iterable");
             let iterable_text =
                 super::AuthoredExpressionText::redact(iterable_pair.clone(), Some(file));
             let iterable = compile(iterable_pair, file, source, scope, captures);
             let mut scope = scope.clone();
-            let pattern = binding.into_inner().next().expect("loop pattern");
-            let names = pattern.clone().into_inner().collect::<Vec<_>>();
             for (index, name) in names.iter().enumerate() {
                 if name.as_str() == "_" {
                     continue;
@@ -2956,7 +2958,7 @@ fn compile_remaining_form(
             node(
                 &pair,
                 ExprKind::For {
-                    addressing,
+                    binding,
                     iterable: iterable_text,
                 },
                 vec![iterable, body],
@@ -3317,7 +3319,7 @@ pub use judgement::{
 pub(crate) use judgement::{judge_expressions, judge_expressions_with_upstream};
 /// One authored loop's iterable evidence, independent of expansion timing.
 pub(crate) struct AuthoredForIterable<'a> {
-    pub addressing: super::LoopAddressing,
+    pub binding: &'a super::ForBinding,
     pub location: &'a DeclarationLocation,
     pub expression: String,
     pub judged: Result<&'a JudgedExpr, MissingEvidence>,
@@ -5536,11 +5538,7 @@ mod judgement {
             self.syntax_nodes
                 .iter()
                 .filter_map(move |((instance, _), syntax)| {
-                    let ExprKind::For {
-                        addressing,
-                        iterable,
-                    } = &syntax.kind
-                    else {
+                    let ExprKind::For { binding, iterable } = &syntax.kind else {
                         return None;
                     };
                     let operand = syntax
@@ -5559,7 +5557,7 @@ mod judgement {
                         })
                     };
                     Some(AuthoredForIterable {
-                        addressing: *addressing,
+                        binding,
                         location,
                         expression,
                         judged: judgement(self),
@@ -7444,7 +7442,7 @@ mod judgement {
                     }
                     result
                 }
-                ExprKind::For { addressing, .. } => {
+                ExprKind::For { binding, .. } => {
                     if let Some(collection) = children.first()
                         && collection.value_shape().is_some_and(|shape| {
                             !matches!(shape, ValueShape::List | ValueShape::Map)
@@ -7468,16 +7466,17 @@ mod judgement {
                     let Some(body) = children.last() else {
                         return incomplete("for body");
                     };
-                    let mut result = match addressing {
-                        super::super::LoopAddressing::Indexed => collection(
+                    let mut result = match binding {
+                        super::super::ForBinding::Indexed(_, _)
+                        | super::super::ForBinding::Positional(_) => collection(
                             body.static_type()
                                 .cloned()
                                 .map(|ty| TypeExpr::List(Box::new(ty))),
                             CollectionKind::List,
                             false,
                         ),
-                        super::super::LoopAddressing::MapKeyed
-                        | super::super::LoopAddressing::ValueKeyed => collection(
+                        super::super::ForBinding::MapKeyed(_, _)
+                        | super::super::ForBinding::ValueKeyed(_) => collection(
                             Err(InferenceIssue::NotInferable(
                                 NotInferableReason::ValueDependent {
                                     reason: "keyed loop group is not a value".into(),

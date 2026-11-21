@@ -330,7 +330,7 @@ fn current_deferred_effects_keep_bound_wire_ids_and_typed_template_addresses() {
         assert_eq!(deferred.len(), 2, "fixture must exercise {variant}");
         let mut bindings = BTreeSet::new();
         for effect in deferred {
-            let binding = effect["template"]["target"]["binding"]
+            let binding = effect["template"]["target"]["target"]["binding"]
                 .as_str()
                 .expect("bound loop");
             bindings.insert(binding.to_owned());

@@ -1100,7 +1100,7 @@ for account_id in orgs.accounts {
     let unbound = deferred.next().expect("unbound deferred loop");
     assert!(matches!(
         bound.target(),
-        carina_core::parser::DeferredForTarget::Bound(target)
+        carina_core::parser::DeferredForTarget::Bound { target, .. }
             if target.binding() == "bound_items"
     ));
     assert!(matches!(
@@ -1209,7 +1209,7 @@ for account_id in orgs.accounts {
         .collect::<Vec<_>>();
     assert!(targets.iter().any(|target| matches!(
         target,
-        carina_core::parser::DeferredForTarget::Bound(bound)
+        carina_core::parser::DeferredForTarget::Bound { target: bound, .. }
             if bound.binding() == "bound_items"
     )));
     assert!(targets.iter().any(|target| matches!(
@@ -1943,18 +1943,12 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     );
 }
 
-#[tokio::test]
-async fn saved_configuration_decode_failure_returns_command_error_without_panicking() {
+async fn malformed_saved_plan_error(document: &serde_json::Value) -> AppError {
     let runtime = crate::test_support::TestCommandRuntime::new();
     let temp = tempfile::tempdir().unwrap();
-    let mut document: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/module_binding_wire_compat/carina.v48.plan.json"
-    ))
-    .unwrap();
-    document["sorted_resources"] = serde_json::json!("invalid saved configuration");
     let path = temp.path().join("invalid-configuration.plan.json");
-    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
-    let error = run_apply_from_plan(
+    std::fs::write(&path, serde_json::to_vec(document).unwrap()).unwrap();
+    run_apply_from_plan(
         &runtime,
         &carina_core::paths::ResolvedPath::new(&path).unwrap(),
         &path,
@@ -1966,7 +1960,17 @@ async fn saved_configuration_decode_failure_returns_command_error_without_panick
         carina_core::shutdown::ShutdownToken::running(),
     )
     .await
-    .expect_err("a malformed saved configuration is a command error");
+    .expect_err("a malformed saved configuration is a command error")
+}
+
+#[tokio::test]
+async fn saved_configuration_decode_failure_returns_command_error_without_panicking() {
+    let mut document: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/module_binding_wire_compat/carina.v48.plan.json"
+    ))
+    .unwrap();
+    document["sorted_resources"] = serde_json::json!("invalid saved configuration");
+    let error = malformed_saved_plan_error(&document).await;
     let AppError::CorruptPlanFile(error) = error else {
         panic!("saved configuration decoding lost its typed error: {error:?}");
     };
@@ -1975,6 +1979,39 @@ async fn saved_configuration_decode_failure_returns_command_error_without_panick
         error.json_error().classify(),
         serde_json::error::Category::Data
     );
+}
+
+#[tokio::test]
+async fn saved_plan_unknown_loop_binding_is_corrupt() {
+    let document: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/module_binding_wire_compat/carina.v48.plan.json"
+    ))
+    .unwrap();
+    for invalid in [
+        serde_json::json!({"Simple": "item"}),
+        serde_json::json!({"Positional": "item"}),
+    ] {
+        let mut document = document.clone();
+        let template = document["plan"]["effects"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find_map(|effect| effect.get_mut("DeferredCreate"))
+            .unwrap();
+        template["template"]["target"]["binding"] = invalid;
+
+        let error = malformed_saved_plan_error(&document).await;
+        let AppError::CorruptPlanFile(error) = error else {
+            panic!("saved loop binding decoding lost its typed error: {error:?}");
+        };
+        let path = error.json_error().json_path();
+        assert!(path.ends_with(".target"), "{path}");
+        assert!(error.json_error().to_string().contains("unknown variant"));
+        assert_eq!(
+            error.json_error().classify(),
+            serde_json::error::Category::Data
+        );
+    }
 }
 
 #[tokio::test]

@@ -704,7 +704,15 @@
             "resource_type": "mock.test.resource",
             "target": {
               "kind": "bound",
-              "binding": "direct.children"
+              "target": {
+                "binding": "direct.children"
+              },
+              "binding": {
+                "MapKeyed": [
+                  "key",
+                  "value"
+                ]
+              }
             },
             "iterable": {
               "Coalesce": {
@@ -725,13 +733,6 @@
                 }
               }
             },
-            "binding": {
-              "Map": [
-                "key",
-                "value"
-              ]
-            },
-            "addressing": "MapKeyed",
             "template_resource": {
               "id": {
                 "provider": "mock",
@@ -876,7 +877,15 @@
             "resource_type": "mock.test.resource",
             "target": {
               "kind": "bound",
-              "binding": "looped[0].children"
+              "target": {
+                "binding": "looped[0].children"
+              },
+              "binding": {
+                "MapKeyed": [
+                  "key",
+                  "value"
+                ]
+              }
             },
             "iterable": {
               "Coalesce": {
@@ -897,13 +906,6 @@
                 }
               }
             },
-            "binding": {
-              "Map": [
-                "key",
-                "value"
-              ]
-            },
-            "addressing": "MapKeyed",
             "template_resource": {
               "id": {
                 "provider": "mock",

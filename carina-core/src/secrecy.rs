@@ -517,7 +517,7 @@ impl TemplateEvidence {
             return Err(TemplateEvidenceMismatch::ResourceType);
         }
         let (matches_element, element) = match (template.target(), selection) {
-            (DeferredForTarget::Bound(_), crate::parser::ExpandedForChild::Bound(member)) => {
+            (DeferredForTarget::Bound { .. }, crate::parser::ExpandedForChild::Bound(member)) => {
                 let address = member.address().binding_address().as_str();
                 (
                     child.id.identity_str() == Some(address)
@@ -529,7 +529,7 @@ impl TemplateEvidence {
                 )
             }
             (
-                DeferredForTarget::Unbound { template },
+                DeferredForTarget::Unbound { template, .. },
                 crate::parser::ExpandedForChild::Unbound { element, .. },
             ) => {
                 let origin = template.element_origin(element.clone());
@@ -543,7 +543,7 @@ impl TemplateEvidence {
                     },
                 )
             }
-            (DeferredForTarget::Bound(_), crate::parser::ExpandedForChild::Unbound { .. })
+            (DeferredForTarget::Bound { .. }, crate::parser::ExpandedForChild::Unbound { .. })
             | (DeferredForTarget::Unbound { .. }, crate::parser::ExpandedForChild::Bound(_)) => {
                 return Err(TemplateEvidenceMismatch::Element);
             }

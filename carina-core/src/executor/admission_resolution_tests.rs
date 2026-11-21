@@ -424,10 +424,12 @@ async fn review1_deferred_final_admission(replace: bool) {
         Some("main.crn".into()),
         1,
         "for (_, item) in ['one', 'two']".into(),
-        crate::parser::DeferredForTarget::bound(absolute_binding("children")).unwrap(),
+        crate::parser::DeferredForTarget::bound(
+            absolute_binding("children"),
+            crate::parser::BoundLoopBinding::Indexed("_".into(), "item".into()),
+        )
+        .unwrap(),
         Value::Concrete(ConcreteValue::List(vec![text("one"), text("two")])),
-        crate::parser::ForBinding::Indexed("_".into(), "item".into()),
-        crate::parser::LoopAddressing::Indexed,
         crate::resource::Resource::<ModuleSource, LoopSlot>::new("test", "children"),
     );
     let compiled = crate::test_support::compiled_loop(Box::new(template));

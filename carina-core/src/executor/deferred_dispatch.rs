@@ -121,7 +121,8 @@ impl DeferredAnonymousIdentityGuard {
         if !matches!(
             template.target(),
             crate::parser::DeferredForTarget::Unbound {
-                template: _template
+                template: _template,
+                ..
             }
         ) {
             return Ok(());
@@ -325,11 +326,6 @@ pub(super) fn materialize_deferred_create<
         ),
     })? {
         crate::resolver::ValueResolution::Present(value) => value,
-        crate::resolver::ValueResolution::Unknown(value)
-            if template.addressing == crate::parser::LoopAddressing::ValueKeyed =>
-        {
-            value
-        }
         crate::resolver::ValueResolution::Absent(_) => {
             return Err(DeferredCreateFailure::IterableAbsent {
                 file: template.file().map(str::to_owned),
@@ -339,14 +335,21 @@ pub(super) fn materialize_deferred_create<
                 candidates,
             });
         }
-        crate::resolver::ValueResolution::Unknown(_) => {
-            return Err(DeferredCreateFailure::IterableUnknown {
-                file: template.file().map(str::to_owned),
-                line: template.line(),
-                binding: Box::new(template.target().clone()),
-                expression,
-                candidates,
-            });
+        crate::resolver::ValueResolution::Unknown(value) => {
+            match template.target().binding_pattern() {
+                crate::parser::ForBinding::ValueKeyed(_) => value,
+                crate::parser::ForBinding::Indexed(_, _)
+                | crate::parser::ForBinding::Positional(_)
+                | crate::parser::ForBinding::MapKeyed(_, _) => {
+                    return Err(DeferredCreateFailure::IterableUnknown {
+                        file: template.file().map(str::to_owned),
+                        line: template.line(),
+                        binding: Box::new(template.target().clone()),
+                        expression,
+                        candidates,
+                    });
+                }
+            }
         }
     };
     let miss_policy = bindings.access_miss_policy_for_value(&template.iterable);
@@ -408,9 +411,9 @@ pub(super) fn materialize_deferred_create<
         })
     };
     let members = match template.target() {
-        DeferredForTarget::Bound(bound) => {
+        DeferredForTarget::Bound { target: bound, .. } => {
             match crate::resource::admit_bound_for_addresses(
-                template.addressing,
+                &template.target().binding_pattern(),
                 bound,
                 crate::resource::knowledge::ClassifiedRef::from(&classified),
                 crate::resource::ForAddressMoment::Apply,
@@ -449,13 +452,14 @@ pub(super) fn materialize_deferred_create<
                 }
             }
         }
-        DeferredForTarget::Unbound { template: origin } => {
-            Ok(crate::parser::ForChildMembers::Unbound {
-                template: origin,
-                binding: &template.binding,
-                iterable: require_iterable(classified)?.for_expansion(),
-            })
-        }
+        DeferredForTarget::Unbound {
+            template: origin,
+            binding,
+        } => Ok(crate::parser::ForChildMembers::Unbound {
+            template: origin,
+            binding,
+            iterable: require_iterable(classified)?.for_expansion(),
+        }),
     };
     let resources = members
         .and_then(|members| {
@@ -497,7 +501,8 @@ pub(super) fn materialize_deferred_create<
     if matches!(
         template.target(),
         crate::parser::DeferredForTarget::Unbound {
-            template: _template
+            template: _template,
+            ..
         }
     ) {
         let canonical_resources = crate::value::canonicalize_resources_with_schemas(
@@ -643,7 +648,7 @@ mod tests {
 
     use super::*;
     use crate::binding_index::{BindingCompleteness, BindingValueSource};
-    use crate::parser::{ExpandedDeferredForExpression, ForBinding};
+    use crate::parser::ExpandedDeferredForExpression;
     use crate::resource::{
         AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
         ExpandedDeferredValue as DeferredValue, ExpandedValue as Value, LoopSlot, ModuleSource,
@@ -674,6 +679,15 @@ mod tests {
     }
 
     fn coalesced_template() -> ExpandedDeferredForExpression {
+        coalesced_template_with_binding(crate::parser::BoundLoopBinding::Indexed(
+            "_".into(),
+            "account".into(),
+        ))
+    }
+
+    fn coalesced_template_with_binding(
+        binding: crate::parser::BoundLoopBinding,
+    ) -> ExpandedDeferredForExpression {
         let scope = RootScope::new();
         let mut template_resource: Resource<ModuleSource, LoopSlot, AbsoluteBindingAddress> =
             Resource::new("test.Child", "children");
@@ -690,14 +704,13 @@ mod tests {
             "for (_, account) in (up.accounts ?? [])".to_string(),
             crate::parser::DeferredForTarget::bound(
                 crate::resource::absolute_binding_address_for_test("children"),
+                binding,
             )
             .expect("fixture binding is valid"),
             Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(Value::root_resource_ref("up", "accounts", vec![])),
                 default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),
             }),
-            ForBinding::Indexed("_".into(), "account".to_string()),
-            crate::parser::LoopAddressing::Indexed,
             template_resource,
         )
     }
@@ -1264,9 +1277,9 @@ mod tests {
 
     #[test]
     fn for_value_keys_whole_pending_collection_stays_unknown() {
-        let mut template = coalesced_template();
-        template.binding = ForBinding::Simple("account".to_string());
-        template.addressing = crate::parser::LoopAddressing::ValueKeyed;
+        let mut template = coalesced_template_with_binding(
+            crate::parser::BoundLoopBinding::ValueKeyed("account".into()),
+        );
         template.header = "for account in (up.accounts ?? [])".to_string();
         template.iterable = Value::root_resource_ref("up", "accounts", vec![]);
         let mut bindings = ResolvedBindings::default();
@@ -1313,9 +1326,9 @@ mod tests {
 
     #[test]
     fn for_value_keys_reject_apply_time_unknown_member() {
-        let mut template = coalesced_template();
-        template.binding = ForBinding::Simple("account".to_string());
-        template.addressing = crate::parser::LoopAddressing::ValueKeyed;
+        let mut template = coalesced_template_with_binding(
+            crate::parser::BoundLoopBinding::ValueKeyed("account".into()),
+        );
         template.header = "for account in (up.accounts ?? [])".to_string();
         template.iterable = Value::Concrete(ConcreteValue::List(vec![Value::root_resource_ref(
             "parent",

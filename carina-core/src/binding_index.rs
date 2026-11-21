@@ -1062,15 +1062,20 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         }
         let mut module_argument_loops = HashMap::new();
         for site in parsed.deferred_for_sites() {
-            if site.addressing != crate::parser::LoopAddressing::ValueKeyed {
-                continue;
-            }
-            let Some(bound) = site.target.bound_binding_address() else {
-                continue;
+            let target = match site.target {
+                crate::parser::DeferredForTarget::Bound {
+                    target,
+                    binding: crate::parser::BoundLoopBinding::ValueKeyed(_),
+                } => target,
+                crate::parser::DeferredForTarget::Bound {
+                    binding:
+                        crate::parser::BoundLoopBinding::Indexed(_, _)
+                        | crate::parser::BoundLoopBinding::MapKeyed(_, _),
+                    ..
+                }
+                | crate::parser::DeferredForTarget::Unbound { .. } => continue,
             };
-            let crate::parser::DeferredForTarget::Bound(target) = site.target else {
-                continue;
-            };
+            let bound = target.binding_address();
             if let Some(resource) =
                 parsed
                     .iter_all_resources()

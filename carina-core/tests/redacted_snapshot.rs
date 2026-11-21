@@ -386,7 +386,7 @@ fn snapshot_state_unresolved_filter_uses_checked_conversion() {
 
 #[test]
 fn snapshot_saved_plan_loop_expansion_uses_checked_conversion() {
-    use carina_core::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
+    use carina_core::parser::{DeferredForExpression, DeferredForTarget};
     use carina_core::resource::{
         LoopSlot, ModuleSource, Resource, absolute_binding_address_for_test,
     };
@@ -400,10 +400,12 @@ fn snapshot_saved_plan_loop_expansion_uses_checked_conversion() {
         None,
         1,
         "for item in state.items".into(),
-        DeferredForTarget::bound(template.binding.clone().unwrap()).unwrap(),
+        DeferredForTarget::bound(
+            template.binding.clone().unwrap(),
+            carina_core::parser::BoundLoopBinding::ValueKeyed("item".into()),
+        )
+        .unwrap(),
         root_resource_ref("state", "items", vec![]),
-        ForBinding::Simple("item".into()),
-        carina_core::parser::LoopAddressing::ValueKeyed,
         template,
     );
     // Decode the same snapshot representation used inside saved-plan values.

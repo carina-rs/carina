@@ -627,6 +627,7 @@ fn canonicalize_in_place<
         if let ResourceRef::Deferred { resource, deferred } = resource {
             let resource = resource.as_resource();
             if let Some(schema) = schemas.get_for(resource) {
+                let loop_binding = D::deferred_binding(deferred);
                 let source = PrefixSource {
                     id: &resource.id,
                     declaration: Some(&resource.declaration),
@@ -635,7 +636,7 @@ fn canonicalize_in_place<
                     variables,
                     references: &references,
                     schemas,
-                    loop_binding: Some(D::deferred_binding(deferred)),
+                    loop_binding: Some(&loop_binding),
                     loop_iterable: Some(D::deferred_iterable(deferred)),
                     legacy_argument_loop: argument_iterable(
                         D::deferred_iterable(deferred),
@@ -1066,7 +1067,7 @@ where
                 references: &references,
                 schemas: self.schemas,
                 module_source: self.resource.module_source(),
-                loop_binding: self.resource.loop_binding(),
+                loop_binding: self.resource.loop_binding().as_ref(),
                 loop_iterable: self.resource.loop_iterable(),
                 legacy_argument_loop: self.resource.loop_iterable().is_some_and(|iterable| {
                     argument_iterable(
@@ -2028,12 +2029,21 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
     fn loop_variable(&mut self, slot: LoopSlot, scope: DiagnosticScope, through: Option<&B>) {
         use crate::parser::ForBinding;
         let name = match (self.source.loop_binding, slot) {
-            (Some(ForBinding::Simple(value)), LoopSlot::Value)
+            (
+                Some(ForBinding::Positional(value) | ForBinding::ValueKeyed(value)),
+                LoopSlot::Value,
+            )
             | (Some(ForBinding::Indexed(_, value)), LoopSlot::Value)
-            | (Some(ForBinding::Map(_, value)), LoopSlot::Value) => value,
+            | (Some(ForBinding::MapKeyed(_, value)), LoopSlot::Value) => value,
             (Some(ForBinding::Indexed(index, _)), LoopSlot::Index) => index,
-            (Some(ForBinding::Map(key, _)), LoopSlot::Key) => key,
-            _ => return,
+            (Some(ForBinding::MapKeyed(key, _)), LoopSlot::Key) => key,
+            (None, _)
+            | (
+                Some(ForBinding::Positional(_) | ForBinding::ValueKeyed(_)),
+                LoopSlot::Index | LoopSlot::Key,
+            )
+            | (Some(ForBinding::Indexed(_, _)), LoopSlot::Key)
+            | (Some(ForBinding::MapKeyed(_, _)), LoopSlot::Index) => return,
         };
         let name = scope
             .path(ReferencePath::Binding(

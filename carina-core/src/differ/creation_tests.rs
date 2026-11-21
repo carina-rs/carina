@@ -300,11 +300,10 @@ fn deferred_payload() -> DeferredCreatePayload {
         "for (_, item) in parent.items".into(),
         crate::parser::DeferredForTarget::bound(
             crate::resource::absolute_binding_address_for_test("children"),
+            crate::parser::BoundLoopBinding::Indexed("_".into(), "item".into()),
         )
         .unwrap(),
         Value::root_resource_ref("parent", "items", vec![]),
-        crate::parser::ForBinding::Indexed("_".into(), "item".into()),
-        crate::parser::LoopAddressing::Indexed,
         Resource::with_provider("mock", "Bucket", "children", None).with_attribute(
             "name",
             // The loop's item has no known element type.

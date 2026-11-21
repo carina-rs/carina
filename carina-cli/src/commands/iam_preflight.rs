@@ -809,7 +809,7 @@ mod tests {
         assert_eq!(required[0].action, raw);
     }
     use aws_sdk_iam::error::ErrorMetadata;
-    use carina_core::parser::{DeferredForExpression, ForBinding};
+    use carina_core::parser::DeferredForExpression;
     use carina_core::provider::{
         BoxFuture, CreateRequest, ProviderError, ProviderResult, ReadRequest, UpdateRequest,
     };
@@ -1232,12 +1232,11 @@ mod tests {
             "for (_, opt) in cert.domain_validation_options".to_string(),
             carina_core::parser::DeferredForTarget::bound(
                 carina_core::resource::absolute_binding_address_for_test("validation_records"),
+                carina_core::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
             )
             .expect("fixture binding is valid"),
             Value::resource_ref("cert", "domain_validation_options", Vec::new())
                 .resolve_root_for_test(),
-            ForBinding::Indexed("_".into(), "opt".to_string()),
-            carina_core::parser::LoopAddressing::Indexed,
             template_resource,
         );
         plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
@@ -1276,12 +1275,11 @@ mod tests {
             "for (_, opt) in cert.domain_validation_options".to_string(),
             carina_core::parser::DeferredForTarget::bound(
                 carina_core::resource::absolute_binding_address_for_test("validation_records"),
+                carina_core::parser::BoundLoopBinding::Indexed("_".into(), "opt".to_string()),
             )
             .expect("fixture binding is valid"),
             Value::resource_ref("cert", "domain_validation_options", Vec::new())
                 .resolve_root_for_test(),
-            ForBinding::Indexed("_".into(), "opt".to_string()),
-            carina_core::parser::LoopAddressing::Indexed,
             template_resource,
         );
         plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(

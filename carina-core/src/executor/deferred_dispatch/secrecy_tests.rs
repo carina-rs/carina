@@ -90,7 +90,6 @@ fn issue_4516_deferred_for_executor_carries_rows_and_saved_plan_unavailability()
                     "resource_type",
                     "target",
                     "iterable",
-                    "binding",
                     "template_resource"
                 ])
             );

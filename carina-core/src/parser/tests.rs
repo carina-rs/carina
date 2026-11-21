@@ -1644,8 +1644,11 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
     template_resource
         .attributes
         .insert("name".to_string(), empty());
-    let target = DeferredForTarget::bound(crate::resource::RelativeBindingName::new("items"))
-        .expect("fixture binding is valid");
+    let target = DeferredForTarget::bound(
+        crate::resource::RelativeBindingName::new("items"),
+        crate::parser::BoundLoopBinding::ValueKeyed("item".into()),
+    )
+    .expect("fixture binding is valid");
     let body = DeferredForBody::resource(template_resource);
     file.parsed_deferred_for_expressions_mut()
         .push(ParsedDeferredForExpression::new(
@@ -1660,8 +1663,6 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
             target,
             empty(),
             ParsedDeferredForIterableState::Deferred,
-            ForBinding::Simple("item".to_string()),
-            crate::parser::LoopAddressing::ValueKeyed,
             body,
         ));
 
@@ -1728,8 +1729,11 @@ fn expansion_boundary_checks_canonical_deferred_template_resource_attributes() {
         .attributes
         .insert("name".to_string(), empty_interpolation_placeholder());
     let mut file = ParsedFile::default();
-    let target = DeferredForTarget::bound(crate::resource::RelativeBindingName::new("items"))
-        .expect("fixture binding is valid");
+    let target = DeferredForTarget::bound(
+        crate::resource::RelativeBindingName::new("items"),
+        crate::parser::BoundLoopBinding::ValueKeyed("item".into()),
+    )
+    .expect("fixture binding is valid");
     let body = DeferredForBody::resource(template_resource);
     file.parsed_deferred_for_expressions_mut()
         .push(ParsedDeferredForExpression::new(
@@ -1746,8 +1750,6 @@ fn expansion_boundary_checks_canonical_deferred_template_resource_attributes() {
                 binding: "pending.items".into(),
             }),
             ParsedDeferredForIterableState::Deferred,
-            ForBinding::Simple("item".to_string()),
-            crate::parser::LoopAddressing::ValueKeyed,
             body,
         ));
 
@@ -9905,7 +9907,7 @@ fn parse_top_level_for_uses_last_segment_of_dotted_iterable() {
     );
     // Deferred (upstream_state not resolved), so no concrete resources
     // but the deferred target should retain _accounts only as migration provenance.
-    let DeferredForTarget::Unbound { template } = result.deferred_for_expressions()[0].target()
+    let DeferredForTarget::Unbound { template, .. } = result.deferred_for_expressions()[0].target()
     else {
         panic!("top-level deferred loop must remain unbound")
     };
