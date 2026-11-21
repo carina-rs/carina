@@ -667,9 +667,13 @@ type each bullet names; read that type's rustdoc for the details.
   convert back into general type compatibility. Configuration admission lives
   in `validation/admission/configuration/` and is closed off from resource
   admission by its types. S3 backend URLs keep encryption on and
-  auto-creation off. Function parameters/returns use
-  `check_resolved_constraints_at`. Member String failures retain their pattern/
-  length category and member label; identity failures run first.
+  auto-creation off. Function parameters/returns check known values with
+  `check_resolved_constraints_at`; unknown values must be proven by the shared
+  admission reference relation, and `NeedsLocal` or missing source types reject
+  at validate. Unknown returns reuse the body's judgement with parameters as
+  their declared types; unavailable provider schemas defer. Member String
+  failures retain their pattern/length category and member label; identity
+  failures run first.
   Int-to-Float widening between identified scalars uses identity-bound containment
   too. Float pairs with identities on both sides retain strict declaration range
   containment; same-identity Float reference admission retains resolved-value

@@ -361,6 +361,12 @@ let subnet_id = subnets[0].subnet_id
 
 Type expressions are used in `arguments`, `attributes`, and `exports` blocks, and in function parameters and return types.
 
+Function annotations are type promises: `validate` checks known values directly,
+and unknown values need type evidence that proves they fit. Unknown returns use
+the body's type with parameters as their declared types. A failed promise reports
+`validate cannot prove it fits`; see [function type promises](/guides/functions/#type-promises-at-validate)
+for the full error and repair guidance. Unavailable provider schemas defer the check.
+
 ### Simple Types
 
 ```crn

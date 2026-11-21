@@ -427,6 +427,18 @@ fn cidr_for_env(env: String): String {
 }
 ```
 
+Parameter and return annotations are type promises. At each call, `validate`
+checks a known value directly; an unknown value needs a type that proves it
+fits. For an unknown return, the body's type is computed with parameters as
+their declared types. A `String` parameter therefore cannot prove a literal-union
+return, even if the actual argument has a narrower type. An untyped upstream
+export supplies no proof. Missing provider schemas keep the check pending.
+
+A failed promise reports, for example, `function 'pick': parameter 'x' is
+declared as 'dev' | 'prod', but its argument has type String, so validate cannot
+prove it fits.` See [type promises](/guides/functions/#type-promises-at-validate)
+for the full error and repair guidance.
+
 ## Validate Expressions
 
 Validate expressions are boolean expressions used in `arguments` blocks for input validation and in `require` statements. They support comparison and logical operators.
