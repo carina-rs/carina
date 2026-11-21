@@ -1585,6 +1585,7 @@ mod tests {
             .expect("fixture binding is valid"),
             Value::Concrete(ConcreteValue::String(ITERABLE_VALUE.into())),
             ForBinding::Simple("item".to_string()),
+            carina_core::parser::LoopAddressing::ValueKeyed,
             Resource::new("test.Widget", "widgets"),
         );
         let effect = Effect::DeferredCreate(crate::test_support::compiled_loop(Box::new(template)));

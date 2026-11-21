@@ -326,8 +326,7 @@ pub(super) fn materialize_deferred_create<
     })? {
         crate::resolver::ValueResolution::Present(value) => value,
         crate::resolver::ValueResolution::Unknown(value)
-            if matches!(template.target(), DeferredForTarget::Bound(_))
-                && matches!(template.binding, crate::parser::ForBinding::Simple(_)) =>
+            if template.addressing == crate::parser::LoopAddressing::ValueKeyed =>
         {
             value
         }
@@ -411,7 +410,7 @@ pub(super) fn materialize_deferred_create<
     let members = match template.target() {
         DeferredForTarget::Bound(bound) => {
             match crate::resource::admit_bound_for_addresses(
-                &template.binding,
+                template.addressing,
                 bound,
                 crate::resource::knowledge::ClassifiedRef::from(&classified),
                 crate::resource::ForAddressMoment::Apply,
@@ -698,6 +697,7 @@ mod tests {
                 default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),
             }),
             ForBinding::Indexed("_".into(), "account".to_string()),
+            crate::parser::LoopAddressing::Indexed,
             template_resource,
         )
     }
@@ -1266,6 +1266,7 @@ mod tests {
     fn for_value_keys_whole_pending_collection_stays_unknown() {
         let mut template = coalesced_template();
         template.binding = ForBinding::Simple("account".to_string());
+        template.addressing = crate::parser::LoopAddressing::ValueKeyed;
         template.header = "for account in (up.accounts ?? [])".to_string();
         template.iterable = Value::root_resource_ref("up", "accounts", vec![]);
         let mut bindings = ResolvedBindings::default();
@@ -1314,6 +1315,7 @@ mod tests {
     fn for_value_keys_reject_apply_time_unknown_member() {
         let mut template = coalesced_template();
         template.binding = ForBinding::Simple("account".to_string());
+        template.addressing = crate::parser::LoopAddressing::ValueKeyed;
         template.header = "for account in (up.accounts ?? [])".to_string();
         template.iterable = Value::Concrete(ConcreteValue::List(vec![Value::root_resource_ref(
             "parent",

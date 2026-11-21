@@ -1227,6 +1227,7 @@ fn loop_effect(replace: bool) -> Effect {
         crate::parser::DeferredForTarget::bound(absolute_binding("children")).unwrap(),
         Value::root_resource_ref("source", "items", vec![]),
         crate::parser::ForBinding::Indexed("_".into(), "item".into()),
+        crate::parser::LoopAddressing::Indexed,
         crate::resource::Resource::new("test", "children").with_attribute(
             "name",
             crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
@@ -1904,6 +1905,7 @@ async fn input_discharge_conflicting_child_in_cbd_parent_window_keeps_old_on_rej
             crate::parser::DeferredForTarget::bound(absolute_binding("children")).unwrap(),
             Value::root_resource_ref("source", "items", vec![]),
             crate::parser::ForBinding::Indexed("_".into(), "item".into()),
+            crate::parser::LoopAddressing::Indexed,
             crate::resource::Resource::new("test", "children").with_attribute(
                 "name",
                 crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(

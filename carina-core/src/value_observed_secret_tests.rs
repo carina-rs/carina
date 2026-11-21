@@ -674,7 +674,7 @@ fn for_value_keys_observed_secret_knowledge_plan_apply() {
         )
         .unwrap();
         let error = crate::resource::admit_bound_for_addresses(
-            &crate::parser::ForBinding::Simple("x".into()),
+            crate::parser::LoopAddressing::ValueKeyed,
             &target,
             members,
             if is_apply {

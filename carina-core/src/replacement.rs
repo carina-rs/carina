@@ -1884,6 +1884,7 @@ mod tests {
                 .unwrap(),
             Value::root_resource_ref("upstream", "items", vec![]),
             crate::parser::ForBinding::Simple("value".into()),
+            crate::parser::LoopAddressing::ValueKeyed,
             Resource::new("test.Record", "record"),
         );
         let mut plan = crate::plan::Plan::new();
@@ -2884,6 +2885,7 @@ mod tests {
                         .unwrap(),
                         Value::root_resource_ref("parent", "values", Vec::new()),
                         crate::parser::ForBinding::Simple("item".into()),
+                        crate::parser::LoopAddressing::ValueKeyed,
                         Resource::<_, crate::resource::LoopSlot>::new("test.Record", "records"),
                     )
                     .into_compiled();

@@ -427,6 +427,7 @@ async fn review1_deferred_final_admission(replace: bool) {
         crate::parser::DeferredForTarget::bound(absolute_binding("children")).unwrap(),
         Value::Concrete(ConcreteValue::List(vec![text("one"), text("two")])),
         crate::parser::ForBinding::Indexed("_".into(), "item".into()),
+        crate::parser::LoopAddressing::Indexed,
         crate::resource::Resource::<ModuleSource, LoopSlot>::new("test", "children"),
     );
     let compiled = crate::test_support::compiled_loop(Box::new(template));

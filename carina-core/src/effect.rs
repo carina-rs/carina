@@ -2071,6 +2071,7 @@ impl EffectWithSource<ModuleSource> {
                     .expect("fixture binding is valid"),
                 Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
                 crate::parser::ForBinding::Indexed("_".into(), "opt".to_string()),
+                crate::parser::LoopAddressing::Indexed,
                 Resource::new("route53.Record", "validation_records"),
             )
         };
@@ -3041,6 +3042,7 @@ mod tests {
                 .expect("fixture binding is valid"),
             Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
             crate::parser::ForBinding::Indexed("_".into(), "opt".to_string()),
+            crate::parser::LoopAddressing::Indexed,
             Resource::new("route53.Record", "validation_records"),
         )
     }
@@ -3599,6 +3601,7 @@ mod tests {
                     .unwrap(),
                 Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
                 crate::parser::ForBinding::Indexed("_".into(), "opt".to_owned()),
+                crate::parser::LoopAddressing::Indexed,
                 Resource::new("test.Conflicting", "validation_records"),
             ));
         changed

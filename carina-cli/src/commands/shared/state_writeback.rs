@@ -2727,6 +2727,7 @@ mod apply_state_save_tests {
             .expect("fixture binding is valid"),
             root_resource_ref("cert", "domain_validation_options", Vec::new()),
             ForBinding::Indexed("_".into(), "opt".to_string()),
+            carina_core::parser::LoopAddressing::Indexed,
             // Comparison pre-resolution keys the materialized template by
             // provider instance and type before any runtime child exists.
             Resource::pending_with_provider("aws", "route53.Record", None),
@@ -5426,6 +5427,7 @@ mod apply_state_save_tests {
             .expect("fixture binding is valid"),
             root_resource_ref("cert", "domain_validation_options", Vec::new()),
             ForBinding::Indexed("_".into(), "opt".to_string()),
+            carina_core::parser::LoopAddressing::Indexed,
             Resource::with_provider("aws", "route53.Record", "validation_records", None)
                 .with_test_binding("validation_records"),
         );
@@ -5504,6 +5506,7 @@ mod apply_state_save_tests {
                 .expect("fixture binding is valid"),
                 root_resource_ref("cert", "domain_validation_options", Vec::new()),
                 ForBinding::Indexed("_".into(), "opt".to_string()),
+                carina_core::parser::LoopAddressing::Indexed,
                 template_resource,
             )),
         )))

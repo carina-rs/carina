@@ -80,6 +80,14 @@ impl ForBinding {
     }
 }
 
+/// Child-address policy decided by the retained syntax compiler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LoopAddressing {
+    Indexed,
+    MapKeyed,
+    ValueKeyed,
+}
+
 /// Whether `name` appears in `text` as a whole identifier (not a substring
 /// of a longer identifier). An identifier is bounded by anything that is
 /// not ASCII alphanumeric or `_`.
@@ -220,6 +228,7 @@ fn parse_deferred_for_body_template(
 fn record_deferred_for_expression(
     body_pair: pest::iterators::Pair<Rule>,
     binding: &ForBinding,
+    addressing: LoopAddressing,
     ctx: &mut ParseContext,
     target: &LoopParseTarget,
     preprocessed_file: &PreprocessedFile,
@@ -273,6 +282,7 @@ fn record_deferred_for_expression(
         iterable,
         iterable_state,
         binding.clone(),
+        addressing,
         body,
     );
 
@@ -385,6 +395,7 @@ pub(crate) fn parse_for_expr(
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<(Vec<Resource>, Vec<DataSource>, Vec<ModuleCall>), ParseError> {
+    let addressing = ctx.for_addressing(&pair)?;
     let for_line = pair.as_span().start_pos().line_col().0;
     let for_span = SourceSpan::from_pest(&pair, preprocessed_file);
     let declaration =
@@ -492,7 +503,7 @@ pub(crate) fn parse_for_expr(
         .map_err(|error| ParseError::from_resolution(error.into(), for_line))?;
     let admission = match &target {
         LoopParseTarget::Bound(bound) => Some(crate::resource::admit_bound_for_addresses(
-            &binding,
+            addressing,
             bound,
             ClassifiedRef::from(&classified),
             crate::resource::ForAddressMoment::Parse,
@@ -591,9 +602,10 @@ pub(crate) fn parse_for_expr(
         }
         return Ok((resources, data_sources, module_calls));
     }
-    match (&target, &binding, &iterable_for_expansion) {
+    match (&target, addressing, &binding, &iterable_for_expansion) {
         (
             LoopParseTarget::Unbound(template),
+            LoopAddressing::Indexed,
             ForBinding::Simple(var),
             ParserIterable::List(items),
         ) => {
@@ -637,6 +649,7 @@ pub(crate) fn parse_for_expr(
         }
         (
             LoopParseTarget::Unbound(template),
+            LoopAddressing::Indexed,
             ForBinding::Indexed(idx_var, val_var),
             ParserIterable::List(items),
         ) => {
@@ -685,6 +698,7 @@ pub(crate) fn parse_for_expr(
         }
         (
             LoopParseTarget::Unbound(template),
+            LoopAddressing::MapKeyed,
             ForBinding::Map(key_var, val_var),
             ParserIterable::Map(map),
         ) => {
@@ -739,7 +753,7 @@ pub(crate) fn parse_for_expr(
         // replayed at plan/apply time. In particular, `ref ?? default` must
         // not collapse to the default before the reference snapshot is known
         // to be complete.
-        (_, _, ParserIterable::Deferred) => {
+        (_, _, _, ParserIterable::Deferred) => {
             let iterable_surface = match &iterable {
                 Value::Deferred(
                     DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument { .. })
@@ -756,6 +770,7 @@ pub(crate) fn parse_for_expr(
             record_deferred_for_expression(
                 body_pair.clone(),
                 &binding,
+                addressing,
                 ctx,
                 &target,
                 preprocessed_file,
@@ -800,6 +815,7 @@ pub(crate) fn parse_for_expr(
                 record_deferred_for_expression(
                     body_pair.clone(),
                     &binding,
+                    addressing,
                     ctx,
                     &target,
                     preprocessed_file,

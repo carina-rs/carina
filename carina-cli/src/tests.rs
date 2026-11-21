@@ -94,8 +94,8 @@ fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAdd
 }
 
 #[test]
-fn saved_plan_version_is_47_for_current_state() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 47);
+fn saved_plan_version_is_48_for_loop_addressing() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 48);
 }
 
 #[test]

@@ -23,6 +23,7 @@ fn deferred_replace_test_template() -> crate::parser::DeferredForExpression {
             .expect("fixture binding is valid"),
         Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
         crate::parser::ForBinding::Indexed("_".into(), "opt".to_string()),
+        crate::parser::LoopAddressing::Indexed,
         template_resource,
     )
 }

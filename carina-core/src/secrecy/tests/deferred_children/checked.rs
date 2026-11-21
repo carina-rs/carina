@@ -22,7 +22,7 @@ fn admitted_member(
         .into_classification();
     let crate::resource::ForAddressAdmission::Admitted(mut members) =
         crate::resource::admit_bound_for_addresses(
-            &template.binding,
+            template.addressing,
             target,
             crate::resource::knowledge::ClassifiedRef::from(&classification),
             crate::resource::ForAddressMoment::Plan,
@@ -785,6 +785,7 @@ fn issue_4516_admitted_file_rejects_deferred_child_without_template_evidence() {
             template.target().clone(),
             template.iterable.clone(),
             template.binding.clone(),
+            template.addressing,
             template.template_resource().as_resource().clone(),
         );
         assert!(matches!(

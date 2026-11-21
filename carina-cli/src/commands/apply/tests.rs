@@ -1948,7 +1948,7 @@ async fn saved_configuration_decode_failure_returns_command_error_without_panick
     let runtime = crate::test_support::TestCommandRuntime::new();
     let temp = tempfile::tempdir().unwrap();
     let mut document: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/module_binding_wire_compat/carina.v47.plan.json"
+        "../../../tests/fixtures/module_binding_wire_compat/carina.v48.plan.json"
     ))
     .unwrap();
     document["sorted_resources"] = serde_json::json!("invalid saved configuration");
@@ -10489,7 +10489,7 @@ mod saved_plan_version_tests {
 
     #[test]
     fn replacement_admission_requests_require_current_plan_format() {
-        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 47);
+        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 48);
     }
 
     #[tokio::test]

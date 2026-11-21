@@ -1062,7 +1062,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         }
         let mut module_argument_loops = HashMap::new();
         for site in parsed.deferred_for_sites() {
-            if !matches!(site.binding, crate::parser::ForBinding::Simple(_)) {
+            if site.addressing != crate::parser::LoopAddressing::ValueKeyed {
                 continue;
             }
             let Some(bound) = site.target.bound_binding_address() else {

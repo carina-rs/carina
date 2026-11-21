@@ -829,6 +829,7 @@ mod tests {
                 default: Box::new(Value::root_resource_ref("fallback", "items", Vec::new())),
             }),
             ForBinding::Indexed("_".into(), "x".to_string()),
+            crate::parser::LoopAddressing::Indexed,
             template_resource,
         );
 
@@ -1202,6 +1203,7 @@ mod tests {
             .expect("fixture binding is valid"),
             Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
             ForBinding::Indexed("_".into(), "opt".to_string()),
+            crate::parser::LoopAddressing::Indexed,
             template_resource,
         );
 
@@ -1277,6 +1279,7 @@ mod tests {
             .expect("fixture binding is valid"),
             Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
             ForBinding::Indexed("_".into(), "opt".to_string()),
+            crate::parser::LoopAddressing::Indexed,
             template_resource,
         );
 

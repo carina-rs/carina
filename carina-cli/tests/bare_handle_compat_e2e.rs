@@ -163,14 +163,133 @@ fn keyed_loop_invalid_reader_spellings_stay_rejected_in_every_position() {
         for reader in ["children.a.name", invalid_subscript] {
             for (position, expression) in loop_reader_positions(reader) {
                 let output = validate_loop_reader(fixture.path(), position, &expression);
+                let expected: &[&str] = match (kind, reader, position) {
+                    (_, "children.a.name", "plain") => &[
+                        "mock.test.resource.other: unknown binding 'children' in reference children.a",
+                    ],
+                    (_, "children.a.name", "single interpolation") => &[
+                        "mock.test.resource.other.comment: mock.test.resource.other: unknown binding 'children' in reference children.a.name",
+                    ],
+                    ("indexed", "children.a.name", _) => {
+                        &["cannot apply access .a to list(mock.test.resource)"]
+                    }
+                    (_, "children.a.name", _) => &["cannot apply access .a to keyed loop group"],
+                    ("value-keyed", "children[0].name", _) => &[
+                        "This loop is value-keyed; use a string subscript, or `for (i, x) in ...` for index addressing.",
+                    ],
+                    ("map", "children[0].name", "plain") => &[
+                        "mock.test.resource.other: unknown binding 'children[0]' in reference children[0].name",
+                    ],
+                    ("map", "children[0].name", "single interpolation") => &[
+                        "mock.test.resource.other.comment: mock.test.resource.other: unknown binding 'children[0]' in reference children[0].name",
+                    ],
+                    ("map", "children[0].name", _) => {
+                        &["cannot apply access [0] to keyed loop group"]
+                    }
+                    ("indexed", "children['a'].name", "plain" | "single interpolation") => {
+                        &["Undefined identifier `children.a`. Did you mean `children`?"]
+                    }
+                    ("indexed", "children['a'].name", _) => &[
+                        "Undefined identifier `children.a`. Did you mean `children`?",
+                        "cannot apply access ['a'] to list(mock.test.resource)",
+                    ],
+                    _ => panic!("unhandled reader case: {kind}, {position}, {reader}"),
+                };
+                let text = output_text(&output);
                 assert!(
                     !output.status.success(),
-                    "{kind}, {position}, {reader} unexpectedly passed: {}",
-                    output_text(&output)
+                    "{kind}, {position}, {reader} unexpectedly passed: {text}"
                 );
+                for message in expected {
+                    assert!(
+                        text.contains(message),
+                        "{kind}, {position}, {reader}: missing {message:?}: {text}"
+                    );
+                }
             }
         }
     }
+}
+
+#[test]
+fn keyed_loop_integer_readers_are_direct_arithmetic_operands() {
+    for (kind, header, reader) in [
+        (
+            "map",
+            "let items = { a = 'x' }\nlet children = for k, v in items",
+            "children['a'].generation",
+        ),
+        (
+            "value-keyed",
+            "let children = for item in ['a']",
+            "children['a'].generation",
+        ),
+        (
+            "indexed",
+            "let children = for (i, item) in ['a']",
+            "children[0].generation",
+        ),
+    ] {
+        let source = format!(
+            "{header} {{ mock.test.creation_constrained {{ name = 'child' generation = 2 }} }}\n"
+        );
+        let fixture = loop_reader_fixture(&source);
+        let expression = format!("\"${{{reader} + 1}}\"");
+        let output = validate_loop_reader(fixture.path(), "direct arithmetic", &expression);
+        assert_success(&format!("{kind}, direct arithmetic"), &output);
+        let invalid_subscript = if kind == "indexed" {
+            "children['a'].generation"
+        } else {
+            "children[0].generation"
+        };
+        for reader in ["children.a.generation", invalid_subscript] {
+            let expression = format!("\"${{{reader} + 1}}\"");
+            let output = validate_loop_reader(fixture.path(), "direct arithmetic", &expression);
+            let text = output_text(&output);
+            let expected = match (kind, reader) {
+                ("indexed", "children.a.generation") => {
+                    "cannot apply access .a to list(mock.test.creation_constrained)"
+                }
+                ("indexed", _) => {
+                    "cannot apply access ['a'] to list(mock.test.creation_constrained)"
+                }
+                ("value-keyed", "children[0].generation") => {
+                    "This loop is value-keyed; use a string subscript, or `for (i, x) in ...` for index addressing."
+                }
+                (_, "children.a.generation") => "cannot apply access .a to keyed loop group",
+                (_, _) => "cannot apply access [0] to keyed loop group",
+            };
+            assert!(
+                !output.status.success() && text.contains(expected),
+                "{kind}, {reader}: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn keyed_loop_group_iterable_directory_diagnostics() {
+    let fixture = loop_reader_fixture(LOOP_READER_CASES[0].1);
+    write_file(
+        fixture.path(),
+        "other.crn",
+        "let copies = for c in children { mock.test.resource { name = c.name } }\n",
+    );
+    let output = run(fixture.path(), &["validate", ".", "--json"]);
+    assert!(!output.status.success(), "{}", output_text(&output));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let messages: Vec<_> = result["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|diagnostic| diagnostic["message"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "'children' is a for binding, not a value; reference an instance attribute, e.g. 'children['key'].<attribute>'"
+        ]
+    );
 }
 
 #[test]

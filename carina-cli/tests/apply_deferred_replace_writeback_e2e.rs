@@ -287,6 +287,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         )
         .resolve_root_for_test(),
         ForBinding::Indexed("_".into(), "opt".to_string()),
+        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
 

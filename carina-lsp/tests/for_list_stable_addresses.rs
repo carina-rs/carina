@@ -92,6 +92,46 @@ fn keyed_loop_compound_reader_directory_diagnostics() {
 }
 
 #[test]
+fn keyed_loop_group_iterable_directory_diagnostics() {
+    let snapshot = Arc::new(snapshot());
+    let engine = DiagnosticEngine::new(Arc::clone(&snapshot), vec!["mock".into()]);
+    let directory = tempfile::tempdir().unwrap();
+    for (file, source) in [
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "backend.crn",
+            "backend local { path = 'carina.state.json' }\n",
+        ),
+        (
+            "main.crn",
+            "let items = { a = 'x' }\nlet children = for k, v in items { mock.test.resource { name = v } }\n",
+        ),
+        ("exports.crn", "exports {}\n"),
+    ] {
+        std::fs::write(directory.path().join(file), source).unwrap();
+    }
+    let path = directory.path().join("other.crn");
+    let source = "let copies = for c in children { mock.test.resource { name = c.name } }\n";
+    std::fs::write(&path, source).unwrap();
+    let document = Document::new_with_path(
+        source.into(),
+        path.clone(),
+        Arc::new(snapshot.provider_context().as_provider_context().clone()),
+    );
+    let diagnostics = engine.analyze(&document, Some(&path));
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "'children' is a for binding, not a value; reference an instance attribute, e.g. 'children['key'].<attribute>'"
+        ]
+    );
+}
+
+#[test]
 fn for_value_keys_upstream_authored_diagnostic_parity() {
     let snapshot = Arc::new(snapshot());
     let engine = DiagnosticEngine::new(Arc::clone(&snapshot), vec!["mock".into()]);

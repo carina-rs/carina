@@ -1086,6 +1086,7 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
         DeferredForTarget::bound(absolute_binding("subnets")).expect("fixture binding is valid"),
         ref_value("vpc", "subnets"),
         ForBinding::Map("_".to_string(), "subnet".to_string()),
+        crate::parser::LoopAddressing::MapKeyed,
         template_resource,
     );
 
@@ -1196,10 +1197,19 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
 fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
     use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
     use crate::resource::{LoopSlot, ModuleSource};
-    for binding in [
-        ForBinding::Indexed("_".into(), "vpc".into()),
-        ForBinding::Indexed("vpc".into(), "value".into()),
-        ForBinding::Map("key".into(), "vpc".into()),
+    for (binding, addressing) in [
+        (
+            ForBinding::Indexed("_".into(), "vpc".into()),
+            crate::parser::LoopAddressing::Indexed,
+        ),
+        (
+            ForBinding::Indexed("vpc".into(), "value".into()),
+            crate::parser::LoopAddressing::Indexed,
+        ),
+        (
+            ForBinding::Map("key".into(), "vpc".into()),
+            crate::parser::LoopAddressing::MapKeyed,
+        ),
     ] {
         let schemas = base_schemas(false);
         let (managed, unresolved) = vpc_resources(false);
@@ -1234,6 +1244,7 @@ fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
             DeferredForTarget::bound(absolute_binding("subnets")).unwrap(),
             ref_value("other", "items"),
             binding,
+            addressing,
             template,
         );
         let (schemas, provider) = crate::provider::comparison_fixture_for_test(
@@ -1314,6 +1325,7 @@ fn deferred_create_cbd_plan(
         target,
         ref_value(producer_binding, "subnets"),
         ForBinding::Indexed("_".into(), "subnet".into()),
+        crate::parser::LoopAddressing::Indexed,
         template,
     );
     let (schemas, provider) = crate::provider::comparison_fixture_for_test(
@@ -1753,6 +1765,7 @@ fn issue_4283_known_conflicting_child_cbd_rejected_before_parent_applies() {
         DeferredForTarget::bound(absolute_binding("subnets")).expect("fixture binding is valid"),
         ref_value("vpc", "subnets"),
         ForBinding::Map("_".to_string(), "subnet".to_string()),
+        crate::parser::LoopAddressing::MapKeyed,
         template_resource,
     );
 

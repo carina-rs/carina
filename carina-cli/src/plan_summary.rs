@@ -210,6 +210,7 @@ mod tests {
             .expect("fixture binding is valid"),
             Value::resource_ref("upstream", "items", Vec::new()).resolve_root_for_test(),
             ForBinding::Indexed("_".into(), "item".to_string()),
+            carina_core::parser::LoopAddressing::Indexed,
             Resource::new("test.Widget", "widgets"),
         )
     }

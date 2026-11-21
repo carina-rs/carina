@@ -3549,6 +3549,7 @@ fn snapshot_top_level_sigil_alignment() {
         Value::resource_ref("cert", "domain_validation_options", Vec::new())
             .resolve_root_for_test(),
         ForBinding::Indexed("_".into(), "option".to_string()),
+        carina_core::parser::LoopAddressing::Indexed,
         deferred_template,
     );
     let deferred_for_expressions = vec![deferred];

@@ -2063,6 +2063,7 @@ mod tests {
                 vec!["names".to_string()],
             ),
             crate::parser::ForBinding::Simple("name".into()),
+            crate::parser::LoopAddressing::ValueKeyed,
             Resource::with_provider("mock", "test.resource", "child", None)
                 .with_absolute_binding(absolute("children")),
         );

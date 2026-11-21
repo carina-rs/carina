@@ -73,6 +73,7 @@ fn deferred_alias_requirement_is_rejected_before_materialization() {
             DeferredForTarget::bound(RootScope::new().resolve("children".into())).unwrap(),
             Value::Concrete(ConcreteValue::List(Vec::new())),
             ForBinding::Simple("value".into()),
+            crate::parser::LoopAddressing::ValueKeyed,
             Resource::<_, LoopSlot>::with_provider("mock", "Child", "children", Some("new".into())),
         )
         .into_compiled();
@@ -152,6 +153,7 @@ fn read_gate_plan(bound: bool, generation: EffectGeneration) -> (Plan, ResolvedR
             DeferredForTarget::bound(RootScope::new().resolve("children".into())).unwrap(),
             Value::root_resource_ref("lookup", "values", Vec::new()),
             ForBinding::Simple("value".into()),
+            crate::parser::LoopAddressing::ValueKeyed,
             Resource::<_, LoopSlot>::with_provider("mock", "Child", "children", None),
         )
         .into_compiled()
@@ -283,6 +285,7 @@ fn deferred_alias_requirement_preserves_sibling_orders_after_reload() {
         DeferredForTarget::bound(RootScope::new().resolve("children".into())).unwrap(),
         Value::Concrete(ConcreteValue::List(Vec::new())),
         ForBinding::Simple("value".into()),
+        crate::parser::LoopAddressing::ValueKeyed,
         Resource::<_, LoopSlot>::with_provider("mock", "Child", "children", Some("new".into())),
     )
     .into_compiled();

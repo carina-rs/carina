@@ -353,6 +353,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         )
         .resolve_root_for_test(),
         ForBinding::Indexed("_".into(), "opt".to_string()),
+        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
 

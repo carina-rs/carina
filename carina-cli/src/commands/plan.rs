@@ -2086,7 +2086,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 47;
+    pub const CURRENT_VERSION: u32 = 48;
 
     #[cfg(test)]
     pub(crate) fn decode_for_test(self) -> DecodedPlanFile {

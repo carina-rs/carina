@@ -252,6 +252,7 @@ fn build_deferred_for_plan() -> Plan {
         .expect("fixture binding is valid"),
         root_ref("cert", "domain_validation_options"),
         ForBinding::Indexed("_".into(), "opt".to_string()),
+        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
 
@@ -305,6 +306,7 @@ fn build_anonymous_deferred_for_plan() -> Plan {
         target,
         root_ref("cert", "domain_validation_options"),
         ForBinding::Simple("opt".to_string()),
+        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
 
@@ -333,6 +335,7 @@ fn build_deferred_replace_plan() -> Plan {
         .expect("fixture binding is valid"),
         root_ref("cert", "domain_validation_options"),
         ForBinding::Indexed("_".into(), "opt".to_string()),
+        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
 

@@ -181,7 +181,7 @@ pub(crate) fn apply_postfix_path_segment(
                 if matches!(
                     handle.kind(),
                     crate::eval_value::UnexpandedStructuralHandleKind::For(
-                        crate::parser::ForBinding::Simple(_)
+                        crate::parser::LoopAddressing::ValueKeyed
                     )
                 ) && matches!(index, Subscript::Int { .. })
                 {

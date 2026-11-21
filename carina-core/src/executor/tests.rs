@@ -274,6 +274,7 @@ fn validation_deferred_for_expression() -> crate::parser::ExpandedDeferredForExp
         .expect("fixture binding is valid"),
         Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
         crate::parser::ForBinding::Indexed("_".into(), "opt".to_string()),
+        crate::parser::LoopAddressing::Indexed,
         template_resource,
     )
 }
@@ -13459,6 +13460,7 @@ async fn conflicting_deferred_case(
                     template.target().clone(),
                     template.iterable.clone(),
                     crate::parser::ForBinding::Map("_".into(), "opt".into()),
+                    crate::parser::LoopAddressing::MapKeyed,
                     template.template_resource().as_resource().clone(),
                 );
                 let mut old = payload.deletes[0].clone();
@@ -14515,6 +14517,7 @@ async fn deferred_reversed_history(coexisting_child: bool) {
         crate::parser::DeferredForTarget::bound(absolute_binding("validation_records")).unwrap(),
         Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
         crate::parser::ForBinding::Indexed("_".into(), "opt".into()),
+        crate::parser::LoopAddressing::Indexed,
         resource,
     );
     let gate = Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(

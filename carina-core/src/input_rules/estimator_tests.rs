@@ -1466,6 +1466,7 @@ fn estimator_deferred_template_uses_retained_literals_and_defers_loop_slots() {
             DeferredForTarget::bound(binding("children")).unwrap(),
             Value::root_resource_ref("parent", "items", vec![]),
             ForBinding::Simple("item".into()),
+            crate::parser::LoopAddressing::ValueKeyed,
             Resource::with_provider("mock", "Target", "children", None)
                 .with_attribute("name", expression),
         );

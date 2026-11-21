@@ -383,6 +383,15 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         self.authored_nodes.node_id(pair)
     }
 
+    pub(super) fn for_addressing(
+        &self,
+        pair: &pest::iterators::Pair<'_, Rule>,
+    ) -> Result<super::LoopAddressing, ParseError> {
+        self.authored_nodes
+            .for_addressing(pair)
+            .ok_or_else(|| super::retained::MissingEvidence::new("authored loop addressing").into())
+    }
+
     pub(super) fn access_locations(
         &self,
         pair: &pest::iterators::Pair<'_, Rule>,

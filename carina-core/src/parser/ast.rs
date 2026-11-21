@@ -11,7 +11,7 @@ use super::error::{
     DeferredForBodyKind, DeferredForBodyUnsupportedError, DeferredForIterableResolution,
     ParseError, ParseWarning, WarningKind,
 };
-use super::expressions::for_expr::ForBinding;
+use super::expressions::for_expr::{ForBinding, LoopAddressing};
 use super::expressions::validate_expr::CompareOp;
 use super::grammar::ParserBindingName;
 use super::util::snake_to_pascal;
@@ -589,6 +589,7 @@ pub struct DeferredForExpression<
     target: DeferredForTarget<B>,
     pub iterable: Value<P, B>,
     pub binding: ForBinding,
+    pub addressing: LoopAddressing,
     template_resource: DeferredForTemplateResource<S, T, B, D>,
     deferred_effect_id: ResolvedResourceId,
     secrecy: TemplateSecrecy,
@@ -607,6 +608,7 @@ impl<S: PartialEq, P: ValueKind, T: ValueKind, B: BindingAddress, D: PartialEq> 
             target,
             iterable,
             binding,
+            addressing,
             template_resource,
             deferred_effect_id,
             secrecy: _secrecy,
@@ -617,6 +619,7 @@ impl<S: PartialEq, P: ValueKind, T: ValueKind, B: BindingAddress, D: PartialEq> 
             target: other_target,
             iterable: other_iterable,
             binding: other_binding,
+            addressing: other_addressing,
             template_resource: other_resource,
             deferred_effect_id: other_effect_id,
             secrecy: _other_secrecy,
@@ -627,6 +630,7 @@ impl<S: PartialEq, P: ValueKind, T: ValueKind, B: BindingAddress, D: PartialEq> 
             target,
             iterable,
             binding,
+            addressing,
             template_resource,
             deferred_effect_id,
         ) == (
@@ -635,6 +639,7 @@ impl<S: PartialEq, P: ValueKind, T: ValueKind, B: BindingAddress, D: PartialEq> 
             other_target,
             other_iterable,
             other_binding,
+            other_addressing,
             other_resource,
             other_effect_id,
         )
@@ -671,6 +676,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
             target,
             iterable: _,
             binding,
+            addressing,
             template_resource: _,
             deferred_effect_id: _,
             secrecy,
@@ -681,11 +687,13 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
             target,
             iterable,
             binding,
+            addressing,
             DeferredForTemplateResource::new(resource),
             secrecy,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         file: Option<String>,
         line: usize,
@@ -693,6 +701,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
         target: DeferredForTarget<B>,
         iterable: Value<P, B>,
         binding: ForBinding,
+        addressing: LoopAddressing,
         template_resource: Resource<S, T, B, D>,
     ) -> Self {
         let template_resource = DeferredForTemplateResource::new(template_resource);
@@ -702,17 +711,20 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
             target,
             iterable,
             binding,
+            addressing,
             template_resource,
             TemplateSecrecy::default(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_template_resource(
         location: DiagnosticLocation,
         header: String,
         target: DeferredForTarget<B>,
         iterable: Value<P, B>,
         binding: ForBinding,
+        addressing: LoopAddressing,
         template_resource: DeferredForTemplateResource<S, T, B, D>,
         secrecy: TemplateSecrecy,
     ) -> Self {
@@ -724,6 +736,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
             target,
             iterable,
             binding,
+            addressing,
             template_resource,
             deferred_effect_id,
             secrecy,
@@ -817,6 +830,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
             line: self.line(),
             header: &self.header,
             binding: &self.binding,
+            addressing: self.addressing,
             target: &self.target,
             iterable: &self.iterable,
             iterable_location: self
@@ -837,6 +851,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress> DeferredForExpression<S, 
             target,
             iterable,
             binding,
+            addressing,
             template_resource,
             deferred_effect_id: _,
             secrecy,
@@ -847,6 +862,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress> DeferredForExpression<S, 
             target,
             iterable,
             binding,
+            addressing,
             template_resource.map_resource(|resource| resource.with_dependency_phase(())),
             secrecy,
         )
@@ -944,6 +960,7 @@ pub struct ParsedDeferredForExpression<
     pub iterable: Value<P, B>,
     pub(crate) iterable_state: ParsedDeferredForIterableState,
     pub binding: ForBinding,
+    pub addressing: LoopAddressing,
     pub(crate) body: DeferredForBody<P, B>,
 }
 
@@ -956,6 +973,7 @@ pub(crate) struct ParsedDeferredForParts<'a, P: ValueKind, B: BindingAddress> {
     pub iterable: &'a Value<P, B>,
     pub iterable_state: &'a ParsedDeferredForIterableState,
     pub binding: &'a ForBinding,
+    pub addressing: LoopAddressing,
     pub body: &'a DeferredForBody<P, B>,
 }
 
@@ -969,6 +987,7 @@ impl<P: ValueKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
             iterable,
             iterable_state,
             binding,
+            addressing,
             body,
         } = self;
         ParsedDeferredForParts {
@@ -979,6 +998,7 @@ impl<P: ValueKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
             iterable,
             iterable_state,
             binding,
+            addressing: *addressing,
             body,
         }
     }
@@ -994,6 +1014,7 @@ impl<P: ValueKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
         iterable: Value<P, B>,
         iterable_state: ParsedDeferredForIterableState,
         binding: ForBinding,
+        addressing: LoopAddressing,
         body: DeferredForBody<P, B>,
     ) -> Self {
         let (file, line, span, header) = site;
@@ -1003,6 +1024,7 @@ impl<P: ValueKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
             iterable,
             iterable_state,
             binding,
+            addressing,
             body,
         )
     }
@@ -1017,6 +1039,7 @@ impl<P: ValueKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
         iterable: Value<P, B>,
         iterable_state: ParsedDeferredForIterableState,
         binding: ForBinding,
+        addressing: LoopAddressing,
         body: DeferredForBody<P, B>,
     ) -> Self {
         let (location, span, header) = site;
@@ -1029,6 +1052,7 @@ impl<P: ValueKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
             iterable,
             iterable_state,
             binding,
+            addressing,
             body,
         }
     }
@@ -1115,6 +1139,7 @@ impl<P: ValueKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
             line: self.line(),
             header: &self.header,
             binding: &self.binding,
+            addressing: self.addressing,
             target: &self.target,
             iterable: &self.iterable,
             iterable_location: self
@@ -1210,6 +1235,7 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
         DeferredForExpression<ModuleSource, ParserPlaceholder, ParserPlaceholder, B>,
         DeferredForResourceExpressionError,
     > {
+        use LoopAddressing::ValueKeyed;
         if let Some(error) = self.undefined_iterable_error(known_bindings) {
             return Err(DeferredForResourceExpressionError::UndefinedIterable(error));
         }
@@ -1221,6 +1247,7 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
             iterable,
             iterable_state,
             binding,
+            addressing,
             body,
         } = self;
         debug_assert!(matches!(
@@ -1270,12 +1297,12 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
             error: Box::new(error.into_element_at(authored())),
         };
         let classification =
-            if let (DeferredForTarget::Bound(bound), ForBinding::Simple(_)) = (&target, &binding) {
+            if let (DeferredForTarget::Bound(bound), ValueKeyed) = (&target, addressing) {
                 let classification = classification.map_err(|error| {
                     admission_error(ParseError::from_resolution(error.into(), location.line()))
                 })?;
                 match crate::resource::admit_bound_for_addresses(
-                    &binding,
+                    addressing,
                     bound,
                     crate::resource::knowledge::ClassifiedRef::from(&classification),
                     crate::resource::ForAddressMoment::Validation,
@@ -1368,6 +1395,7 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
             target,
             iterable,
             binding,
+            addressing,
             template_resource,
             TemplateSecrecy::default(),
         ))
@@ -1387,6 +1415,7 @@ impl<P: ValueKind> ParsedDeferredForExpression<P, RelativeBindingName> {
             iterable,
             iterable_state,
             binding,
+            addressing,
             body,
         } = self;
         ParsedDeferredForExpression {
@@ -1402,6 +1431,7 @@ impl<P: ValueKind> ParsedDeferredForExpression<P, RelativeBindingName> {
             iterable: iterable.resolve_bindings(resolve),
             iterable_state,
             binding,
+            addressing,
             body: match body {
                 DeferredForBody::Resource(resource) => DeferredForBody::Resource(Box::new(
                     (*resource).map_resource(|resource| resource.resolve_bindings(resolve)),
@@ -1430,6 +1460,7 @@ impl<P: ValueKind> ParsedDeferredForExpression<P, AbsoluteBindingAddress> {
             iterable,
             iterable_state: _iterable_state,
             binding: _binding,
+            addressing: _addressing,
             body,
         } = self;
         match target {
@@ -1463,6 +1494,7 @@ impl<P: ValueKind, T: ValueKind> DeferredForExpression<ModuleSource, P, T, Absol
             target,
             iterable,
             binding: _binding,
+            addressing: _addressing,
             template_resource,
             deferred_effect_id,
             secrecy: _secrecy,
@@ -1493,6 +1525,7 @@ pub struct DeferredForSite<
     pub line: usize,
     pub header: &'a str,
     pub binding: &'a ForBinding,
+    pub addressing: LoopAddressing,
     pub target: &'a DeferredForTarget<B>,
     pub iterable: &'a Value<P, B>,
     pub(crate) iterable_location: Option<&'a super::DeclarationLocation>,
@@ -1523,6 +1556,7 @@ impl<P: ValueKind, T: ValueKind, D>
             target,
             iterable,
             binding,
+            addressing,
             mut template_resource,
             deferred_effect_id: _,
             secrecy,
@@ -1536,6 +1570,7 @@ impl<P: ValueKind, T: ValueKind, D>
             target,
             iterable,
             binding,
+            addressing,
             template_resource
                 .map_resource(Resource::<SavedModuleSource, T, AbsoluteBindingAddress, D>::from),
             secrecy,
@@ -1762,6 +1797,7 @@ where
             target: &'a DeferredForTarget<B>,
             iterable: &'a Value<P, B>,
             binding: &'a ForBinding,
+            addressing: LoopAddressing,
             template_resource:
                 deferred_template_resource_serde::SerializableResource<'a, S, T, B, D>,
         }
@@ -1777,6 +1813,7 @@ where
                 target: &self.target,
                 iterable: &self.iterable,
                 binding: &self.binding,
+                addressing: self.addressing,
                 template_resource: deferred_template_resource_serde::SerializableResource(
                     self.template_resource.as_resource(),
                 ),
@@ -1813,6 +1850,7 @@ where
             target: DeferredForTarget<B>,
             iterable: Value<P, B>,
             binding: ForBinding,
+            addressing: LoopAddressing,
             template_resource: deferred_template_resource_serde::DeserializableResource<S, T, B, D>,
         }
 
@@ -1872,6 +1910,7 @@ where
             wire.target,
             wire.iterable,
             wire.binding,
+            wire.addressing,
             template_resource,
             TemplateSecrecy::Unavailable(crate::secrecy::TemplateEvidenceUnavailable::SavedPlan),
         ))
@@ -1958,6 +1997,7 @@ impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPla
             target,
             iterable,
             binding,
+            addressing,
             template_resource,
             deferred_effect_id: _,
             secrecy,
@@ -1971,6 +2011,7 @@ impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPla
             target,
             iterable.into_expanded()?,
             binding,
+            addressing,
             template_resource,
             secrecy,
         ))
@@ -9218,7 +9259,7 @@ impl<E> ExpandedFile<E> {
                 })?;
             if let DeferredForTarget::Bound(bound) = deferred.target() {
                 match crate::resource::admit_bound_for_addresses(
-                    &deferred.binding,
+                    deferred.addressing,
                     bound,
                     crate::resource::knowledge::ClassifiedRef::from(&classification),
                     crate::resource::ForAddressMoment::Plan,
@@ -9407,7 +9448,7 @@ pub(crate) fn expand_deferred_children_for_test<
 ) -> Result<Vec<Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>>, DeferredForExpansionError> {
     let members = match deferred.target() {
         DeferredForTarget::Bound(target) => match crate::resource::admit_bound_for_addresses(
-            &deferred.binding,
+            deferred.addressing,
             target,
             iterable.classified(),
             crate::resource::ForAddressMoment::Plan,
@@ -9443,12 +9484,13 @@ pub(crate) fn expand_deferred_children_with_members<
     miss_policy: crate::resource::AccessMissPolicy,
     type_checks: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<Vec<Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>>, DeferredForExpansionError> {
-    expand_for_members(members, |child| {
+    expand_for_members(deferred.addressing, members, |child| {
         build_expanded_child(deferred, child, miss_policy, type_checks)
     })
 }
 
 fn expand_for_members<R, E: From<ShapeMismatch>>(
+    addressing: LoopAddressing,
     members: ForChildMembers<'_>,
     mut build: impl FnMut(ExpandedForChild<'_>) -> Result<R, E>,
 ) -> Result<Vec<R>, E> {
@@ -9476,11 +9518,8 @@ fn expand_for_members<R, E: From<ShapeMismatch>>(
         }
         other => other,
     };
-    match (binding, &iterable) {
-        (
-            ForBinding::Simple(_) | ForBinding::Indexed(_, _),
-            Value::Concrete(ConcreteValue::List(items)),
-        ) => items
+    match (addressing, &iterable) {
+        (LoopAddressing::Indexed, Value::Concrete(ConcreteValue::List(items))) => items
             .iter()
             .enumerate()
             .map(|(index, value)| {
@@ -9492,7 +9531,7 @@ fn expand_for_members<R, E: From<ShapeMismatch>>(
                 })
             })
             .collect(),
-        (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::Map(map))) => {
+        (LoopAddressing::MapKeyed, Value::Concrete(ConcreteValue::Map(map))) => {
             let mut keys: Vec<_> = map.keys().collect();
             keys.sort();
             keys.into_iter()
@@ -9506,11 +9545,14 @@ fn expand_for_members<R, E: From<ShapeMismatch>>(
                 })
                 .collect()
         }
-        (ForBinding::Simple(_) | ForBinding::Indexed(_, _), other) => {
+        (LoopAddressing::Indexed, other) => {
             Err(ShapeMismatch::new("list", deferred_iterable_kind(other)).into())
         }
-        (ForBinding::Map(_, _), other) => {
+        (LoopAddressing::MapKeyed, other) => {
             Err(ShapeMismatch::new("map", deferred_iterable_kind(other)).into())
+        }
+        (LoopAddressing::ValueKeyed, _) => {
+            unreachable!("value-keyed members require bound admission")
         }
     }
 }
@@ -10368,7 +10410,7 @@ mod substitute_placeholder_tests {
             .into_classification();
         let crate::resource::ForAddressAdmission::Admitted(members) =
             crate::resource::admit_bound_for_addresses(
-                &deferred.binding,
+                deferred.addressing,
                 target,
                 crate::resource::knowledge::ClassifiedRef::from(&classification),
                 crate::resource::ForAddressMoment::Validation,
@@ -10491,6 +10533,7 @@ mod substitute_placeholder_tests {
                 .expect("fixture binding is valid"),
             Value::root_resource_ref("cert", "options", Vec::new()),
             ForBinding::Simple("opt".to_string()),
+            crate::parser::LoopAddressing::ValueKeyed,
             template_resource,
         );
 
@@ -10546,6 +10589,7 @@ mod substitute_placeholder_tests {
                 .expect("fixture binding is valid"),
             Value::root_resource_ref("source", "children", Vec::new()),
             ForBinding::Simple("child".to_string()),
+            crate::parser::LoopAddressing::ValueKeyed,
             template_resource,
         );
 
@@ -10618,6 +10662,7 @@ mod substitute_placeholder_tests {
             DeferredForTarget::bound(absolute_binding("children")).unwrap(),
             Value::root_resource_ref("source", "flags", Vec::new()),
             ForBinding::Simple("flag".to_string()),
+            crate::parser::LoopAddressing::ValueKeyed,
             resource
                 .into_loop_template(&crate::schema::SchemaRegistry::new(), None)
                 .unwrap(),
@@ -10673,7 +10718,7 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn deferred_list_and_map_expansion_produce_distinct_children() {
-        let deferred = |binding| {
+        let deferred = |binding, addressing| {
             DeferredForExpression::new(
                 None,
                 1,
@@ -10682,14 +10727,15 @@ mod substitute_placeholder_tests {
                     .expect("fixture binding is valid"),
                 Value::root_resource_ref("source", "children", Vec::new()),
                 binding,
+                addressing,
                 LoopResource::pending_with_provider("mock", "Target", None),
             )
         };
 
-        let list_deferred = deferred(ForBinding::Indexed(
-            "index".to_string(),
-            "child".to_string(),
-        ));
+        let list_deferred = deferred(
+            ForBinding::Indexed("index".into(), "child".into()),
+            LoopAddressing::Indexed,
+        );
         let list_children = crate::validation::deferred_types::with_session_for_test(
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
@@ -10728,7 +10774,10 @@ mod substitute_placeholder_tests {
         assert_eq!(list_children[1].id.identity_str(), Some("children[1]"));
         assert_ne!(list_children[0].id, list_children[1].id);
 
-        let map_deferred = deferred(ForBinding::Map("key".to_string(), "child".to_string()));
+        let map_deferred = deferred(
+            ForBinding::Map("key".into(), "child".into()),
+            LoopAddressing::MapKeyed,
+        );
         let map_children = crate::validation::deferred_types::with_session_for_test(
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
@@ -10866,6 +10915,7 @@ mod substitute_placeholder_tests {
                 default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),
             }),
             ForBinding::Simple("opt".to_string()),
+            crate::parser::LoopAddressing::ValueKeyed,
             LoopResource::new("mock.Target", "children"),
         );
 
@@ -10893,6 +10943,7 @@ mod substitute_placeholder_tests {
                 .expect("fixture binding is valid"),
             Value::root_resource_ref("cert", "options", Vec::new()),
             ForBinding::Simple("opt".to_string()),
+            crate::parser::LoopAddressing::ValueKeyed,
             Resource::new("mock.Target", "children"),
         );
 
@@ -10914,6 +10965,7 @@ mod substitute_placeholder_tests {
             DeferredForTarget::bound(absolute_binding("children")).unwrap(),
             Value::root_resource_ref("cert", "options", Vec::new()),
             ForBinding::Simple("opt".into()),
+            crate::parser::LoopAddressing::ValueKeyed,
             Resource::new("mock.Target", "children"),
         );
         let wire = serde_json::to_value(deferred.into_compiled()).unwrap();
@@ -10940,6 +10992,7 @@ mod substitute_placeholder_tests {
             DeferredForTarget::bound(absolute_binding("children")).unwrap(),
             Value::root_resource_ref("cert", "options", Vec::new()),
             ForBinding::Simple("opt".into()),
+            crate::parser::LoopAddressing::ValueKeyed,
             Resource::new("mock.Target", "children"),
         );
         let mut wire = serde_json::to_value(deferred.into_compiled()).unwrap();
@@ -10966,6 +11019,7 @@ mod substitute_placeholder_tests {
             Value::resource_ref("upstream", "items", vec![]),
             ParsedDeferredForIterableState::Deferred,
             ForBinding::Simple("item".into()),
+            crate::parser::LoopAddressing::ValueKeyed,
             DeferredForBody::resource(Resource::new("mock.test.resource", "rows")),
         );
         parsed.record_source_location(source, Path::new("/project"));
@@ -11051,6 +11105,7 @@ mod substitute_placeholder_tests {
             DeferredForTarget::bound(absolute_binding("children")).expect("valid bound target"),
             Value::root_resource_ref("parent", "children", Vec::new()),
             ForBinding::Simple("child".to_string()),
+            crate::parser::LoopAddressing::ValueKeyed,
             resource,
         )
         .into_compiled()
@@ -11168,6 +11223,7 @@ mod substitute_placeholder_tests {
             ),
             ParsedDeferredForIterableState::Deferred,
             ForBinding::Simple("item".to_string()),
+            crate::parser::LoopAddressing::ValueKeyed,
             body,
         );
         let DeferredForBody::Resource(template) = parsed.body() else {
@@ -11187,7 +11243,12 @@ mod substitute_placeholder_tests {
         assert_eq!(expression.deferred_effect_id().identity_str(), "right[?]");
     }
 
-    fn finalization_control(bound: bool, binding: ForBinding, shape_mismatch: bool) {
+    fn finalization_control(
+        bound: bool,
+        binding: ForBinding,
+        addressing: LoopAddressing,
+        shape_mismatch: bool,
+    ) {
         let mut parsed = crate::parser::parse(
             "let rs = for x in upstream.items { mock.test.resource { name = x } }",
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
@@ -11196,6 +11257,7 @@ mod substitute_placeholder_tests {
         .into_parsed_deferred_for_expressions()
         .remove(0);
         parsed.binding = binding;
+        parsed.addressing = addressing;
         if !bound {
             parsed.target = DeferredForTarget::Unbound {
                 template: UnboundLoopTemplate::new(
@@ -11229,22 +11291,42 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn for_value_keys_finalization_tolerates_shape_mismatch() {
-        finalization_control(true, ForBinding::Simple("x".into()), true);
+        finalization_control(
+            true,
+            ForBinding::Simple("x".into()),
+            LoopAddressing::ValueKeyed,
+            true,
+        );
     }
 
     #[test]
     fn deferred_unbound_finalization_preserves_failed_knowledge() {
-        finalization_control(false, ForBinding::Simple("x".into()), false);
+        finalization_control(
+            false,
+            ForBinding::Simple("x".into()),
+            LoopAddressing::Indexed,
+            false,
+        );
     }
 
     #[test]
     fn deferred_indexed_finalization_preserves_failed_knowledge() {
-        finalization_control(true, ForBinding::Indexed("i".into(), "x".into()), false);
+        finalization_control(
+            true,
+            ForBinding::Indexed("i".into(), "x".into()),
+            LoopAddressing::Indexed,
+            false,
+        );
     }
 
     #[test]
     fn deferred_map_finalization_preserves_failed_knowledge() {
-        finalization_control(true, ForBinding::Map("k".into(), "x".into()), false);
+        finalization_control(
+            true,
+            ForBinding::Map("k".into(), "x".into()),
+            LoopAddressing::MapKeyed,
+            false,
+        );
     }
 
     #[test]
@@ -11275,6 +11357,7 @@ mod substitute_placeholder_tests {
             ),
             ParsedDeferredForIterableState::Deferred,
             ForBinding::Simple("item".to_string()),
+            crate::parser::LoopAddressing::ValueKeyed,
             body,
         );
 
@@ -11334,6 +11417,7 @@ mod substitute_placeholder_tests {
             ),
             ParsedDeferredForIterableState::Deferred,
             ForBinding::Simple("item".to_string()),
+            crate::parser::LoopAddressing::Indexed,
             DeferredForBody::Resource(Box::new(template)),
         );
         let DeferredForBody::Resource(template) = parsed.body() else {
@@ -11487,6 +11571,7 @@ mod substitute_placeholder_tests {
             target: &'a DeferredForTarget,
             iterable: &'a Value,
             binding: &'a ForBinding,
+            addressing: LoopAddressing,
             template_resource: &'a Resource<ModuleSource, LoopSlot, AbsoluteBindingAddress, ()>,
         }
 
@@ -11533,6 +11618,7 @@ mod substitute_placeholder_tests {
                 .expect("fixture binding is non-empty"),
             Value::root_resource_ref("parent", "children", Vec::new()),
             ForBinding::Simple("child".to_string()),
+            crate::parser::LoopAddressing::ValueKeyed,
             resource,
         )
         .into_compiled();
@@ -11550,6 +11636,7 @@ mod substitute_placeholder_tests {
             target: expression.target(),
             iterable: &expression.iterable,
             binding: &expression.binding,
+            addressing: expression.addressing,
             template_resource: expression.template_resource().as_resource(),
         };
 

@@ -403,6 +403,7 @@ fn snapshot_saved_plan_loop_expansion_uses_checked_conversion() {
         DeferredForTarget::bound(template.binding.clone().unwrap()).unwrap(),
         root_resource_ref("state", "items", vec![]),
         ForBinding::Simple("item".into()),
+        carina_core::parser::LoopAddressing::ValueKeyed,
         template,
     );
     // Decode the same snapshot representation used inside saved-plan values.

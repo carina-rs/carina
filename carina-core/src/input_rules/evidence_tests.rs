@@ -1136,6 +1136,7 @@ fn deferred_template_retains_literal_guard_evidence() {
                 .unwrap(),
                 Value::root_resource_ref("parent", "items", vec![]),
                 ForBinding::Simple("item".into()),
+                crate::parser::LoopAddressing::ValueKeyed,
                 Resource::with_provider("mock", "Review", "children", None)
                     .with_attribute("enabled", enabled.clone())
                     .with_attribute(

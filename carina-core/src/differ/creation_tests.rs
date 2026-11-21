@@ -304,6 +304,7 @@ fn deferred_payload() -> DeferredCreatePayload {
         .unwrap(),
         Value::root_resource_ref("parent", "items", vec![]),
         crate::parser::ForBinding::Indexed("_".into(), "item".into()),
+        crate::parser::LoopAddressing::Indexed,
         Resource::with_provider("mock", "Bucket", "children", None).with_attribute(
             "name",
             // The loop's item has no known element type.

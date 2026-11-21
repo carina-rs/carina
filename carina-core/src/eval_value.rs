@@ -46,7 +46,7 @@ pub(crate) struct UnexpandedStructuralHandle<B: BindingAddress = RelativeBinding
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnexpandedStructuralHandleKind {
     Resource(ResourceTypePath),
-    For(crate::parser::ForBinding),
+    For(crate::parser::LoopAddressing),
     If,
     Use,
     Module,
@@ -87,11 +87,11 @@ impl UnexpandedStructuralHandleKind {
             Self::Use => {
                 "instantiate the module, then reference an output from the module call".to_string()
             }
-            Self::For(crate::parser::ForBinding::Indexed(_, _)) => {
+            Self::For(crate::parser::LoopAddressing::Indexed) => {
                 format!("reference an instance attribute, e.g. '{binding}[0].<attribute>'")
             }
             Self::For(
-                crate::parser::ForBinding::Simple(_) | crate::parser::ForBinding::Map(_, _),
+                crate::parser::LoopAddressing::ValueKeyed | crate::parser::LoopAddressing::MapKeyed,
             ) => {
                 format!("reference an instance attribute, e.g. '{binding}['key'].<attribute>'")
             }

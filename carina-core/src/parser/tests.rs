@@ -1661,6 +1661,7 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
             empty(),
             ParsedDeferredForIterableState::Deferred,
             ForBinding::Simple("item".to_string()),
+            crate::parser::LoopAddressing::ValueKeyed,
             body,
         ));
 
@@ -1746,6 +1747,7 @@ fn expansion_boundary_checks_canonical_deferred_template_resource_attributes() {
             }),
             ParsedDeferredForIterableState::Deferred,
             ForBinding::Simple("item".to_string()),
+            crate::parser::LoopAddressing::ValueKeyed,
             body,
         ));
 

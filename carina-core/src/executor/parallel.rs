@@ -1535,6 +1535,7 @@ mod tests {
             crate::parser::DeferredForTarget::bound(absolute("children")).unwrap(),
             crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(Vec::new())),
             crate::parser::ForBinding::Indexed("_".into(), "value".into()),
+            crate::parser::LoopAddressing::Indexed,
             crate::resource::Resource::<crate::resource::ModuleSource, crate::resource::LoopSlot>::with_provider(
                 "mock", "test.Child", "children", None,
             ),

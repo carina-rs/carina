@@ -130,6 +130,7 @@ fn deferred_create_uses_create_symbol_and_kind() {
         .expect("fixture binding is valid"),
         root_ref("cert", "domain_validation_options"),
         ForBinding::Indexed("_".into(), "opt".to_string()),
+        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
 

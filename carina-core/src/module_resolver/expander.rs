@@ -4071,7 +4071,7 @@ fn admit_module_argument_loops(
             continue;
         };
         if !matches!(&deferred.body, DeferredForBody::Resource(_))
-            || !matches!(&deferred.binding, crate::parser::ForBinding::Simple(_))
+            || deferred.addressing != crate::parser::LoopAddressing::ValueKeyed
         {
             continue;
         }
@@ -4093,7 +4093,7 @@ fn admit_module_argument_loops(
             .clone()
             .map_bindings(&mut |binding| resolver.scope.resolve(binding));
         let members = match crate::resource::admit_bound_for_addresses(
-            &deferred.binding,
+            deferred.addressing,
             &target,
             crate::resource::knowledge::ClassifiedRef::from(&classification),
             crate::resource::ForAddressMoment::Validation,
@@ -4161,6 +4161,7 @@ fn expand_parsed_deferred_for_expression(
         iterable,
         iterable_state,
         binding,
+        addressing,
         body,
     } = deferred.parts();
     let instance_identity = ResourceIdentity::try_from(resolver.scope.key().to_string())
@@ -4235,6 +4236,7 @@ fn expand_parsed_deferred_for_expression(
         iterable,
         iterable_state,
         binding.clone(),
+        addressing,
         body,
     ))
 }

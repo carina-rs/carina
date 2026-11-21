@@ -1072,6 +1072,7 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
         .expect("fixture binding is valid"),
         root_resource_ref("cert", "domain_validation_options"),
         carina_core::parser::ForBinding::Indexed("_".into(), "opt".to_string()),
+        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
 
@@ -1129,6 +1130,7 @@ fn deferred_validation_records_effect() -> Effect {
         .expect("fixture binding is valid"),
         root_resource_ref("cert", "domain_validation_options"),
         carina_core::parser::ForBinding::Indexed("_".into(), "opt".to_string()),
+        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
 

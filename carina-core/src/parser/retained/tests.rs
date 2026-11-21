@@ -187,6 +187,47 @@ fn source_schema_report(source: &str) -> (crate::parser::ParsedFile, ExpressionR
 }
 
 #[test]
+fn loop_addressing_is_retained_for_bound_and_unbound_sites() {
+    use crate::parser::LoopAddressing;
+    for (site, iterable, expected) in [
+        ("let children = for x", "['a']", LoopAddressing::ValueKeyed),
+        (
+            "let children = for (i, x)",
+            "['a']",
+            LoopAddressing::Indexed,
+        ),
+        (
+            "let children = for k, x",
+            "{ a = 'x' }",
+            LoopAddressing::MapKeyed,
+        ),
+        ("for x", "['a']", LoopAddressing::Indexed),
+        ("for (i, x)", "['a']", LoopAddressing::Indexed),
+        ("for k, x", "{ a = 'x' }", LoopAddressing::MapKeyed),
+    ] {
+        let source = format!(
+            "let items = {iterable}\n{site} in items {{ mock.test.Source {{ name = x }} }}"
+        );
+        let (_, report) = source_schema_report(&source);
+        let addressing: Vec<_> = report
+            .authored_for_iterables(&report)
+            .map(|authored| authored.addressing)
+            .collect();
+        assert_eq!(addressing, [expected], "{source}");
+        if site.starts_with("let") {
+            let group = report
+                .binding(&RelativeBindingName::new("children"))
+                .unwrap();
+            assert_eq!(
+                matches!(group.static_type(), Ok(TypeExpr::List(_))),
+                expected == LoopAddressing::Indexed,
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
 fn keyed_loop_groups_have_no_value_type_or_collection_sink() {
     for source in [
         "let items = { a = 'x' }\nlet children = for k, v in items { mock.test.Source { name = v } }",

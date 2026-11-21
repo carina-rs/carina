@@ -33,7 +33,7 @@ use crate::binding_index::{
 };
 use crate::deps::collect_dependencies;
 use crate::parser::{
-    ForBinding, LoadedProviderContext, ModuleCall, ModuleCallId, ParsedValue as Value,
+    LoadedProviderContext, LoopAddressing, ModuleCall, ModuleCallId, ParsedValue as Value,
     ProviderContext, ResourceRef, ResourceTypePath, SourceFileId, SourceSpan, TypeExpr,
 };
 use crate::resource::{
@@ -6513,9 +6513,9 @@ fn validate_authored_for_iterable_types<B: BindingAddress>(
 ) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>> {
     let mut diagnostics = Vec::new();
     for authored in report.authored_for_iterables(key_report) {
-        let expected = match authored.binding {
-            ForBinding::Simple(_) | ForBinding::Indexed(_, _) => DeferredIterableKind::List,
-            ForBinding::Map(_, _) => DeferredIterableKind::Map,
+        let expected = match authored.addressing {
+            LoopAddressing::Indexed | LoopAddressing::ValueKeyed => DeferredIterableKind::List,
+            LoopAddressing::MapKeyed => DeferredIterableKind::Map,
         };
         let (judged, key_judged) = match (authored.judged, authored.key_judged) {
             (Ok(judged), Ok(key_judged)) => (judged, key_judged),
@@ -6533,7 +6533,7 @@ fn validate_authored_for_iterable_types<B: BindingAddress>(
         validate_for_iterable_operand(
             ForIterableValidationContext {
                 expected,
-                value_keys: matches!(authored.binding, ForBinding::Simple(_)) && authored.bound,
+                addressing: authored.addressing,
                 judged,
                 key_judged,
                 provider_context,
@@ -6619,7 +6619,7 @@ impl std::fmt::Display for DeferredIterableKind {
 
 struct ForIterableValidationContext<'a> {
     expected: DeferredIterableKind,
-    value_keys: bool,
+    addressing: LoopAddressing,
     provider_context: &'a ProviderContext,
     judged: &'a crate::parser::retained::JudgedExpr,
     key_judged: &'a crate::parser::retained::JudgedExpr,
@@ -6671,7 +6671,7 @@ fn validate_for_iterable_operand(
     };
     let judged = context.judged.for_sink(&sink, context.provider_context);
     let key_judged = context.key_judged.for_sink(&sink, context.provider_context);
-    if context.value_keys
+    if context.addressing == LoopAddressing::ValueKeyed
         && (key_judged.collection_kind() == Some(crate::parser::retained::CollectionKind::List)
             || context.key_judged.has_list_elements())
     {
@@ -6684,7 +6684,7 @@ fn validate_for_iterable_operand(
             }
         }
     }
-    if context.value_keys
+    if context.addressing == LoopAddressing::ValueKeyed
         && let Ok(DeferredIterableShape::List(Some(element))) =
             deferred_iterable_shape_for_phase(&key_judged)
         && let Err(error) = crate::resource::classify_for_key_type(&element)

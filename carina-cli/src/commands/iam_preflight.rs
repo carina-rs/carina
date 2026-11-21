@@ -1237,6 +1237,7 @@ mod tests {
             Value::resource_ref("cert", "domain_validation_options", Vec::new())
                 .resolve_root_for_test(),
             ForBinding::Indexed("_".into(), "opt".to_string()),
+            carina_core::parser::LoopAddressing::Indexed,
             template_resource,
         );
         plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
@@ -1280,6 +1281,7 @@ mod tests {
             Value::resource_ref("cert", "domain_validation_options", Vec::new())
                 .resolve_root_for_test(),
             ForBinding::Indexed("_".into(), "opt".to_string()),
+            carina_core::parser::LoopAddressing::Indexed,
             template_resource,
         );
         plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(

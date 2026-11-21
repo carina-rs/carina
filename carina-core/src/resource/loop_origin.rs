@@ -812,7 +812,7 @@ mod for_key_type_tests {
                 .unwrap()
                 .into_classification();
             let admission = admit_bound_for_addresses(
-                &crate::parser::ForBinding::Simple("x".into()),
+                crate::parser::LoopAddressing::ValueKeyed,
                 &target,
                 crate::resource::knowledge::ClassifiedRef::from(&classified),
                 ForAddressMoment::Validation,
@@ -927,7 +927,7 @@ mod for_key_type_tests {
         let target =
             crate::parser::BoundDeferredTarget::new(RelativeBindingName::new("rs")).unwrap();
         let error = admit_bound_for_addresses(
-            &crate::parser::ForBinding::Simple("x".into()),
+            crate::parser::LoopAddressing::ValueKeyed,
             &target,
             crate::resource::knowledge::ClassifiedRef::from(&classification),
             ForAddressMoment::Validation,
@@ -958,7 +958,7 @@ mod for_key_type_tests {
         let target =
             crate::parser::BoundDeferredTarget::new(RelativeBindingName::new("rs")).unwrap();
         let error = admit_bound_for_addresses(
-            &crate::parser::ForBinding::Simple("x".into()),
+            crate::parser::LoopAddressing::ValueKeyed,
             &target,
             crate::resource::knowledge::ClassifiedRef::from(&classified),
             ForAddressMoment::Validation,

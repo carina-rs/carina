@@ -11102,6 +11102,7 @@ fn deferred_block_name_conflict_reports_materialized_template_address() {
             .expect("fixture binding is valid"),
         Value::resource_ref("pending", "items", Vec::new()).resolve_root_for_test(),
         carina_core::parser::ForBinding::Indexed("_".into(), "item".to_string()),
+        carina_core::parser::LoopAddressing::Indexed,
         template_resource,
     );
     let unresolved = carina_core::parser::ParsedFile::default();

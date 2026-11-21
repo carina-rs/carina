@@ -2028,6 +2028,7 @@ fn parsed_deferred_resource(
         expression.iterable.clone(),
         crate::parser::ParsedDeferredForIterableState::Deferred,
         expression.binding.clone(),
+        expression.addressing,
         DeferredForBody::Resource(Box::new(expression.template_resource().clone())),
     )
 }
@@ -9256,6 +9257,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                     .expect("fixture binding is valid"),
                 Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 ForBinding::Map("_".to_string(), "opt".to_string()),
+                crate::parser::LoopAddressing::MapKeyed,
                 Resource {
                     id: ResourceId::with_identity("route53.RecordSet", "placeholder"),
                     attributes: {
@@ -9414,6 +9416,7 @@ fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
                     .expect("fixture binding is valid"),
                 Value::resource_ref("accounts", "items", Vec::new()),
                 ForBinding::Map("_".to_string(), "account".to_string()),
+                crate::parser::LoopAddressing::MapKeyed,
                 Resource::pending_with_provider("awscc", "sso.Assignment", None),
             ),
         ));
@@ -9496,6 +9499,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                         .expect("fixture binding is valid"),
                     Value::resource_ref("accounts", "list", Vec::new()),
                     ForBinding::Map("_".to_string(), "a".to_string()),
+                    crate::parser::LoopAddressing::MapKeyed,
                     Resource {
                         id: ResourceId::with_identity("sso.Assignment", "placeholder"),
                         attributes: HashMap::new().into_iter().collect(),
