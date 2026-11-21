@@ -30,6 +30,21 @@ fn output_text(output: &Output) -> String {
     )
 }
 
+fn validate_diagnostic_messages(root: &Path) -> (Vec<String>, Vec<String>) {
+    let output = run(root, &["validate", ".", "--json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", output_text(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let messages = |kind: &str| {
+        report[kind]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|diagnostic| diagnostic["message"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    (messages("errors"), messages("warnings"))
+}
+
 fn assert_success(label: &str, output: &Output) {
     let text = output_text(output);
     assert!(output.status.success(), "{label} failed:\n{text}");
@@ -112,7 +127,7 @@ fn loop_reader_positions(reader: &str) -> [(&'static str, String); 8] {
     ]
 }
 
-fn validate_loop_reader(root: &Path, position: &str, expression: &str) -> Output {
+fn write_loop_reader(root: &Path, position: &str, expression: &str) {
     let comment = if position == "export" {
         "'other'"
     } else {
@@ -133,6 +148,10 @@ fn validate_loop_reader(root: &Path, position: &str, expression: &str) -> Output
         "exports.crn",
         &format!("exports {{ out: String = {export} }}\n"),
     );
+}
+
+fn validate_loop_reader(root: &Path, position: &str, expression: &str) -> Output {
+    write_loop_reader(root, position, expression);
     run(root, &["validate", "."])
 }
 
@@ -162,12 +181,41 @@ fn keyed_loop_invalid_reader_spellings_stay_rejected_in_every_position() {
         };
         for reader in ["children.a.name", invalid_subscript] {
             for (position, expression) in loop_reader_positions(reader) {
-                let output = validate_loop_reader(fixture.path(), position, &expression);
-                assert!(
-                    !output.status.success(),
-                    "{kind}, {position}, {reader} unexpectedly passed: {}",
-                    output_text(&output)
-                );
+                let expected = match (kind, reader, position) {
+                    ("value-keyed", "children[0].name", _) => vec![
+                        "This loop is value-keyed; use a string subscript, or `for (i, x) in ...` for index addressing.",
+                    ],
+                    ("indexed", "children['a'].name", "plain" | "single interpolation") => {
+                        vec!["Undefined identifier `children.a`. Did you mean `children`?"]
+                    }
+                    ("indexed", "children['a'].name", _) => vec![
+                        "Undefined identifier `children.a`. Did you mean `children`?",
+                        "cannot apply access ['a'] to list(mock.test.resource)",
+                    ],
+                    (_, "children.a.name", "plain") => {
+                        vec!["unknown binding 'children' in reference children.a"]
+                    }
+                    (_, "children.a.name", "single interpolation") => vec![
+                        "mock.test.resource.other: unknown binding 'children' in reference children.a.name",
+                    ],
+                    ("indexed", "children.a.name", _) => {
+                        vec!["cannot apply access .a to list(mock.test.resource)"]
+                    }
+                    (_, "children.a.name", _) => vec!["cannot apply access .a to keyed loop group"],
+                    ("map", "children[0].name", "plain") => {
+                        vec!["unknown binding 'children[0]' in reference children[0].name"]
+                    }
+                    ("map", "children[0].name", "single interpolation") => vec![
+                        "mock.test.resource.other: unknown binding 'children[0]' in reference children[0].name",
+                    ],
+                    ("map", "children[0].name", _) => {
+                        vec!["cannot apply access [0] to keyed loop group"]
+                    }
+                    other => panic!("uncovered invalid reader case: {other:?}"),
+                };
+                write_loop_reader(fixture.path(), position, &expression);
+                let (errors, _) = validate_diagnostic_messages(fixture.path());
+                assert_eq!(errors, expected, "{kind}, {position}, {reader}");
             }
         }
     }
@@ -225,6 +273,59 @@ fn keyed_loop_whole_groups_stay_rejected_as_values() {
             );
         }
     }
+}
+
+#[test]
+fn keyed_loop_group_directory_diagnostic_lists() {
+    let fixture = loop_reader_fixture(LOOP_READER_CASES[0].1);
+    let bare_group = "'children' is a for binding, not a value; reference an instance attribute, e.g. 'children['key'].<attribute>'";
+    let coalesce = "coalesce default type `Map` does not match left type `keyed loop group`";
+    let unused_key = "for-loop binding 'k' is unused. Rename to '_' to suppress this warning.";
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for (position, other, exports, errors) in [
+        (
+            "iterable",
+            "let copies = for c in children { mock.test.resource { name = c.name } }\n",
+            "exports {}\n",
+            vec![bare_group],
+        ),
+        (
+            "sink",
+            "let other = mock.test.resource { name = 'other' comment = children }\n",
+            "exports { out: String = other.name }\n",
+            vec![bare_group],
+        ),
+        (
+            "coalesce sink",
+            "let other = mock.test.resource { name = 'other' comment = children ?? {} }\n",
+            "exports { out: String = other.name }\n",
+            vec![coalesce, bare_group],
+        ),
+        (
+            "export",
+            "",
+            "exports { out = children }\n",
+            vec![bare_group],
+        ),
+        (
+            "coalesce export",
+            "",
+            "exports { out = children ?? {} }\n",
+            vec![bare_group],
+        ),
+    ] {
+        write_file(fixture.path(), "other.crn", other);
+        write_file(fixture.path(), "exports.crn", exports);
+        let (errors_actual, warnings) = validate_diagnostic_messages(fixture.path());
+        actual.push((position, errors_actual, warnings));
+        expected.push((
+            position,
+            errors.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+            vec![unused_key.to_owned()],
+        ));
+    }
+    assert_eq!(actual, expected, "complete CLI diagnostic lists");
 }
 
 #[test]

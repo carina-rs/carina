@@ -42,6 +42,92 @@ fn checked_configuration(
 }
 
 #[test]
+fn keyed_loop_group_directory_diagnostic_lists() {
+    let snapshot = Arc::new(snapshot());
+    let engine = DiagnosticEngine::new(Arc::clone(&snapshot), vec!["mock".into()]);
+    let directory = tempfile::tempdir().unwrap();
+    for (file, source) in [
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "backend.crn",
+            "backend local { path = 'carina.state.json' }\n",
+        ),
+        (
+            "main.crn",
+            "let items = { a = 'x' }\nlet children = for k, v in items { mock.test.resource { name = v } }\n",
+        ),
+    ] {
+        std::fs::write(directory.path().join(file), source).unwrap();
+    }
+    let bare_group = "'children' is a for binding, not a value; reference an instance attribute, e.g. 'children['key'].<attribute>'";
+    let coalesce = "coalesce default type `Map` does not match left type `keyed loop group`";
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for (position, other, exports, file, errors) in [
+        (
+            "iterable",
+            "let copies = for c in children { mock.test.resource { name = c.name } }\n",
+            "exports {}\n",
+            "other.crn",
+            vec![bare_group],
+        ),
+        (
+            "sink",
+            "let other = mock.test.resource { name = 'other' comment = children }\n",
+            "exports { out: String = other.name }\n",
+            "other.crn",
+            vec![bare_group],
+        ),
+        (
+            "coalesce sink",
+            "let other = mock.test.resource { name = 'other' comment = children ?? {} }\n",
+            "exports { out: String = other.name }\n",
+            "other.crn",
+            vec![coalesce, bare_group],
+        ),
+        (
+            "export",
+            "",
+            "exports { out = children }\n",
+            "exports.crn",
+            vec![bare_group],
+        ),
+        (
+            "coalesce export",
+            "",
+            "exports { out = children ?? {} }\n",
+            "exports.crn",
+            vec![bare_group],
+        ),
+    ] {
+        std::fs::write(directory.path().join("other.crn"), other).unwrap();
+        std::fs::write(directory.path().join("exports.crn"), exports).unwrap();
+        let path = directory.path().join(file);
+        let document = Document::new_with_path(
+            std::fs::read_to_string(&path).unwrap(),
+            path.clone(),
+            Arc::new(snapshot.provider_context().as_provider_context().clone()),
+        );
+        let diagnostics = engine.analyze(&document, Some(&path));
+        actual.push((
+            position,
+            diagnostics
+                .into_iter()
+                .map(|diagnostic| (diagnostic.severity, diagnostic.message))
+                .collect::<Vec<_>>(),
+        ));
+        expected.push((
+            position,
+            errors
+                .into_iter()
+                .map(|message| (Some(DiagnosticSeverity::ERROR), message.to_owned()))
+                .collect::<Vec<_>>(),
+        ));
+    }
+    assert_eq!(actual, expected, "complete LSP diagnostic lists");
+}
+
+#[test]
 fn keyed_loop_compound_reader_directory_diagnostics() {
     let snapshot = Arc::new(snapshot());
     let engine = DiagnosticEngine::new(Arc::clone(&snapshot), vec!["mock".into()]);

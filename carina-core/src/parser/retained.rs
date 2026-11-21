@@ -4025,7 +4025,6 @@ mod judgement {
                     InferredKind::BuiltinStringList(_) => {
                         InferredKind::BuiltinStringList(Classification::Known)
                     }
-                    InferredKind::KeyedGroup(knowledge) => InferredKind::KeyedGroup(knowledge),
                     other => other,
                 };
             }
@@ -4046,7 +4045,6 @@ mod judgement {
                     InferredKind::BuiltinStringList(_) => {
                         InferredKind::BuiltinStringList(Classification::Known)
                     }
-                    InferredKind::KeyedGroup(knowledge) => InferredKind::KeyedGroup(knowledge),
                     other => other,
                 };
             }
@@ -4281,7 +4279,10 @@ mod judgement {
                 .map(ToString::to_string)
                 .unwrap_or_else(|_| {
                     self.value_shape()
-                        .map(|shape| format!("{shape:?}"))
+                        .map(|shape| match shape {
+                            ValueShape::KeyedGroup => "keyed loop group".into(),
+                            shape => format!("{shape:?}"),
+                        })
                         .unwrap_or_else(|| "value-dependent expression".into())
                 })
         }
@@ -6905,7 +6906,7 @@ mod judgement {
                     } else if let Some(definition) = self.expressions.definitions.get(name) {
                         InferredExpr::from(&self.judge(definition))
                     } else {
-                        ordinary(Ok(TypeExpr::String), true).with_kind(|_| InferredKind::Literal)
+                        value_dependent("binding has no authored definition")
                     }
                 }
                 ExprKind::Reference {
@@ -7809,7 +7810,11 @@ mod judgement {
             CollectionKind::Map => InferredKind::Map(knowledge),
             CollectionKind::KeyedGroup => InferredKind::KeyedGroup(knowledge),
         });
-        result.report_at(FailureOwner::Boundary);
+        result.report_at(match shape {
+            // Binding-scope validation owns structural group value errors.
+            CollectionKind::KeyedGroup => FailureOwner::BindingScope,
+            CollectionKind::List | CollectionKind::Map => FailureOwner::Boundary,
+        });
         result
     }
 
