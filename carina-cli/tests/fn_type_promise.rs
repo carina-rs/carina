@@ -12,6 +12,9 @@ mod module_body;
 #[path = "fn_type_promise/review_round2.rs"]
 mod review_round2;
 
+#[path = "fn_type_promise/untyped_parameter.rs"]
+mod untyped_parameter;
+
 use carina_cli::commands::validate::{ValidateDiagnostics, validate_diagnostics_with_factories};
 use carina_cli::wiring::LoadedProviderFactory;
 use carina_core::paths::ResolvedPath;
@@ -138,6 +141,15 @@ fn assert_rule3(directory: &Directory, position: Position, declared: &str, actua
     );
 }
 
+fn assert_untyped_return(directory: &Directory, declared: &str) {
+    assert_message(
+        directory,
+        &format!(
+            "function 'promise': return value is declared as {declared}, but it comes from parameter 'value', which has no declared type, so validate cannot prove it fits. Pass a value known at validate, or declare the type of parameter 'value'."
+        ),
+    );
+}
+
 fn case_directory(
     scope: Scope,
     position: Position,
@@ -198,15 +210,17 @@ macro_rules! rule3_case {
         #[test]
         fn $name() {
             let directory = case_directory($scope, $position, $ty, $setup, $expression);
-            let actual =
-                if matches!($position, Position::Return) && $expression == "upstream.untyped" {
-                    "unknown"
-                } else if matches!($scope, Scope::Module) && $expression == "upstream.untyped" {
+            if matches!($position, Position::Return) && $expression == "upstream.untyped" {
+                assert_untyped_return(&directory, $ty);
+            } else {
+                let actual = if matches!($scope, Scope::Module) && $expression == "upstream.untyped"
+                {
                     "String"
                 } else {
                     $actual
                 };
-            $check(&directory, $position, $ty, actual);
+                $check(&directory, $position, $ty, actual);
+            }
         }
     };
 }
@@ -1066,7 +1080,7 @@ fn tp2_untyped_body_primitive_return_owns_error() {
     directory.write_source(&format!(
         "{SOURCE}fn promise(value): Int {{ value }}\ntest.Sink {{ name = 'sink' number = promise(src.identifier) }}\n"
     ));
-    assert_rule3(&directory, Position::Return, "Int", "unknown");
+    assert_untyped_return(&directory, "Int");
 }
 
 #[test]
@@ -1104,5 +1118,5 @@ fn tp2_untyped_parameter_cannot_prove_int_return() {
     directory.write_source(&format!(
         "{SOURCE}fn promise(value): Int {{ value }}\ntest.Sink {{ name = 'sink' number = promise(src.count) }}\n"
     ));
-    assert_rule3(&directory, Position::Return, "Int", "unknown");
+    assert_untyped_return(&directory, "Int");
 }

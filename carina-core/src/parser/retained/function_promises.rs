@@ -20,11 +20,12 @@ use crate::validation::typecheck::{
 };
 use std::collections::BTreeSet;
 
-struct Source {
+struct Source<'a> {
     reference: Option<ResolvedRefType>,
     ty: Option<TypeExpr>,
     constructed_string: bool,
     untyped_export: Option<String>,
+    untyped_parameter: Option<(&'a str, &'a str)>,
     unavailable: bool,
     pending_substitution: bool,
     incomplete_context: bool,
@@ -36,7 +37,7 @@ pub(super) struct Finding {
     pub diagnostic: Located<InferenceError>,
 }
 
-impl Source {
+impl Source<'_> {
     fn evidence(&self) -> StaticAssignmentSource<'_> {
         if self.unavailable {
             StaticAssignmentSource::SchemaUnavailable
@@ -54,6 +55,11 @@ impl Source {
     fn diagnostic_source(&self) -> FunctionTypeSource<'_> {
         if let Some(export) = self.untyped_export.as_deref() {
             FunctionTypeSource::UntypedExport(export)
+        } else if let Some((function, parameter)) = self.untyped_parameter {
+            FunctionTypeSource::UntypedParameter {
+                function,
+                parameter,
+            }
         } else if let Some(reference) = &self.reference {
             FunctionTypeSource::Typed {
                 display: reference.display_type_name(),
@@ -99,6 +105,7 @@ struct Evidence<'a, 'index, B: BindingAddress> {
     complete_sources: bool,
     projections: HashMap<(ExpressionInstance, NodeId), &'a Value<ParserPlaceholder, B>>,
     definitions: HashSet<&'a str>,
+    untyped_parameters: HashMap<(ExpressionInstance, NodeId), (&'a str, &'a str)>,
 }
 
 impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
@@ -128,6 +135,21 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
                 };
             }
         }
+        let mut untyped_parameters = HashMap::new();
+        for node in report.syntax_nodes.values() {
+            if let ExprKind::Function { name, signature } = &node.kind {
+                for ((parameter, ty), id) in
+                    signature.parameters.iter().zip(&signature.parameter_nodes)
+                {
+                    if ty.is_none() {
+                        untyped_parameters.insert(
+                            (node.location.instance.clone(), *id),
+                            (name.as_str(), parameter.as_str()),
+                        );
+                    }
+                }
+            }
+        }
         Self {
             expressions,
             report,
@@ -135,6 +157,7 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
             values,
             complete_sources,
             projections,
+            untyped_parameters,
             definitions: expressions
                 .definitions
                 .keys()
@@ -392,7 +415,7 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
         false
     }
 
-    fn source(&self, expression: &ExprValue<ParserPlaceholder, B>) -> Source {
+    fn source(&self, expression: &ExprValue<ParserPlaceholder, B>) -> Source<'_> {
         let expressions = self.expressions;
         let report = self.report;
         let bindings = self.bindings;
@@ -419,6 +442,10 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
                         .is_single_string_construction()
             }),
             untyped_export: None,
+            untyped_parameter: self
+                .untyped_parameters
+                .get(&(node.location.instance.clone(), node.id))
+                .copied(),
             unavailable: self.schema_unavailable(expression),
             pending_substitution: self
                 .projection(expression)

@@ -154,7 +154,8 @@ For an unknown return value, Carina types the body once with each parameter's
 declared type. For example, `fn pick(x: String): 'dev' | 'prod' { x }` accepts
 `pick('dev')`, but rejects `pick(src.identifier)` when `src.identifier` is an
 unknown `String`. Declaring `x` with a narrower type supplies the corresponding
-return evidence. An untyped parameter supplies no type evidence for the return.
+return evidence. Untyped parameters supply no type evidence for declared returns
+or typed parameters in nested calls.
 
 Calls inside a function body use the enclosing function's declared parameter
 types, once per declaration. A non-proving nested call is reported at each outer

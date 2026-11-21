@@ -93,6 +93,10 @@ pub(crate) enum FunctionTypeSource<'a> {
     },
     Unknown,
     UntypedExport(&'a str),
+    UntypedParameter {
+        function: &'a str,
+        parameter: &'a str,
+    },
 }
 
 /// Only type/source metadata reaches this formatter, never an argument value.
@@ -122,12 +126,29 @@ pub(crate) fn format_function_type_promise_error(
         (FunctionTypeSource::UntypedExport(export), _) => {
             format!("{subject} comes from upstream export '{export}', which has no declared type")
         }
+        (FunctionTypeSource::UntypedParameter { parameter, .. }, FunctionTypePosition::Return) => {
+            format!("it comes from parameter '{parameter}', which has no declared type")
+        }
+        (
+            FunctionTypeSource::UntypedParameter {
+                function,
+                parameter,
+            },
+            FunctionTypePosition::Parameter(_),
+        ) => {
+            format!(
+                "its argument comes from parameter '{parameter}' of function '{function}', which has no declared type"
+            )
+        }
     };
     let advice = match source {
         FunctionTypeSource::Unknown => UNKNOWN_FUNCTION_TYPE_ADVICE.into(),
         FunctionTypeSource::UntypedExport(_) => {
             "Pass a value known at validate, or declare the export's type.".into()
         }
+        FunctionTypeSource::UntypedParameter { parameter, .. } => format!(
+            "Pass a value known at validate, or declare the type of parameter '{parameter}'."
+        ),
         // A named reference can retain a value check even for its own type.
         FunctionTypeSource::Typed { writable: None, .. } => UNKNOWN_FUNCTION_TYPE_ADVICE.into(),
         FunctionTypeSource::Typed {
