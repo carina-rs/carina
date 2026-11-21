@@ -126,7 +126,8 @@ pub fn build_plan_scheduler_dependency_edges(
 }
 
 use crate::resource::ResolvedResourceId;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use crate::schema::LeafPath;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -417,9 +418,21 @@ pub struct AcceptedRequest {
 pub enum AcceptedRequestKind {
     Create,
     Update {
-        sent: BTreeSet<String>,
+        sent: BTreeMap<String, SentKey>,
         removed: BTreeSet<String>,
     },
+}
+
+/// One sent update key and the observed leaves grafted into its payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentKey {
+    grafted_leaves: Vec<LeafPath>,
+}
+
+impl SentKey {
+    pub fn grafted_leaves(&self) -> &[LeafPath] {
+        &self.grafted_leaves
+    }
 }
 
 impl AcceptedRequest {
@@ -437,14 +450,19 @@ impl AcceptedRequest {
         resolved_desired_attributes: SecretPreservingAttributes,
     ) -> Self {
         let sent_attributes = request.patch().sent_attributes();
-        let mut sent = BTreeSet::new();
+        let mut sent = BTreeMap::new();
         let mut removed = BTreeSet::new();
         for op in &request.patch().ops {
             match op {
                 PatchOp::Add { key, .. }
                 | PatchOp::Replace { key, .. }
                 | PatchOp::Reassert { key, .. } => {
-                    sent.insert(key.clone());
+                    sent.insert(
+                        key.clone(),
+                        SentKey {
+                            grafted_leaves: request.grafted_leaves(key).to_vec(),
+                        },
+                    );
                 }
                 PatchOp::Remove { key } => {
                     removed.insert(key.clone());
@@ -481,13 +499,38 @@ impl AcceptedRequest {
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn update_for_test(sent: &[&str], removed: &[&str]) -> Self {
+        let sent = sent
+            .iter()
+            .map(|key| (*key, Vec::new()))
+            .collect::<Vec<_>>();
+        Self::update_with_grafted_leaves_for_test(&sent, removed)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn update_with_grafted_leaves_for_test(
+        sent: &[(&str, Vec<LeafPath>)],
+        removed: &[&str],
+    ) -> Self {
         Self {
             kind: AcceptedRequestKind::Update {
-                sent: sent.iter().map(|key| (*key).to_string()).collect(),
+                sent: sent
+                    .iter()
+                    .map(|(key, leaves)| {
+                        (
+                            (*key).to_string(),
+                            SentKey {
+                                grafted_leaves: leaves.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
                 removed: removed.iter().map(|key| (*key).to_string()).collect(),
             },
             sent_attributes: SentAttributes::only(
-                sent.iter().map(|key| (*key).to_string()).collect(),
+                sent.iter()
+                    .map(|(key, _leaves)| (*key).to_string())
+                    .collect(),
             ),
             resolved_desired_attributes: None,
         }

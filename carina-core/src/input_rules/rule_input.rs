@@ -437,7 +437,7 @@ impl RuleInput {
             schema: schema.clone(),
             desired: project_attributes(&resource.attributes),
             update: Some(UpdateOverlay::new(
-                &patch,
+                &patch.patch,
                 resource.ignore_changes().clone(),
             )),
             declarations,

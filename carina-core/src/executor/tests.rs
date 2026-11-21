@@ -4415,6 +4415,10 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
             ),
         ]))),
     );
+    updated.directives.ignore_changes = vec![crate::resource::ParsedIgnorePath::new(vec![
+        crate::resource::ParsedIgnorePathSegment::Attribute("config".into()),
+        crate::resource::ParsedIgnorePathSegment::Attribute("issuer".into()),
+    ])];
     let update_id = updated.id.clone();
     let from = State::existing(
         update_id.clone(),
@@ -4442,6 +4446,10 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
     )
     .with_identifier("id-123");
 
+    let schemas = provider_boundary_constraint_schemas();
+    let updated = updated.with_dependency_phase(());
+    let updated = ResolvedResource::resolve_with_schemas(updated, &schemas)
+        .expect("fixture ignore paths resolve against the schema");
     let mut plan = Plan::new();
     plan.add(create_effect(created));
     plan.add(Effect::Update {
@@ -4449,12 +4457,11 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
             from.id.identity_display().to_string(),
         ),
         from: Box::new(from),
-        to: resolved(updated),
+        to: updated,
         changed_attributes: vec!["target".to_string(), "obsolete".to_string()],
     });
     provider.push_create(Ok(ok_state(&create_id)));
     provider.push_update(Ok(ok_state(&update_id)));
-    let schemas = provider_boundary_constraint_schemas();
     let input = ExecutionInput {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -4520,14 +4527,22 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
         panic!("update must publish update request provenance");
     };
     assert_eq!(
-        sent,
-        &BTreeSet::from([
+        sent.keys().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([
             "config".to_string(),
             "target".to_string(),
             "token".to_string(),
         ])
     );
     assert_eq!(removed, &BTreeSet::from(["obsolete".to_string()]));
+    assert_eq!(
+        sent["config"].grafted_leaves(),
+        &[crate::schema::LeafPath::from_segments([
+            crate::schema::LeafPathSegment::StructField("issuer".into()),
+        ]),]
+    );
+    assert!(sent["target"].grafted_leaves().is_empty());
+    assert!(sent["token"].grafted_leaves().is_empty());
 }
 
 #[tokio::test]

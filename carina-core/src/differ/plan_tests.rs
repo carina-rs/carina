@@ -2099,7 +2099,8 @@ fn nested_authored_field_removal_produces_update_patch_without_removed_field() {
         &from,
         &schema,
     )
-    .expect("fixture update patch is valid");
+    .expect("fixture update patch is valid")
+    .patch;
     assert_eq!(patch.ops.len(), 1);
     let crate::provider::PatchOp::Replace {
         value: Value::Concrete(ConcreteValue::Map(patch_config)),
@@ -2417,7 +2418,8 @@ fn whole_value_list_authoring_compares_and_sends_the_full_desired_list() {
         &from,
         &schema,
     )
-    .expect("fixture update patch is valid");
+    .expect("fixture update patch is valid")
+    .patch;
     assert_eq!(patch.ops.len(), 1);
     assert!(matches!(
         &patch.ops[0],
@@ -2647,7 +2649,8 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
     let ready = provider_ready(to.as_resource().clone());
     let schema = crate::schema::CompiledResourceSchema::new("awscc.cloudfront.Distribution");
     let patch = crate::provider::build_update_patch(changed_attributes, &ready, from, &schema)
-        .expect("fixture update patch is valid");
+        .expect("fixture update patch is valid")
+        .patch;
     let crate::provider::PatchOp::Replace {
         value: crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(patch_config)),
         ..

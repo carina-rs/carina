@@ -51,8 +51,8 @@ use crate::resource::{
 use crate::resource::{DataSource, RedactedSecretHash};
 use crate::schema::{
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema, LeafPath,
-    RawShape, RefinedScalarKind, SchemaRegistry, Shape, TypeIdentity, ValidatedConfigSchema,
-    ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    LeafPathSegment, RawShape, RefinedScalarKind, SchemaRegistry, Shape, TypeIdentity,
+    ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
 use crate::value::{
     PersistedListView, PersistedValue, PersistedValueDecodeError, PersistedView, SerializationError,
@@ -1221,6 +1221,7 @@ pub struct UpdateRequest {
     /// Structured description of the user's intended change and any write-only
     /// values reasserted alongside it.
     patch: crate::validation::admission::final_input::FinalInput<WireReady<UpdatePatch>>,
+    grafted: BTreeMap<String, Vec<LeafPath>>,
     /// Effective directives resolved from the managed resource schema.
     directives: ProviderDirectives,
     input: Arc<ProtectedUpdateInput>,
@@ -1236,7 +1237,8 @@ impl UpdateRequest {
         resource: &ProviderReadyResource,
         context: &crate::executor::ProviderPreparationContext<'_>,
     ) -> Result<Self, crate::executor::ProviderPreparationError> {
-        let patch = context.prepare_update_patch(changed_attributes, resource, &from)?;
+        let PlannedUpdatePatch { patch, grafted } =
+            context.prepare_update_patch(changed_attributes, resource, &from)?;
         let protected = resource.protected_desired_tree();
         let annotate_patch =
             |annotate: fn(&ProviderReadyResource, &str, &Value) -> Value| UpdatePatch {
@@ -1276,6 +1278,7 @@ impl UpdateRequest {
             desired_for_fixture: resource.clone(),
             from,
             patch,
+            grafted,
             directives: *resource.directives(),
             input,
             diagnostics,
@@ -1295,6 +1298,10 @@ impl UpdateRequest {
     /// Patch derived from the checked desired resource.
     pub fn patch(&self) -> &UpdatePatch {
         self.patch.payload().as_inner()
+    }
+
+    pub(crate) fn grafted_leaves(&self, key: &str) -> &[LeafPath] {
+        self.grafted.get(key).map_or(&[], Vec::as_slice)
     }
 
     pub(crate) fn diagnostic_values(&self) -> impl Iterator<Item = &Value> {
@@ -1567,6 +1574,13 @@ impl UpdatePatch {
     }
 }
 
+/// Update payload paired with the host-only provenance of observed leaf grafts.
+#[derive(Debug, Clone)]
+pub struct PlannedUpdatePatch<P = UpdatePatch> {
+    pub patch: P,
+    pub(crate) grafted: BTreeMap<String, Vec<LeafPath>>,
+}
+
 /// Build an [`UpdatePatch`] from a list of changed attribute names plus
 /// the desired (`to`) and current (`from`) views.
 ///
@@ -1596,7 +1610,7 @@ pub fn build_update_patch<P: StateValueLeaf>(
     to: &ProviderReadyResource,
     from: &State<P>,
     schema: &ResourceSchema,
-) -> Result<UpdatePatch, UpdatePatchError> {
+) -> Result<PlannedUpdatePatch, UpdatePatchError> {
     plan_update_patch(changed_attributes, to.as_inner(), from, schema)
 }
 
@@ -1608,11 +1622,12 @@ pub(crate) fn plan_update_patch<S, P: StateValueLeaf>(
     to: &crate::resource::ResolvedResource<S>,
     from: &State<P>,
     schema: &ResourceSchema,
-) -> Result<UpdatePatch, UpdatePatchError> {
+) -> Result<PlannedUpdatePatch, UpdatePatchError> {
     let ignore_changes = to.ignore_changes();
     let to = to.as_resource();
     let mut patched_keys = HashSet::new();
     let mut ops = Vec::new();
+    let mut grafted = BTreeMap::new();
     for key in changed_attributes {
         if ignore_changes.ignores_whole_attribute(key) {
             continue;
@@ -1638,9 +1653,12 @@ pub(crate) fn plan_update_patch<S, P: StateValueLeaf>(
             .map(crate::resource::state_value_snapshot);
         let sent_value = value
             .map(|value| {
-                ignore_changes
-                    .with_observed_readable_leaves(key, value, observed.as_ref())
-                    .to_value_at(format!("{}.{}", to.id, key))
+                let (value, leaves) =
+                    ignore_changes.with_observed_readable_leaves(key, value, observed.as_ref());
+                if !leaves.is_empty() {
+                    grafted.insert(key.clone(), leaves);
+                }
+                value.to_value_at(format!("{}.{}", to.id, key))
             })
             .transpose()?;
         match (sent_value, in_from) {
@@ -1658,7 +1676,10 @@ pub(crate) fn plan_update_patch<S, P: StateValueLeaf>(
     }
 
     if ops.is_empty() {
-        return Ok(UpdatePatch { ops });
+        return Ok(PlannedUpdatePatch {
+            patch: UpdatePatch { ops },
+            grafted,
+        });
     }
 
     let mut reasserts = Vec::new();
@@ -1693,23 +1714,28 @@ pub(crate) fn plan_update_patch<S, P: StateValueLeaf>(
             }
             return Err(ignored_write_only_error(&to.id, key, ignored_write_only[0]).into());
         }
+        let (value, leaves) = ignore_changes.with_observed_readable_leaves(
+            key,
+            value,
+            from.attributes
+                .get(key)
+                .map(crate::resource::state_value_snapshot)
+                .as_ref(),
+        );
+        if !leaves.is_empty() {
+            grafted.insert(key.clone(), leaves);
+        }
         reasserts.push(PatchOp::Reassert {
             key: key.clone(),
-            value: ignore_changes
-                .with_observed_readable_leaves(
-                    key,
-                    value,
-                    from.attributes
-                        .get(key)
-                        .map(crate::resource::state_value_snapshot)
-                        .as_ref(),
-                )
-                .to_value_at(format!("{}.{}", to.id, key))?,
+            value: value.to_value_at(format!("{}.{}", to.id, key))?,
         });
     }
     reasserts.sort_by(|left, right| left.key().cmp(right.key()));
     ops.extend(reasserts);
-    Ok(UpdatePatch { ops })
+    Ok(PlannedUpdatePatch {
+        patch: UpdatePatch { ops },
+        grafted,
+    })
 }
 
 fn ignored_write_only_error(
@@ -2184,6 +2210,55 @@ fn secret_hash_shape_view(value: PersistedView<'_>) -> SecretHashShape {
 
 fn contains_secret_hash_view(value: PersistedView<'_>) -> bool {
     secret_hash_shape_view(value) != SecretHashShape::None
+}
+
+/// Restrict previous hash protection to grafted subtrees. Public siblings remain
+/// available as alignment evidence inside any selected list. Opaque ancestors
+/// keep their whole protection because their hashed leaves cannot be separated.
+pub fn restrict_previous_secret_hashes_to_leaves(
+    previous: &PersistedValue,
+    leaves: &[LeafPath],
+) -> Result<PersistedValue, SerializationError> {
+    fn restrict(value: &mut SnapshotValue, paths: &[&[LeafPathSegment]]) {
+        if paths.iter().any(|path| {
+            path.is_empty() || matches!(path.first(), Some(LeafPathSegment::ListIndex(_)))
+        }) {
+            return;
+        }
+        let Value::Concrete(ConcreteValue::Map(children)) = value else {
+            return;
+        };
+        children.retain(|name, child| {
+            if !crate::value::contains_redacted_secret(child) {
+                return true;
+            }
+            let child_paths = paths
+                .iter()
+                .filter_map(|path| {
+                    let (segment, rest) = path.split_first()?;
+                    let matches = match segment {
+                        LeafPathSegment::StructField(field) => field == name,
+                        LeafPathSegment::MapKey(key) => key.expose_plaintext() == name.as_str(),
+                        LeafPathSegment::ListIndex(_) => false,
+                    };
+                    matches.then_some(rest)
+                })
+                .collect::<Vec<_>>();
+            if child_paths.is_empty() {
+                return false;
+            }
+            restrict(child, &child_paths);
+            true
+        });
+    }
+    let Some(mut value) = previous.decode() else {
+        return Ok(previous.clone());
+    };
+    restrict(
+        &mut value,
+        &leaves.iter().map(LeafPath::segments).collect::<Vec<_>>(),
+    );
+    PersistedValue::encode_provider_value(&value, None)
 }
 
 /// Preserve secret hashes from a previous persisted value while retaining
@@ -14952,7 +15027,9 @@ mod tests {
         let to = resolved_for_test(to);
         let schema = ResourceSchema::new("test");
         let changed = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let patch = build_update_patch(&changed, &to, &from, &schema).expect("valid patch");
+        let patch = build_update_patch(&changed, &to, &from, &schema)
+            .expect("valid patch")
+            .patch;
         assert_eq!(patch.ops.len(), 3);
 
         let by_key: HashMap<&str, &PatchOp> = patch.ops.iter().map(|op| (op.key(), op)).collect();
@@ -15164,7 +15241,8 @@ mod tests {
 
         let patch =
             build_update_patch(&["description".to_string()], &to, &from, schema.as_schema())
-                .expect("fully ignored write-only leaves need no reassertion");
+                .expect("fully ignored write-only leaves need no reassertion")
+                .patch;
 
         assert!(matches!(
             &patch.ops[..],
@@ -15201,9 +15279,11 @@ mod tests {
         let changed = ["description".to_string()];
 
         let planned = plan_update_patch(&changed, to.as_inner(), &from, schema.as_schema())
-            .expect("planning must accept the patch");
+            .expect("planning must accept the patch")
+            .patch;
         let applied = build_update_patch(&changed, &to, &from, schema.as_schema())
-            .expect("apply must accept the same patch");
+            .expect("apply must accept the same patch")
+            .patch;
 
         assert_eq!(planned.ops, applied.ops);
     }
@@ -15248,8 +15328,13 @@ mod tests {
             ignored_path(&["config", "version"]),
         );
 
-        let patch = build_update_patch(&["config".to_string()], &to, &from, schema.as_schema())
-            .expect("readable ignored leaf can be filled from the read");
+        let PlannedUpdatePatch { patch, grafted } =
+            build_update_patch(&["config".to_string()], &to, &from, schema.as_schema())
+                .expect("readable ignored leaf can be filled from the read");
+        let expected = vec![LeafPath::from_segments([LeafPathSegment::StructField(
+            "version".into(),
+        )])];
+        assert_eq!(grafted.get("config"), Some(&expected));
         let PatchOp::Replace { value, .. } = &patch.ops[0] else {
             panic!("expected config replacement: {:?}", patch.ops);
         };
@@ -15258,6 +15343,17 @@ mod tests {
         };
         assert_eq!(config["version"], patch_test_value("external"));
         assert_eq!(config["memory"], Value::Concrete(ConcreteValue::Int(256)));
+
+        let absent: State = State::existing(from.id.clone(), HashMap::new());
+        let added = build_update_patch(&["config".into()], &to, &absent, schema.as_schema())
+            .expect("an absent observation removes the ignored input leaf");
+        assert_eq!(added.grafted.get("config"), Some(&expected));
+        assert!(matches!(&added.patch.ops[0], PatchOp::Add { .. }));
+        let Some(Value::Concrete(ConcreteValue::Map(config))) = added.patch.ops[0].sent_value()
+        else {
+            panic!("expected added config map");
+        };
+        assert!(!config.contains_key("version"));
     }
 
     #[test]
@@ -15382,7 +15478,8 @@ mod tests {
 
         let patch =
             build_update_patch(&["description".to_string()], &to, &from, schema.as_schema())
-                .expect("valid reassert patch");
+                .expect("valid reassert patch")
+                .patch;
 
         assert!(matches!(
             &patch.ops[..],
@@ -15445,7 +15542,8 @@ mod tests {
             );
 
         let patch = build_update_patch(&["description".to_string()], &to, &from, &schema)
-            .expect("valid write-only patch");
+            .expect("valid write-only patch")
+            .patch;
 
         assert!(matches!(
             &patch.ops[0],
@@ -15509,7 +15607,8 @@ mod tests {
             &from,
             &schema,
         )
-        .expect("valid changed write-only patch");
+        .expect("valid changed write-only patch")
+        .patch;
 
         assert!(matches!(
             &patch.ops[0],
@@ -15550,12 +15649,14 @@ mod tests {
         assert!(
             build_update_patch(&[], &to, &from, &schema)
                 .expect("empty patch is valid")
+                .patch
                 .ops
                 .is_empty()
         );
         assert!(
             build_update_patch(&["absent".to_string()], &to, &from, &schema)
                 .expect("absent patch is valid")
+                .patch
                 .ops
                 .is_empty(),
             "a changed key absent from both sides must be dropped and cannot trigger reassertion"
@@ -15572,6 +15673,7 @@ mod tests {
         assert!(
             build_update_patch(&[], &to, &from, schema.as_schema())
                 .expect("empty nested patch is valid")
+                .patch
                 .ops
                 .is_empty(),
             "a write-only-bearing attribute cannot create a reassert-only patch"
@@ -15625,7 +15727,8 @@ mod tests {
                             let from = State::existing(id, from_attributes);
                             let desired = resolved_for_test(desired);
                             let patch = build_update_patch(&changed, &desired, &from, &schema)
-                                .expect("generated fixture has no ignored paths");
+                                .expect("generated fixture has no ignored paths")
+                                .patch;
                             let patch_keys: Vec<&str> =
                                 patch.ops.iter().map(PatchOp::key).collect();
                             let unique: std::collections::HashSet<_> =

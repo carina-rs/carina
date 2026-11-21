@@ -6850,6 +6850,327 @@ fn previous_secret_hash_unsent_update_requires_provider_equality() {
     }
 }
 
+fn previous_secret_hash_sent_map_row() -> ResourceState {
+    let public = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let protected =
+        |text: &str| Value::Deferred(DeferredValue::Secret(Box::new(public(text)).into()));
+    let previous_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("retained".into(), protected("fixture-secret-4570")),
+        ("other".into(), protected("fixture-secret-4570")),
+        ("changing".into(), public("before")),
+    ])));
+    // The accepted map carries the observed ignored leaf alongside public writes.
+    let sent_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("retained".into(), public("fixture-secret-4570")),
+        ("other".into(), public("public")),
+        ("changing".into(), public("after")),
+    ])));
+    previous_secret_hash_grafted_map_row(
+        previous_tags,
+        sent_tags,
+        vec![carina_core::schema::LeafPath::from_segments([
+            carina_core::schema::LeafPathSegment::MapKey("retained".into()),
+        ])],
+    )
+}
+
+fn previous_secret_hash_grafted_map_row(
+    previous_tags: Value,
+    sent_tags: Value,
+    grafted: Vec<carina_core::schema::LeafPath>,
+) -> ResourceState {
+    let previous_tags = PersistedValue::encode_desired_value(&previous_tags, None).unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("tags", previous_tags.as_json().clone());
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None)
+            .with_attribute("tags", sent_tags.clone()),
+    );
+    let state: State = State::existing(
+        resource.id.clone(),
+        HashMap::from([("tags".into(), sent_tags)]),
+    )
+    .with_identifier("sink-id");
+    let request = AcceptedRequest::update_with_grafted_leaves_for_test(&[("tags", grafted)], &[]);
+    ResourceState::from_provider_state_with_final_desired(
+        &resource,
+        &state,
+        Some(&existing),
+        None,
+        RowBasis::Applied(&request),
+        None,
+        None,
+        &exact_comparison_context(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn previous_secret_hash_grafted_leaf_in_sent_map_is_protected() {
+    let row = previous_secret_hash_sent_map_row();
+    let attributes = row.persisted_attributes().unwrap();
+    let tags = attributes.encoded_value("tags").unwrap().as_json();
+    assert!(
+        tags["retained"][carina_core::value::PERSISTED_SECRET_KEY].is_string(),
+        "grafted leaf must retain its previous secret hash"
+    );
+    assert!(
+        !serde_json::to_string(&row)
+            .unwrap()
+            .contains("fixture-secret-4570"),
+        "written row must not contain ignored secret plaintext"
+    );
+    assert!(tags["changing"] == "after", "sent sibling remains public");
+}
+
+#[test]
+fn previous_secret_hash_non_grafted_sibling_in_sent_map_is_released() {
+    let row = previous_secret_hash_sent_map_row();
+    let attributes = row.persisted_attributes().unwrap();
+    let tags = attributes.encoded_value("tags").unwrap().as_json();
+    assert!(
+        tags["other"] == "public",
+        "non-grafted leaf must be released"
+    );
+    assert!(tags["changing"] == "after", "sent sibling remains public");
+}
+
+#[test]
+fn previous_secret_hash_grafted_nested_dollar_key_is_leaf_precise() {
+    use carina_core::schema::{LeafPath, LeafPathSegment};
+    let text = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(text("fixture-secret-4570")).into(),
+    ));
+    let nested = |retained, other| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "nested".into(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                ("$retained".into(), retained),
+                ("other".into(), other),
+            ]))),
+        )])))
+    };
+    let row = previous_secret_hash_grafted_map_row(
+        nested(secret.clone(), secret),
+        nested(text("fixture-secret-4570"), text("public")),
+        vec![LeafPath::from_segments([
+            LeafPathSegment::StructField("nested".into()),
+            LeafPathSegment::MapKey("$retained".into()),
+        ])],
+    );
+    let attributes = row.persisted_attributes().unwrap();
+    let tags = attributes.encoded_value("tags").unwrap().as_json();
+    assert!(tags["nested"]["$$retained"][carina_core::value::PERSISTED_SECRET_KEY].is_string());
+    assert!(tags["nested"]["other"] == "public");
+    assert!(
+        !serde_json::to_string(&row)
+            .unwrap()
+            .contains("fixture-secret-4570"),
+        "protected nested material must remain hashed"
+    );
+}
+
+#[test]
+fn previous_secret_hash_grafted_subtree_reuses_list_alignment_policy() {
+    use carina_core::schema::{LeafPath, LeafPathSegment};
+    let text = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(text("fixture-secret-4570")).into(),
+    ));
+    let item = |anchor: &str, payload| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("anchor".into(), text(anchor)),
+            ("payload".into(), payload),
+        ])))
+    };
+    let map = |retained, other| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "retained".into(),
+                Value::Concrete(ConcreteValue::List(retained)),
+            ),
+            ("other".into(), other),
+        ])))
+    };
+    let anchored = vec![
+        item("first", secret.clone()),
+        item("second", text("visible")),
+    ];
+    let observed = vec![
+        item("first", text("fixture-secret-4570")),
+        item("second", text("visible")),
+    ];
+    for (label, previous, provider, whole) in [
+        (
+            "matching anchors",
+            anchored.clone(),
+            observed.clone(),
+            false,
+        ),
+        (
+            "reordered anchors",
+            anchored.clone(),
+            observed.iter().rev().cloned().collect(),
+            true,
+        ),
+        (
+            "different lengths",
+            anchored.clone(),
+            vec![observed[0].clone()],
+            true,
+        ),
+        (
+            "changed anchor",
+            anchored,
+            vec![
+                item("changed", text("fixture-secret-4570")),
+                observed[1].clone(),
+            ],
+            true,
+        ),
+        (
+            "scalar elements",
+            vec![secret.clone(), text("visible")],
+            vec![text("fixture-secret-4570"), text("visible")],
+            true,
+        ),
+        (
+            "no public anchors",
+            vec![Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "payload".into(),
+                secret.clone(),
+            )])))],
+            vec![Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "payload".into(),
+                text("fixture-secret-4570"),
+            )])))],
+            true,
+        ),
+    ] {
+        let row = previous_secret_hash_grafted_map_row(
+            map(previous, secret.clone()),
+            map(provider, text("public")),
+            vec![LeafPath::from_segments([LeafPathSegment::MapKey(
+                "retained".into(),
+            )])],
+        );
+        let attributes = row.persisted_attributes().unwrap();
+        let tags = attributes.encoded_value("tags").unwrap().as_json();
+        assert_eq!(
+            tags["retained"][carina_core::value::PERSISTED_SECRET_KEY].is_string(),
+            whole,
+            "{label}"
+        );
+        if !whole {
+            assert!(
+                tags["retained"][0]["payload"][carina_core::value::PERSISTED_SECRET_KEY]
+                    .is_string(),
+                "{label}"
+            );
+            assert!(
+                tags["retained"][1]["payload"] == "visible",
+                "aligned public members stay public"
+            );
+        }
+        assert!(
+            tags["other"] == "public",
+            "public leaf outside the grafted list is released: {label}"
+        );
+        assert!(
+            !serde_json::to_string(&row)
+                .unwrap()
+                .contains("fixture-secret-4570"),
+            "list protection must not expose protected material: {label}"
+        );
+    }
+}
+
+#[test]
+fn previous_secret_hash_grafted_leaf_under_opaque_ancestor_keeps_whole_hash() {
+    use carina_core::schema::{LeafPath, LeafPathSegment};
+    let text = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let map = |changing: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("retained".into(), text("fixture-secret-4570")),
+            ("changing".into(), text(changing)),
+        ])))
+    };
+    let row = previous_secret_hash_grafted_map_row(
+        Value::Deferred(DeferredValue::Secret(Box::new(map("before")).into())),
+        map("after"),
+        vec![LeafPath::from_segments([LeafPathSegment::MapKey(
+            "retained".into(),
+        )])],
+    );
+    let attributes = row.persisted_attributes().unwrap();
+    let tags = attributes.get("tags").unwrap();
+    assert!(
+        tags.secret_hash().is_some(),
+        "an opaque ancestor cannot be narrowed to one leaf"
+    );
+    assert!(
+        carina_core::value::format_value_user_facing(&tags) == "(secret)",
+        "public members inside the hashed unit are masked too"
+    );
+    assert!(
+        !serde_json::to_string(&row)
+            .unwrap()
+            .contains("fixture-secret-4570"),
+        "opaque protection must not expose protected material"
+    );
+}
+
+#[test]
+fn previous_secret_hash_wholly_ignored_key_is_protected() {
+    let public = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let previous = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(public("fixture-secret-4570")).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", previous.as_json().clone());
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None)
+            .with_attribute("computed", public("public"))
+            .with_attribute("other", public("after")),
+    );
+    let state: State = State::existing(
+        resource.id.clone(),
+        HashMap::from([
+            ("computed".into(), public("fixture-secret-4570")),
+            ("other".into(), public("after")),
+        ]),
+    )
+    .with_identifier("sink-id");
+    // A wholly ignored key is absent from the accepted patch.
+    let request = AcceptedRequest::update_for_test(&["other"], &[]);
+    let row = ResourceState::from_provider_state_with_final_desired(
+        &resource,
+        &state,
+        Some(&existing),
+        None,
+        RowBasis::Applied(&request),
+        None,
+        None,
+        &exact_comparison_context(),
+    )
+    .unwrap();
+    let attributes = row.persisted_attributes().unwrap();
+    assert!(attributes.get("computed").unwrap().secret_hash().is_some());
+    assert!(
+        !serde_json::to_string(&row)
+            .unwrap()
+            .contains("fixture-secret-4570"),
+        "unsent key must not expose its previous secret"
+    );
+}
+
 #[test]
 fn previous_secret_hash_decision_matrix() {
     use carina_core::resource::{AuthoredAccessPath, FunctionArgument, InterpolationPart};
