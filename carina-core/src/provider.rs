@@ -2353,6 +2353,11 @@ fn merge_previous_secret_hashes_into_provider_json_inner(
             return Ok(previous_value.to_owned_json());
         };
         if !previous_secret_hash_array_alignment_is_trusted(previous_items, provider_items) {
+            // Masked descendants cannot be re-hashed without plaintext. Keep
+            // the previous list whole when its leaf alignment is untrusted.
+            if secret_hash_shape_view(provider_value) == SecretHashShape::Nested {
+                return Ok(previous_value.to_owned_json());
+            }
             return hash_provider_view_as_secret(provider_value, Some(previous_value));
         }
         let replacements = previous_items
@@ -12459,6 +12464,67 @@ mod tests {
     }
 
     #[test]
+    fn merge_previous_secret_hashes_keeps_previous_unaligned_masked_lists() {
+        let secret = |text: &str| {
+            PersistedValue::encode_desired_value(
+                &Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(text.into()))).into(),
+                )),
+                None,
+            )
+            .unwrap()
+        };
+        let previous_token = secret("fixture-secret-4570-previous");
+        let provider_token = secret("fixture-secret-4570-provider");
+        let previous = PersistedValue::from_serialized_json(serde_json::json!([
+            {"port": 80, "token": previous_token.as_json()},
+            {"port": 443, "token": previous_token.as_json()}
+        ]))
+        .unwrap();
+        for provider_json in [
+            serde_json::json!([
+                {"port": 443, "token": provider_token.as_json()},
+                {"port": 80, "token": provider_token.as_json()}
+            ]),
+            serde_json::json!([{"port": 80, "token": provider_token.as_json()}]),
+        ] {
+            let provider = PersistedValue::from_serialized_json(provider_json).unwrap();
+            let merged =
+                merge_previous_secret_hashes_into_provider_value(&previous, Some(&provider))
+                    .expect("an unaligned masked list must retain previous protection")
+                    .expect("the previous list contains secret hashes");
+            assert!(merged == previous, "the previous list must be kept whole");
+            assert!(
+                !merged.as_json().to_string().contains("fixture-secret-4570"),
+                "the retained list must contain no secret plaintext"
+            );
+
+            let mut plaintext_json = provider.as_json().clone();
+            for item in plaintext_json.as_array_mut().unwrap() {
+                item["token"] = serde_json::json!("fixture-secret-4570-provider");
+            }
+            let material = serde_json::to_vec(&plaintext_json).unwrap();
+            let plaintext = PersistedValue::from_serialized_json(plaintext_json).unwrap();
+            let merged =
+                merge_previous_secret_hashes_into_provider_value(&previous, Some(&plaintext))
+                    .expect("an unaligned plaintext list can still be hashed whole")
+                    .unwrap();
+            let hash = merged.as_json()[crate::value::PERSISTED_SECRET_KEY]
+                .as_str()
+                .and_then(RedactedSecretHash::from_encoded_digest)
+                .expect("the plaintext provider list must become one opaque hash");
+            assert!(
+                hash.verify(&material),
+                "the hash must cover the provider list"
+            );
+            assert!(
+                !merged.as_json().to_string().contains("fixture-secret-4570"),
+                "the provider list must contain no secret plaintext"
+            );
+        }
+    }
+
+    #[test]
     fn merge_previous_secret_hashes_rehashes_plaintext_and_keeps_provider_hashes() {
         let previous = PersistedValue::encode_desired_value(
             &Value::Deferred(DeferredValue::Secret(
@@ -12512,7 +12578,7 @@ mod tests {
     }
 
     #[test]
-    fn persistence_merges_propagate_typed_unavailable_secret() {
+    fn provider_secret_hashing_propagates_typed_unavailable_secret() {
         let secret = Value::Deferred(DeferredValue::Secret(
             Box::new(Value::Concrete(ConcreteValue::String(
                 "previous secret".into(),
@@ -12529,21 +12595,6 @@ mod tests {
         )
         .unwrap();
         let error = hash_provider_json_as_secret(&provider, Some(&previous)).unwrap_err();
-        assert!(
-            matches!(error, SerializationError::UnavailableSecret(ref error)
-            if error.path() == "(secret)")
-        );
-        for rendered in [error.to_string(), format!("{error:?}")] {
-            assert!(!rendered.contains("token"), "{rendered}");
-        }
-        let list = |value: &PersistedValue| {
-            PersistedValue::from_serialized_json(serde_json::json!([value.as_json()])).unwrap()
-        };
-        let error = merge_previous_secret_hashes_into_provider_value(
-            &list(&previous),
-            Some(&list(&provider)),
-        )
-        .expect_err("an unaligned list without an opaque ancestor still requires plaintext");
         assert!(
             matches!(error, SerializationError::UnavailableSecret(ref error)
             if error.path() == "(secret)")

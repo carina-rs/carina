@@ -172,6 +172,61 @@ fn refresh_retained_map_leaf_beside_desired_secret_keeps_previous_hash_until_app
 }
 
 #[test]
+fn reordered_secret_struct_list_refresh_succeeds_then_updates_once() {
+    let scenario = Scenario::new(
+        "test.resource",
+        "name = 'sink'\n\
+         rules = [\n\
+           { action = secret('__MARKER__-a') conditions = [{ value = 'a' }] },\n\
+           { action = secret('__MARKER__-b') conditions = [{ value = 'b' }] }\n\
+         ]",
+    );
+    scenario.run(&["init", "."]);
+    scenario.run(&["apply", "--auto-approve", "--parallelism=1", "."]);
+    let before = scenario.attributes();
+    for rule in before["rules"].as_array().unwrap() {
+        assert!(
+            rule["action"][PERSISTED_SECRET_KEY].is_string(),
+            "each rule's secret action must be hashed"
+        );
+    }
+
+    scenario.write(
+        "name = 'sink'\n\
+         rules = [\n\
+           { action = secret('__MARKER__-b') conditions = [{ value = 'b' }] },\n\
+           { action = secret('__MARKER__-a') conditions = [{ value = 'a' }] }\n\
+         ]",
+    );
+    scenario.run(&["state", "refresh", "."]);
+    let refreshed = scenario.attributes();
+    for rule in refreshed["rules"].as_array().unwrap() {
+        assert!(
+            rule["action"][PERSISTED_SECRET_KEY].is_string(),
+            "refresh must keep each rule's secret action hashed"
+        );
+    }
+    let plan = scenario.run(&["plan", "."]);
+    assert!(
+        plan.contains("Plan: 0 to add, 1 to change, 0 to destroy."),
+        "the reordered list must require exactly one Update after refresh:\n{plan}"
+    );
+
+    scenario.run(&["apply", "--auto-approve", "--parallelism=1", "."]);
+    let applied = scenario.attributes();
+    assert!(applied["rules"][0]["conditions"][0]["value"] == "b");
+    assert!(applied["rules"][1]["conditions"][0]["value"] == "a");
+    for rule in applied["rules"].as_array().unwrap() {
+        assert!(
+            rule["action"][PERSISTED_SECRET_KEY].is_string(),
+            "accepted reordered rules must keep their secret actions hashed"
+        );
+    }
+    let plan = scenario.run(&["plan", "."]);
+    assert!(plan.contains("No changes."), "{plan}");
+}
+
+#[test]
 fn ignored_map_leaf_in_sent_attribute_keeps_previous_secret_hash() {
     assert_ignored_leaf_protected(
         "test.resource",
