@@ -1543,6 +1543,7 @@ pub async fn run_state_refresh(
     )?;
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
+    let unresolved = loaded.unresolved_parsed;
 
     super::apply::symlink_retarget_test_barrier("CARINA_TEST_STATE_REFRESH_CONFIG_HANDSHAKE_DIR")
         .await;
@@ -1552,8 +1553,12 @@ pub async fn run_state_refresh(
         base_dir,
         &mut crate::commands::human_provider_notices(runtime.color_mode()),
     )?;
-    let validated_config =
-        providers.validate_read_only_config(parsed, base_dir, &duplicate_declarations)?;
+    let validated_config = providers.validate_state_refresh_config(
+        parsed,
+        unresolved,
+        base_dir,
+        &duplicate_declarations,
+    )?;
 
     let verified_backend = verify_for_mutation(
         base_dir,
@@ -1613,13 +1618,14 @@ pub async fn run_state_refresh(
 }
 
 pub(crate) async fn run_state_refresh_locked(
-    mut validated_config: ValidatedConfig<carina_core::parser::ExpandedInferredFile>,
+    validated_config: impl Into<crate::wiring::ValidatedStateRefresh>,
     backend: &dyn StateBackend,
     lock: StateLockRef<'_>,
     base_dir: &carina_core::paths::ResolvedPath,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let (mut validated_config, desired_source) = validated_config.into().into_parts();
     let color_mode = validated_config.context().runtime().color_mode();
     let (file, authority) = carina_state::ObservationStateAuthority::load(backend).await?;
     let mut state_file = authority.bind(file);
@@ -1897,6 +1903,7 @@ pub(crate) async fn run_state_refresh_locked(
         .cloned()
         .map(ResolvedResourceId::new)
         .collect();
+    let desired_orphans = orphans.clone();
     managed_current = into_all_prior_states(orphans, managed_current);
 
     // Restore managed attributes from the same lifted map used by the
@@ -1930,7 +1937,7 @@ pub(crate) async fn run_state_refresh_locked(
         ctx.schemas(),
     );
 
-    // Reject invalid move declarations even though refresh preserves addresses.
+    // Reject invalid move declarations; only the shadow desired pipeline reconciles addresses.
     crate::wiring::resolve_moved_pairs(
         ctx,
         parsed,
@@ -1946,6 +1953,40 @@ pub(crate) async fn run_state_refresh_locked(
         .cloned()
         .map(|resource| expanded_graph.resolve_resource(resource, ctx.schemas()))
         .collect::<Result<Vec<_>, _>>()?;
+
+    // Read-only refresh can proceed even when full desired preparation is
+    // unavailable (for example default_tags needs an unread upstream). Such
+    // a failure grants no release authority and never changes the read route.
+    let final_desired = match desired_source {
+        Some(source) => {
+            let inputs = crate::wiring::RefreshedDesiredInputs {
+                context: ctx,
+                source,
+                provider: &provider,
+                state_file: &state_file,
+                current: &managed_current,
+                orphans: &desired_orphans,
+                data_source_values: &data_source_values,
+                remote_bindings: provider_inputs.remote_bindings(),
+                refresh_phase: &refresh_phase,
+                saved_dependencies: &saved_dep_bindings,
+            };
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(AppError::Interrupted),
+                result = crate::wiring::prepare_refreshed_desired(inputs) => match result {
+                    Ok(desired) => Some(desired),
+                    Err(_) => {
+                        // Provider/type errors may carry values. Record only this
+                        // fixed classification; refresh remains fail-closed.
+                        log::debug!("State refresh desired preparation unavailable; retaining previous secret hashes");
+                        None
+                    }
+                }
+            }
+        }
+        None => None,
+    };
 
     let mut state = state_file.take().unwrap();
 
@@ -1967,6 +2008,7 @@ pub(crate) async fn run_state_refresh_locked(
             fresh_current,
             &mut state,
             Some(resource),
+            final_desired.as_ref(),
             ctx.schemas(),
             &provider,
             "",
@@ -1988,6 +2030,7 @@ pub(crate) async fn run_state_refresh_locked(
             orphan_id,
             fresh_current,
             &mut state,
+            None,
             None,
             ctx.schemas(),
             &provider,
@@ -2639,6 +2682,7 @@ fn diff_display_update_resource_with_provider(
     fresh_current: &Current,
     state: &mut carina_state::StateFile,
     resource: Option<&ResolvedResource>,
+    final_desired: Option<&crate::wiring::ReleaseWitness>,
     schemas: &carina_core::schema::SchemaRegistry,
     provider: &ProviderRouter,
     label_suffix: &str,
@@ -2694,12 +2738,15 @@ fn diff_display_update_resource_with_provider(
             let refreshed_resource_state = if exists {
                 match resource {
                     Some(resource) => Some(
-                        ResourceState::from_provider_state_for_resource_and_schema(
+                        crate::wiring::write_resource_state(
                             resource,
-                            fresh_state,
+                            carina_state::ResourceStateWrite::Provider {
+                                state: fresh_state,
+                                basis: RowBasis::Carried,
+                            },
                             Some(existing_rs),
                             resource_schema,
-                            RowBasis::Carried,
+                            final_desired,
                             None,
                             comparison,
                         )
@@ -2869,12 +2916,18 @@ fn diff_display_update_resource(
 ) -> Result<(), AppError> {
     let (schemas, provider) =
         carina_core::provider::comparison_fixture_for_test(schemas, std::iter::once(id.as_inner()));
+    let final_desired = crate::wiring::ReleaseWitness::for_test(
+        resource
+            .into_iter()
+            .map(|resource| (resource.id.clone(), resource.attributes.clone())),
+    );
     diff_display_update_resource_with_provider(
         color_mode,
         id,
         fresh_current,
         state,
         resource,
+        Some(&final_desired),
         &schemas,
         &provider,
         label_suffix,
@@ -2884,6 +2937,8 @@ fn diff_display_update_resource(
 
 #[cfg(test)]
 mod tests {
+    mod retained_secret_measurements;
+
     use carina_core::provider::{Provider, ProviderNormalizer};
     use carina_core::resource::SnapshotValue;
     #[test]
@@ -3100,6 +3155,7 @@ mod tests {
             &fresh,
             &mut state,
             Some(&desired),
+            None,
             &schemas,
             &provider,
             "",

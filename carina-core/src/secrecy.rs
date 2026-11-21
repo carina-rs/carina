@@ -198,6 +198,22 @@ fn literal_root<B: BindingAddress>(mut source: &ExprValue<ParserPlaceholder, B>)
     }
 }
 
+fn wait_root<B: BindingAddress>(
+    mut source: &ExprValue<ParserPlaceholder, B>,
+) -> Option<&ExprValue<ParserPlaceholder, B>> {
+    loop {
+        match source.secrecy_kind() {
+            ExprKind::Wait => return Some(source),
+            ExprKind::Alias | ExprKind::Parens | ExprKind::Definition
+                if source.secrecy_children().len() == 1 =>
+            {
+                source = &source.secrecy_children()[0]
+            }
+            _ => return None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Declaration {
     identity: DeclarationIdentity,
@@ -2803,7 +2819,6 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         parsing: _,
                     }
                     | ExprKind::NestedBlock { name: _, header: _ }
-                    | ExprKind::Wait
                     | ExprKind::Iterable => {
                         self.schedule(Operation::Last, children(), path, depth, work)
                     }
@@ -2836,6 +2851,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         read: _,
                     }
                     | ExprKind::For { .. }
+                    | ExprKind::Wait
                     | ExprKind::ModuleCall
                     | ExprKind::ProviderDeclaration
                     | ExprKind::RequireCondition
@@ -4096,6 +4112,13 @@ enum ReferenceSource<B: BindingAddress> {
     Handle,
     Pending,
 }
+
+enum ReferenceOwner<'a, B: BindingAddress> {
+    Resource(&'a ResourceSource<B>),
+    Definition(&'a ExprValue<ParserPlaceholder, B>),
+    Resolved(ReferenceSource<B>),
+}
+
 impl<B: BindingAddress> Owner<'_, B> {
     fn reference_source(
         &self,
@@ -4103,8 +4126,46 @@ impl<B: BindingAddress> Owner<'_, B> {
         path: &[PathSegment],
         environment: Arc<Environment<B>>,
     ) -> ReferenceSource<B> {
+        match self.lookup_reference_owner(binding, path) {
+            ReferenceOwner::Resource(resource) => self.resource_reference_source(resource, path),
+            ReferenceOwner::Resolved(source) => source,
+            ReferenceOwner::Definition(definition) => {
+                if let Some(wait) = wait_root(definition) {
+                    let Some(target) = wait.secrecy_children().first() else {
+                        return ReferenceSource::Pending;
+                    };
+                    let ExprKind::Binding {
+                        binding: target, ..
+                    } = target.secrecy_kind()
+                    else {
+                        return ReferenceSource::Pending;
+                    };
+                    // A wait replaces only its retained definition, using the
+                    // ordinary owner order for its target as well. Resolve one
+                    // hop: another wait is not a managed resource target.
+                    return match self.lookup_reference_owner(target, path) {
+                        ReferenceOwner::Resource(resource) => {
+                            self.resource_reference_source(resource, path)
+                        }
+                        ReferenceOwner::Definition(_) | ReferenceOwner::Resolved(_) => {
+                            ReferenceSource::Pending
+                        }
+                    };
+                }
+                ReferenceSource::Source(
+                    Thunk {
+                        source: Source::Syntax(definition.clone()),
+                        environment,
+                    },
+                    path.to_vec(),
+                )
+            }
+        }
+    }
+
+    fn lookup_reference_owner(&self, binding: &B, path: &[PathSegment]) -> ReferenceOwner<'_, B> {
         if self.upstream.contains(binding) {
-            return ReferenceSource::Public;
+            return ReferenceOwner::Resolved(ReferenceSource::Public);
         }
         if let Some(value) = self.syntax.secrecy_argument(binding) {
             // One fresh identity per authored argument source. Repeated
@@ -4122,73 +4183,75 @@ impl<B: BindingAddress> Owner<'_, B> {
                     })
                 })
                 .clone();
-            return ReferenceSource::Source(
+            return ReferenceOwner::Resolved(ReferenceSource::Source(
                 Thunk {
                     source: Source::Value(Arc::new(value.clone())),
                     environment,
                 },
                 path.to_vec(),
-            );
+            ));
         }
         if let Some(resource) = self.resources.get(binding) {
-            let schema =
-                self.schemas
-                    .get(&resource.provider, &resource.resource_type, resource.kind);
-            let Some(step) = path.first() else {
-                return if schema.is_some() {
-                    ReferenceSource::Handle
-                } else {
-                    ReferenceSource::Pending
-                };
-            };
-            let name = match step {
-                PathSegment::Field { name } => Some(name.as_str()),
-                PathSegment::Subscript {
-                    index: Subscript::Str { key },
-                } => Some(key.expose_plaintext()),
-                PathSegment::Subscript {
-                    index: Subscript::Int { index: _ },
-                } => None,
-            };
-            if resource.kind == SchemaKind::Resource
-                && let Some(source) = name.and_then(|name| resource.attributes.get(name))
-            {
-                return ReferenceSource::Source(source.clone(), path[1..].to_vec());
-            }
-            if schema.is_none() {
-                return ReferenceSource::Pending;
-            }
-            let ty = crate::parser::TypeExpr::Ref(crate::parser::ResourceTypePath::new(
-                &resource.provider,
-                &resource.resource_type,
-            ));
-            return if crate::validation::narrow_type_expr(&ty, path, Some(self.schemas)).is_some() {
-                ReferenceSource::Public
-            } else {
-                ReferenceSource::Pending
-            };
+            return ReferenceOwner::Resource(resource);
         }
         if let Some(PathSegment::Field { name }) = path.first()
             && let Some(output) = self.syntax.secrecy_output(binding, name)
         {
-            return ReferenceSource::Source(
+            return ReferenceOwner::Resolved(ReferenceSource::Source(
                 Thunk {
                     source: Source::Syntax(output),
                     environment: self.empty_environment.clone(),
                 },
                 path[1..].to_vec(),
-            );
+            ));
         }
         if let Some(definition) = self.syntax.secrecy_definition(binding) {
-            return ReferenceSource::Source(
-                Thunk {
-                    source: Source::Syntax(definition.clone()),
-                    environment,
-                },
-                path.to_vec(),
-            );
+            return ReferenceOwner::Definition(definition);
         }
-        ReferenceSource::Pending
+        ReferenceOwner::Resolved(ReferenceSource::Pending)
+    }
+
+    fn resource_reference_source(
+        &self,
+        resource: &ResourceSource<B>,
+        path: &[PathSegment],
+    ) -> ReferenceSource<B> {
+        let schema = self
+            .schemas
+            .get(&resource.provider, &resource.resource_type, resource.kind);
+        let Some(step) = path.first() else {
+            return if schema.is_some() {
+                ReferenceSource::Handle
+            } else {
+                ReferenceSource::Pending
+            };
+        };
+        let name = match step {
+            PathSegment::Field { name } => Some(name.as_str()),
+            PathSegment::Subscript {
+                index: Subscript::Str { key },
+            } => Some(key.expose_plaintext()),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: _ },
+            } => None,
+        };
+        if resource.kind == SchemaKind::Resource
+            && let Some(source) = name.and_then(|name| resource.attributes.get(name))
+        {
+            return ReferenceSource::Source(source.clone(), path[1..].to_vec());
+        }
+        if schema.is_none() {
+            return ReferenceSource::Pending;
+        }
+        let ty = crate::parser::TypeExpr::Ref(crate::parser::ResourceTypePath::new(
+            &resource.provider,
+            &resource.resource_type,
+        ));
+        if crate::validation::narrow_type_expr(&ty, path, Some(self.schemas)).is_some() {
+            ReferenceSource::Public
+        } else {
+            ReferenceSource::Pending
+        }
     }
 }
 

@@ -1,0 +1,13 @@
+let src = mock.test.resource {
+  name = 'src'
+  computed = secret('__MARKER__')
+}
+
+fn g(r: mock.test.resource, x: String): String {
+  "prefix-${r.computed}"
+}
+
+let sink = mock.test.resource {
+  name = 'sink'
+  computed = g(src, lower(src.identifier))
+}

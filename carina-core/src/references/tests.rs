@@ -566,7 +566,7 @@ async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs()
     let desired = crate::validation::deferred_types::with_session_for_test(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         |session| {
-            crate::validation::admission::final_input::FinalPlanInputs::admit(
+            crate::validation::admission::final_input::FinalPlanInputs::admit_for_test(
                 fixture.desired.clone(),
                 vec![],
                 &fixture.registry,
