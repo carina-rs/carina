@@ -549,9 +549,10 @@ pub(crate) fn fixture_in_flight_create(
 }
 
 #[cfg(test)]
-pub(crate) fn fixture_repend_in_flight_create(
+pub(crate) fn fixture_repend_in_flight_create<'a, P: carina_core::resource::StateValueLeaf + 'a>(
     pending: carina_core::provider::InFlightCreate,
     token: impl Into<String>,
+    desired_attributes: impl IntoIterator<Item = (&'a String, &'a carina_core::resource::Value<P>)>,
 ) -> carina_core::provider::InFlightCreate {
     let id = pending.id().clone();
     let bindings = carina_core::binding_index::ResolvedBindings::default();
@@ -594,7 +595,7 @@ pub(crate) fn fixture_repend_in_flight_create(
                 carina_core::provider::ResumeFailureKind::InFlight {
                     pending,
                     error: _error,
-                } => pending,
+                } => pending.with_desired_for_test(desired_attributes),
                 carina_core::provider::ResumeFailureKind::IdentifierReported {
                     identified: _identified,
                     error,

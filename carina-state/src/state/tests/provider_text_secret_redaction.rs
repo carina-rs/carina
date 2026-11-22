@@ -60,8 +60,9 @@ async fn persisted_read_back_failure(incomplete: bool) -> String {
     } else {
         identified
     };
-    let identified =
-        identified.with_secrets_for_test(&crate::provider_text_fixtures::context(&[SECRET]));
+    let identified = identified
+        .with_secrets_for_test(&crate::provider_text_fixtures::context(&[SECRET]))
+        .with_desired_for_test(&desired.attributes);
     let row = resource_state_from_observation_for_test(
         &desired,
         &identified,

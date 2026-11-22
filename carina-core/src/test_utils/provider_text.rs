@@ -504,7 +504,22 @@ fn resume(payload: Payload, context: &Context) -> Result<HostResumeOutcome, Host
         create_request(),
     )
     .unwrap();
+    let writeback = crate::executor::AcceptedRequest::create_for_test(&context.desired.attributes)
+        .resolved_desired_attributes()
+        .clone();
     block_on(fixture(payload, context).provider().resume_create(request))
+        .map(|outcome| outcome.into_writeback(writeback.clone()))
+        .map_err(|failure| match failure.into_kind() {
+            ResumeFailureKind::NoResource(error) => {
+                HostResumeFailure::no_resource_from_verdict(error)
+            }
+            ResumeFailureKind::IdentifierReported { identified, error } => {
+                HostResumeFailure::identifier_reported(identified.into_writeback(writeback), error)
+            }
+            ResumeFailureKind::InFlight { pending, error } => {
+                HostResumeFailure::in_flight(pending.into_writeback(writeback), error)
+            }
+        })
 }
 impl BindProviderText for UpdateOutcome {
     type Host = HostUpdateOutcome;

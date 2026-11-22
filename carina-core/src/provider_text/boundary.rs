@@ -556,7 +556,7 @@ impl Provider<super::Bound> for ProviderBoundary<'_> {
         id: &ResourceId,
         request: CreateRequest,
         attempt: CreateAttempt,
-    ) -> BoxFuture<'_, Result<HostCreateOutcome, HostCreateFailure>> {
+    ) -> BoxFuture<'_, Result<HostCreateOutcome, CreateFailure<super::Bound>>> {
         self.diagnostics.include_ready_resource(request.resource());
         self.secrets.extend(&RedactionSet::collect(
             request.resource().diagnostic_values(),
@@ -577,7 +577,7 @@ impl Provider<super::Bound> for ProviderBoundary<'_> {
     fn resume_create(
         &self,
         request: ResumeCreateRequest,
-    ) -> BoxFuture<'_, Result<HostResumeOutcome, HostResumeFailure>> {
+    ) -> BoxFuture<'_, Result<ResumeOutcome<super::Bound>, ResumeFailure<super::Bound>>> {
         self.diagnostics
             .include_ready_resource(request.request().resource());
         self.secrets.extend(&RedactionSet::collect(

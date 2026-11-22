@@ -7014,7 +7014,7 @@ mod tests {
             provider_attributes,
         )
         .with_identifier("provider-id");
-        let accepted_create = AcceptedRequest::create_for_test();
+        let accepted_create = AcceptedRequest::create_for_test(&applied.attributes);
         let prior = ResourceState::from_provider_state_for_resource_and_schema(
             &applied,
             &provider_state,

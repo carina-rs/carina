@@ -1,3 +1,6 @@
+#[path = "tests/bootstrap_writeback.rs"]
+mod bootstrap_writeback;
+
 use super::*;
 use carina_core::binding_index::LivePreApplyInputs;
 use carina_core::config_loader::get_base_dir;
@@ -132,10 +135,13 @@ fn validate_with_test_factories(
     )
 }
 
-fn complete_create(state: carina_core::resource::State) -> carina_core::executor::Applied {
+fn complete_create(
+    state: carina_core::resource::State,
+    desired: &indexmap::IndexMap<String, Value>,
+) -> carina_core::executor::Applied {
     carina_core::executor::Applied::Complete {
         state: state.to_snapshot(),
-        request: carina_core::executor::AcceptedRequest::create_for_test(),
+        request: carina_core::executor::AcceptedRequest::create_for_test(desired),
     }
 }
 
@@ -189,10 +195,11 @@ fn complete_update(
     state: carina_core::resource::State,
     sent: &[&str],
     removed: &[&str],
+    desired: &indexmap::IndexMap<String, Value>,
 ) -> carina_core::executor::Applied {
     carina_core::executor::Applied::Complete {
         state: state.to_snapshot(),
-        request: carina_core::executor::AcceptedRequest::update_for_test(sent, removed),
+        request: carina_core::executor::AcceptedRequest::update_for_test(sent, removed, desired),
     }
 }
 
@@ -5197,7 +5204,10 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
         )]),
     )
     .with_identifier("legacy-id");
-    let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
+    let applied_states = HashMap::from([(
+        id.clone(),
+        complete_create(applied_state, &sorted_resources[0].attributes),
+    )]);
     let plan = plan_with_name_override(&id, "legacy-temp", "legacy");
 
     let migrated = build_state_after_apply(
@@ -7042,7 +7052,7 @@ impl Provider for BootstrapRecordingProvider {
     fn create(
         &self,
         id: &ResourceId,
-        _request: CreateRequest,
+        request: CreateRequest,
         attempt: carina_core::provider::CreateAttempt,
     ) -> BoxFuture<
         '_,
@@ -7054,16 +7064,20 @@ impl Provider for BootstrapRecordingProvider {
             BootstrapCreateBehavior::Success => {
                 let identifier = AppliedIdentifier::new("state-bucket")
                     .expect("fixture identifier is non-empty");
+                let mut attributes = HashMap::from([(
+                    "bucket".to_string(),
+                    Value::Concrete(ConcreteValue::String("state-bucket".into())),
+                )]);
+                if let Some(secret) = request.resource().as_resource().get_attr("tags_secret") {
+                    attributes.insert("tags_secret".to_string(), secret.clone());
+                }
                 Box::pin(async move {
                     Ok(attempt
                         .issued(
                             identifier,
                             carina_core::provider::Sent::AllRequestAttributes,
                         )
-                        .succeeded(HashMap::from([(
-                            "bucket".to_string(),
-                            Value::Concrete(ConcreteValue::String("state-bucket".into())),
-                        )])))
+                        .succeeded(attributes))
                 })
             }
             BootstrapCreateBehavior::PartialSuccess => {
@@ -7077,19 +7091,20 @@ impl Provider for BootstrapRecordingProvider {
                         .try_into()
                         .expect("nonempty partial attributes"),
                 );
+                let mut attributes = HashMap::from([(
+                    "bucket".to_string(),
+                    Value::Concrete(ConcreteValue::String("state-bucket".into())),
+                )]);
+                if let Some(secret) = request.resource().as_resource().get_attr("tags_secret") {
+                    attributes.insert("tags_secret".to_string(), secret.clone());
+                }
                 Box::pin(async move {
                     Ok(attempt
                         .issued(
                             identifier,
                             carina_core::provider::Sent::AllRequestAttributes,
                         )
-                        .partial(
-                            HashMap::from([(
-                                "bucket".to_string(),
-                                Value::Concrete(ConcreteValue::String("state-bucket".into())),
-                            )]),
-                            diagnostic,
-                        ))
+                        .partial(attributes, diagnostic))
                 })
             }
             BootstrapCreateBehavior::NotCreated => Box::pin(async move {
@@ -7107,7 +7122,12 @@ impl Provider for BootstrapRecordingProvider {
                     "bucket-id",
                     HashMap::from([(
                         "observed".to_string(),
-                        Value::Concrete(ConcreteValue::String("yes".into())),
+                        request
+                            .resource()
+                            .as_resource()
+                            .get_attr("observed")
+                            .cloned()
+                            .unwrap_or_else(|| string_value("yes")),
                     )]),
                 )
                 .expect("fixture identifier is non-empty");
@@ -7254,6 +7274,10 @@ async fn bootstrap_declared_state_bucket(
             "bucket",
             Value::Concrete(ConcreteValue::String("state-bucket".into())),
         );
+    bootstrap_declared_state_bucket_with_resource(color_mode, provider, backend, resource).await
+}
+
+fn bootstrap_bucket_schemas() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
@@ -7264,10 +7288,28 @@ async fn bootstrap_declared_state_bucket(
             .attribute(
                 PatternAttributeSchema::optional("versioning", PatternAttributeType::string())
                     .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("tags_secret", PatternAttributeType::string())
+                    .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("observed", PatternAttributeType::string())
+                    .build(),
             ))
         .validate()
         .expect("schema fixture must be valid"),
     );
+    schemas
+}
+
+async fn bootstrap_declared_state_bucket_with_resource(
+    color_mode: crate::output_style::ColorMode,
+    provider: &BootstrapRecordingProvider,
+    backend: &dyn StateBackend,
+    resource: Resource,
+) -> Result<(Resource, SchemaRegistry), AppError> {
+    let schemas = bootstrap_bucket_schemas();
     let provider_configs = empty_resolved_provider_configs();
     let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
 
@@ -7326,6 +7368,124 @@ async fn declared_state_bucket_bootstrap_success_seeds_protected_provider_state(
         row.identifier().map(AppliedIdentifier::as_str),
         Some("state-bucket")
     );
+}
+
+async fn assert_bootstrap_secret_seed(behavior: BootstrapCreateBehavior) {
+    let plaintext = "bootstrap-authored-secret-4473-c8b47d2e";
+    let attribute = match behavior {
+        BootstrapCreateBehavior::IdentifierReported => "observed",
+        BootstrapCreateBehavior::Success
+        | BootstrapCreateBehavior::PartialSuccess
+        | BootstrapCreateBehavior::InFlight => "tags_secret",
+        BootstrapCreateBehavior::NotCreated
+        | BootstrapCreateBehavior::IdentifierReportedNotFound => {
+            unreachable!("unsupported bootstrap secret fixture behavior")
+        }
+    };
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0).into(),
+        behavior,
+    };
+    let (_temp, backend) = bootstrap_test_backend();
+    let resource = Resource::with_provider("aws", "s3.Bucket", "state_bucket", None)
+        .with_attribute("bucket", string_value("state-bucket"))
+        .with_attribute(
+            attribute,
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(string_value(plaintext)).into(),
+            )),
+        );
+    let outcome = bootstrap_declared_state_bucket_with_resource(
+        crate::output_style::ColorMode::Plain,
+        &provider,
+        backend.as_ref(),
+        resource,
+    )
+    .await;
+    match behavior {
+        BootstrapCreateBehavior::Success | BootstrapCreateBehavior::PartialSuccess => {
+            assert!(outcome.is_ok(), "bootstrap must seed state");
+        }
+        BootstrapCreateBehavior::IdentifierReported | BootstrapCreateBehavior::InFlight => {
+            assert!(
+                matches!(outcome, Err(AppError::StateBucketCreate(_))),
+                "bootstrap must preserve the classified create failure"
+            );
+        }
+        BootstrapCreateBehavior::NotCreated
+        | BootstrapCreateBehavior::IdentifierReportedNotFound => {
+            unreachable!("unsupported bootstrap secret fixture behavior")
+        }
+    }
+    assert_eq!(
+        provider.create_calls.load(Ordering::SeqCst),
+        1,
+        "bootstrap must dispatch exactly one create"
+    );
+    let raw = backend
+        .read_state_bytes()
+        .await
+        .unwrap_or_else(|_| panic!("bootstrap seed state must be readable"))
+        .expect("bootstrap seed state must exist");
+    let text = std::str::from_utf8(raw.bytes()).expect("bootstrap state must be UTF-8");
+    assert!(
+        !text.contains(plaintext),
+        "bootstrap state must not contain authored secret plaintext"
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(text).unwrap_or_else(|_| panic!("bootstrap state must be valid JSON"));
+    let resources = state["resources"]
+        .as_array()
+        .expect("bootstrap state must contain a resource list");
+    assert_eq!(
+        resources.len(),
+        1,
+        "bootstrap must seed exactly one resource"
+    );
+    let current = &resources[0]["current"];
+    let attributes = match behavior {
+        BootstrapCreateBehavior::InFlight => &current["envelope"]["secrets"],
+        _ => &current["attributes"],
+    };
+    let digest = attributes[attribute]["$secret"]
+        .as_str()
+        .expect(match behavior {
+            BootstrapCreateBehavior::InFlight => {
+                "bootstrap in-flight envelope.secrets must contain the authored secret hash"
+            }
+            _ => "bootstrap authored secret must be stored as a hash",
+        });
+    assert_eq!(
+        attributes[attribute].as_object().unwrap().len(),
+        1,
+        "bootstrap secret must serialize as a single hash marker"
+    );
+    let hash = carina_core::resource::RedactedSecretHash::from_encoded_digest(digest)
+        .expect("bootstrap secret must have a valid digest");
+    assert!(
+        hash.verify(serde_json::to_vec(plaintext).expect("fixture string must serialize")),
+        "bootstrap secret hash must match the authored value"
+    );
+}
+
+#[tokio::test]
+async fn declared_state_bucket_bootstrap_does_not_write_authored_secret_plaintext() {
+    assert_bootstrap_secret_seed(BootstrapCreateBehavior::Success).await;
+}
+
+#[tokio::test]
+async fn bootstrap_partial_success_does_not_write_authored_secret_plaintext() {
+    assert_bootstrap_secret_seed(BootstrapCreateBehavior::PartialSuccess).await;
+}
+
+#[tokio::test]
+async fn bootstrap_identified_failure_does_not_write_authored_secret_plaintext() {
+    assert_bootstrap_secret_seed(BootstrapCreateBehavior::IdentifierReported).await;
+}
+
+#[tokio::test]
+async fn bootstrap_in_flight_seed_does_not_write_authored_secret_plaintext() {
+    assert_bootstrap_secret_seed(BootstrapCreateBehavior::InFlight).await;
 }
 
 #[tokio::test]
@@ -8203,7 +8363,7 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     let mut applied_states = HashMap::new();
     applied_states.insert(
         sorted_resources[0].id.clone(),
-        complete_create(applied_state),
+        complete_create(applied_state, &sorted_resources[0].attributes),
     );
 
     let current_states = HashMap::new();
@@ -8343,7 +8503,7 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
     let mut applied_states = HashMap::new();
     applied_states.insert(
         sorted_resources[0].id.clone(),
-        complete_create(applied_state),
+        complete_create(applied_state, &sorted_resources[0].attributes),
     );
 
     let current_states = HashMap::new();
@@ -8617,7 +8777,7 @@ fn block_unique_name_attribute_state_roundtrip() {
     let mut applied_states = HashMap::new();
     applied_states.insert(
         sorted_resources[0].id.clone(),
-        complete_create(applied_state),
+        complete_create(applied_state, &sorted_resources[0].attributes),
     );
 
     let state = build_state_after_apply(
@@ -8740,7 +8900,10 @@ fn move_plus_update_keeps_post_update_attributes() {
         State::<carina_core::resource::NoPlaceholder>::existing(new_id.clone(), applied_attrs)
             .with_identifier("tag-abc");
     let mut applied_states = HashMap::new();
-    applied_states.insert(new_id.clone(), complete_update(applied, &["value"], &[]));
+    applied_states.insert(
+        new_id.clone(),
+        complete_update(applied, &["value"], &[], &sorted_resources[0].attributes),
+    );
 
     // Old state row carries the pre-Update value.
     let old_row = ResourceState::try_applied("ec2.Tag", "tag_old", "awscc", "tag-abc")
@@ -9049,6 +9212,7 @@ fn move_from_overlapping_desired_resource_errors() {
         complete_create(
             State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
                 .with_identifier("x"),
+            &sorted_resources[0].attributes,
         ),
     );
 
@@ -9118,6 +9282,7 @@ fn remove_overlapping_desired_resource_errors() {
         complete_create(
             State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
                 .with_identifier("x"),
+            &sorted_resources[0].attributes,
         ),
     );
 
@@ -9182,6 +9347,7 @@ fn self_move_overlapping_desired_resource_errors() {
         complete_create(
             State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
                 .with_identifier("x"),
+            &sorted_resources[0].attributes,
         ),
     );
 

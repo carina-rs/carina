@@ -41,8 +41,11 @@ impl CreatePermit {
     pub fn request(&self) -> &crate::provider::CreateRequest {
         self.request.request()
     }
-    pub(crate) fn into_request(self) -> crate::provider::CreateRequest {
-        (*self.request).into_parts().0
+    pub(super) fn prepared_write(&self) -> &super::PreparedWrite<crate::provider::CreateRequest> {
+        &self.request
+    }
+    pub(super) fn into_write(self) -> super::PreparedWrite<crate::provider::CreateRequest> {
+        *self.request
     }
 }
 
@@ -260,8 +263,7 @@ impl<S: Clone> ScheduledResume<S> {
         super::EffectFailureKind,
     > {
         let attributes = write.writeback().clone();
-        let accepted = super::AcceptedRequest::from_create_request(write.request())
-            .with_resolved_desired_attributes(attributes.clone());
+        let accepted = super::AcceptedRequest::from_prepared_create(&write);
         let request = match self {
             Self::Resend { pending, create } => PreparedResume::Resend(
                 crate::provider::ResumeCreateRequest::new(*pending, create.authorize(write))

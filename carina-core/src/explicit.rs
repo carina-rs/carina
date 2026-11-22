@@ -2250,8 +2250,8 @@ mod tests {
         let stored_attributes = stored
             .map(|stored| BTreeMap::from([("items".to_string(), stored)]))
             .unwrap_or_default();
-        let sent = crate::executor::AcceptedRequest::create_for_test();
-        let sent_desired = sent.sent_desired_attributes(&resource);
+        let sent = crate::executor::AcceptedRequest::create_for_test(&resource.attributes);
+        let sent_desired = sent.sent_desired_attributes();
         let ExplicitFields::Struct { mut children } =
             build_from_resource_for_stored_values_after_send(
                 &resource,
@@ -2299,8 +2299,8 @@ mod tests {
                 ])),
             ),
         ]);
-        let create = crate::executor::AcceptedRequest::create_for_test();
-        let create_desired = create.sent_desired_attributes(&resource);
+        let create = crate::executor::AcceptedRequest::create_for_test(&resource.attributes);
+        let create_desired = create.sent_desired_attributes();
         let prior_explicit = build_from_resource_for_stored_values_after_send(
             &resource,
             None,
@@ -2323,8 +2323,12 @@ mod tests {
                 ])),
             ),
         ]);
-        let update = crate::executor::AcceptedRequest::update_for_test(&["description"], &[]);
-        let update_desired = update.sent_desired_attributes(&resource);
+        let update = crate::executor::AcceptedRequest::update_for_test(
+            &["description"],
+            &[],
+            &resource.attributes,
+        );
+        let update_desired = update.sent_desired_attributes();
 
         let rebuilt = build_from_resource_for_stored_values_after_send(
             &resource,
@@ -3154,8 +3158,8 @@ mod tests {
         let resource: Resource =
             Resource::new("example.Listener", "listener").with_attribute("items", desired);
         let stored_attributes = std::collections::BTreeMap::from([("items".to_string(), stored)]);
-        let sent = crate::executor::AcceptedRequest::create_for_test();
-        let sent_desired = sent.sent_desired_attributes(&resource);
+        let sent = crate::executor::AcceptedRequest::create_for_test(&resource.attributes);
+        let sent_desired = sent.sent_desired_attributes();
 
         let ExplicitFields::Struct { children } = build_from_resource_for_stored_values_after_send(
             &resource,

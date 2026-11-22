@@ -2428,7 +2428,7 @@ fn from_provider_state_aligns_reordered_nested_and_provider_added_list_elements(
     )
     .with_identifier("listener-id");
 
-    let accepted = AcceptedRequest::create_for_test();
+    let accepted = AcceptedRequest::create_for_test(&resource.attributes);
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
         &provider_state,
@@ -2514,7 +2514,7 @@ fn state_writeback_uses_explicit_basis_per_sent_top_level_attribute() {
         &prior_provider,
         None,
         None,
-        RowBasis::Applied(&AcceptedRequest::create_for_test()),
+        RowBasis::Applied(&AcceptedRequest::create_for_test(&resource.attributes)),
         None,
     )
     .expect("create writeback records the server default");
@@ -2546,7 +2546,7 @@ fn state_writeback_uses_explicit_basis_per_sent_top_level_attribute() {
         ]),
     )
     .with_identifier("listener-id");
-    let update = AcceptedRequest::update_for_test(&["description"], &[]);
+    let update = AcceptedRequest::update_for_test(&["description"], &[], &updated.attributes);
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&updated),
         &updated_provider,
@@ -3479,7 +3479,7 @@ fn carried_whole_value_clears_when_readded_field_has_a_unique_pair() {
         Diff::NoChange(_)
     ));
 
-    let accepted = AcceptedRequest::create_for_test();
+    let accepted = AcceptedRequest::create_for_test(&applied.attributes);
     let applied_row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&applied),
         &provider,
@@ -6330,7 +6330,7 @@ fn accepted_create_records_write_only_attributes() {
                 .write_only()
                 .build(),
         );
-    let request = AcceptedRequest::create_for_test();
+    let request = AcceptedRequest::create_for_test(&resource.attributes);
     let rs = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
         &provider_state,
@@ -6462,7 +6462,7 @@ fn accepted_create_does_not_record_write_only_attribute_absent_from_desired() {
         &provider_state,
         None,
         Some(&schema),
-        RowBasis::Applied(&AcceptedRequest::create_for_test()),
+        RowBasis::Applied(&AcceptedRequest::create_for_test(&resource.attributes)),
         None,
     )
     .unwrap();
@@ -6518,7 +6518,7 @@ fn accepted_write_only_does_not_overwrite_protected_provider_value() {
         &provider_state,
         None,
         Some(&schema),
-        RowBasis::Applied(&AcceptedRequest::create_for_test()),
+        RowBasis::Applied(&AcceptedRequest::create_for_test(&resource.attributes)),
         None,
     )
     .unwrap();
@@ -6754,7 +6754,7 @@ fn applied_previous_secret_hash_authority_requires_known_public_desired() {
             expected_desired_key,
             "{label}: classify the entire desired value tree"
         );
-        let request = AcceptedRequest::update_for_test(&["computed"], &[]);
+        let request = AcceptedRequest::update_for_test(&["computed"], &[], &resource.attributes);
         for (authority, protected) in [
             (PreviousSecretHashAuthority::None, false),
             (
@@ -6822,7 +6822,7 @@ fn previous_secret_hash_unsent_update_requires_provider_equality() {
         PersistedValue::encode_desired_value(&old, None).unwrap(),
     )]))
     .unwrap();
-    let request = AcceptedRequest::update_for_test(&["other"], &[]);
+    let request = AcceptedRequest::update_for_test(&["other"], &[], &attributes);
     for (provider, expected) in [
         ("different", PreviousSecretHashDecision::Protect),
         ("public", PreviousSecretHashDecision::Release),
@@ -7000,7 +7000,6 @@ fn previous_secret_hash_decision_matrix() {
         ("omitted reference", Some(reference), None, false, false),
         ("omitted call", Some(call), None, false, false),
     ];
-    let request = AcceptedRequest::update_for_test(&["computed"], &[]);
     for previous in [&previous, &nested_previous] {
         for (label, desired, provider, applied_release, read_release) in &cases {
             let attributes = desired
@@ -7014,6 +7013,7 @@ fn previous_secret_hash_decision_matrix() {
                     DesiredKey::NotKnownPublic
                 );
             }
+            let request = AcceptedRequest::update_for_test(&["computed"], &[], &attributes);
             let final_desired = FinalDesiredAttributes::for_test(attributes.clone());
             for (basis, applied) in [("applied", true), ("carried", false), ("imported", false)] {
                 let authority = if applied {
@@ -7138,7 +7138,7 @@ fn previous_secret_hash_unsent_update_uses_final_plan_desired() {
         resource.id.clone(),
         IndexMap::from([("computed".into(), public)]),
     )]);
-    let request = AcceptedRequest::update_for_test(&["other"], &[]);
+    let request = AcceptedRequest::update_for_test(&["other"], &[], &resource.attributes);
     let row = ResourceState::from_provider_state_with_final_desired(
         &resource,
         &state,
@@ -7348,6 +7348,7 @@ fn observation_previous_secret_hashes_release_only_equal_public_values() {
                 pending,
                 identifier.clone(),
                 HostCreateObservation::Observed(observed()),
+                &resource.attributes,
             )
         } else {
             let failure = create_attempt_for_test(resource.id.clone())
@@ -7357,7 +7358,9 @@ fn observation_previous_secret_hashes_release_only_equal_public_values() {
                     ProviderError::internal("synthetic post-create finishing failure"),
                 );
             match failure.into_host_for_test().into_kind() {
-                CreateFailureKind::IdentifierReported { identified, .. } => identified,
+                CreateFailureKind::IdentifierReported { identified, .. } => {
+                    identified.with_desired_for_test(&resource.attributes)
+                }
                 _ => panic!("fixture must produce an identifier-reported create"),
             }
         };
@@ -7606,7 +7609,7 @@ fn accepted_write_only_keeps_raw_legacy_shaped_text_plain() {
         .with_identifier("plain-id"),
         None,
         Some(&schema),
-        RowBasis::Applied(&AcceptedRequest::create_for_test()),
+        RowBasis::Applied(&AcceptedRequest::create_for_test(&resource.attributes)),
         None,
     )
     .expect("marker-shaped desired plaintext is ordinary text");
@@ -7682,7 +7685,7 @@ fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove()
 
     // Add: a sent attribute without prior leaf provenance establishes it.
     let (added_resource, schema) = nested_write_only_state_fixture("add-secret");
-    let add = AcceptedRequest::update_for_test(&["config"], &[]);
+    let add = AcceptedRequest::update_for_test(&["config"], &[], &added_resource.attributes);
     let added = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&added_resource),
         &provider_state(&added_resource),
@@ -7714,7 +7717,7 @@ fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove()
     // Replace and Reassert both arrive at state writeback as a sent key. A
     // replacement rotates the recorded hash; a reassert preserves it.
     let (replaced_resource, _) = nested_write_only_state_fixture("replace-secret");
-    let replace = AcceptedRequest::update_for_test(&["config"], &[]);
+    let replace = AcceptedRequest::update_for_test(&["config"], &[], &replaced_resource.attributes);
     let replaced = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&replaced_resource),
         &provider_state(&replaced_resource),
@@ -7729,7 +7732,8 @@ fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove()
         replaced.nested_write_only().get("config")
     );
 
-    let reassert = AcceptedRequest::update_for_test(&["config"], &[]);
+    let reassert =
+        AcceptedRequest::update_for_test(&["config"], &[], &replaced_resource.attributes);
     let reasserted = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&replaced_resource),
         &provider_state(&replaced_resource),
@@ -7746,7 +7750,7 @@ fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove()
 
     let removed_resource =
         carina_core::resource::Resource::with_provider("mock", "test.Resource", "nested", None);
-    let remove = AcceptedRequest::update_for_test(&[], &["config"]);
+    let remove = AcceptedRequest::update_for_test(&[], &["config"], &removed_resource.attributes);
     let removed = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&removed_resource),
         &ProviderState::<carina_core::resource::NoPlaceholder>::existing(
@@ -7812,7 +7816,7 @@ fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
         )]),
     )
     .with_identifier("resource-id");
-    let accepted = AcceptedRequest::update_for_test(&["config"], &[]);
+    let accepted = AcceptedRequest::update_for_test(&["config"], &[], &resource.attributes);
 
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
@@ -7886,6 +7890,7 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
         pending,
         identifier,
         CreateObservation::Observed(observed_state),
+        &resource.attributes,
     );
 
     let row = resource_state_from_observation_for_test(
@@ -7951,6 +7956,7 @@ fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys()
             CreateObservation::Observed(
                 AppliedState::new(resource.id.clone(), "persisted-id", HashMap::new()).unwrap(),
             ),
+            &resource.attributes,
         )
         .with_partial_read_for_test(diagnostic);
         let row = resource_state_from_observation_for_test(
@@ -8014,6 +8020,7 @@ fn resumed_partial_create_records_exact_missing_attributes() {
         pending,
         identifier.clone(),
         CreateObservation::Observed(observed_state),
+        &resource.attributes,
     )
     .with_partial_read_for_test(diagnostic);
 
@@ -8072,7 +8079,7 @@ fn unobserved_not_found_create_records_identifier_and_partial_read() {
         CreateFailureKind::IdentifierReported {
             identified,
             error: _,
-        } => identified,
+        } => identified.with_desired_for_test(&resource.attributes),
         CreateFailureKind::NoResource(error) => {
             panic!("identifier-bearing failure became not_created: {error}")
         }
@@ -8144,7 +8151,7 @@ fn unobserved_read_failed_observation_records_identifier_and_provider_error_deta
         CreateFailureKind::IdentifierReported {
             identified,
             error: _,
-        } => identified,
+        } => identified.with_desired_for_test(&resource.attributes),
         CreateFailureKind::NoResource(error) => {
             panic!("identifier-bearing failure became not_created: {error}")
         }
@@ -8299,6 +8306,7 @@ fn identified_create_records_nested_leaf_from_desired_under_ancestor_secret_wrap
                 pending,
                 identifier.clone(),
                 CreateObservation::Observed(observed_state()),
+                &resource.attributes,
             )
         } else {
             let failed = create_attempt_for_test(resource.id.clone())
@@ -8311,7 +8319,7 @@ fn identified_create_records_nested_leaf_from_desired_under_ancestor_secret_wrap
                 CreateFailureKind::IdentifierReported {
                     identified,
                     error: _error,
-                } => identified,
+                } => identified.with_desired_for_test(&resource.attributes),
                 CreateFailureKind::NoResource(error) => {
                     panic!("expected an observed create, got not_created failure: {error}")
                 }
@@ -8468,7 +8476,7 @@ fn from_provider_state_imported_demotion_releases_only_equal_public_value() {
                     .unwrap()
             );
         }
-        let request = AcceptedRequest::update_for_test(&["computed"], &[]);
+        let request = AcceptedRequest::update_for_test(&["computed"], &[], &resource.attributes);
         let applied = resource_state_from_provider_state_for_resource_and_schema_for_test(
             &resolved(&resource),
             &provider,
@@ -8520,7 +8528,7 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
             .write_only()
             .build(),
     );
-    let request = AcceptedRequest::update_for_test(&["password"], &[]);
+    let request = AcceptedRequest::update_for_test(&["password"], &[], &resource.attributes);
     let rs = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
         &provider_state,
@@ -8562,7 +8570,8 @@ fn accepted_update_ignores_sent_non_write_only_key_absent_from_writeback_resourc
             .write_only()
             .build(),
     );
-    let request = AcceptedRequest::update_for_test(&["apply_time_normalized_key"], &[]);
+    let request =
+        AcceptedRequest::update_for_test(&["apply_time_normalized_key"], &[], &resource.attributes);
 
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
@@ -9581,7 +9590,7 @@ fn conservative_list_authoring_round_trips_and_recovers_on_writeback() {
         Diff::NoChange(_)
     ));
 
-    let accepted = AcceptedRequest::update_for_test(&["rules"], &[]);
+    let accepted = AcceptedRequest::update_for_test(&["rules"], &[], &desired.attributes);
     let rewritten = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&desired),
         &current,
@@ -10172,7 +10181,7 @@ fn previous_secret_hash_omitted_public_value_keeps_root_and_nested_hashes() {
     );
     let provider: State =
         State::existing(resource.id.clone(), BTreeMap::new()).with_identifier("sink-id");
-    let request = AcceptedRequest::update_for_test(&["other"], &[]);
+    let request = AcceptedRequest::update_for_test(&["other"], &[], &resource.attributes);
     for previous in [
         secret.clone(),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([

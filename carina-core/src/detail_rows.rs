@@ -5766,8 +5766,8 @@ mod tests {
             Resource::new("test.Listener", "listener").with_attribute("rules", desired_rules);
         let stored =
             std::collections::BTreeMap::from([("rules".to_string(), applied_rules.clone())]);
-        let sent = crate::executor::AcceptedRequest::create_for_test();
-        let sent_desired = sent.sent_desired_attributes(&applied);
+        let sent = crate::executor::AcceptedRequest::create_for_test(&applied.attributes);
+        let sent_desired = sent.sent_desired_attributes();
         let prior = crate::explicit::build_from_resource_for_stored_values_after_send(
             &applied,
             None,

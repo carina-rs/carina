@@ -823,6 +823,7 @@ enum ResumeFixture {
     IdentifierReportedNotFound,
     IdentifierReportedReadFailed,
     NoResource,
+    ResentInFlight,
     ResentInFlightWithInvalidSent,
 }
 
@@ -1046,6 +1047,7 @@ impl Provider for MockProvider {
             (!results.is_empty()).then(|| results.remove(0))
         };
         Box::pin(async move {
+            let valid_pending_sent = matches!(result, Some(ResumeFixture::ResentInFlight));
             match result.expect("unexpected resume_create") {
                 ResumeFixture::Resent => {
                     let id = request.id().clone();
@@ -1186,7 +1188,12 @@ impl Provider for MockProvider {
                     let (resume, _create_request) = request.into_parts();
                     Err(resume.no_resource(ProviderError::not_found("recorded create ended")))
                 }
-                ResumeFixture::ResentInFlightWithInvalidSent => {
+                ResumeFixture::ResentInFlight | ResumeFixture::ResentInFlightWithInvalidSent => {
+                    let sent = if valid_pending_sent {
+                        crate::provider::Sent::AllRequestAttributes
+                    } else {
+                        crate::provider::Sent::only(["outside_request"])
+                    };
                     let (resume, _create_request) = request.into_parts();
                     let attempt = match resume {
                         crate::provider::Resume::Unissued(attempt) => attempt.resend(),
@@ -1198,7 +1205,7 @@ impl Provider for MockProvider {
                     };
                     let pending = attempt.pending(
                         crate::provider::PendingToken::new("resent-token"),
-                        crate::provider::Sent::only(["outside_request"]),
+                        sent,
                         1,
                     );
                     Err(pending.preserve(ProviderError::timeout("resent create is pending")))
@@ -3369,6 +3376,66 @@ async fn resumed_partial_success_reports_once_and_preserves_partial_binding() {
 }
 
 #[tokio::test]
+async fn resume_writeback_retains_desired_secret_for_every_record() {
+    for fixture in [
+        ResumeFixture::Resumed,
+        ResumeFixture::Partial,
+        ResumeFixture::IdentifierReportedNotFound,
+        ResumeFixture::ResentInFlight,
+    ] {
+        let provider = MockProvider::new();
+        let source = make_resource("source", &[]).with_attribute(
+            "computed",
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "resume-secret".into(),
+                )))
+                .into(),
+            )),
+        );
+        let id = source.id.clone();
+        let pending = if matches!(fixture, ResumeFixture::ResentInFlight) {
+            persisted_unissued_create_for_executor(&id)
+        } else {
+            persisted_create_for_executor(&id)
+        };
+        let mut plan = Plan::new();
+        plan.add_resume_create(
+            resolved_fixture_resources(vec![source]).remove(0),
+            pending.started_at().clone(),
+        );
+        provider.push_resume(fixture);
+        let result = execute_lifecycle_fixture(
+            &provider,
+            &plan,
+            HashMap::from([(id.clone(), Current::CreateInFlight(pending))]),
+        )
+        .await;
+        let desired = match result
+            .applied_states
+            .get(&id)
+            .expect("resume retained its record")
+        {
+            Applied::Observed(identified) => identified.resolved_desired_attributes(),
+            Applied::CreateInFlight(pending) => {
+                let crate::provider::InFlightPersistence::Fresh(fresh) = pending.persistence()
+                else {
+                    panic!("resent pending create must retain fresh writeback values");
+                };
+                fresh.resolved_desired_attributes()
+            }
+            other => panic!("unexpected resume writeback: {other:?}"),
+        };
+        assert!(
+            desired
+                .values()
+                .get("computed")
+                .is_some_and(crate::value::contains_secret)
+        );
+    }
+}
+
+#[tokio::test]
 async fn resume_dispatch_validates_resent_sent_against_checked_request() {
     let provider = MockProvider::new();
     provider.push_resume(ResumeFixture::ResentInFlightWithInvalidSent);
@@ -3392,12 +3459,14 @@ async fn resume_dispatch_validates_resent_sent_against_checked_request() {
                 .await
                 .expect("fixture request passes provider preparation");
             let permit = crate::replacement::create_permit_for_test(request);
+            let writeback = permit.prepared_write().writeback().clone();
             let request = crate::provider::ResumeCreateRequest::new(pending, permit)
                 .expect("fixture continuation and request share a route");
 
             let failure = crate::executor::dispatch_resume_create(
                 &crate::provider::ProviderBoundary::fixture(&provider),
                 request,
+                writeback,
             )
             .await
             .expect_err("resent pending fixture returns a classified failure");

@@ -1186,15 +1186,18 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
             let PreparedBasicRequest::Create(write) = prepared else {
                 unreachable!("prepared create variant")
             };
-            let resolved_attrs = write.writeback().clone();
-            let accepted_request = AcceptedRequest::from_create_request(write.request())
-                .with_resolved_desired_attributes(resolved_attrs.clone());
-            let (create, cancellation) = super::dispatch_create(provider, create.authorize(write));
+            let (create, cancellation) =
+                super::dispatch_create_for_writeback(provider, create.authorize(write));
             started_effect.track_create_cancellation(cancellation);
             match create.await {
-                Ok(outcome) => {
-                    let (state, request, diagnostic, read_back_end) =
-                        super::complete_create_for_writeback(outcome, accepted_request);
+                Ok(super::CreateWriteback {
+                    state,
+                    request,
+                    diagnostic,
+                    read_back_end,
+                    ..
+                }) => {
+                    let resolved_attrs = request.resolved_desired_attributes().clone();
                     if let Some(diagnostic) = diagnostic {
                         BasicEffectResult::PartialSuccess {
                             completed: CompletedEffect {
@@ -1235,8 +1238,6 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
                         }
                     }
                     HostCreateFailureKind::IdentifierReported { identified, error } => {
-                        let identified =
-                            identified.with_resolved_desired_attributes(resolved_attrs.clone());
                         let note = identified.post_error_note();
                         BasicEffectResult::ClassifiedFailure {
                             failure: EffectFailureKind::provider_with_note(error, note),
@@ -1281,26 +1282,21 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
             };
             let outcome = match request {
                 PreparedResume::Resend(request) => {
-                    super::dispatch_resume_create(provider, request).await
+                    super::dispatch_resume_create(provider, request, resolved_attrs.clone()).await
                 }
                 PreparedResume::Poll(request) => {
-                    super::dispatch_poll_create(provider, request).await
+                    super::dispatch_poll_create(provider, request, resolved_attrs.clone()).await
                 }
             };
             match outcome.map(crate::provider::HostResumeOutcome::into_kind) {
-                Ok(HostResumeOutcomeKind::Resumed(completed)) => {
-                    let completed =
-                        completed.with_resolved_desired_attributes(resolved_attrs.clone());
-                    BasicEffectResult::ResumeSuccess {
-                        completed,
-                        resource_id: resource.id.clone(),
-                        resolved_attrs,
-                        binding: resource.binding.clone(),
-                    }
-                }
+                Ok(HostResumeOutcomeKind::Resumed(completed)) => BasicEffectResult::ResumeSuccess {
+                    completed: *completed,
+                    resource_id: resource.id.clone(),
+                    resolved_attrs,
+                    binding: resource.binding.clone(),
+                },
                 Ok(HostResumeOutcomeKind::PartialSuccess(partial)) => {
-                    let partial =
-                        (*partial).with_resolved_desired_attributes(resolved_attrs.clone());
+                    let partial = *partial;
                     BasicEffectResult::ResumePartialSuccess {
                         partial,
                         resource_id: resource.id.clone(),
@@ -1345,8 +1341,6 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
                         }
                     }
                     HostResumeFailureKind::IdentifierReported { identified, error } => {
-                        let identified =
-                            identified.with_resolved_desired_attributes(resolved_attrs.clone());
                         let note = identified.post_error_note();
                         BasicEffectResult::ClassifiedFailure {
                             failure: EffectFailureKind::provider_with_note(error, note),
@@ -1564,8 +1558,8 @@ mod process_basic_result_tests {
                 Instant::now(),
                 BasicEffectResult::PartialSuccess {
                     completed: CompletedEffect {
+                        request: AcceptedRequest::create_for_test(&writeback_state.attributes),
                         state: Box::new(writeback_state),
-                        request: AcceptedRequest::create_for_test(),
                     },
                     resource_id: id.clone(),
                     diagnostic: diagnostic.clone(),
@@ -1663,8 +1657,8 @@ mod process_basic_result_tests {
             resource,
             BasicEffectResult::PartialSuccess {
                 completed: CompletedEffect {
+                    request: AcceptedRequest::create_for_test(&writeback_state.attributes),
                     state: Box::new(writeback_state),
-                    request: AcceptedRequest::create_for_test(),
                 },
                 resource_id: id,
                 diagnostic: diagnostic.clone(),
@@ -1722,8 +1716,8 @@ mod process_basic_result_tests {
             resource,
             BasicEffectResult::PartialSuccess {
                 completed: CompletedEffect {
+                    request: AcceptedRequest::create_for_test(&writeback_state.attributes),
                     state: Box::new(writeback_state),
-                    request: AcceptedRequest::create_for_test(),
                 },
                 resource_id: id,
                 diagnostic,
@@ -1783,8 +1777,8 @@ mod process_basic_result_tests {
             resource,
             BasicEffectResult::PartialSuccess {
                 completed: CompletedEffect {
+                    request: AcceptedRequest::create_for_test(&state.attributes),
                     state: Box::new(state),
-                    request: AcceptedRequest::create_for_test(),
                 },
                 resource_id: id,
                 diagnostic,

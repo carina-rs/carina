@@ -3076,11 +3076,9 @@ impl ResourceState {
         preferred_hashes: Option<&PersistedAttributes>,
         comparison: &ComparisonContext<'_, R>,
     ) -> Result<Self, ResourceStateEncodingError> {
-        let applied_desired = identified
-            .resolved_desired_attributes()
-            .map(|attributes| resource_with_secret_shape_union(resource, attributes))
-            .transpose()?;
-        let writeback_resource = applied_desired.as_ref().unwrap_or(resource);
+        let applied_desired =
+            resource_with_secret_shape_union(resource, identified.resolved_desired_attributes())?;
+        let writeback_resource = &applied_desired;
         let sent_desired = identified.sent_desired_attributes_for(writeback_resource);
         let previous = existing.and_then(ResourceState::persisted_attributes);
         let no_observed_values = BTreeMap::new();
@@ -3205,7 +3203,7 @@ impl ResourceState {
     /// known authoring record. A legacy `Unrecorded` authoring record is seeded
     /// from desired keys. A freshly sent create encodes sent write-only and
     /// secret values and establishes the current desired authoring baseline.
-    pub fn from_in_flight<S, R: ReferenceEquality>(
+    pub fn from_in_flight<S: Clone, R: ReferenceEquality>(
         resource: &ResolvedResource<S>,
         pending: &InFlightCreate,
         existing: Option<&ResourceState>,
@@ -3213,6 +3211,14 @@ impl ResourceState {
         preferred_hashes: Option<&PersistedAttributes>,
         comparison: &ComparisonContext<'_, R>,
     ) -> Result<Self, ResourceStateEncodingError> {
+        let applied_desired = match pending.persistence() {
+            InFlightPersistence::Fresh(fresh) => Some(resource_with_secret_shape_union(
+                resource,
+                fresh.resolved_desired_attributes(),
+            )?),
+            InFlightPersistence::Persisted => None,
+        };
+        let writeback_resource = applied_desired.as_ref().unwrap_or(resource);
         let (persisted, sent_desired) = match pending.persistence() {
             InFlightPersistence::Persisted => {
                 if let Some(existing) = existing {
@@ -3253,7 +3259,7 @@ impl ResourceState {
             }
             InFlightPersistence::Fresh(fresh) => {
                 let selected = Self::selected_sent_attributes(
-                    resource,
+                    writeback_resource,
                     fresh.sent(),
                     existing,
                     preferred_hashes,
@@ -3263,14 +3269,14 @@ impl ResourceState {
                 write_only.retain_keys(|key| sent_write_only.contains(key));
                 let mut secrets = selected;
                 secrets.retain_keys(|key| {
-                    resource
+                    writeback_resource
                         .attributes
                         .get(key)
                         .is_some_and(carina_core::value::contains_secret)
                 });
                 (
                     fresh.persist(write_only, secrets),
-                    Some(fresh.sent_desired_attributes_for(resource)),
+                    Some(fresh.sent_desired_attributes(writeback_resource.attributes.keys())),
                 )
             }
         };
@@ -3285,7 +3291,7 @@ impl ResourceState {
             .map(DesiredAuthoringBasis::Sent)
             .unwrap_or(DesiredAuthoringBasis::CarriedRead);
         row.populate_desired_metadata(
-            resource,
+            writeback_resource,
             existing,
             &BTreeMap::new(),
             schema,
@@ -3389,10 +3395,10 @@ impl ResourceState {
         // desired values that were actually accepted, or a secret selected by a
         // coalesce/function/interpolation can be persisted as provider plaintext.
         let applied_desired = match row_basis {
-            RowBasis::Applied(request) => request
-                .resolved_desired_attributes()
-                .map(|attributes| resource_with_secret_shape_union(resource, attributes))
-                .transpose()?,
+            RowBasis::Applied(request) => Some(resource_with_secret_shape_union(
+                resource,
+                request.resolved_desired_attributes(),
+            )?),
             RowBasis::Imported | RowBasis::Carried => None,
         };
         let writeback_resource = applied_desired.as_ref().unwrap_or(resource);
@@ -3485,21 +3491,17 @@ impl ResourceState {
             (Some(previous), RowBasis::Applied(request)) => {
                 // Rule 1 reads only the accepted request projection and sent set.
                 // Rule 2 uses the final plan witness, including for unsent keys.
-                let request_attributes = match request.resolved_desired_attributes() {
-                    Some(attributes) => Cow::Owned(
-                        attributes
-                            .values()
-                            .iter()
-                            .map(|(key, value)| {
-                                value.to_value_at(key).map(|value| (key.clone(), value))
-                            })
-                            .collect::<Result<IndexMap<_, _>, _>>()
-                            .map_err(SerializationError::UnavailableSecret)?,
-                    ),
-                    // Bootstrap and fixture accepted requests already carry
-                    // a resolved writeback resource.
-                    None => Cow::Borrowed(&writeback_resource.attributes),
-                };
+                let request_attributes = Cow::Owned(
+                    request
+                        .resolved_desired_attributes()
+                        .values()
+                        .iter()
+                        .map(|(key, value)| {
+                            value.to_value_at(key).map(|value| (key.clone(), value))
+                        })
+                        .collect::<Result<IndexMap<_, _>, _>>()
+                        .map_err(SerializationError::UnavailableSecret)?,
+                );
                 PreviousSecretHashAuthority::AcceptedWrite {
                     previous,
                     request,
@@ -3582,7 +3584,7 @@ impl ResourceState {
         };
         let authoring_basis = match row_basis {
             RowBasis::Applied(request) => {
-                DesiredAuthoringBasis::Sent(request.sent_desired_attributes(writeback_resource))
+                DesiredAuthoringBasis::Sent(request.sent_desired_attributes())
             }
             RowBasis::Imported => DesiredAuthoringBasis::DesiredRead,
             RowBasis::Carried => DesiredAuthoringBasis::CarriedRead,
