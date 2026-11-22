@@ -172,7 +172,7 @@ fn refresh_retained_map_leaf_beside_desired_secret_keeps_previous_hash_until_app
 }
 
 #[test]
-fn reordered_secret_struct_list_refresh_succeeds_then_updates_once() {
+fn reordered_secret_struct_list_refresh_keeps_provider_order_then_updates_once() {
     let scenario = Scenario::new(
         "test.resource",
         "name = 'sink'\n\
@@ -200,6 +200,8 @@ fn reordered_secret_struct_list_refresh_succeeds_then_updates_once() {
     );
     scenario.run(&["state", "refresh", "."]);
     let refreshed = scenario.attributes();
+    assert!(refreshed["rules"][0]["conditions"][0]["value"] == "a");
+    assert!(refreshed["rules"][1]["conditions"][0]["value"] == "b");
     for rule in refreshed["rules"].as_array().unwrap() {
         assert!(
             rule["action"][PERSISTED_SECRET_KEY].is_string(),
@@ -209,7 +211,7 @@ fn reordered_secret_struct_list_refresh_succeeds_then_updates_once() {
     let plan = scenario.run(&["plan", "."]);
     assert!(
         plan.contains("Plan: 0 to add, 1 to change, 0 to destroy."),
-        "the reordered list must require exactly one Update after refresh:\n{plan}"
+        "the refreshed provider order must require exactly one Update:\n{plan}"
     );
 
     scenario.run(&["apply", "--auto-approve", "--parallelism=1", "."]);

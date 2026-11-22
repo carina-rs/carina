@@ -3039,7 +3039,7 @@ fn carried_list_pending_removal_transfers_across_unique_reorder() {
 }
 
 #[test]
-fn carried_list_with_secret_field_keeps_previous_list_whole() {
+fn carried_list_with_secret_field_still_pairs_by_ordinary_identity_fields() {
     let authored_rule = |port: i64, description: Option<&str>, token: &str| {
         let Value::Concrete(ConcreteValue::Map(mut fields)) = list_rule(port, description) else {
             unreachable!("list_rule always returns a map");
@@ -3122,15 +3122,15 @@ fn carried_list_with_secret_field_keeps_previous_list_whole() {
         RowBasis::Carried,
         None,
     )
-    .expect("an unaligned masked list must retain the previous list");
-    assert!(
-        carried
-            .persisted_attributes()
-            .unwrap()
-            .encoded_value("rules")
-            == prior.persisted_attributes().unwrap().encoded_value("rules"),
-        "the carried list must keep the previous order, values, and secret hashes"
-    );
+    .expect("secret hashes must not prevent ordinary unique pairing");
+    let ExplicitFields::Struct { children } = &carried.explicit else {
+        panic!("expected carried root Struct");
+    };
+    let ExplicitFields::ListElements { elements } = &children["rules"] else {
+        panic!("unique port identity should retain aligned ListElements");
+    };
+    assert_explicit_struct_keys(&elements[0], &["port", "token"]);
+    assert_explicit_struct_keys(&elements[1], &["port", "description", "token"]);
 }
 
 #[test]

@@ -2353,10 +2353,11 @@ fn merge_previous_secret_hashes_into_provider_json_inner(
             return Ok(previous_value.to_owned_json());
         };
         if !previous_secret_hash_array_alignment_is_trusted(previous_items, provider_items) {
-            // Masked descendants cannot be re-hashed without plaintext. Keep
-            // the previous list whole when its leaf alignment is untrusted.
+            // With untrusted alignment, fall back to the masked provider value
+            // as on main. Remaining leaf leaks inside reordered/resized lists
+            // are tracked in carina-rs/carina#4592.
             if secret_hash_shape_view(provider_value) == SecretHashShape::Nested {
-                return Ok(previous_value.to_owned_json());
+                return Ok(provider_value.to_owned_json());
             }
             return hash_provider_view_as_secret(provider_value, Some(previous_value));
         }
@@ -12464,7 +12465,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_previous_secret_hashes_keeps_previous_unaligned_masked_lists() {
+    fn merge_previous_secret_hashes_keeps_provider_unaligned_masked_lists() {
         let secret = |text: &str| {
             PersistedValue::encode_desired_value(
                 &Value::Deferred(DeferredValue::Secret(
@@ -12491,12 +12492,12 @@ mod tests {
             let provider = PersistedValue::from_serialized_json(provider_json).unwrap();
             let merged =
                 merge_previous_secret_hashes_into_provider_value(&previous, Some(&provider))
-                    .expect("an unaligned masked list must retain previous protection")
+                    .expect("an unaligned masked list must fall back to the provider value")
                     .expect("the previous list contains secret hashes");
-            assert!(merged == previous, "the previous list must be kept whole");
+            assert!(merged == provider, "the masked provider list must be kept");
             assert!(
                 !merged.as_json().to_string().contains("fixture-secret-4570"),
-                "the retained list must contain no secret plaintext"
+                "the masked provider list must contain no secret plaintext"
             );
 
             let mut plaintext_json = provider.as_json().clone();
@@ -12522,6 +12523,42 @@ mod tests {
                 "the provider list must contain no secret plaintext"
             );
         }
+    }
+
+    #[test]
+    fn merge_previous_secret_hashes_keeps_newly_masked_struct_list_fields() {
+        let secret = |text: &str| {
+            PersistedValue::encode_desired_value(
+                &Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(text.into()))).into(),
+                )),
+                None,
+            )
+            .unwrap()
+        };
+        let token = secret("fixture-secret-4570-token");
+        let note = secret("n");
+        let previous = PersistedValue::from_serialized_json(serde_json::json!([
+            {"port": 80, "note": "n", "token": token.as_json()}
+        ]))
+        .unwrap();
+        let provider = PersistedValue::from_serialized_json(serde_json::json!([
+            {"port": 80, "note": note.as_json(), "token": token.as_json()}
+        ]))
+        .unwrap();
+
+        let merged = merge_previous_secret_hashes_into_provider_value(&previous, Some(&provider))
+            .expect("a newly masked field must fall back to the provider list")
+            .expect("the previous list contains a secret hash");
+        assert!(merged == provider, "the masked provider list must be kept");
+        assert!(
+            merged.as_json()[0]["note"][crate::value::PERSISTED_SECRET_KEY].is_string(),
+            "the newly secret note must remain hashed"
+        );
+        assert!(
+            !merged.as_json().to_string().contains("fixture-secret-4570"),
+            "the merged list must contain no secret plaintext"
+        );
     }
 
     #[test]
