@@ -35,12 +35,12 @@ use carina_core::resource::{
     Value as GenericValue,
 };
 use carina_core::schema::{SchemaRegistry, TypeError};
-use carina_core::validation::DeferredAccessTypeError;
 #[cfg(test)]
 use carina_core::validation::admission::attributes::uses_resource_attribute_admission;
 use carina_core::validation::admission::attributes::{
     ClassificationDiagnostics, ResourceAttributeInputs, ValidationEvaluation,
 };
+use carina_core::validation::{DeferredAccessTypeError, merge_function_promise_diagnostics};
 
 #[derive(Debug)]
 enum OrdinaryDiagnostic {
@@ -257,7 +257,7 @@ fn render_analysis_resolution_error(
             doc,
             finding.as_ref(),
             DiagnosticSeverity::ERROR,
-            finding.detail().diagnostic_message(),
+            finding.detail().to_string(),
         ),
     }
 }
@@ -1700,6 +1700,7 @@ impl DiagnosticRun<'_> {
             self.collect_diagnostics_in(doc, current_file_path, &mut conversion_validation);
         conversion_validation.extend(ordinary.into_iter().map(OrdinaryDiagnostic::visible));
         let mut diagnostics = Vec::new();
+        let mut promises: BTreeMap<PathBuf, Vec<Diagnostic>> = BTreeMap::new();
         for finding in conversion_validation.complete().into_presented() {
             use carina_core::validation::{OrdinaryFinding, PresentedFinding};
             match finding {
@@ -1759,12 +1760,7 @@ impl DiagnosticRun<'_> {
                     let Some(diagnostic) = diagnostic else {
                         continue;
                     };
-                    let mut routed = self.routed_findings.borrow_mut();
-                    let destination = if path == doc.source_file() {
-                        &mut diagnostics
-                    } else {
-                        routed.entry(path.to_path_buf()).or_default()
-                    };
+                    let destination = promises.entry(path.to_path_buf()).or_default();
                     if !destination.contains(&diagnostic) {
                         destination.push(diagnostic);
                     }
@@ -1789,9 +1785,24 @@ impl DiagnosticRun<'_> {
             }
         }
 
-        diagnostics.sort_by_key(|finding| (finding.range.start, finding.range.end));
-        for findings in self.routed_findings.borrow_mut().values_mut() {
-            findings.sort_by_key(|finding| (finding.range.start, finding.range.end));
+        let mut routed = self.routed_findings.borrow_mut();
+        for (path, mut promises) in promises {
+            let destination = if path == doc.source_file() {
+                &mut diagnostics
+            } else {
+                routed.entry(path).or_default()
+            };
+            promises.retain(|finding| !destination.contains(finding));
+            *destination = merge_function_promise_diagnostics(
+                std::mem::take(destination),
+                promises,
+                |finding| {
+                    Some((
+                        (),
+                        Some((finding.range.start.line, finding.range.start.character)),
+                    ))
+                },
+            );
         }
         diagnostics
     }

@@ -6691,10 +6691,6 @@ mod judgement {
                 }
                 Err(SinkRejection::Ordinary(error)) => error,
             };
-            if crate::validation::admission::static_judgement::type_needs_schema(sink, self.config)
-            {
-                return None;
-            }
             let error = match error {
                 crate::validation::typecheck::FunctionExpressionError::Annotation(error) => {
                     let mut failed = declared(

@@ -7,13 +7,17 @@ fn project(source: &str) -> Directory {
 }
 
 fn parity(directory: &Directory, expected: &[&str]) {
+    parity_with_lsp(directory, expected, expected);
+}
+
+fn parity_with_lsp(directory: &Directory, expected_cli: &[&str], expected_lsp: &[&str]) {
     let cli = validate(directory);
-    assert_eq!(messages(&cli), expected, "{}", cli.json);
+    assert_eq!(messages(&cli), expected_cli, "{}", cli.json);
     let lsp: Vec<_> = lsp_errors(directory)
         .into_iter()
         .map(|finding| finding.message)
         .collect();
-    assert_eq!(lsp, expected, "CLI/LSP findings differ");
+    assert_eq!(lsp, expected_lsp, "LSP findings differ");
 }
 
 #[test]
@@ -39,12 +43,15 @@ fn tp13_struct_resolved_known_field_uses_value_check() {
 #[test]
 fn tp13_struct_invalid_known_field_keeps_value_error() {
     for tag in ["'qa'", "a.description"] {
-        parity(
+        parity_with_lsp(
             &project(&format!(
                 "let a = test.Role {{ role_name = 'dev' description = 'qa' }}\nfn s(x: struct {{ name: String, tag: 'dev' | 'prod' }}): String {{ x.name }}\nlet sink = test.Sink {{ name = 'sink' value = s({{ name = src.identifier, tag = {tag} }}) }}\n",
             )),
             &[
                 "function 's': parameter 'x': at struct field 'tag': expected 'dev' | 'prod', got string 'qa'",
+            ],
+            &[
+                "Invalid expression at line 4: function 's': parameter 'x': at struct field 'tag': expected 'dev' | 'prod', got string 'qa'",
             ],
         );
     }

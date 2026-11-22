@@ -1160,8 +1160,13 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         // use overlap-or-defer in both declaration and reference Full checks.
         let scalar = matches!(&source.attr.kind, String { .. } | Int { .. })
             && matches!(&target.attr.kind, String { .. } | Int { .. } | Float { .. });
-        let same_identity = identity_leaf(&source.attr.kind)
-            .and_then(|leaf| leaf.identity())
+        // Reference reads carry identity too. Keep their computed proof when
+        // the destination has that identity, without changing value admission.
+        let source_identity = match &source.attr.kind {
+            Reference { identity, .. } => Some(identity),
+            kind => identity_leaf(kind).and_then(|leaf| leaf.identity()),
+        };
+        let same_identity = source_identity
             .zip(identity_leaf(&target.attr.kind).and_then(|leaf| leaf.identity()))
             .is_some_and(|(source, target)| source == target);
         if let Some(obligation) = check.destination_obligation(scalar, same_identity)

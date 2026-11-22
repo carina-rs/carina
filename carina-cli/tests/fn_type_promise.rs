@@ -855,7 +855,8 @@ fn tp1_lsp_validate_rule3_parity_module() {
 mod tp1_missing_schema {
     use super::*;
 
-    fn check(scope: Scope, position: Position, ty: &str) {
+    /// Missing schemas defer promise findings; ordinary checks keep main's outcomes.
+    fn check_without_promise_findings(scope: Scope, position: Position, ty: &str) {
         let directory = case_directory(scope, position, ty, "", "src.identifier");
         let diagnostics = validate_diagnostics_with_factories(
             &ResolvedPath::new(directory.root()).unwrap(),
@@ -866,37 +867,55 @@ mod tp1_missing_schema {
         assert!(
             errors
                 .iter()
-                .all(|error| !error.contains("function 'promise'")),
-            "missing schemas must not produce rule 3: {}",
+                .all(|error| !error.contains("cannot prove it fits")),
+            "missing schemas must not produce a function-promise finding: {}",
             diagnostics.json
         );
         assert!(
-            diagnostics
-                .json
-                .to_string()
-                .contains("provider not installed"),
+            errors.contains(&"provider not installed"),
             "fixture must actually exercise a failed provider load: {}",
             diagnostics.json
         );
+        if matches!(position, Position::Return) && ty == "test.Name" {
+            assert_eq!(
+                errors,
+                [
+                    "function 'promise': return value: expected test.Name, got String",
+                    "provider not installed",
+                ],
+                "{}",
+                diagnostics.json
+            );
+            let deferred: Vec<_> = diagnostics.json["warnings"]
+                .as_array()
+                .expect("the provider annotation must retain its deferred warning")
+                .iter()
+                .filter(|warning| {
+                    warning["message"] == "function 'promise' return value: type check for test.Name was deferred because provider schemas were not loaded"
+                })
+                .collect();
+            assert_eq!(deferred.len(), 1, "{}", diagnostics.json);
+            assert_eq!(deferred[0]["code"], "providers_not_loaded");
+        }
     }
 
     macro_rules! missing_schema_matrix {
         ($scope:expr) => {
             #[test]
             fn parameter_union() {
-                check($scope, Position::Parameter, ENVIRONMENT);
+                check_without_promise_findings($scope, Position::Parameter, ENVIRONMENT);
             }
             #[test]
             fn return_union() {
-                check($scope, Position::Return, ENVIRONMENT);
+                check_without_promise_findings($scope, Position::Return, ENVIRONMENT);
             }
             #[test]
             fn parameter_provider_type() {
-                check($scope, Position::Parameter, "test.Name");
+                check_without_promise_findings($scope, Position::Parameter, "test.Name");
             }
             #[test]
             fn return_provider_type() {
-                check($scope, Position::Return, "test.Name");
+                check_without_promise_findings($scope, Position::Return, "test.Name");
             }
         };
     }

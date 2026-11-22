@@ -67,6 +67,60 @@ pub enum PresentedFinding<E: ValidationClientError = std::convert::Infallible> {
     FunctionPromise(crate::parser::Located<crate::parser::retained::FunctionTypePromise>),
 }
 
+/// Insert source-ordered promise diagnostics without reordering existing findings.
+/// Clients supply their rendered file and start position, including UTF-16 editor
+/// positions. A file-only finding still counts as that file's last diagnostic;
+/// findings without a file are appended at the end.
+pub fn merge_function_promise_diagnostics<T, F: Ord, P: Ord>(
+    ordinary: Vec<T>,
+    promises: Vec<T>,
+    position: impl Fn(&T) -> Option<(F, Option<P>)>,
+) -> Vec<T> {
+    if promises.is_empty() {
+        return ordinary;
+    }
+    let positions: Vec<_> = ordinary.iter().map(&position).collect();
+    let mut promises: Vec<_> = promises
+        .into_iter()
+        .map(|finding| (position(&finding), finding))
+        .collect();
+    promises.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut merged = Vec::with_capacity(ordinary.len() + promises.len());
+    let mut before: Vec<Vec<T>> = (0..=ordinary.len()).map(|_| Vec::new()).collect();
+    for (location, finding) in promises {
+        let index = location
+            .and_then(|(file, start)| {
+                positions
+                    .iter()
+                    .position(|other| {
+                        other.as_ref().is_some_and(|(path, point)| {
+                            *path == file
+                                && point
+                                    .as_ref()
+                                    .zip(start.as_ref())
+                                    .is_some_and(|(point, start)| point > start)
+                        })
+                    })
+                    .or_else(|| {
+                        positions
+                            .iter()
+                            .rposition(|other| {
+                                other.as_ref().is_some_and(|(path, _)| *path == file)
+                            })
+                            .map(|last| last + 1)
+                    })
+            })
+            .unwrap_or(ordinary.len());
+        before[index].push(finding);
+    }
+    for (index, finding) in ordinary.into_iter().enumerate() {
+        merged.append(&mut before[index]);
+        merged.push(finding);
+    }
+    merged.append(before.last_mut().expect("the final insertion bucket"));
+    merged
+}
+
 /// A conversion after the validation report's consuming exit.
 #[derive(Debug, Clone)]
 pub struct PresentedConversion {

@@ -288,16 +288,36 @@ fn refresh_retained_secret_call_in_module_keeps_previous_hash() {
 
 #[test]
 fn refresh_retained_call_with_visible_secret_argument_keeps_previous_hash() {
+    use carina_core::resource::{DeferredValue, Value as ResourceValue};
+
     let scenario = Scenario::new(
         false,
         "visible(lookup({ 'src-id' = src.computed }, src.identifier, secret('__MARKER__')))",
     );
     let source = fs::read_to_string(&scenario.source).unwrap();
-    fs::write(
-        &scenario.source,
-        format!("fn visible(x: HttpsUrl): String {{ x }}\n{source}"),
+    fs::write(&scenario.source, format!("fn visible(x) {{ x }}\n{source}")).unwrap();
+    let parsed = carina_core::config_loader::parse_directory(
+        &carina_core::paths::ResolvedPath::new(scenario.project.path()).unwrap(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
-    .unwrap();
+    .unwrap_or_else(|_| panic!("the unannotated visible fixture must parse"))
+    .into_parsed();
+    let sink = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.as_str() == "sink")
+        })
+        .expect("the fixture must retain its sink resource");
+    let computed = &sink.attributes["computed"];
+    assert!(
+        matches!(computed, ResourceValue::Deferred(DeferredValue::FunctionCall { name, .. }) if name == "visible")
+            || matches!(computed, ResourceValue::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) if function.name == "visible"),
+        "visible(...) must remain a deferred call until its resource inputs resolve at apply"
+    );
     scenario.assert_refresh_protected(&scenario.marker);
 }
 

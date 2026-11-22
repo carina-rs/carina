@@ -11,10 +11,14 @@ fn project(source: &str) -> Directory {
 }
 
 fn parity(directory: &Directory, expected: &[&str]) {
+    parity_with_lsp(directory, expected, expected);
+}
+
+fn parity_with_lsp(directory: &Directory, expected_cli: &[&str], expected_lsp: &[&str]) {
     let cli = validate(directory);
     let mut actual = messages(&cli);
     actual.sort_unstable();
-    let mut expected = expected.to_vec();
+    let mut expected = expected_cli.to_vec();
     expected.sort_unstable();
     assert_eq!(actual, expected, "{}", cli.json);
     let mut lsp: Vec<_> = lsp_errors(directory)
@@ -22,7 +26,9 @@ fn parity(directory: &Directory, expected: &[&str]) {
         .map(|error| error.message)
         .collect();
     lsp.sort_unstable();
-    assert_eq!(lsp, expected, "CLI/LSP finding set differs");
+    let mut expected = expected_lsp.to_vec();
+    expected.sort_unstable();
+    assert_eq!(lsp, expected, "LSP finding set differs");
 }
 
 #[test]
@@ -38,9 +44,12 @@ fn tp6_invalid_resource_input_keeps_value_error() {
     let directory = project(&format!(
         "let a = test.Role {{ role_name = 'qa' }}\n{PICK}test.Sink {{ name = 'sink' value = pick(a.role_name) }}\n"
     ));
-    parity(
+    parity_with_lsp(
         &directory,
         &["function 'pick': parameter 'x': expected 'dev' | 'prod', got string 'qa'"],
+        &[
+            "Invalid expression at line 3: function 'pick': parameter 'x': expected 'dev' | 'prod', got string 'qa'",
+        ],
     );
 }
 
@@ -156,9 +165,12 @@ fn tp6_invalid_known_relevant_return_keeps_value_error() {
     let directory = project(&format!(
         "{ROLE}fn pick(x: String, y: String): 'dev' | 'prod' {{ x }}\ntest.Sink {{ name = 'sink' value = pick('qa', a.arn) }}\n"
     ));
-    parity(
+    parity_with_lsp(
         &directory,
         &["function 'pick': return value: expected 'dev' | 'prod', got string 'qa'"],
+        &[
+            "User-defined function error: function 'pick': return value: expected 'dev' | 'prod', got string 'qa'",
+        ],
     );
 }
 
