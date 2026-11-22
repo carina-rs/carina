@@ -26,7 +26,7 @@ expression: output
 ┌ Details ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │-/+ aws.route53.Record validation_records[*] (N records after cert applies)                                           │
 │                                                                                                                      │
-│  <- for opt in cert.domain_validation_options                                                                        │
+│  <- for (_, opt) in cert.domain_validation_options                                                                   │
 │  hosted_zone_id: 'Z123'                                                                                              │
 │  name: (known after cert applies)                                                                                    │
 │  resource_records: (known after cert applies)                                                                        │

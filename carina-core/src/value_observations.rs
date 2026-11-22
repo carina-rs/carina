@@ -15,7 +15,7 @@ pub trait BindingState {
 
 /// A complete decoded state-file authority. Any crate may decode a complete
 /// document; no caller can mint it from a lookup, selected rows or `None`.
-/// The state crate uses this same decoder after its legacy wire migrations.
+/// The state crate uses this same current-format decoder.
 #[derive(Debug, Clone)]
 pub struct ObservationState {
     document: crate::state_document::DecodedStateDocument,

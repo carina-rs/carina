@@ -1,0 +1,38 @@
+[
+  {
+    "message": "unknown attribute `directives` on `b`",
+    "severity": "error",
+    "code": null,
+    "location": {
+      "file": "main.crn",
+      "range": {
+        "start": {
+          "line": 1,
+          "column": 99
+        },
+        "end": {
+          "line": 1,
+          "column": 112
+        }
+      }
+    }
+  },
+  {
+    "message": "Attribute 'directives': ?? alternatives mix secret and public values; all alternatives must be secret or all public.",
+    "severity": "error",
+    "code": null,
+    "location": {
+      "file": "main.crn",
+      "range": {
+        "start": {
+          "line": 1,
+          "column": 96
+        },
+        "end": {
+          "line": 1,
+          "column": 98
+        }
+      }
+    }
+  }
+]

@@ -387,9 +387,10 @@ where
         {
             let (resource, result) = step.into_parts();
             let attributes = resource.attributes();
-            let mut admitted = result
+            let admitted = result
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| format!("missing fixture schema: {:?}", resource.id()))?;
+            let (mut admitted, _prefixes_for_test) = admitted.into_parts();
             let mut local = admitted
                 .errors()
                 .chain(

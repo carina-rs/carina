@@ -32,8 +32,8 @@ use crate::wait::predicate::resolve_wait_predicate;
 use super::{
     ExistingComparisonInputs, PlanInputSavedAttributes, PlanPriorStates, PlannedListKeyRelease,
     PlanningComparison, PresentDiff,
-    comparison::{AuthoredAttributeViews, AuthoredRemovalEvidence},
-    diff_present_with_releases, type_aware_equal,
+    comparison::{AuthoredAttributeViews, AuthoredRemovalEvidence, planned_values_equal},
+    diff_present_with_releases,
 };
 
 #[cfg(test)]
@@ -574,7 +574,7 @@ fn create_only_values_compatible_on_path<'schema, P: crate::resource::StateValue
                 };
                 if field.create_only {
                     return current_fields.get(&field.name).is_some_and(|current| {
-                        type_aware_equal(
+                        planned_values_equal(
                             current,
                             desired,
                             Some(&field.field_type),
@@ -1283,6 +1283,7 @@ fn create_plan_parts(
                                 &from,
                                 schema,
                             )
+                            .map(|planned| planned.to_patch())
                         {
                             plan.add_error(PlanError::new(id, error.into()));
                             continue;

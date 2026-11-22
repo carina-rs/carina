@@ -1181,6 +1181,7 @@ impl DiagnosticRun<'_> {
         &self,
         doc: &Document,
         tree: &carina_core::parser::AnalysisTree<'_>,
+        exports: &carina_core::upstream_exports::UpstreamExports,
     ) -> Vec<Diagnostic> {
         let mut diagnostics: Vec<_> = carina_core::validation::validate_for_iterable_bindings(tree)
             .iter()
@@ -1194,9 +1195,11 @@ impl DiagnosticRun<'_> {
             })
             .collect();
         diagnostics.extend(
-            carina_core::validation::validate_deferred_for_iterable_types(
+            carina_core::validation::validate_for_iterable_types_with_upstream(
                 tree,
                 self.provider_context.catalog(),
+                &self.schemas,
+                exports,
             )
             .iter()
             .filter_map(|finding| {

@@ -72,9 +72,9 @@ pub(crate) fn structural_handle(
     ))
 }
 
-pub(crate) fn for_structural_handle(binding_name: &str) -> EvalValue {
+pub(crate) fn for_structural_handle(binding_name: &str, binding: super::ForBinding) -> EvalValue {
     EvalValue::structural_handle(UnexpandedStructuralHandle::new(
-        UnexpandedStructuralHandleKind::For,
+        UnexpandedStructuralHandleKind::For(binding),
         binding_name,
     ))
 }
@@ -634,11 +634,16 @@ fn parse_primary_inner_with_resource_or_module(
             ))
         }
         Rule::for_expr => {
+            let binding = super::expressions::for_expr::parse_for_binding(first_inner(
+                inner.clone(),
+                "binding pattern",
+                "for expression",
+            )?)?;
             let target = LoopParseTarget::bound(binding_name);
             let (resources, data_sources, module_calls) =
                 parse_for_expr(inner, ctx, target, preprocessed_file, source_file)?;
             Ok((
-                for_structural_handle(binding_name_str),
+                for_structural_handle(binding_name_str, binding),
                 resources,
                 data_sources,
                 module_calls,

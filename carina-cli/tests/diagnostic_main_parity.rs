@@ -120,7 +120,7 @@ fn cycle_includes_selected_binding_dependencies() {
         &[
             (
                 "main.crn",
-                "provider mock {}\nlet copies = for n in [1] {\n  mock.test.resource { name = b.name directives { depends_on = [b] } }\n}\n",
+                "provider mock {}\nlet copies = for (_, n) in [1] {\n  mock.test.resource { name = b.name directives { depends_on = [b] } }\n}\n",
             ),
             (
                 "sibling.crn",
@@ -229,7 +229,7 @@ fn identity_conflict_stops_before_upstream_shapes() {
 fn upstream_expanded_copies_keep_each_context() {
     for expression in ["up.names.bad", "up.names['bad']"] {
         let dir = upstream_fixture(&format!(
-            "let copies = for n in [1, 2] {{\n  mock.test.resource {{ name = {expression} }}\n}}\n"
+            "let copies = for (_, n) in [1, 2] {{\n  mock.test.resource {{ name = {expression} }}\n}}\n"
         ));
         let (output, text) = validate(&dir.path().join("down"));
         assert!(!output.status.success(), "{text}");

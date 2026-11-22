@@ -1,7 +1,7 @@
-# Moved block with attribute removal: prev_desired_keys transfer
-# State has "old_vpc" with desired_keys=["cidr_block", "tags"].
+# Moved block with attribute removal: previous explicit-field transfer
+# State has "old_vpc" with explicit fields "cidr_block" and "tags".
 # After move to "new_vpc", tags are removed from the DSL.
-# Plan should detect the removal (via prev_desired_keys under the new name).
+# Plan should detect the removal (via the previous explicit fields under the new name).
 
 provider awscc {
   region = awscc.Region.ap_northeast_1

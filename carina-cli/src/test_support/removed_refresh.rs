@@ -387,7 +387,7 @@ async fn removed_no_refresh_deferred_child_collision() {
             name = "parent"
             rules = [{ action = "child" }]
         }
-        let children = for rule in parent.rules {
+        let children = for (_, rule) in parent.rules {
             mock.test.resource { name = rule.action }
         }
         removed { from = mock.test.resource 'children[0]' }
@@ -467,8 +467,8 @@ async fn removed_no_refresh_state_preserves_deposed_read_behavior() {
         state["resources"][0]["deposed"].as_array().unwrap().len(),
         1
     );
-    let validated = carina_state::check_and_migrate_bytes(&f.bytes()).unwrap();
-    assert!(!validated.state().resources()[0].has_current_instance());
+    let validated = carina_state::load_state_bytes(&f.bytes()).unwrap();
+    assert!(!validated.resources()[0].has_current_instance());
     let log = fs::read_to_string(&f.log).unwrap();
     assert_eq!(
         log.lines().filter(|line| line.starts_with("read ")).count(),

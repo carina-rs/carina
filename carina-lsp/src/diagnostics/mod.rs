@@ -380,7 +380,7 @@ fn secrecy_related_message(cause: &carina_core::secrecy::DerivationError, name: 
     format!("{description} in module instance '{name}'")
 }
 
-fn authored_range(
+fn analyzed_range(
     location: &carina_core::parser::DeclarationLocation,
     open_sources: &[(PathBuf, Arc<str>)],
     analyzed_sources: &carina_core::config_loader::SourceOverrides,
@@ -438,7 +438,7 @@ fn render_secrecy(
         )?
     } else {
         Diagnostic {
-            range: authored_range(authored, open_sources, analyzed_sources)?,
+            range: analyzed_range(authored, open_sources, analyzed_sources)?,
             severity: Some(DiagnosticSeverity::ERROR),
             source: Some("carina".into()),
             message,
@@ -455,7 +455,7 @@ fn render_secrecy(
             )
             .map(|diagnostic| diagnostic.range)
         } else {
-            authored_range(&call.location, open_sources, analyzed_sources)
+            analyzed_range(&call.location, open_sources, analyzed_sources)
         };
         // Missing or unmappable related text never suppresses the operator.
         diagnostic.related_information = range.and_then(|range| {
@@ -716,7 +716,12 @@ impl<'a> ExpandedDiagnosticValidationInputs<'a> {
             carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
             session,
         )
-        .map(|outcome| outcome.map(|outcome| outcome.values))
+        .map(|outcome| {
+            outcome.map(|outcome| {
+                let (values, _prefixes_for_test) = outcome.values.into_parts();
+                values
+            })
+        })
     }
 
     fn admit_owner<F: carina_core::validation::ValidationClientError>(
@@ -848,7 +853,7 @@ pub struct DiagnosticEngine {
 }
 
 struct DirectoryProviderDeclarations {
-    directory: PathIdentity,
+    directory: PathBuf,
     providers: Vec<ProviderConfig>,
 }
 
@@ -923,7 +928,7 @@ pub(super) struct DiagnosticRun<'a> {
     source_snapshot: Option<&'a carina_core::config_loader::SourceOverrides>,
     analysis_sources: &'a RefCell<carina_core::config_loader::SourceOverrides>,
     secrecy_causes: &'a RefCell<SecrecyCauses>,
-    routed_diagnostics: &'a RefCell<BTreeMap<PathBuf, Vec<Diagnostic>>>,
+    routed_findings: &'a RefCell<BTreeMap<PathBuf, Vec<Diagnostic>>>,
 }
 
 #[cfg(test)]
@@ -939,6 +944,66 @@ impl std::ops::Deref for DiagnosticRun<'_> {
 }
 
 impl DiagnosticRun<'_> {
+    /// One publication seam for deferred prefixes: use the authored key only,
+    /// never a module-call projection. Non-prefix findings retain their routes.
+    fn publish_deferred_prefixes(
+        &self,
+        doc: &Document,
+        publication: carina_core::identifier::DeferredPrefixPublication<'_>,
+        sources: &carina_core::config_loader::SourceOverrides,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
+        let configuration_sources = self.analysis_sources.borrow();
+        for finding in publication.findings() {
+            let Some(location) = finding.location() else {
+                continue;
+            };
+            let path = location.file().path();
+            let identity = PathIdentity::new(path);
+            let is_current = identity == PathIdentity::new(doc.source_file());
+            let publication = if is_current {
+                doc.source_file().to_path_buf()
+            } else {
+                self.open_sources
+                    .iter()
+                    .find(|(path, _)| PathIdentity::new(path) == identity)
+                    .map(|(path, _)| path.clone())
+                    .unwrap_or_else(|| location.file().diagnostic_path())
+            };
+            let diagnostic = if path == doc.source_file() {
+                render_merged(
+                    doc,
+                    &carina_core::parser::Located::new(location.clone(), ()),
+                    DiagnosticSeverity::ERROR,
+                    finding.diagnostic_message(),
+                )
+            } else {
+                analyzed_range(location, self.open_sources, &configuration_sources)
+                    .or_else(|| analyzed_range(location, self.open_sources, sources))
+                    .map(|range| Diagnostic {
+                        range,
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        source: Some("carina".into()),
+                        message: finding.diagnostic_message(),
+                        ..Default::default()
+                    })
+            };
+            if let Some(diagnostic) = diagnostic {
+                if is_current {
+                    if !diagnostics.contains(&diagnostic) {
+                        diagnostics.push(diagnostic);
+                    }
+                } else {
+                    let mut routed = self.routed_findings.borrow_mut();
+                    let entries = routed.entry(publication).or_default();
+                    if !entries.contains(&diagnostic) {
+                        entries.push(diagnostic);
+                    }
+                }
+            }
+        }
+    }
+
     fn resolve_diagnostic_upstream_exports<D, B: BindingAddress>(
         &self,
         base: &carina_core::paths::ResolvedPath,
@@ -1042,7 +1107,9 @@ impl DiagnosticRun<'_> {
                 format!("{}: {}", resource_id, finding.detail()),
             ));
         }
-        let mut value_validation = outcome.values;
+        // The canonical-file publication seam reports all prefix findings once,
+        // including owners outside this resource's per-document projection.
+        let (mut value_validation, _prefixes_reported_by_file) = outcome.values.into_parts();
         diagnostics.extend(render_classification_diagnostics(
             doc,
             rref,
@@ -1677,7 +1744,7 @@ impl DiagnosticRun<'_> {
                     } else if current_root_context
                         && path.parent().map(PathIdentity::new) != root_directory
                     {
-                        authored_range(finding.location(), self.open_sources, &overrides).map(
+                        analyzed_range(finding.location(), self.open_sources, &overrides).map(
                             |range| Diagnostic {
                                 range,
                                 severity: Some(DiagnosticSeverity::ERROR),
@@ -1692,7 +1759,7 @@ impl DiagnosticRun<'_> {
                     let Some(diagnostic) = diagnostic else {
                         continue;
                     };
-                    let mut routed = self.routed_diagnostics.borrow_mut();
+                    let mut routed = self.routed_findings.borrow_mut();
                     let destination = if path == doc.source_file() {
                         &mut diagnostics
                     } else {
@@ -1723,7 +1790,7 @@ impl DiagnosticRun<'_> {
         }
 
         diagnostics.sort_by_key(|finding| (finding.range.start, finding.range.end));
-        for findings in self.routed_diagnostics.borrow_mut().values_mut() {
+        for findings in self.routed_findings.borrow_mut().values_mut() {
             findings.sort_by_key(|finding| (finding.range.start, finding.range.end));
         }
         diagnostics
@@ -2051,7 +2118,7 @@ impl DiagnosticRun<'_> {
                 exports,
                 resolve_errors,
             ));
-            diagnostics.extend(self.check_for_iterable_bindings(doc, merged));
+            diagnostics.extend(self.check_for_iterable_bindings(doc, merged, exports));
         }
 
         // carina#2191 Phase 5: surface `check_provider_instance_routing`
@@ -2448,7 +2515,7 @@ impl DiagnosticRun<'_> {
                             diagnostics.push(diagnostic);
                         }
                     } else {
-                        let mut routed = self.routed_diagnostics.borrow_mut();
+                        let mut routed = self.routed_findings.borrow_mut();
                         let findings = routed.entry(path).or_default();
                         if !findings
                             .iter()
@@ -2894,7 +2961,8 @@ impl DiagnosticRun<'_> {
                         replay_coverage::declined_outcome(false);
                         continue;
                     };
-                    for error in report.values.errors() {
+                    let (values, _prefixes_reported_by_file) = report.values.as_parts();
+                    for error in values.errors() {
                         let finding = carina_core::parser::Located::new(
                             call.declaration_location().clone(),
                             error,
@@ -2914,10 +2982,18 @@ impl DiagnosticRun<'_> {
                 }
             }
             // The canonical files supply both owners and values. Raw document trees remain only for syntax checks.
-            publish_prefix_errors(doc, &pre_expansion_configuration, &mut diagnostics);
+            publish_prefix_rejections(doc, &pre_expansion_configuration, &mut diagnostics);
             if let Some(configuration) = &expanded_configuration {
-                publish_prefix_errors(doc, configuration, &mut diagnostics);
+                publish_prefix_rejections(doc, configuration, &mut diagnostics);
             }
+            // Every document publishes from its own directory analysis. This
+            // includes that directory's imported children when expansion succeeds;
+            // a module buffer never selects an outer caller graph for prefixes.
+            let prefix_publication = expanded_configuration
+                .as_ref()
+                .map(|configuration| configuration.deferred_prefix_publication())
+                .unwrap_or_else(|| pre_expansion_configuration.deferred_prefix_publication());
+            self.publish_deferred_prefixes(doc, prefix_publication, &overrides, &mut diagnostics);
             let resource_diagnostics_start = diagnostics.len();
             if let Some(authored_tree) = &authored_tree {
                 for resource in authored_tree
@@ -3286,7 +3362,7 @@ impl DiagnosticEngine {
 
     pub(crate) fn with_directory_providers(
         mut self,
-        directory: PathIdentity,
+        directory: PathBuf,
         providers: Vec<ProviderConfig>,
     ) -> Self {
         self.directory_providers = Some(DirectoryProviderDeclarations {
@@ -3308,7 +3384,7 @@ impl DiagnosticEngine {
                     source_snapshot: None,
                     analysis_sources: &RefCell::default(),
                     secrecy_causes: &RefCell::default(),
-                    routed_diagnostics: &RefCell::default(),
+                    routed_findings: &RefCell::default(),
                 })
             },
         )
@@ -3364,7 +3440,8 @@ impl DiagnosticEngine {
         current_file_path: Option<&Path>,
         open_sources: &[(PathBuf, Arc<str>)],
     ) -> Vec<Diagnostic> {
-        self.analyze_document_set_with_open_sources(raw, current_file_path, open_sources)
+        self.analyze_document_snapshot(raw, current_file_path, open_sources)
+            .into_documents()
             .remove(raw.source_file())
             .unwrap_or_default()
     }
@@ -3432,7 +3509,7 @@ impl DiagnosticEngine {
         } else {
             doc
         };
-        let routed_diagnostics = RefCell::default();
+        let routed_findings = RefCell::default();
         let analysis_sources = RefCell::default();
         let secrecy_causes = RefCell::default();
         let terminal =
@@ -3444,11 +3521,11 @@ impl DiagnosticEngine {
                     source_snapshot: Some(&source_snapshot),
                     analysis_sources: &analysis_sources,
                     secrecy_causes: &secrecy_causes,
-                    routed_diagnostics: &routed_diagnostics,
+                    routed_findings: &routed_findings,
                 }
                 .collect_diagnostics(&doc, current_file_path)
             });
-        let mut report = routed_diagnostics.into_inner();
+        let mut report = routed_findings.into_inner();
         report.insert(
             raw.source_file().to_path_buf(),
             Self::publish_type_diagnostics(terminal, &doc),
@@ -3472,7 +3549,16 @@ impl DiagnosticEngine {
                     })
                     .collect()
             },
-            imported_directories: analysis_sources.into_inner().imported_directories(),
+            imported_directories: analysis_sources
+                .into_inner()
+                .imported_directories()
+                .into_iter()
+                .chain(
+                    self.directory_providers
+                        .as_ref()
+                        .map(|scope| PathIdentity::new(&scope.directory)),
+                )
+                .collect(),
         }
     }
 
@@ -3505,7 +3591,7 @@ impl DiagnosticEngine {
                 .and_then(|directory| self.directory_catalog(doc, &directory, source_snapshot))
                 .unwrap_or_else(|| {
                     if let Some(scope) = &self.directory_providers
-                        && scope.directory == PathIdentity::new(directory)
+                        && PathIdentity::new(&scope.directory) == PathIdentity::new(directory)
                     {
                         // A resource edit may break declaration parsing without
                         // invalidating this directory's loaded provider snapshot.
@@ -3765,7 +3851,7 @@ fn decorate_schema_diagnostic(diagnostic: &mut Diagnostic, error: &carina_core::
     }
 }
 
-fn publish_prefix_errors<X, D, B: BindingAddress>(
+fn publish_prefix_rejections<X, D, B: BindingAddress>(
     doc: &Document,
     configuration: &PrefixCanonicalized<'_, carina_core::parser::retained::JudgedFile<'_, X, D, B>>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -3773,27 +3859,26 @@ fn publish_prefix_errors<X, D, B: BindingAddress>(
     X: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    for (resource, error) in configuration.prefix_failures() {
-        let location = error
-            .location()
-            .filter(|location| location.file().path() == doc.source_file())
-            .or_else(|| {
-                resource
-                    .module_source
-                    .as_ref()
-                    .and_then(carina_core::resource::ModuleSource::module_call)
-                    .map(|origin| origin.module_call_path().root().id.declaration_location())
-            });
-        if let Some(location) = location
-            && let Some(diagnostic) = render_merged(
-                doc,
-                &carina_core::parser::Located::new(location.clone(), ()),
-                DiagnosticSeverity::ERROR,
-                error.to_string(),
-            )
-            && !diagnostics.contains(&diagnostic)
-        {
-            diagnostics.push(diagnostic);
-        }
+    for error in configuration.rejections() {
+        publish_prefix_finding(doc, error.owner(), error.diagnostic_message(), diagnostics);
+    }
+}
+fn publish_prefix_finding(
+    doc: &Document,
+    owner: &carina_core::finding::FindingOwner,
+    message: String,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let location = owner.location_in(doc.source_file());
+    if let Some(location) = location
+        && let Some(diagnostic) = render_merged(
+            doc,
+            &carina_core::parser::Located::new(location.clone(), ()),
+            DiagnosticSeverity::ERROR,
+            message,
+        )
+        && !diagnostics.contains(&diagnostic)
+    {
+        diagnostics.push(diagnostic);
     }
 }

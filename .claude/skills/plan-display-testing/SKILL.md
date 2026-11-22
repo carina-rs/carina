@@ -23,7 +23,8 @@ cargo nextest run -p carina-cli plan_snapshot
 
 Fixture files are in `carina-cli/tests/fixtures/plan_display/`. Each
 directory contains a `.crn` file and optionally a `carina.state.json`
-(state v3 with binding/dependency_bindings). When adding new plan display
+(state v21, serialized by the current canonical writer, with resolved
+resource IDs in dependency arrays). When adding new plan display
 features, add a fixture and snapshot test to cover the new behavior.
 
 When plan output changes intentionally, update snapshots with

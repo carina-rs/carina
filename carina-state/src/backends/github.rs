@@ -8,7 +8,7 @@ use std::{
     borrow::Cow,
     collections::BTreeMap,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -19,7 +19,7 @@ use tokio::time::Instant;
 use super::url::encode_component;
 use crate::{BackendError, LeasePath, StatePath, StorageUnavailable};
 use crate::{
-    BackendResult, GitHubBackendSettings, LoadedState, LockInfo, RawState, StateBackend, StateFile,
+    BackendResult, GitHubBackendSettings, LockInfo, RawState, StateBackend, StateFile,
     StorageReadiness,
 };
 
@@ -254,7 +254,6 @@ pub struct GitHubBackend {
     // Raw export reads deliberately never update this writer's precondition.
     expected_state: Mutex<Expected>,
     pending_lease: Mutex<Option<PendingLease>>,
-    migration_logged: OnceLock<crate::MigrationInfo>,
 }
 
 const CLEANUP_OPERATION_MARGIN: Duration = Duration::from_millis(500);
@@ -574,7 +573,6 @@ impl GitHubBackend {
             mutations: tokio::sync::Mutex::new(()),
             expected_state: Mutex::new(Expected::Unread),
             pending_lease: Mutex::new(None),
-            migration_logged: OnceLock::new(),
         }
     }
     pub(crate) async fn from_config(settings: &GitHubBackendSettings) -> BackendResult<Self> {
@@ -1978,7 +1976,7 @@ impl StateBackend for GitHubBackend {
         self.settings.cleanup_budget()
     }
 
-    async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
+    async fn read_state(&self) -> BackendResult<Option<StateFile>> {
         let operation = Operation::new(None, OPERATION_BUDGET);
         bounded(&operation, async {
             let _gate = self.mutations.lock().await;
@@ -1989,17 +1987,11 @@ impl StateBackend for GitHubBackend {
                 *self.expected_state.lock().expect("state revision mutex") = Expected::Known(None);
                 return Ok(None);
             };
-            let (state, migration) = crate::check_and_migrate_bytes(&file.bytes)
-                .map_err(|error| error.with_state_read_remote_location(&self.location()))?
-                .into_parts();
+            let state = crate::load_state_bytes(&file.bytes)
+                .map_err(|error| error.with_state_read_remote_location(&self.location()))?;
             *self.expected_state.lock().expect("state revision mutex") =
                 Expected::Known(Some(file.sha));
-            Ok(Some(if let Some(info) = migration {
-                crate::log_state_migration_once(&self.migration_logged, info, &self.location());
-                LoadedState::Migrated { state, info }
-            } else {
-                LoadedState::Pristine(state)
-            }))
+            Ok(Some(state))
         })
         .await
     }

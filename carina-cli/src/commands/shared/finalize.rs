@@ -285,7 +285,7 @@ mod tests {
     use super::*;
     use carina_core::shutdown::CLEANUP_DEADLINE;
     use carina_core::shutdown::testing::shutdown_channel;
-    use carina_state::{BackendResult, LoadedState, LockInfo, StateBackend, StateFile};
+    use carina_state::{BackendResult, LockInfo, StateBackend, StateFile};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -669,7 +669,7 @@ mod tests {
             self.cleanup_budget
         }
 
-        async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
+        async fn read_state(&self) -> BackendResult<Option<StateFile>> {
             Ok(None)
         }
 

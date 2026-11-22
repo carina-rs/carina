@@ -8,6 +8,34 @@ use crate::provider_text::DiagnosticText;
 use crate::resource::ResourceDirective;
 use crate::validation::ResourceDirectiveFinding;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AuthoredSlotKind {
+    Attribute,
+    Directives,
+}
+
+/// Classify metadata blocks for resource evaluation and retained slots.
+/// Conversion placement follows its own unchanged syntax policy.
+pub(super) fn resource_child_kind(pair: &Pair<'_, Rule>) -> AuthoredSlotKind {
+    let child = if pair.as_rule() == Rule::block_content {
+        pair.clone().into_inner().next().expect("resource content")
+    } else {
+        pair.clone()
+    };
+    if child.as_rule() == Rule::nested_block
+        && child
+            .into_inner()
+            .next()
+            .expect("nested block name")
+            .as_str()
+            == "directives"
+    {
+        AuthoredSlotKind::Directives
+    } else {
+        AuthoredSlotKind::Attribute
+    }
+}
+
 pub(super) struct ResourceBody<'i> {
     resource_type: Pair<'i, Rule>,
     contents: Pairs<'i, Rule>,
@@ -65,7 +93,7 @@ impl<'i> BlockContents<'i> {
                     if block.as_rule() == Rule::nested_block {
                         let mut contents = block.into_inner();
                         let name = contents.next().expect("nested block name");
-                        if name.as_str() == "directives" {
+                        if resource_child_kind(&pair) == AuthoredSlotKind::Directives {
                             let location = DeclarationLocation::from_pair(&name, file, source);
                             let block = ResourceDirectives::classify(
                                 location.clone(),

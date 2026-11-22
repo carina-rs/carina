@@ -21,8 +21,9 @@ use crate::parser::{
     ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
 };
 use crate::resource::{
-    ConcreteValue, DeferredValue, ForLoopElement, LegacyLoopAddress, LoopElementOrigin, LoopKind,
-    LoopSlot, LoopSource, ParserPlaceholder, RelativeBindingName, UnboundLoopTemplate,
+    BoundForAddress, ConcreteValue, DeferredValue, ForLoopElement, LegacyLoopAddress,
+    LoopElementOrigin, LoopKind, LoopSlot, LoopSource, ParserPlaceholder, RelativeBindingName,
+    UnboundLoopTemplate,
 };
 
 use crate::resource::knowledge::{Classification, ClassifiedRef, KnowledgeContext};
@@ -59,7 +60,7 @@ fn parser_iterable<'s, 'a>(
 }
 
 /// Binding pattern for a for expression
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ForBinding {
     /// Simple: `for x in ...`
     Simple(String),
@@ -120,6 +121,46 @@ pub(crate) enum LoopParseTarget {
     Unbound(UnboundLoopTemplate),
 }
 
+/// Bound children cannot be represented without admission. Templates and
+/// anonymous provenance are separate from the admitted child arm.
+pub(crate) enum ForBodyTarget {
+    Template(LoopParseTarget),
+    Bound(BoundForAddress<RelativeBindingName>),
+    Unbound {
+        template: UnboundLoopTemplate,
+        element: ForLoopElement,
+    },
+}
+
+impl ForBodyTarget {
+    fn resource_target(&self) -> ResourceParseTarget {
+        match self {
+            Self::Bound(address) => ResourceParseTarget::LoopChild(address.clone()),
+            Self::Template(LoopParseTarget::Bound(target)) => {
+                ResourceParseTarget::DeferredForTemplate {
+                    target: target.clone(),
+                }
+            }
+            Self::Template(LoopParseTarget::Unbound(_)) => {
+                ResourceParseTarget::Pending { origin: None }
+            }
+            Self::Unbound { template, element } => ResourceParseTarget::Pending {
+                origin: Some(template.element_origin(element.clone())),
+            },
+        }
+    }
+
+    fn set_module_expansion(&self, call: &mut ModuleCall) {
+        match self {
+            Self::Bound(address) => call.set_expansion_key(address),
+            Self::Unbound { template, element } => {
+                call.set_unbound_expansion_key(template, element)
+            }
+            Self::Template(_) => unreachable!("templates are not concrete module expansions"),
+        }
+    }
+}
+
 enum DeferredForBodyTemplateParse {
     Parsed(DeferredForBody),
     RetryableProvisional,
@@ -157,8 +198,7 @@ fn parse_deferred_for_body_template(
     let parsed = parse_for_body(
         body_pair,
         &template_ctx,
-        target,
-        None,
+        &ForBodyTarget::Template(target.clone()),
         preprocessed_file,
         source_file,
     );
@@ -269,17 +309,6 @@ impl LoopParseTarget {
         }
     }
 
-    fn element_address(&self, element: &ForLoopElement) -> String {
-        element.address(self.scheduler_key())
-    }
-
-    fn element_origin(&self, element: ForLoopElement) -> Option<LoopElementOrigin> {
-        match self {
-            Self::Bound(_) => None,
-            Self::Unbound(template) => Some(template.element_origin(element)),
-        }
-    }
-
     pub(crate) fn if_origin(&self) -> Option<LoopElementOrigin> {
         match self {
             Self::Bound(_) => None,
@@ -298,22 +327,6 @@ impl LoopParseTarget {
         }
     }
 
-    fn resource_target(&self, element: Option<ForLoopElement>) -> ResourceParseTarget {
-        match self {
-            Self::Bound(target) => match element.as_ref() {
-                Some(element) => ResourceParseTarget::Bound {
-                    binding: self.element_address(element),
-                },
-                None => ResourceParseTarget::DeferredForTemplate {
-                    target: target.clone(),
-                },
-            },
-            Self::Unbound(_) => ResourceParseTarget::Pending {
-                origin: element.and_then(|element| self.element_origin(element)),
-            },
-        }
-    }
-
     fn deferred_target(&self) -> DeferredForTarget<RelativeBindingName> {
         match self {
             Self::Bound(target) => DeferredForTarget::Bound(target.clone()),
@@ -327,7 +340,7 @@ impl LoopParseTarget {
 /// Parse a for expression and expand it into individual resources and/or module calls.
 ///
 /// `for x in list { resource_expr }` expands to resources with addresses like
-/// `binding[0]`, `binding[1]`, etc.
+/// value-keyed child bindings. The indexed binding form opts into indices.
 ///
 /// Extract a binding name from a for-expression's iterable.
 ///
@@ -363,7 +376,7 @@ pub(crate) fn extract_for_iterable_name(
 /// `binding["key1"]`, `binding["key2"]`, etc.
 ///
 /// When the body is a module call, each iteration produces a module call with
-/// a binding name like `binding[0]` or `binding["key"]`.
+/// the admitted child binding as its expansion key.
 #[allow(clippy::type_complexity)]
 pub(crate) fn parse_for_expr(
     pair: pest::iterators::Pair<Rule>,
@@ -429,7 +442,7 @@ pub(crate) fn parse_for_expr(
     let mut module_calls = Vec::new();
 
     let collect = |result: ForBodyResult,
-                   expansion_key: String,
+                   child: &ForBodyTarget,
                    resources: &mut Vec<Resource>,
                    data_sources: &mut Vec<DataSource>,
                    module_calls: &mut Vec<ModuleCall>| {
@@ -438,7 +451,7 @@ pub(crate) fn parse_for_expr(
             ForBodyResult::DataSource(d) => data_sources.push(*d),
             ForBodyResult::ModuleCall(mut c) => {
                 let unexpanded_id = c.id().clone();
-                c.set_expansion_key(expansion_key);
+                child.set_module_expansion(&mut c);
                 ctx.remap_binding_use_module_call(&unexpanded_id, c.id());
                 module_calls.push(c);
             }
@@ -457,16 +470,138 @@ pub(crate) fn parse_for_expr(
         }
     };
 
-    let classified = iterable
+    // StringList is schema canonicalization's compact representation of String
+    // members. Preserve each ValueString's flags when adapting its parser view.
+    let string_members = match &iterable {
+        Value::Concrete(ConcreteValue::StringList(strings)) => {
+            Some(Value::Concrete(ConcreteValue::List(
+                strings
+                    .iter()
+                    .cloned()
+                    .map(|value| Value::Concrete(ConcreteValue::String(value)))
+                    .collect(),
+            )))
+        }
+        _ => None,
+    };
+    let classified = string_members
+        .as_ref()
+        .unwrap_or(&iterable)
         .knowledge(&KnowledgeContext::validation())
         .map(|proof| proof.into_classification())
         .map_err(|error| ParseError::from_resolution(error.into(), for_line))?;
-    let iterable_for_expansion = parser_iterable(&classified);
-    match (&binding, &iterable_for_expansion) {
-        (ForBinding::Simple(var), ParserIterable::List(items)) => {
+    let admission = match &target {
+        LoopParseTarget::Bound(bound) => Some(crate::resource::admit_bound_for_addresses(
+            &binding,
+            bound,
+            ClassifiedRef::from(&classified),
+            crate::resource::ForAddressMoment::Parse,
+        )),
+        LoopParseTarget::Unbound(_) => None,
+    };
+    let mut address_pending = None;
+    let mut iterable_for_expansion = parser_iterable(&classified);
+    let bound_members = match admission {
+        Some(Ok(crate::resource::ForAddressAdmission::Admitted(addresses))) => Some(addresses),
+        Some(Ok(crate::resource::ForAddressAdmission::Defer(pending))) => {
+            address_pending = Some(pending);
+            iterable_for_expansion = ParserIterable::Deferred;
+            None
+        }
+        Some(Ok(crate::resource::ForAddressAdmission::Reject(error))) => {
+            return Err(ParseError::for_key(error, &iterable_location));
+        }
+        // Shape errors retain the parser's existing binding-pattern wording.
+        Some(Err(crate::resource::ForAdmissionFailure::Shape(_))) | None => None,
+        Some(Err(error @ crate::resource::ForAdmissionFailure::Knowledge(_))) => {
+            return Err(ParseError::for_admission_failure(error, &iterable_location));
+        }
+    };
+    if let Some(members) = bound_members {
+        for (position, member) in members.iter().enumerate() {
+            let child = ForBodyTarget::Bound(member.address().clone());
+            let mut iter_ctx = ctx.child_scope();
+            match &binding {
+                ForBinding::Simple(value) | ForBinding::Indexed(_, value) => {
+                    if let ForBinding::Indexed(index, _) = &binding {
+                        bind(
+                            &mut iter_ctx,
+                            index,
+                            Value::Concrete(ConcreteValue::Int(
+                                member.index().expect("indexed binding"),
+                            )),
+                        );
+                    }
+                    let metadata = match structural_handle_metadata.as_ref() {
+                        Some(UnexpandedStructuralHandleMetadata::List(items)) => {
+                            items.get(position).cloned().flatten()
+                        }
+                        Some(
+                            UnexpandedStructuralHandleMetadata::Handle { .. }
+                            | UnexpandedStructuralHandleMetadata::Map(_)
+                            | UnexpandedStructuralHandleMetadata::ExpressionOperands(_),
+                        )
+                        | None => None,
+                    };
+                    bind_eval(
+                        &mut iter_ctx,
+                        value,
+                        EvalValue::computed(member.value().clone(), metadata),
+                    );
+                }
+                ForBinding::Map(key, value) => {
+                    let member_key = member.key().expect("map binding");
+                    bind(
+                        &mut iter_ctx,
+                        key,
+                        Value::Concrete(ConcreteValue::String(member_key.into())),
+                    );
+                    let metadata = match structural_handle_metadata.as_ref() {
+                        Some(UnexpandedStructuralHandleMetadata::Map(entries)) => {
+                            entries.get(member_key).cloned()
+                        }
+                        Some(
+                            UnexpandedStructuralHandleMetadata::Handle { .. }
+                            | UnexpandedStructuralHandleMetadata::List(_)
+                            | UnexpandedStructuralHandleMetadata::ExpressionOperands(_),
+                        )
+                        | None => None,
+                    };
+                    bind_eval(
+                        &mut iter_ctx,
+                        value,
+                        EvalValue::computed(member.value().clone(), metadata),
+                    );
+                }
+            }
+            let result = parse_for_body(
+                body_pair.clone(),
+                &iter_ctx,
+                &child,
+                preprocessed_file,
+                source_file,
+            )?;
+            collect(
+                result,
+                &child,
+                &mut resources,
+                &mut data_sources,
+                &mut module_calls,
+            );
+        }
+        return Ok((resources, data_sources, module_calls));
+    }
+    match (&target, &binding, &iterable_for_expansion) {
+        (
+            LoopParseTarget::Unbound(template),
+            ForBinding::Simple(var),
+            ParserIterable::List(items),
+        ) => {
             for (i, item) in items.iter().enumerate() {
-                let element = ForLoopElement::Index(i);
-                let expansion_key = target.element_address(&element);
+                let child = ForBodyTarget::Unbound {
+                    template: template.clone(),
+                    element: ForLoopElement::Index(i),
+                };
                 let mut iter_ctx = ctx.child_scope();
                 let metadata = match structural_handle_metadata.as_ref() {
                     Some(UnexpandedStructuralHandleMetadata::List(items)) => {
@@ -487,24 +622,29 @@ pub(crate) fn parse_for_expr(
                 let result = parse_for_body(
                     body_pair.clone(),
                     &iter_ctx,
-                    &target,
-                    Some(element),
+                    &child,
                     preprocessed_file,
                     source_file,
                 )?;
                 collect(
                     result,
-                    expansion_key,
+                    &child,
                     &mut resources,
                     &mut data_sources,
                     &mut module_calls,
                 );
             }
         }
-        (ForBinding::Indexed(idx_var, val_var), ParserIterable::List(items)) => {
+        (
+            LoopParseTarget::Unbound(template),
+            ForBinding::Indexed(idx_var, val_var),
+            ParserIterable::List(items),
+        ) => {
             for (i, item) in items.iter().enumerate() {
-                let element = ForLoopElement::Index(i);
-                let expansion_key = target.element_address(&element);
+                let child = ForBodyTarget::Unbound {
+                    template: template.clone(),
+                    element: ForLoopElement::Index(i),
+                };
                 let mut iter_ctx = ctx.child_scope();
                 bind(
                     &mut iter_ctx,
@@ -530,28 +670,33 @@ pub(crate) fn parse_for_expr(
                 let result = parse_for_body(
                     body_pair.clone(),
                     &iter_ctx,
-                    &target,
-                    Some(element),
+                    &child,
                     preprocessed_file,
                     source_file,
                 )?;
                 collect(
                     result,
-                    expansion_key,
+                    &child,
                     &mut resources,
                     &mut data_sources,
                     &mut module_calls,
                 );
             }
         }
-        (ForBinding::Map(key_var, val_var), ParserIterable::Map(map)) => {
+        (
+            LoopParseTarget::Unbound(template),
+            ForBinding::Map(key_var, val_var),
+            ParserIterable::Map(map),
+        ) => {
             // Sort keys for deterministic output
             let mut keys: Vec<&str> = map.keys().copied().collect();
             keys.sort();
             for key in keys {
                 let val = &map[key];
-                let element = ForLoopElement::Key(key.to_owned());
-                let expansion_key = target.element_address(&element);
+                let child = ForBodyTarget::Unbound {
+                    template: template.clone(),
+                    element: ForLoopElement::Key(key.to_owned()),
+                };
                 let mut iter_ctx = ctx.child_scope();
                 bind(
                     &mut iter_ctx,
@@ -577,14 +722,13 @@ pub(crate) fn parse_for_expr(
                 let result = parse_for_body(
                     body_pair.clone(),
                     &iter_ctx,
-                    &target,
-                    Some(element),
+                    &child,
                     preprocessed_file,
                     source_file,
                 )?;
                 collect(
                     result,
-                    expansion_key,
+                    &child,
                     &mut resources,
                     &mut data_sources,
                     &mut module_calls,
@@ -595,7 +739,7 @@ pub(crate) fn parse_for_expr(
         // replayed at plan/apply time. In particular, `ref ?? default` must
         // not collapse to the default before the reference snapshot is known
         // to be complete.
-        (_, ParserIterable::Deferred) => {
+        (_, _, ParserIterable::Deferred) => {
             let iterable_surface = match &iterable {
                 Value::Deferred(
                     DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument { .. })
@@ -622,7 +766,10 @@ pub(crate) fn parse_for_expr(
                 declaration.clone(),
                 header,
                 iterable.clone(),
-                ParsedDeferredForIterableState::Deferred,
+                address_pending.map_or(
+                    ParsedDeferredForIterableState::Deferred,
+                    ParsedDeferredForIterableState::AddressPending,
+                ),
             )?;
             // Return empty — the for body produces zero concrete resources
         }
@@ -833,8 +980,7 @@ fn parse_for_iterable(
 pub(crate) fn parse_for_body(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
-    target: &LoopParseTarget,
-    element: Option<ForLoopElement>,
+    target: &ForBodyTarget,
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<ForBodyResult, ParseError> {
@@ -860,18 +1006,23 @@ pub(crate) fn parse_for_body(
                 let resource = parse_resource_for_target(
                     inner,
                     &local_ctx,
-                    target.resource_target(element.clone()),
+                    target.resource_target(),
                     preprocessed_file,
                     source_file,
                 )?;
                 return Ok(ForBodyResult::Resource(Box::new(resource)));
             }
             Rule::read_resource_expr => {
-                let bound_target = target.bound_read_target(LoopKind::For)?;
-                let address = element.as_ref().map_or_else(
-                    || bound_target.template_address().to_string(),
-                    |element| target.element_address(element),
-                );
+                let address = match target {
+                    ForBodyTarget::Bound(address) => address.binding_address().to_string(),
+                    ForBodyTarget::Template(target) => target
+                        .bound_read_target(LoopKind::For)?
+                        .template_address()
+                        .to_string(),
+                    ForBodyTarget::Unbound { template, .. } => {
+                        return Err(template.unbound_read_error(LoopKind::For));
+                    }
+                };
                 let data_source = parse_read_resource_expr(
                     inner,
                     &local_ctx,
@@ -884,17 +1035,16 @@ pub(crate) fn parse_for_body(
             Rule::module_call => {
                 let mut call =
                     parse_module_call(inner, &local_ctx, preprocessed_file, source_file)?;
-                call.binding_name = match (target, element.as_ref()) {
-                    (LoopParseTarget::Bound(_), Some(element)) => {
-                        Some(RelativeBindingName::new(target.element_address(element)))
-                    }
-                    (LoopParseTarget::Bound(bound), None) => {
+                call.binding_name = match target {
+                    ForBodyTarget::Bound(address) => Some(address.binding_address().clone()),
+                    ForBodyTarget::Template(LoopParseTarget::Bound(bound)) => {
                         Some(bound.template_address().binding_address().clone())
                     }
-                    (LoopParseTarget::Unbound(_), _) => None,
+                    ForBodyTarget::Template(LoopParseTarget::Unbound(_))
+                    | ForBodyTarget::Unbound { .. } => None,
                 };
-                if let Some(element) = element {
-                    call.set_loop_origin(target.element_origin(element));
+                if let ForBodyTarget::Unbound { template, element } = target {
+                    call.set_loop_origin(Some(template.element_origin(element.clone())));
                 }
                 return Ok(ForBodyResult::ModuleCall(call));
             }

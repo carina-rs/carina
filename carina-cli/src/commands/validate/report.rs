@@ -288,7 +288,7 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
         }
         AppError::AttributePrefix(error) => Diagnostic {
             location: error.location().map(Location::authored),
-            ..Diagnostic::new(error.to_string(), "error")
+            ..Diagnostic::new(error.diagnostic_message(), "error")
         },
         AppError::ParameterReference { finding, .. } => {
             Diagnostic::located(finding.detail().to_string(), finding.location())

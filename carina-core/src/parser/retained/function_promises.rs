@@ -349,7 +349,7 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
             {
                 continue;
             }
-            if matches!(node.kind, ExprKind::For) {
+            if matches!(node.kind, ExprKind::For { .. }) {
                 pending.extend(node.children.first());
                 let empty = node
                     .children
@@ -455,9 +455,11 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
                     self.bindings.upstream_is_unavailable(binding.as_str())
                 }
                 _ => match &node.kind {
-                    ExprKind::Reference { binding, .. } | ExprKind::Binding(binding) => {
-                        self.bindings.upstream_is_unavailable(binding.as_str())
-                    }
+                    ExprKind::Reference { binding, .. }
+                    | ExprKind::Binding {
+                        binding,
+                        authored_binding: _,
+                    } => self.bindings.upstream_is_unavailable(binding.as_str()),
                     _ => false,
                 },
             };
@@ -484,7 +486,12 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
             if !visited.insert((node.location.instance.clone(), node.id)) {
                 continue;
             }
-            if let ExprKind::Binding(binding) | ExprKind::Reference { binding, .. } = &node.kind {
+            if let ExprKind::Binding {
+                binding,
+                authored_binding: _,
+            }
+            | ExprKind::Reference { binding, .. } = &node.kind
+            {
                 if self.expressions.arguments.contains_key(binding) {
                     return true;
                 }
@@ -584,6 +591,7 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
         let authored_path = match &node.kind {
             ExprKind::Reference {
                 binding,
+                authored_binding: _,
                 attribute,
                 segments,
             } => Some(AccessPath::from_binding(

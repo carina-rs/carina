@@ -234,9 +234,8 @@ pub(crate) fn fixture_resource_state_metadata(
         "resources": [encoded],
         "exports": {},
     });
-    let state = carina_state::state::check_and_migrate(&state.to_string())
-        .expect("fixture state passes the public state loader")
-        .into_state();
+    let state = carina_state::state::load_state(&state.to_string())
+        .expect("fixture state passes the public state loader");
     state
         .resources()
         .first()

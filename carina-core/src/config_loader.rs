@@ -3779,8 +3779,8 @@ let orgs = upstream_state {
             .iter()
             .filter_map(|read| read.binding.as_deref())
             .collect::<Vec<_>>();
-        assert_eq!(call_bindings, ["mods[0]", "mods[1]"]);
-        assert_eq!(read_bindings, ["reads[0]", "reads[1]"]);
+        assert_eq!(call_bindings, ["mods.alpha", "mods.beta"]);
+        assert_eq!(read_bindings, ["reads.alpha", "reads.beta"]);
     }
 
     #[test]

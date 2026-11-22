@@ -253,7 +253,7 @@ pub(super) enum AdmissionBoundary {
 type ResourceAdmissionParts<'file, E, D, B> = (
     CanonicalResource<'file, E, D, B>,
     Result<
-        Option<crate::schema::ResourceValueValidation>,
+        Option<crate::identifier::PrefixAdmitted<crate::schema::ResourceValueValidation>>,
         crate::parser::retained::MissingEvidence,
     >,
 );
@@ -267,7 +267,7 @@ where
 {
     resource: CanonicalResource<'file, E, D, B>,
     values: Result<
-        Option<crate::schema::ResourceValueValidation>,
+        Option<crate::identifier::PrefixAdmitted<crate::schema::ResourceValueValidation>>,
         crate::parser::retained::MissingEvidence,
     >,
 }

@@ -605,7 +605,7 @@ fn issue4398_pending_constraint_wire_unchanged() {
     assert!(output.status.success(), "{}", text(&output));
     let bytes = fs::read(d.path.join("saved.plan")).unwrap();
     let plan: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(plan["version"], 46);
+    assert_eq!(plan["version"], 47);
     // Captured from main-carina (83fec2e1c), with the same caller and four
     // legacy top-level declarations in file order, then source order.
     let bound_argument = |name| {

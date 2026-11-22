@@ -51,8 +51,8 @@ use crate::resource::{
 use crate::resource::{DataSource, RedactedSecretHash};
 use crate::schema::{
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema, LeafPath,
-    RawShape, RefinedScalarKind, SchemaRegistry, Shape, TypeIdentity, ValidatedConfigSchema,
-    ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    LeafPathSegment, RawShape, RefinedScalarKind, SchemaRegistry, Shape, TypeIdentity,
+    ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
 use crate::value::{
     PersistedListView, PersistedValue, PersistedValueDecodeError, PersistedView, SerializationError,
@@ -1007,16 +1007,6 @@ impl SentAttributes {
         }
     }
 
-    fn from_update_patch(patch: &UpdatePatch) -> Self {
-        Self::only(
-            patch
-                .ops
-                .iter()
-                .filter_map(|op| op.sent_value().map(|_| op.key().to_string()))
-                .collect(),
-        )
-    }
-
     fn from_create_sent<S, D>(
         sent: &Sent,
         resource: &Resource<
@@ -1220,7 +1210,7 @@ pub struct UpdateRequest {
     from: SnapshotState,
     /// Structured description of the user's intended change and any write-only
     /// values reasserted alongside it.
-    patch: crate::validation::admission::final_input::FinalInput<WireReady<UpdatePatch>>,
+    patch: AdmittedUpdatePatch,
     /// Effective directives resolved from the managed resource schema.
     directives: ProviderDirectives,
     input: Arc<ProtectedUpdateInput>,
@@ -1241,6 +1231,7 @@ impl UpdateRequest {
         let annotate_patch =
             |annotate: fn(&ProviderReadyResource, &str, &Value) -> Value| UpdatePatch {
                 ops: patch
+                    .patch
                     .payload()
                     .as_inner()
                     .ops
@@ -1294,7 +1285,11 @@ impl UpdateRequest {
 
     /// Patch derived from the checked desired resource.
     pub fn patch(&self) -> &UpdatePatch {
-        self.patch.payload().as_inner()
+        self.patch.patch.payload().as_inner()
+    }
+
+    pub(crate) fn planned_ops(&self) -> &[PlannedPatchOp] {
+        &self.patch.planned.ops
     }
 
     pub(crate) fn diagnostic_values(&self) -> impl Iterator<Item = &Value> {
@@ -1313,7 +1308,7 @@ impl UpdateRequest {
 
     /// The checked projection consumed by provider transport adapters.
     pub fn wire_patch(&self) -> &[WirePatchOp] {
-        self.patch.payload().wire()
+        self.patch.patch.payload().wire()
     }
 
     /// Effective directives resolved while the desired resource crossed the
@@ -1561,14 +1556,108 @@ impl PatchOp {
     }
 }
 
-impl UpdatePatch {
-    pub(crate) fn sent_attributes(&self) -> SentAttributes {
-        SentAttributes::from_update_patch(self)
+/// Host-only update operations, each owning its observed leaf grafts.
+#[derive(Debug, Clone)]
+pub struct PlannedUpdatePatch {
+    ops: Vec<PlannedPatchOp>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PlannedPatchOp {
+    Add(PlannedSentOp),
+    Replace(PlannedSentOp),
+    Reassert(PlannedSentOp),
+    Remove { key: String },
+}
+
+#[derive(Clone)]
+pub(crate) struct PlannedSentOp {
+    key: String,
+    value: Value,
+    grafted_leaves: Vec<LeafPath>,
+}
+
+impl fmt::Debug for PlannedSentOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PlannedSentOp")
+            .field("key", &self.key)
+            .field("grafted_leaves", &self.grafted_leaves)
+            .finish()
     }
 }
 
-/// Build an [`UpdatePatch`] from a list of changed attribute names plus
-/// the desired (`to`) and current (`from`) views.
+impl PlannedSentOp {
+    pub(crate) fn sent_parts(&self) -> (&str, &[LeafPath]) {
+        (&self.key, &self.grafted_leaves)
+    }
+}
+
+impl PlannedPatchOp {
+    fn key(&self) -> &str {
+        match self {
+            Self::Add(sent) | Self::Replace(sent) | Self::Reassert(sent) => &sent.key,
+            Self::Remove { key } => key,
+        }
+    }
+
+    fn to_patch_op(&self) -> PatchOp {
+        match self {
+            Self::Add(PlannedSentOp { key, value, .. }) => PatchOp::Add {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            Self::Replace(PlannedSentOp { key, value, .. }) => PatchOp::Replace {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            Self::Reassert(PlannedSentOp { key, value, .. }) => PatchOp::Reassert {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            Self::Remove { key } => PatchOp::Remove { key: key.clone() },
+        }
+    }
+}
+
+/// A planned update and the immutable projection admitted from those exact ops.
+#[derive(Debug, Clone)]
+pub(crate) struct AdmittedUpdatePatch {
+    planned: PlannedUpdatePatch,
+    patch: crate::validation::admission::final_input::FinalInput<WireReady<UpdatePatch>>,
+}
+
+impl PlannedUpdatePatch {
+    /// Project the provider payload without host-only graft provenance.
+    pub fn to_patch(&self) -> UpdatePatch {
+        UpdatePatch {
+            ops: self.ops.iter().map(PlannedPatchOp::to_patch_op).collect(),
+        }
+    }
+
+    pub(crate) fn admit(
+        self,
+        resource: &ProviderReadyResource,
+        schema: crate::schema::OwnerBoundResourceSchema<'_>,
+        bindings: &crate::binding_index::ResolvedBindings,
+        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Result<AdmittedUpdatePatch, crate::executor::ProviderPreparationError> {
+        let patch = crate::validation::admission::final_input::admit_update_patch(
+            self.to_patch(),
+            resource,
+            schema,
+            bindings,
+            session,
+        )?;
+        Ok(AdmittedUpdatePatch {
+            planned: self,
+            patch,
+        })
+    }
+}
+
+/// Plan update operations from changed attribute names and the desired (`to`)
+/// and current (`from`) views. [`PlannedUpdatePatch::to_patch`] projects the
+/// provider's [`UpdatePatch`].
 ///
 /// For each `key` in `changed_attributes`:
 /// - present in `to` but missing in `from` → [`PatchOp::Add`]
@@ -1596,7 +1685,7 @@ pub fn build_update_patch<P: StateValueLeaf>(
     to: &ProviderReadyResource,
     from: &State<P>,
     schema: &ResourceSchema,
-) -> Result<UpdatePatch, UpdatePatchError> {
+) -> Result<PlannedUpdatePatch, UpdatePatchError> {
     plan_update_patch(changed_attributes, to.as_inner(), from, schema)
 }
 
@@ -1608,7 +1697,7 @@ pub(crate) fn plan_update_patch<S, P: StateValueLeaf>(
     to: &crate::resource::ResolvedResource<S>,
     from: &State<P>,
     schema: &ResourceSchema,
-) -> Result<UpdatePatch, UpdatePatchError> {
+) -> Result<PlannedUpdatePatch, UpdatePatchError> {
     let ignore_changes = to.ignore_changes();
     let to = to.as_resource();
     let mut patched_keys = HashSet::new();
@@ -1636,29 +1725,28 @@ pub(crate) fn plan_update_patch<S, P: StateValueLeaf>(
             .attributes
             .get(key)
             .map(crate::resource::state_value_snapshot);
-        let sent_value = value
-            .map(|value| {
-                ignore_changes
-                    .with_observed_readable_leaves(key, value, observed.as_ref())
-                    .to_value_at(format!("{}.{}", to.id, key))
-            })
-            .transpose()?;
-        match (sent_value, in_from) {
-            (Some(value), false) => ops.push(PatchOp::Add {
-                key: key.clone(),
-                value,
-            }),
-            (Some(value), true) => ops.push(PatchOp::Replace {
-                key: key.clone(),
-                value,
-            }),
-            (None, true) => ops.push(PatchOp::Remove { key: key.clone() }),
-            (None, false) => {}
-        }
+        let op = match value {
+            Some(value) => {
+                let (value, leaves) =
+                    ignore_changes.with_observed_readable_leaves(key, value, observed.as_ref());
+                let sent = PlannedSentOp {
+                    key: key.clone(),
+                    value: value.to_value_at(format!("{}.{}", to.id, key))?,
+                    grafted_leaves: leaves,
+                };
+                if in_from {
+                    PlannedPatchOp::Replace(sent)
+                } else {
+                    PlannedPatchOp::Add(sent)
+                }
+            }
+            None => PlannedPatchOp::Remove { key: key.clone() },
+        };
+        ops.push(op);
     }
 
     if ops.is_empty() {
-        return Ok(UpdatePatch { ops });
+        return Ok(PlannedUpdatePatch { ops });
     }
 
     let mut reasserts = Vec::new();
@@ -1693,23 +1781,23 @@ pub(crate) fn plan_update_patch<S, P: StateValueLeaf>(
             }
             return Err(ignored_write_only_error(&to.id, key, ignored_write_only[0]).into());
         }
-        reasserts.push(PatchOp::Reassert {
+        let (value, leaves) = ignore_changes.with_observed_readable_leaves(
+            key,
+            value,
+            from.attributes
+                .get(key)
+                .map(crate::resource::state_value_snapshot)
+                .as_ref(),
+        );
+        reasserts.push(PlannedPatchOp::Reassert(PlannedSentOp {
             key: key.clone(),
-            value: ignore_changes
-                .with_observed_readable_leaves(
-                    key,
-                    value,
-                    from.attributes
-                        .get(key)
-                        .map(crate::resource::state_value_snapshot)
-                        .as_ref(),
-                )
-                .to_value_at(format!("{}.{}", to.id, key))?,
-        });
+            value: value.to_value_at(format!("{}.{}", to.id, key))?,
+            grafted_leaves: leaves,
+        }));
     }
     reasserts.sort_by(|left, right| left.key().cmp(right.key()));
     ops.extend(reasserts);
-    Ok(UpdatePatch { ops })
+    Ok(PlannedUpdatePatch { ops })
 }
 
 fn ignored_write_only_error(
@@ -1805,7 +1893,7 @@ impl<'a> IntoIterator for &'a SavedAttrs {
 /// `RedactedSecret` values. Persisted strings always remain strings.
 ///
 /// Raw JSON cannot be inserted after construction. State loaders call
-/// [`Self::from_encoded`] after versioned migrations rewrite legacy encodings;
+/// [`Self::from_encoded`] to validate current structural encodings;
 /// callers that already hold validated values use [`Self::from_persisted_values`].
 ///
 /// ```compile_fail
@@ -1906,16 +1994,6 @@ impl Serialize for PersistedAttributes {
     }
 }
 
-/// Which existing state hashes may classify provider plaintext as secret.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreviousSecretHashAuthority<'a> {
-    None,
-    /// Protect every key that already contains a stored secret hash.
-    AllPreviouslyHashedKeys(&'a PersistedAttributes),
-    /// Protect stored hashes only for keys absent from the desired resource.
-    OnlyKeysAbsentFromDesired(&'a PersistedAttributes),
-}
-
 /// Select the saved-plan hash for an attribute, falling back to the current
 /// state's hash when the plan did not capture one.
 pub fn previous_hash<'a>(
@@ -1975,8 +2053,7 @@ impl PersistedAttributes {
         })
     }
 
-    /// Validate JSON entering through the state-row load seam after versioned
-    /// migrations have rewritten legacy encodings.
+    /// Validate current persisted JSON entering through the state-row load seam.
     pub fn from_encoded(
         encoded: impl IntoIterator<Item = (String, serde_json::Value)>,
     ) -> Result<Self, PersistedAttributesError> {
@@ -2197,10 +2274,59 @@ fn contains_secret_hash_view(value: PersistedView<'_>) -> bool {
     secret_hash_shape_view(value) != SecretHashShape::None
 }
 
+/// Restrict previous hash protection to grafted subtrees. Public siblings remain
+/// available as alignment evidence inside any selected list. Opaque ancestors
+/// keep their whole protection because their hashed leaves cannot be separated.
+pub fn restrict_previous_secret_hashes_to_leaves(
+    previous: &PersistedValue,
+    leaves: &[LeafPath],
+) -> Result<PersistedValue, SerializationError> {
+    fn restrict(value: &mut SnapshotValue, paths: &[&[LeafPathSegment]]) {
+        if paths.iter().any(|path| {
+            path.is_empty() || matches!(path.first(), Some(LeafPathSegment::ListIndex(_)))
+        }) {
+            return;
+        }
+        let Value::Concrete(ConcreteValue::Map(children)) = value else {
+            return;
+        };
+        children.retain(|name, child| {
+            if !crate::value::contains_redacted_secret(child) {
+                return true;
+            }
+            let child_paths = paths
+                .iter()
+                .filter_map(|path| {
+                    let (segment, rest) = path.split_first()?;
+                    let matches = match segment {
+                        LeafPathSegment::StructField(field) => field == name,
+                        LeafPathSegment::MapKey(key) => key.expose_plaintext() == name.as_str(),
+                        LeafPathSegment::ListIndex(_) => false,
+                    };
+                    matches.then_some(rest)
+                })
+                .collect::<Vec<_>>();
+            if child_paths.is_empty() {
+                return false;
+            }
+            restrict(child, &child_paths);
+            true
+        });
+    }
+    let Some(mut value) = previous.decode() else {
+        return Ok(previous.clone());
+    };
+    restrict(
+        &mut value,
+        &leaves.iter().map(LeafPath::segments).collect::<Vec<_>>(),
+    );
+    PersistedValue::encode_provider_value(&value, None)
+}
+
 /// Preserve secret hashes from a previous persisted value while retaining
 /// provider material at every unprotected path. Returns `None` when the
-/// previous value contains no secret hash. Unavailable provider plaintext
-/// returns its typed serialization error rather than retaining stale evidence.
+/// previous value contains no secret hash. An opaque previous hash is kept when
+/// the provider subtree contains nested hashes and cannot be re-hashed.
 pub fn merge_previous_secret_hashes_into_provider_value(
     previous_value: &PersistedValue,
     provider_value: Option<&PersistedValue>,
@@ -2211,6 +2337,11 @@ pub fn merge_previous_secret_hashes_into_provider_value(
             if secret_hash_shape(provider_value) == SecretHashShape::TopLevel =>
         {
             Some(provider_value.clone())
+        }
+        (SecretHashShape::TopLevel, Some(provider_value))
+            if secret_hash_shape(provider_value) == SecretHashShape::Nested =>
+        {
+            Some(previous_value.clone())
         }
         (SecretHashShape::TopLevel, Some(provider_value)) if !provider_value.view().is_null() => {
             Some(hash_provider_json_as_secret(
@@ -2245,8 +2376,10 @@ fn merge_previous_secret_hashes_into_provider_json_inner(
         let Some(provider_value) = provider_value.filter(|value| !value.is_null()) else {
             return Ok(previous_value.to_owned_json());
         };
-        if secret_hash_shape_view(provider_value) == SecretHashShape::TopLevel {
-            return Ok(provider_value.to_owned_json());
+        match secret_hash_shape_view(provider_value) {
+            SecretHashShape::TopLevel => return Ok(provider_value.to_owned_json()),
+            SecretHashShape::Nested => return Ok(previous_value.to_owned_json()),
+            SecretHashShape::None => {}
         }
         return hash_provider_view_as_secret(provider_value, Some(previous_value));
     }
@@ -2277,6 +2410,12 @@ fn merge_previous_secret_hashes_into_provider_json_inner(
             return Ok(previous_value.to_owned_json());
         };
         if !previous_secret_hash_array_alignment_is_trusted(previous_items, provider_items) {
+            // With untrusted alignment, fall back to the masked provider value
+            // as on main. Remaining leaf leaks inside reordered/resized lists
+            // are tracked in carina-rs/carina#4592.
+            if secret_hash_shape_view(provider_value) == SecretHashShape::Nested {
+                return Ok(provider_value.to_owned_json());
+            }
             return hash_provider_view_as_secret(provider_value, Some(previous_value));
         }
         let replacements = previous_items
@@ -12253,53 +12392,20 @@ mod tests {
         argon2::Argon2::default()
             .hash_password_into(material, b"carina-secret-v1", &mut output)
             .expect("hash pre-v12 fallback-salt fixture");
-        let encoded =
-            crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
-                serde_json::json!(format!("_secret:argon2:{}", hex::encode(output))),
-                "mock.test.resource",
-                "old",
-                "password",
-            )
-            .expect("migrate row-bound legacy digest");
+        let encoded = serde_json::json!({"$secret": format!(
+            "argon2-legacy:{}:{}", hex::encode(b"carina:mock.test.resource:old:password"), hex::encode(output)
+        )});
         let persisted =
-            PersistedValue::from_serialized_json(encoded).expect("migrated structural secret");
+            PersistedValue::from_serialized_json(encoded).expect("structural legacy secret");
         let crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
             crate::resource::SnapshotLeaf::RedactedSecret { hash },
-        )) = persisted.decode().expect("typed migrated secret")
+        )) = persisted.decode().expect("typed legacy secret")
         else {
-            panic!("migration must produce a typed redacted secret")
+            panic!("structural secret must decode as a typed redacted secret")
         };
 
         assert!(hash.verify(material));
         assert!(hash.encoded_digest().starts_with("argon2-legacy:"));
-    }
-
-    #[test]
-    fn state_row_upgrade_rejects_legacy_salt_too_long_for_its_digest_format() {
-        let error =
-            crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
-                serde_json::json!(format!("_secret:argon2:{}", "ab".repeat(32))),
-                "mock.test.resource",
-                &"x".repeat(5000),
-                "token",
-            )
-            .expect_err("an upgraded legacy digest must never exceed the parser's salt bound");
-        match error {
-            crate::resource::legacy_secret_migration::LegacySecretMigrationError::StateAttribute {
-                key,
-                source,
-            } => {
-                assert_eq!(key, "token");
-                assert!(matches!(
-                    *source,
-                    crate::resource::legacy_secret_migration::LegacySecretMigrationError::LegacySaltTooLong {
-                        actual,
-                        maximum: 4096,
-                    } if actual > 4096
-                ));
-            }
-            other => panic!("unexpected migration error: {other:?}"),
-        }
     }
 
     #[test]
@@ -12365,7 +12471,208 @@ mod tests {
     }
 
     #[test]
-    fn persistence_merges_propagate_typed_unavailable_secret() {
+    fn merge_previous_secret_hashes_keeps_opaque_ancestors_above_masked_subtrees() {
+        let secret = |text: &str| {
+            PersistedValue::encode_desired_value(
+                &Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(text.into()))).into(),
+                )),
+                None,
+            )
+            .unwrap()
+        };
+        let previous = secret("previous");
+        let masked = secret("current");
+        let map = |value: &PersistedValue, sibling: &str| {
+            PersistedValue::from_serialized_json(serde_json::json!({
+                "protected": value.as_json(), "sibling": sibling,
+            }))
+            .unwrap()
+        };
+        let list = |value: &PersistedValue| {
+            PersistedValue::from_serialized_json(serde_json::json!([
+                {"anchor": "stable", "protected": value.as_json()}
+            ]))
+            .unwrap()
+        };
+        for provider_json in [
+            serde_json::json!({"other": masked.as_json(), "changing": "after"}),
+            serde_json::json!([masked.as_json(), "after"]),
+        ] {
+            let provider = PersistedValue::from_serialized_json(provider_json).unwrap();
+            for (previous, provider, expected) in [
+                (previous.clone(), provider.clone(), previous.clone()),
+                (
+                    map(&previous, "before"),
+                    map(&provider, "after"),
+                    map(&previous, "after"),
+                ),
+                (list(&previous), list(&provider), list(&previous)),
+            ] {
+                let merged =
+                    merge_previous_secret_hashes_into_provider_value(&previous, Some(&provider))
+                        .expect("masked descendants cannot prevent whole-hash protection")
+                        .expect("the previous value contains a secret hash");
+                assert!(
+                    merged == expected,
+                    "opaque ancestors must retain their whole hash while public siblings update"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_previous_secret_hashes_keeps_provider_unaligned_masked_lists() {
+        let secret = |text: &str| {
+            PersistedValue::encode_desired_value(
+                &Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(text.into()))).into(),
+                )),
+                None,
+            )
+            .unwrap()
+        };
+        let previous_token = secret("fixture-secret-4570-previous");
+        let provider_token = secret("fixture-secret-4570-provider");
+        let previous = PersistedValue::from_serialized_json(serde_json::json!([
+            {"port": 80, "token": previous_token.as_json()},
+            {"port": 443, "token": previous_token.as_json()}
+        ]))
+        .unwrap();
+        for provider_json in [
+            serde_json::json!([
+                {"port": 443, "token": provider_token.as_json()},
+                {"port": 80, "token": provider_token.as_json()}
+            ]),
+            serde_json::json!([{"port": 80, "token": provider_token.as_json()}]),
+        ] {
+            let provider = PersistedValue::from_serialized_json(provider_json).unwrap();
+            let merged =
+                merge_previous_secret_hashes_into_provider_value(&previous, Some(&provider))
+                    .expect("an unaligned masked list must fall back to the provider value")
+                    .expect("the previous list contains secret hashes");
+            assert!(merged == provider, "the masked provider list must be kept");
+            assert!(
+                !merged.as_json().to_string().contains("fixture-secret-4570"),
+                "the masked provider list must contain no secret plaintext"
+            );
+
+            let mut plaintext_json = provider.as_json().clone();
+            for item in plaintext_json.as_array_mut().unwrap() {
+                item["token"] = serde_json::json!("fixture-secret-4570-provider");
+            }
+            let material = serde_json::to_vec(&plaintext_json).unwrap();
+            let plaintext = PersistedValue::from_serialized_json(plaintext_json).unwrap();
+            let merged =
+                merge_previous_secret_hashes_into_provider_value(&previous, Some(&plaintext))
+                    .expect("an unaligned plaintext list can still be hashed whole")
+                    .unwrap();
+            let hash = merged.as_json()[crate::value::PERSISTED_SECRET_KEY]
+                .as_str()
+                .and_then(RedactedSecretHash::from_encoded_digest)
+                .expect("the plaintext provider list must become one opaque hash");
+            assert!(
+                hash.verify(&material),
+                "the hash must cover the provider list"
+            );
+            assert!(
+                !merged.as_json().to_string().contains("fixture-secret-4570"),
+                "the provider list must contain no secret plaintext"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_previous_secret_hashes_keeps_newly_masked_struct_list_fields() {
+        let secret = |text: &str| {
+            PersistedValue::encode_desired_value(
+                &Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(text.into()))).into(),
+                )),
+                None,
+            )
+            .unwrap()
+        };
+        let token = secret("fixture-secret-4570-token");
+        let note = secret("n");
+        let previous = PersistedValue::from_serialized_json(serde_json::json!([
+            {"port": 80, "note": "n", "token": token.as_json()}
+        ]))
+        .unwrap();
+        let provider = PersistedValue::from_serialized_json(serde_json::json!([
+            {"port": 80, "note": note.as_json(), "token": token.as_json()}
+        ]))
+        .unwrap();
+
+        let merged = merge_previous_secret_hashes_into_provider_value(&previous, Some(&provider))
+            .expect("a newly masked field must fall back to the provider list")
+            .expect("the previous list contains a secret hash");
+        assert!(merged == provider, "the masked provider list must be kept");
+        assert!(
+            merged.as_json()[0]["note"][crate::value::PERSISTED_SECRET_KEY].is_string(),
+            "the newly secret note must remain hashed"
+        );
+        assert!(
+            !merged.as_json().to_string().contains("fixture-secret-4570"),
+            "the merged list must contain no secret plaintext"
+        );
+    }
+
+    #[test]
+    fn merge_previous_secret_hashes_rehashes_plaintext_and_keeps_provider_hashes() {
+        let previous = PersistedValue::encode_desired_value(
+            &Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("before".into()))).into(),
+            )),
+            None,
+        )
+        .unwrap();
+        let provider =
+            PersistedValue::from_serialized_json(serde_json::json!({"changing": "after"})).unwrap();
+        let expected = hash_provider_json_as_secret(&provider, Some(&previous)).unwrap();
+        let material = serde_json::to_vec(&serde_json::json!({"changing": "after"})).unwrap();
+        let map = |value: &PersistedValue| {
+            PersistedValue::from_serialized_json(serde_json::json!({"protected": value.as_json()}))
+                .unwrap()
+        };
+        let list = |value: &PersistedValue| {
+            PersistedValue::from_serialized_json(serde_json::json!([
+                {"anchor": "stable", "protected": value.as_json()}
+            ]))
+            .unwrap()
+        };
+        for (provider, already_hashed) in [(provider, false), (expected.clone(), true)] {
+            for (previous, provider, expected) in [
+                (previous.clone(), provider.clone(), expected.clone()),
+                (map(&previous), map(&provider), map(&expected)),
+                (list(&previous), list(&provider), list(&expected)),
+            ] {
+                let merged =
+                    merge_previous_secret_hashes_into_provider_value(&previous, Some(&provider))
+                        .expect("available material can be merged")
+                        .unwrap();
+                if already_hashed {
+                    assert!(merged == expected, "an existing provider hash must win");
+                }
+                let json = merged.as_json();
+                let protected = json
+                    .get("protected")
+                    .or_else(|| json.pointer("/0/protected"))
+                    .unwrap_or(json);
+                let hash = protected[crate::value::PERSISTED_SECRET_KEY]
+                    .as_str()
+                    .and_then(RedactedSecretHash::from_encoded_digest)
+                    .expect("the protected node must remain a whole hash");
+                assert!(
+                    hash.verify(&material),
+                    "the whole hash must verify the current provider plaintext"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_secret_hashing_propagates_typed_unavailable_secret() {
         let secret = Value::Deferred(DeferredValue::Secret(
             Box::new(Value::Concrete(ConcreteValue::String(
                 "previous secret".into(),
@@ -12388,29 +12695,6 @@ mod tests {
         );
         for rendered in [error.to_string(), format!("{error:?}")] {
             assert!(!rendered.contains("token"), "{rendered}");
-        }
-        let map = |value: &PersistedValue| {
-            PersistedValue::from_serialized_json(serde_json::json!({"protected": value.as_json()}))
-                .unwrap()
-        };
-        let list = |value: &PersistedValue| {
-            PersistedValue::from_serialized_json(serde_json::json!([value.as_json()])).unwrap()
-        };
-        for (previous, provider) in [
-            (previous.clone(), provider.clone()),
-            (map(&previous), map(&provider)),
-            (list(&previous), list(&provider)),
-        ] {
-            let error =
-                merge_previous_secret_hashes_into_provider_value(&previous, Some(&provider))
-                    .expect_err("an unavailable provider secret must not retain stale evidence");
-            assert!(
-                matches!(error, SerializationError::UnavailableSecret(ref error)
-                if error.path() == "(secret)")
-            );
-            for rendered in [error.to_string(), format!("{error:?}")] {
-                assert!(!rendered.contains("token"), "{rendered}");
-            }
         }
     }
 
@@ -14996,7 +15280,9 @@ mod tests {
         let to = resolved_for_test(to);
         let schema = ResourceSchema::new("test");
         let changed = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let patch = build_update_patch(&changed, &to, &from, &schema).expect("valid patch");
+        let patch = build_update_patch(&changed, &to, &from, &schema)
+            .expect("valid patch")
+            .to_patch();
         assert_eq!(patch.ops.len(), 3);
 
         let by_key: HashMap<&str, &PatchOp> = patch.ops.iter().map(|op| (op.key(), op)).collect();
@@ -15019,6 +15305,19 @@ mod tests {
         let c = by_key["c"];
         assert!(matches!(c, PatchOp::Remove { .. }));
         assert_eq!(c.sent_value(), None);
+    }
+
+    #[test]
+    fn plan_update_patch_debug_omits_sent_values() {
+        let to = resolved_for_test(
+            Resource::new("test", "example")
+                .with_attribute("token", patch_test_value("fixture-secret-4570")),
+        );
+        let from: State = State::existing(to.id.clone(), HashMap::new());
+        let planned =
+            build_update_patch(&["token".into()], &to, &from, &ResourceSchema::new("test"))
+                .expect("fixture patch must be valid");
+        assert!(!format!("{planned:?}").contains("fixture-secret-4570"));
     }
 
     fn patch_test_value(value: &str) -> Value {
@@ -15208,7 +15507,8 @@ mod tests {
 
         let patch =
             build_update_patch(&["description".to_string()], &to, &from, schema.as_schema())
-                .expect("fully ignored write-only leaves need no reassertion");
+                .expect("fully ignored write-only leaves need no reassertion")
+                .to_patch();
 
         assert!(matches!(
             &patch.ops[..],
@@ -15245,9 +15545,11 @@ mod tests {
         let changed = ["description".to_string()];
 
         let planned = plan_update_patch(&changed, to.as_inner(), &from, schema.as_schema())
-            .expect("planning must accept the patch");
+            .expect("planning must accept the patch")
+            .to_patch();
         let applied = build_update_patch(&changed, &to, &from, schema.as_schema())
-            .expect("apply must accept the same patch");
+            .expect("apply must accept the same patch")
+            .to_patch();
 
         assert_eq!(planned.ops, applied.ops);
     }
@@ -15292,8 +15594,16 @@ mod tests {
             ignored_path(&["config", "version"]),
         );
 
-        let patch = build_update_patch(&["config".to_string()], &to, &from, schema.as_schema())
+        let planned = build_update_patch(&["config".to_string()], &to, &from, schema.as_schema())
             .expect("readable ignored leaf can be filled from the read");
+        let expected = vec![LeafPath::from_segments([LeafPathSegment::StructField(
+            "version".into(),
+        )])];
+        let [PlannedPatchOp::Replace(sent)] = planned.ops.as_slice() else {
+            panic!("expected one planned config replacement");
+        };
+        assert_eq!(sent.sent_parts(), ("config", expected.as_slice()));
+        let patch = planned.to_patch();
         let PatchOp::Replace { value, .. } = &patch.ops[0] else {
             panic!("expected config replacement: {:?}", patch.ops);
         };
@@ -15302,6 +15612,20 @@ mod tests {
         };
         assert_eq!(config["version"], patch_test_value("external"));
         assert_eq!(config["memory"], Value::Concrete(ConcreteValue::Int(256)));
+
+        let absent: State = State::existing(from.id.clone(), HashMap::new());
+        let added = build_update_patch(&["config".into()], &to, &absent, schema.as_schema())
+            .expect("an absent observation removes the ignored input leaf");
+        let [PlannedPatchOp::Add(sent)] = added.ops.as_slice() else {
+            panic!("expected one planned config addition");
+        };
+        assert_eq!(sent.sent_parts(), ("config", expected.as_slice()));
+        let added = added.to_patch();
+        assert!(matches!(&added.ops[0], PatchOp::Add { .. }));
+        let Some(Value::Concrete(ConcreteValue::Map(config))) = added.ops[0].sent_value() else {
+            panic!("expected added config map");
+        };
+        assert!(!config.contains_key("version"));
     }
 
     #[test]
@@ -15426,7 +15750,8 @@ mod tests {
 
         let patch =
             build_update_patch(&["description".to_string()], &to, &from, schema.as_schema())
-                .expect("valid reassert patch");
+                .expect("valid reassert patch")
+                .to_patch();
 
         assert!(matches!(
             &patch.ops[..],
@@ -15489,7 +15814,8 @@ mod tests {
             );
 
         let patch = build_update_patch(&["description".to_string()], &to, &from, &schema)
-            .expect("valid write-only patch");
+            .expect("valid write-only patch")
+            .to_patch();
 
         assert!(matches!(
             &patch.ops[0],
@@ -15553,7 +15879,8 @@ mod tests {
             &from,
             &schema,
         )
-        .expect("valid changed write-only patch");
+        .expect("valid changed write-only patch")
+        .to_patch();
 
         assert!(matches!(
             &patch.ops[0],
@@ -15594,12 +15921,14 @@ mod tests {
         assert!(
             build_update_patch(&[], &to, &from, &schema)
                 .expect("empty patch is valid")
+                .to_patch()
                 .ops
                 .is_empty()
         );
         assert!(
             build_update_patch(&["absent".to_string()], &to, &from, &schema)
                 .expect("absent patch is valid")
+                .to_patch()
                 .ops
                 .is_empty(),
             "a changed key absent from both sides must be dropped and cannot trigger reassertion"
@@ -15616,6 +15945,7 @@ mod tests {
         assert!(
             build_update_patch(&[], &to, &from, schema.as_schema())
                 .expect("empty nested patch is valid")
+                .to_patch()
                 .ops
                 .is_empty(),
             "a write-only-bearing attribute cannot create a reassert-only patch"
@@ -15669,7 +15999,8 @@ mod tests {
                             let from = State::existing(id, from_attributes);
                             let desired = resolved_for_test(desired);
                             let patch = build_update_patch(&changed, &desired, &from, &schema)
-                                .expect("generated fixture has no ignored paths");
+                                .expect("generated fixture has no ignored paths")
+                                .to_patch();
                             let patch_keys: Vec<&str> =
                                 patch.ops.iter().map(PatchOp::key).collect();
                             let unique: std::collections::HashSet<_> =

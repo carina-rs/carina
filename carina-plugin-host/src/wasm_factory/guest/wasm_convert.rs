@@ -3702,6 +3702,16 @@ mod tests {
     }
 
     #[test]
+    fn for_value_keys_wait_satisfier_wit_roundtrip() {
+        for base in ["rs", "module.rs", "modules['a.b'].rs", "modules[0].rs"] {
+            let pattern = CoreBindingPattern::ForLoopChildren { base: base.into() };
+            let wire = core_to_wit_binding_pattern(&pattern);
+            assert!(matches!(&wire, wit::BindingPattern::ForLoopChildren(value) if value == base));
+            assert_eq!(wit_to_core_binding_pattern(wire).unwrap(), pattern);
+        }
+    }
+
+    #[test]
     fn binding_pattern_round_trips_through_wit() {
         let patterns = vec![
             CoreBindingPattern::Exact("validation_record".to_string()),

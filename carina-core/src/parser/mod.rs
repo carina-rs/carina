@@ -10,6 +10,9 @@ pub use analysis::{
     DeclarationLocation, DeclarationProvenance, DirectoryScoped, FileScoped, Located,
 };
 mod ast;
+#[cfg(test)]
+pub(crate) use ast::expand_deferred_children_for_test;
+pub(crate) use ast::{ExpandedForChild, ForChildMembers, expand_deferred_children_with_members};
 mod authored_text;
 mod failed_file;
 pub use failed_file::{
@@ -122,7 +125,7 @@ pub use ast::{
     RootBindingResolvedInferredFile, RootBindingResolvedParsedFile, SavedDeferredForExpression,
     ShapeMismatch, SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TopLevelResourceRef,
     TypeExpr, UntilPredicateAst, UpstreamState, UseStatement, UserFunction, UserFunctionBody,
-    ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
+    ValidateExpr, ValidationBlock, WaitBinding,
 };
 pub(crate) use ast::{
     BareBindingSource, DeclarationSource, DeferredForResourceExpressionError, ParsedBareBindingUse,
@@ -158,7 +161,7 @@ pub(crate) use entry::{
 };
 pub use error::{
     DeferredForBodyKind, DeferredForBodyUnsupportedError, DeferredForIterableResolution,
-    FloatLiteralError, ParseError, ParseWarning, ParseWarningSpan,
+    FloatLiteralError, ForKeyDiagnostic, ParseError, ParseWarning, ParseWarningSpan,
     SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE, UnresolvedTypeToken, WarningKind,
 };
 pub(crate) use expressions::string_literal::{
@@ -203,7 +206,7 @@ pub(crate) use util::eval_type_name;
 pub use util::{pascal_to_snake, snake_to_pascal};
 
 pub use grammar::Rule;
-pub(crate) use grammar::{PreprocessedFile, preprocess_file};
+pub(crate) use grammar::{PreprocessedFile, indexed_bound_loop_rewrite, preprocess_file};
 
 pub(crate) use blocks::module_call::parse_module_call;
 pub(crate) use blocks::resource::{

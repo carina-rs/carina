@@ -119,9 +119,7 @@ mod tests {
 
     use async_trait::async_trait;
     use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
-    use carina_state::{
-        BackendError, BackendResult, LoadedState, LockInfo, StateBackend, StateFile,
-    };
+    use carina_state::{BackendError, BackendResult, LockInfo, StateBackend, StateFile};
     use tokio::sync::{Notify, oneshot};
 
     use super::{HeartbeatOutcome, StateLock, with_lock_heartbeat};
@@ -155,7 +153,7 @@ mod tests {
             carina_core::shutdown::CleanupBudget::TWO_SECOND
         }
 
-        async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
+        async fn read_state(&self) -> BackendResult<Option<StateFile>> {
             Ok(None)
         }
 

@@ -119,6 +119,7 @@ fn admission_uses_owning_resource_order_even_for_reversed_classifications() {
             session,
             &std::cell::RefCell::new(Default::default()),
         );
+        let (report, _prefixes_for_test) = report.into_parts();
         assert_eq!(
             report
                 .errors()

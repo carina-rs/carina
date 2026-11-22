@@ -1,10 +1,20 @@
 use super::*;
 use crate::provider_text_fixtures::*;
 mod provider_text_secret_redaction;
+
+fn desired_value_comparison_for_test(
+    schema: Option<&ResourceSchema>,
+) -> DesiredValueComparison<'_> {
+    DesiredValueComparison {
+        schema,
+        context: exact_comparison_context().schema(),
+    }
+}
+
 use carina_core::resource::Directives;
 use carina_core::resource::{
-    DeferredValue, PendingReRead, ReReadReason, ResolvedDependencies, SavedModuleSource,
-    SnapshotLeaf, absolute_binding_address_for_test,
+    DeferredValue, PendingReRead, ReReadReason, ResolvedDependencies, SnapshotLeaf,
+    absolute_binding_address_for_test,
 };
 use carina_core::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
@@ -99,18 +109,14 @@ fn round2_3_full_state_and_export_display_keep_main_namespace_error_text() {
     let mut state = serde_json::to_value(StateFile::new()).unwrap();
     state["exports"] = serde_json::json!({"value": {"$enum": {}}});
     let root_bytes = serde_json::to_vec(&state).unwrap();
-    let state_error = check_and_migrate_bytes(&root_bytes)
-        .unwrap_err()
-        .to_string();
+    let state_error = load_state_bytes(&root_bytes).unwrap_err().to_string();
     let display_error = PublishedExports::from_state_bytes(&root_bytes)
         .unwrap_err()
         .to_string();
     state["exports"] = serde_json::json!({"value": {"private_member": [{"$enum": {}}]}});
     let nested_bytes = serde_json::to_vec(&state).unwrap();
     assert_eq!(
-        check_and_migrate_bytes(&nested_bytes)
-            .unwrap_err()
-            .to_string(),
+        load_state_bytes(&nested_bytes).unwrap_err().to_string(),
         state_error
     );
     assert_eq!(
@@ -578,12 +584,15 @@ fn resource_state_from_provider_state_for_resource_and_schema_for_test<
     row_basis: RowBasis<'_>,
     preferred_hashes: Option<&PersistedAttributes>,
 ) -> Result<ResourceState, ResourceStateEncodingError> {
-    ResourceState::from_provider_state_for_resource_and_schema(
+    let final_desired =
+        FinalDesiredValues::for_test([(resource.id.clone(), resource.attributes.clone())]);
+    ResourceState::from_provider_state_with_final_desired(
         resource,
         state,
         existing,
         schema,
         row_basis,
+        Some(&final_desired),
         preferred_hashes,
         &exact_comparison_context(),
     )
@@ -596,11 +605,14 @@ fn resource_state_from_observation_for_test<S: Clone>(
     schema: Option<&carina_core::schema::CompiledResourceSchema>,
     preferred_hashes: Option<&PersistedAttributes>,
 ) -> Result<ResourceState, ResourceStateEncodingError> {
-    ResourceState::from_observation(
+    let final_desired =
+        FinalDesiredValues::for_test([(resource.id.clone(), resource.attributes.clone())]);
+    ResourceState::from_observation_with_final_desired(
         resource,
         identified,
         existing,
         schema,
+        Some(&final_desired),
         preferred_hashes,
         &exact_comparison_context(),
     )
@@ -625,197 +637,8 @@ fn diff<P: StateValueLeaf>(
     .unwrap()
 }
 
-fn migrate_legacy_with_config(
-    state: StateFile,
-    resources: &[Resource],
-) -> Result<(StateFile, ReportedLegacyMigration), LegacyDependencyMigrationError> {
-    let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
-    let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
-        let mut configuration = parsed;
-        configuration.resources = resources.to_vec();
-        configuration.into()
-    })
-    .expect("legacy migration fixture graph must resolve");
-    let no_move_plan: carina_core::plan::Plan = carina_core::plan::Plan::new();
-    let moved_pairs =
-        carina_core::effect::ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
-    let migration =
-        expect_classified(state.classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())?);
-    let migrated_rows = migration.migrated_rows();
-    let mut warnings = Vec::new();
-    let state = migration
-        .report_and_validate(|warning| warnings.push(warning.clone()))?
-        .state;
-    Ok((
-        state,
-        ReportedLegacyMigration {
-            migrated_rows,
-            warnings,
-        },
-    ))
-}
-
-#[derive(Debug)]
-struct ReportedLegacyMigration {
-    migrated_rows: usize,
-    warnings: Vec<LegacyDestroyOrderingWarning>,
-}
-
-fn expect_classified<T>(outcome: LegacyClassificationOutcome<T>) -> T {
-    match outcome {
-        LegacyClassificationOutcome::Classified(classified) => classified,
-        LegacyClassificationOutcome::RequiresReads(rows) => {
-            panic!("fixture requires reads: {rows}")
-        }
-    }
-}
-
-impl ReportedLegacyMigration {
-    fn migrated_rows(&self) -> usize {
-        self.migrated_rows
-    }
-
-    fn warnings(&self) -> &[LegacyDestroyOrderingWarning] {
-        &self.warnings
-    }
-}
-
-fn finish_legacy_dependency_migration(state: StateFile) -> StateFile {
-    if !state.requires_legacy_dependency_migration() {
-        return state;
-    }
-    let (state, report) = migrate_legacy_with_config(state, &[])
-        .expect("source-independent migration fixture must cross the v20 dependency seam");
-    assert!(
-        report.warnings().is_empty(),
-        "migration fixture contains an unresolved legacy dependency: {:?}",
-        report.warnings()
-    );
-    state
-}
-
 #[test]
-fn v19_migrates_to_unwritable_v20_then_graph_aware_v21_without_losing_row_data() {
-    let json = serde_json::json!({
-        "version": 19,
-        "exports_version": PublishedExports::CURRENT_VERSION,
-        "serial": 7,
-        "lineage": "v19-lineage",
-        "carina_version": "legacy",
-        "resources": [{
-            "resource_type": "test.Resource",
-            "identity": "carried",
-            "provider": "mock",
-            "current": {
-                "kind": "applied",
-                "identifier": "provider-id",
-                "attributes": {"name": "carried"},
-                "nested_write_only": {}
-            },
-            "protected": true,
-            "directives": {"prevent_destroy": false},
-            "binding": "carried_binding"
-        }],
-        "exports": {"answer": 42}
-    });
-
-    let migrated = check_and_migrate(&json.to_string()).expect("v19 state must migrate");
-    assert_eq!(
-        migrated.migration(),
-        Some(MigrationInfo { from: 19, to: 21 })
-    );
-    let state = migrated.into_state();
-    assert_eq!(state.version, 20);
-    assert!(state.requires_legacy_dependency_migration());
-    assert!(serde_json::to_value(&state).is_err());
-    let (state, report) = migrate_legacy_with_config(state, &[])
-        .expect("an empty legacy dependency snapshot is graph-migratable");
-    assert_eq!(report.migrated_rows(), 0);
-    assert_eq!(state.version, 21);
-    assert_eq!(state.serial, 7);
-    assert_eq!(state.lineage, "v19-lineage");
-    assert_eq!(state.resources().len(), 1);
-    assert_eq!(state.resources()[0].identity.as_str(), "carried");
-    assert!(state.resources()[0].protected);
-    assert_eq!(
-        persisted_prevent_destroy_json(&state.resources()[0].directives),
-        serde_json::json!({"kind": "unspecified"})
-    );
-    assert_eq!(
-        state.resources()[0]
-            .binding
-            .as_ref()
-            .map(|binding| binding.as_str()),
-        Some("carried_binding")
-    );
-    assert_eq!(
-        serde_json::to_value(&state).unwrap()["exports"]["answer"],
-        serde_json::json!(42)
-    );
-}
-
-#[test]
-fn v19_migration_preserves_true_and_makes_false_or_missing_unspecified() {
-    let row = |identity: &str, directives: Option<serde_json::Value>| {
-        let mut row = serde_json::json!({
-            "resource_type": "test.Resource",
-            "identity": identity,
-            "provider": "mock",
-            "current": {
-                "kind": "applied",
-                "identifier": format!("provider-{identity}"),
-                "attributes": {},
-                "nested_write_only": {}
-            }
-        });
-        if let Some(directives) = directives {
-            row["directives"] = directives;
-        }
-        row
-    };
-    let json = serde_json::json!({
-        "version": 19,
-        "exports_version": PublishedExports::CURRENT_VERSION,
-        "serial": 1,
-        "lineage": "prevent-destroy-migration",
-        "carina_version": "legacy",
-        "resources": [
-            row("explicit-true", Some(serde_json::json!({"prevent_destroy": true}))),
-            row("legacy-false", Some(serde_json::json!({"prevent_destroy": false}))),
-            row("legacy-missing", None)
-        ]
-    });
-
-    let state = check_and_migrate(&json.to_string())
-        .expect("v19 directives must migrate")
-        .into_state();
-    let settings = state
-        .resources()
-        .iter()
-        .map(|row| {
-            (
-                row.identity.as_str(),
-                persisted_prevent_destroy_json(&row.directives),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-
-    assert_eq!(
-        settings["explicit-true"],
-        serde_json::json!({"kind": "explicit", "value": true})
-    );
-    assert_eq!(
-        settings["legacy-false"],
-        serde_json::json!({"kind": "unspecified"})
-    );
-    assert_eq!(
-        settings["legacy-missing"],
-        serde_json::json!({"kind": "unspecified"})
-    );
-}
-
-#[test]
-fn v20_to_v21_preserves_all_three_prevent_destroy_states() {
+fn current_state_preserves_all_three_prevent_destroy_states() {
     let row = |identity: &str, prevent_destroy: serde_json::Value| {
         serde_json::json!({
             "resource_type": "test.Resource",
@@ -831,10 +654,10 @@ fn v20_to_v21_preserves_all_three_prevent_destroy_states() {
         })
     };
     let json = serde_json::json!({
-        "version": 20,
+        "version": StateFile::CURRENT_VERSION,
         "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
-        "lineage": "tri-state-v20-to-v21",
+        "lineage": "current-tri-state",
         "carina_version": "test",
         "resources": [
             row("unspecified", serde_json::json!({"kind": "unspecified"})),
@@ -844,14 +667,7 @@ fn v20_to_v21_preserves_all_three_prevent_destroy_states() {
         "exports": {}
     });
 
-    let state = check_and_migrate(&json.to_string())
-        .expect("v20 tri-state directives must decode")
-        .into_state();
-    assert_eq!(state.version, 20);
-    let (state, report) = migrate_legacy_with_config(state, &[])
-        .expect("empty dependency sets must cross the v20 to v21 graph seam");
-    assert_eq!(report.migrated_rows(), 0);
-    assert_eq!(state.version, 21);
+    let state = load_state(&json.to_string()).expect("current tri-state directives must decode");
 
     let settings = state
         .resources()
@@ -875,7 +691,7 @@ fn v20_to_v21_preserves_all_three_prevent_destroy_states() {
         settings["explicit-true"],
         serde_json::json!({"kind": "explicit", "value": true})
     );
-    serde_json::to_value(&state).expect("the migrated v21 state must be writable");
+    serde_json::to_value(&state).expect("current state must be writable");
 }
 
 #[test]
@@ -883,7 +699,7 @@ fn create_outcome_unknown_row_round_trips_without_identifier_or_token() {
     use carina_core::resource::Current;
 
     let json = serde_json::json!({
-        "version": 20,
+        "version": StateFile::CURRENT_VERSION,
         "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "unknown-create",
@@ -908,13 +724,7 @@ fn create_outcome_unknown_row_round_trips_without_identifier_or_token() {
         }],
         "exports": {}
     });
-    let state = check_and_migrate(&json.to_string())
-        .expect("v20 outcome-unknown state must load")
-        .into_state();
-    assert_eq!(state.version, 20);
-    let (state, _report) = migrate_legacy_with_config(state, &[])
-        .expect("token-less outcome rows must survive graph-aware migration");
-    assert_eq!(state.version, 21);
+    let state = load_state(&json.to_string()).expect("current outcome-unknown state must load");
     let id = ResourceId::with_provider_identity(
         "mock",
         "test.Resource",
@@ -947,9 +757,8 @@ fn create_outcome_unknown_row_round_trips_without_identifier_or_token() {
             "started_at": "2026-10-23T08:00:00Z"
         })
     );
-    let reloaded = check_and_migrate(&encoded.to_string())
-        .expect("serialized outcome-unknown row must reload")
-        .into_state();
+    let reloaded =
+        load_state(&encoded.to_string()).expect("serialized outcome-unknown row must reload");
     assert_eq!(
         serde_json::to_value(&state).unwrap(),
         serde_json::to_value(&reloaded).unwrap()
@@ -959,7 +768,7 @@ fn create_outcome_unknown_row_round_trips_without_identifier_or_token() {
 #[test]
 fn create_outcome_unknown_row_rejects_identifier_and_token_fields() {
     let base = serde_json::json!({
-        "version": 20,
+        "version": StateFile::CURRENT_VERSION,
         "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "exclusive-unknown-create",
@@ -979,7 +788,7 @@ fn create_outcome_unknown_row_rejects_identifier_and_token_fields() {
         let mut malformed = base.clone();
         malformed["resources"][0]["current"][forbidden] = serde_json::json!("forbidden");
         assert!(
-            check_and_migrate(&malformed.to_string()).is_err(),
+            load_state(&malformed.to_string()).is_err(),
             "outcome-unknown current must reject {forbidden}"
         );
     }
@@ -988,7 +797,7 @@ fn create_outcome_unknown_row_rejects_identifier_and_token_fields() {
 #[test]
 fn outcome_unknown_lookup_mints_the_only_forget_handle() {
     let json = serde_json::json!({
-        "version": 20,
+        "version": StateFile::CURRENT_VERSION,
         "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "forget-unknown-create",
@@ -1004,7 +813,7 @@ fn outcome_unknown_lookup_mints_the_only_forget_handle() {
         }],
         "exports": {}
     });
-    let mut state = check_and_migrate(&json.to_string()).unwrap().into_state();
+    let mut state = load_state(&json.to_string()).unwrap();
     let address = StateBlockAddress::new("mock", "test.Resource", "unknown");
     let id = ResourceId::with_provider_identity("mock", "test.Resource", "unknown", None);
 
@@ -1032,7 +841,7 @@ fn outcome_unknown_lookup_mints_the_only_forget_handle() {
 #[test]
 fn outcome_unknown_forget_keeps_deposed_generations_in_a_shell() {
     let json = serde_json::json!({
-        "version": 20,
+        "version": StateFile::CURRENT_VERSION,
         "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "forget-unknown-create-with-deposed",
@@ -1052,7 +861,9 @@ fn outcome_unknown_forget_keeps_deposed_generations_in_a_shell() {
                     "identifier": "old-id",
                     "provider_instance": "old-route",
                     "attributes": {},
-                    "dependency_bindings": ["network"]
+                    "dependency_bindings": [{
+                        "provider": "mock", "resource_type": "test.Network", "identity": "network"
+                    }]
                 }]
             },
             {
@@ -1071,7 +882,7 @@ fn outcome_unknown_forget_keeps_deposed_generations_in_a_shell() {
         ],
         "exports": {}
     });
-    let mut state = check_and_migrate(&json.to_string()).unwrap().into_state();
+    let mut state = load_state(&json.to_string()).unwrap();
     let address = StateBlockAddress::new("mock", "test.Resource", "unknown");
     let id = ResourceId::with_provider_identity(
         "mock",
@@ -1100,6 +911,9 @@ fn outcome_unknown_forget_keeps_deposed_generations_in_a_shell() {
         shell.deposed[0].provider_instance.as_deref(),
         Some("old-route")
     );
+    assert!(shell.deposed[0].dependency_bindings.contains(
+        &ResolvedResourceId::with_provider_identity("mock", "test.Network", "network", None)
+    ));
 }
 
 #[test]
@@ -1149,221 +963,12 @@ fn outcome_unknown_lookup_rejects_normal_and_missing_rows_with_removed_hint() {
 }
 
 #[test]
-fn v15_migrates_to_current_and_round_trips_all_current_instance_variants() {
-    let json = serde_json::json!({
-        "version": 15,
-        "serial": 4,
-        "lineage": "test-lineage",
-        "carina_version": "test",
-        "resources": [
-            {
-                "resource_type": "test.Resource",
-                "identity": "none",
-                "provider": "mock",
-                "current": { "kind": "none" },
-                "deposed": [{
-                    "key": "00000000-0000-4000-8000-000000000001",
-                    "identifier": "old",
-                    "attributes": {},
-                    "dependency_bindings": []
-                }]
-            },
-            {
-                "resource_type": "test.Resource",
-                "identity": "applied",
-                "provider": "mock",
-                "current": {
-                    "kind": "applied",
-                    "identifier": "cloud-id",
-                    "attributes": { "name": "example" },
-                    "write_only_attributes": ["password"],
-                    "partial_read": null
-                }
-            },
-            {
-                "resource_type": "test.Resource",
-                "identity": "pending",
-                "provider": "mock",
-                "current": {
-                    "kind": "create_in_flight",
-                    "envelope": {
-                        "token": "opaque-token",
-                        "identifier": null,
-                        "write_only": {},
-                        "secrets": {}
-                    },
-                    "started_at": "2026-10-23T08:00:00Z"
-                }
-            },
-            {
-                "resource_type": "test.Resource",
-                "identity": "missing",
-                "provider": "mock",
-                "current": {
-                    "kind": "missing_identifier",
-                    "attributes": { "name": "unknown-owner" }
-                }
-            }
-        ],
-        "exports": {}
-    });
-
-    let migrated = check_and_migrate(&json.to_string()).expect("v15 state must load");
-    assert_eq!(
-        migrated.migration(),
-        Some(MigrationInfo {
-            from: 15,
-            to: StateFile::CURRENT_VERSION,
-        })
-    );
-    let state = finish_legacy_dependency_migration(migrated.into_state());
-    assert!(matches!(
-        state.resources()[0].current(),
-        CurrentInstance::None
-    ));
-    assert!(matches!(
-        state.resources()[1].current(),
-        CurrentInstance::Applied { .. }
-    ));
-    assert!(matches!(
-        state.resources()[2].current(),
-        CurrentInstance::CreateInFlight { .. }
-    ));
-    assert!(matches!(
-        state.resources()[3].current(),
-        CurrentInstance::MissingIdentifier { .. }
-    ));
-
-    let encoded = serde_json::to_string(&state).expect("v15 state must serialize");
-    let reloaded = check_and_migrate(&encoded)
-        .expect("serialized v15 state must reload")
-        .into_state();
-    assert_eq!(
-        serde_json::to_value(&state).unwrap(),
-        serde_json::to_value(&reloaded).unwrap()
-    );
-}
-
-#[test]
-fn v17_migrates_nested_write_only_records_to_empty() {
-    let json = serde_json::json!({
-        "version": 17,
-        "exports_version": PublishedExports::CURRENT_VERSION,
-        "serial": 1,
-        "lineage": "v17-lineage",
-        "carina_version": "legacy",
-        "resources": [
-            {
-                "resource_type": "test.Resource",
-                "identity": "example",
-                "provider": "mock",
-                "current": {
-                    "kind": "applied",
-                    "identifier": "cloud-id",
-                    "attributes": { "name": "example" }
-                }
-            },
-            {
-                "resource_type": "test.Resource",
-                "identity": "legacy",
-                "provider": "mock",
-                "current": {
-                    "kind": "missing_identifier",
-                    "attributes": { "name": "legacy" }
-                }
-            }
-        ],
-        "exports": {}
-    });
-
-    let migrated = check_and_migrate(&json.to_string()).expect("v17 state must migrate");
-    assert_eq!(
-        migrated.migration(),
-        Some(MigrationInfo {
-            from: 17,
-            to: StateFile::CURRENT_VERSION,
-        })
-    );
-    let state = finish_legacy_dependency_migration(migrated.into_state());
-    assert!(state.resources()[0].nested_write_only().is_empty());
-    assert!(state.resources()[1].nested_write_only().is_empty());
-    let encoded = serde_json::to_value(&state).expect("migrated state serializes");
-    assert_eq!(
-        encoded["resources"][0]["current"]["nested_write_only"],
-        serde_json::json!({})
-    );
-    assert_eq!(
-        encoded["resources"][1]["current"]["nested_write_only"],
-        serde_json::json!({})
-    );
-}
-
-#[test]
-fn v18_migrates_partial_read_detail_to_incomplete_reread_reason() {
-    let json = serde_json::json!({
-        "version": 18,
-        "exports_version": PublishedExports::CURRENT_VERSION,
-        "serial": 1,
-        "lineage": "v18-partial-read-lineage",
-        "carina_version": "legacy",
-        "resources": [{
-            "resource_type": "test.Resource",
-            "identity": "example",
-            "provider": "mock",
-            "current": {
-                "kind": "applied",
-                "identifier": "cloud-id",
-                "attributes": { "name": "example" },
-                "nested_write_only": {},
-                "partial_read": {
-                    "detail": "legacy partial read",
-                    "missing_attributes": ["computed"]
-                }
-            }
-        }],
-        "exports": {}
-    });
-
-    let migrated = check_and_migrate(&json.to_string()).expect("v18 state must migrate");
-    assert_eq!(
-        migrated.migration(),
-        Some(MigrationInfo {
-            from: 18,
-            to: StateFile::CURRENT_VERSION,
-        })
-    );
-    let state = finish_legacy_dependency_migration(migrated.into_state());
-    let marker = state.resources()[0]
-        .partial_read()
-        .expect("legacy marker survives migration");
-    assert_eq!(
-        marker.pending(),
-        &PendingReRead::new(ReReadReason::Incomplete {
-            detail: "legacy partial read".into(),
-        })
-    );
-    assert_eq!(
-        marker.missing_attributes(),
-        &BTreeSet::from(["computed".to_string()])
-    );
-
-    let encoded = serde_json::to_value(&state).expect("migrated state serializes");
-    assert_eq!(
-        encoded["resources"][0]["current"]["partial_read"]["pending"]["reason"],
-        serde_json::json!({
-            "kind": "incomplete",
-            "detail": "legacy partial read"
-        })
-    );
-}
-
-#[test]
-fn v19_state_rejects_partial_read_marker_with_empty_missing_attributes() {
+fn current_state_rejects_partial_read_marker_with_empty_missing_attributes() {
     let json = serde_json::json!({
         "version": StateFile::CURRENT_VERSION,
         "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
-        "lineage": "v19-empty-partial-read-lineage",
+        "lineage": "current-empty-partial-read-lineage",
         "carina_version": "test",
         "resources": [{
             "resource_type": "test.Resource",
@@ -1388,61 +993,11 @@ fn v19_state_rejects_partial_read_marker_with_empty_missing_attributes() {
         "exports": {}
     });
 
-    let message = invalid_state_json_message(check_and_migrate(&json.to_string()));
+    let message = invalid_state_json_message(load_state(&json.to_string()));
 
     assert!(
         message.contains("partial-read marker must contain at least one missing attribute"),
         "unexpected state-load error: {message}",
-    );
-}
-
-#[test]
-fn v18_empty_partial_read_marker_migrates_to_no_marker() {
-    let json = serde_json::json!({
-        "version": 18,
-        "exports_version": PublishedExports::CURRENT_VERSION,
-        "serial": 1,
-        "lineage": "v18-empty-partial-read-lineage",
-        "carina_version": "legacy",
-        "resources": [{
-            "resource_type": "test.Resource",
-            "identity": "example",
-            "provider": "mock",
-            "current": {
-                "kind": "applied",
-                "identifier": "cloud-id",
-                "attributes": { "name": "example" },
-                "nested_write_only": {},
-                "partial_read": {
-                    "detail": "legacy empty partial read",
-                    "missing_attributes": []
-                }
-            }
-        }],
-        "exports": {}
-    });
-
-    let migrated = check_and_migrate(&json.to_string())
-        .expect("a v18 empty partial-read marker must be dropped during migration");
-    assert_eq!(
-        migrated.migration(),
-        Some(MigrationInfo {
-            from: 18,
-            to: StateFile::CURRENT_VERSION,
-        })
-    );
-    let state = finish_legacy_dependency_migration(migrated.into_state());
-    assert!(
-        state.resources()[0].partial_read().is_none(),
-        "an empty legacy marker must not survive migration"
-    );
-
-    let encoded = serde_json::to_value(state).expect("migrated state serializes");
-    assert!(
-        encoded["resources"][0]["current"]
-            .get("partial_read")
-            .is_none(),
-        "the dropped marker must not be serialized"
     );
 }
 
@@ -1514,12 +1069,12 @@ fn restore_partial_read_markers_shrinks_and_clears_resolved_attributes() {
 }
 
 #[test]
-fn v18_applied_row_without_nested_write_only_is_rejected() {
+fn current_applied_row_without_nested_write_only_is_rejected() {
     let json = serde_json::json!({
-        "version": 18,
+        "version": StateFile::CURRENT_VERSION,
         "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
-        "lineage": "v18-lineage",
+        "lineage": "current-missing-provenance-lineage",
         "carina_version": "current",
         "resources": [{
             "resource_type": "test.Resource",
@@ -1534,8 +1089,8 @@ fn v18_applied_row_without_nested_write_only_is_rejected() {
         "exports": {}
     });
 
-    let error = check_and_migrate(&json.to_string())
-        .expect_err("v18 must require explicit nested write-only provenance");
+    let error = load_state(&json.to_string())
+        .expect_err("current state requires explicit nested write-only provenance");
 
     assert!(
         error.to_string().contains("nested_write_only"),
@@ -1544,9 +1099,10 @@ fn v18_applied_row_without_nested_write_only_is_rejected() {
 }
 
 #[test]
-fn v15_in_flight_row_has_stable_golden_serialization() {
+fn current_in_flight_row_has_stable_golden_serialization() {
     let json = serde_json::json!({
-        "version": 15,
+        "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 4,
         "lineage": "golden-lineage",
         "carina_version": "test",
@@ -1567,80 +1123,11 @@ fn v15_in_flight_row_has_stable_golden_serialization() {
         }],
         "exports": {}
     });
-    let state = check_and_migrate(&json.to_string())
-        .expect("golden v15 state must load")
-        .into_state();
+    let state = load_state(&json.to_string()).expect("golden current state must load");
 
     assert_eq!(
-        serde_json::to_string(&state.resources()[0]).expect("v15 row serializes"),
+        serde_json::to_string(&state.resources()[0]).expect("current row serializes"),
         r#"{"resource_type":"test.Resource","identity":"pending","provider":"mock","current":{"kind":"create_in_flight","envelope":{"token":"opaque-token","identifier":null,"write_only":{},"secrets":{}},"started_at":"2026-10-23T08:00:00Z"},"protected":false,"directives":{"force_delete":false,"create_before_destroy":false,"prevent_destroy":{"kind":"unspecified"}},"prefixes":{},"name_overrides":{},"binding":null,"dependency_bindings":[]}"#
-    );
-}
-
-#[test]
-fn v14_to_current_preserves_write_only_partial_and_deposed_fields() {
-    let json = serde_json::json!({
-        "version": 14,
-        "serial": 2,
-        "lineage": "legacy",
-        "carina_version": "legacy",
-        "resources": [{
-            "resource_type": "test.Resource",
-            "identity": "main",
-            "provider": "mock",
-            "identifier": "cloud-id",
-            "attributes": { "name": "example", "password": "masked" },
-            "write_only_attributes": ["password"],
-            "directives": {
-                "depends_on": ["upstream"]
-            },
-            "partial_read": {
-                "detail": "provider read omitted status",
-                "missing_attributes": ["status"]
-            },
-            "deposed": [{
-                "key": "00000000-0000-4000-8000-000000000002",
-                "identifier": "old-id",
-                "attributes": { "name": "old" },
-                "dependency_bindings": []
-            }]
-        }],
-        "exports": {}
-    });
-
-    let migrated = check_and_migrate(&json.to_string()).expect("v14 state must migrate");
-    assert_eq!(
-        migrated.migration(),
-        Some(MigrationInfo {
-            from: 14,
-            to: StateFile::CURRENT_VERSION,
-        })
-    );
-    let state = migrated.into_state();
-    let upstream = Resource::with_provider("mock", "test.Dependency", "upstream", None)
-        .with_absolute_binding(absolute_binding("upstream"));
-    let (state, _reported) = migrate_legacy_with_config(state, &[upstream])
-        .expect("v14 directive dependency resolves with configuration");
-    let CurrentInstance::Applied {
-        identifier,
-        attributes,
-        write_only_attributes,
-        nested_write_only,
-        partial_read,
-    } = state.resources()[0].current()
-    else {
-        panic!("v14 applied row must migrate to CurrentInstance::Applied");
-    };
-    assert_eq!(identifier.as_str(), "cloud-id");
-    assert!(attributes.contains_key("password"));
-    assert_eq!(write_only_attributes, &["password"]);
-    assert!(nested_write_only.is_empty());
-    assert!(partial_read.is_some());
-    assert_eq!(state.resources()[0].deposed.len(), 1);
-    assert_eq!(
-        state.resources()[0].directives.depends_on,
-        fixture_persisted_dependencies(["upstream"]),
-        "legacy directive dependencies must cross migration through checked absolute addresses"
     );
 }
 
@@ -1833,7 +1320,10 @@ fn whole_value(paths: &[&[&str]]) -> ExplicitFields {
 #[test]
 fn test_state_file_new() {
     let state = StateFile::new();
-    assert_eq!(state.version, StateFile::CURRENT_VERSION);
+    assert_eq!(
+        serde_json::to_value(&state).unwrap()["version"],
+        StateFile::CURRENT_VERSION
+    );
     assert_eq!(StateFile::CURRENT_VERSION, 21);
     assert_eq!(state.serial, 0);
     assert!(!state.lineage.is_empty());
@@ -1841,7 +1331,7 @@ fn test_state_file_new() {
 }
 
 #[test]
-fn v15_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
+fn current_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
     use carina_core::resource::{Resource, State as ProviderState};
 
     assert_eq!(StateFile::CURRENT_VERSION, 21);
@@ -1870,9 +1360,7 @@ fn v15_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
     state.upsert_resource(row).expect("insert test row");
 
     let json = serde_json::to_string(&state).expect("serialize current state");
-    let reloaded = check_and_migrate(&json)
-        .expect("reload current state")
-        .into_state();
+    let reloaded = load_state(&json).expect("reload current state");
     let loaded = match reloaded.build_state_for_resource(&resource.id) {
         Current::Present(present) => present.state().clone(),
         Current::Absent(state) => panic!("expected present state, got {state:?}"),
@@ -2462,7 +1950,10 @@ fn test_state_file_serialization() {
     let json = serde_json::to_string_pretty(&state).unwrap();
     let deserialized = StateFile::from_json_str(&json).unwrap();
 
-    assert_eq!(deserialized.version, state.version);
+    assert_eq!(
+        serde_json::to_value(&deserialized).unwrap()["version"],
+        StateFile::CURRENT_VERSION
+    );
     assert_eq!(deserialized.serial, state.serial);
     assert_eq!(deserialized.lineage, state.lineage);
     assert_eq!(deserialized.resources.len(), 1);
@@ -2744,8 +2235,8 @@ fn test_resource_state_serialization_with_binding_and_deps() {
 }
 
 #[test]
-fn test_resource_state_deserialization_without_v3_fields() {
-    // v2 state files don't have binding or dependency_bindings fields
+fn resource_state_optional_address_metadata_defaults_to_empty() {
+    // Optional address metadata may be omitted on a current row.
     let json = r#"{
         "resource_type": "s3.Bucket",
         "name": "my-bucket",
@@ -2770,7 +2261,7 @@ fn test_resource_state_deserialization_without_v3_fields() {
 }
 
 #[test]
-fn resource_state_name_overrides_migrates_from_v7_bare_string() {
+fn resource_state_name_overrides_accepts_bare_string() {
     let json = r#"{
         "resource_type": "s3.Bucket",
         "identity": "my-bucket",
@@ -3692,9 +3183,7 @@ fn carried_list_pending_removal_with_duplicates_falls_back_to_whole_value() {
     state.upsert_resource(carried).unwrap();
     let encoded = serde_json::to_string(&state).expect("WholeValue state serializes");
     assert!(encoded.contains(r#""kind":"whole-value""#));
-    let reloaded = check_and_migrate(&encoded)
-        .expect("current WholeValue state reloads")
-        .into_state();
+    let reloaded = load_state(&encoded).expect("current WholeValue state reloads");
     assert_eq!(
         reloaded.resources()[0].explicit,
         state.resources()[0].explicit
@@ -4245,9 +3734,7 @@ fn test_from_provider_state_replaces_prior_authored_keys_after_all_attributes_ar
     let mut state = StateFile::new();
     state.upsert_resource(rs).unwrap();
     let encoded = serde_json::to_string(&state).expect("current state serializes");
-    let checked = check_and_migrate(&encoded).expect("current state reloads without migration");
-    assert!(checked.migration().is_none());
-    let reloaded = checked.into_state();
+    let reloaded = load_state(&encoded).expect("current state reloads");
     let reloaded_row = reloaded
         .find_resource_for_id(&resource.id)
         .expect("reloaded IGW row");
@@ -4459,156 +3946,6 @@ fn test_from_provider_state_replaces_unrecorded_when_desired_and_state_attrs_are
         ExplicitFields::Struct {
             children: HashMap::new()
         }
-    );
-}
-
-#[test]
-fn test_migrate_v6_empty_struct_to_unrecorded() {
-    // carina#3280: state files at v6 carry the corrupt-row shape as
-    // `Struct { children: {} }`. The v6 → v7 migration rewrites
-    // every top-level empty Struct to `Unrecorded` so callers never
-    // encounter the ambiguous shape after read.
-    use carina_core::explicit::ExplicitFields;
-    let v6 = r#"{
-        "version": 6,
-        "serial": 1,
-        "lineage": "test-lineage",
-        "carina_version": "0.1.0",
-        "resources": [
-            {
-                "resource_type": "sso.Assignment",
-                "name": "x",
-                "provider": "awscc",
-                "identifier": "id",
-                "attributes": { "target_id": "123" },
-                "protected": false,
-                "directives": {},
-                "prefixes": {},
-                "name_overrides": {},
-                "binding": "x",
-                "dependency_bindings": [],
-                "explicit": { "kind": "struct", "children": {} }
-            }
-        ]
-    }"#;
-    let state = finish_legacy_dependency_migration(
-        check_and_migrate(v6)
-            .expect("migration should succeed")
-            .into_state(),
-    );
-    assert_eq!(state.version, StateFile::CURRENT_VERSION);
-    let rs = state
-        .resources
-        .iter()
-        .find(|r| r.identity.as_str() == "x")
-        .expect("test resource");
-    assert!(
-        matches!(rs.explicit, ExplicitFields::Unrecorded),
-        "v6 empty-Struct row must migrate to Unrecorded, got {:?}",
-        rs.explicit
-    );
-}
-
-#[test]
-fn test_migrate_v6_preserves_populated_explicit() {
-    // carina#3280 sibling: the v6 → v7 migration must leave populated
-    // `Struct` rows untouched. Only the top-level empty-Struct
-    // (corruption) shape is rewritten.
-    use carina_core::explicit::ExplicitFields;
-    let v6 = r#"{
-        "version": 6,
-        "serial": 1,
-        "lineage": "test-lineage",
-        "carina_version": "0.1.0",
-        "resources": [
-            {
-                "resource_type": "ec2.Vpc",
-                "name": "vpc",
-                "provider": "awscc",
-                "identifier": "vpc-1",
-                "attributes": { "cidr_block": "10.0.0.0/16" },
-                "protected": false,
-                "directives": {},
-                "prefixes": {},
-                "name_overrides": {},
-                "binding": "vpc",
-                "dependency_bindings": [],
-                "explicit": {
-                    "kind": "struct",
-                    "children": { "cidr_block": { "kind": "leaf" } }
-                }
-            }
-        ]
-    }"#;
-    let state = check_and_migrate(v6)
-        .expect("migration should succeed")
-        .into_state();
-    let rs = state
-        .resources
-        .iter()
-        .find(|r| r.identity.as_str() == "vpc")
-        .unwrap();
-    let ExplicitFields::Struct { children } = &rs.explicit else {
-        panic!(
-            "populated v6 Struct must survive migration, got {:?}",
-            rs.explicit
-        );
-    };
-    assert!(children.contains_key("cidr_block"));
-}
-
-#[test]
-fn test_migrate_v6_does_not_rewrite_nested_empty_struct() {
-    // carina#3280: the migration is top-level-only by design. A
-    // nested empty `Struct { children: {} }` (the legitimate
-    // "user wrote `tags = {}`" shape) must survive the migration
-    // unchanged — it is structurally meaningful at that position
-    // (recursive `project` correctly drops every field), unlike the
-    // top-level legacy-corruption case.
-    use carina_core::explicit::ExplicitFields;
-    let v6 = r#"{
-        "version": 6,
-        "serial": 1,
-        "lineage": "test-lineage",
-        "carina_version": "0.1.0",
-        "resources": [
-            {
-                "resource_type": "ec2.Vpc",
-                "name": "vpc",
-                "provider": "awscc",
-                "identifier": "vpc-1",
-                "attributes": {},
-                "protected": false,
-                "directives": {},
-                "prefixes": {},
-                "name_overrides": {},
-                "binding": "vpc",
-                "dependency_bindings": [],
-                "explicit": {
-                    "kind": "struct",
-                    "children": {
-                        "tags": { "kind": "struct", "children": {} }
-                    }
-                }
-            }
-        ]
-    }"#;
-    let state = check_and_migrate(v6)
-        .expect("migration should succeed")
-        .into_state();
-    let rs = state
-        .resources
-        .iter()
-        .find(|r| r.identity.as_str() == "vpc")
-        .unwrap();
-    let ExplicitFields::Struct { children } = &rs.explicit else {
-        panic!("expected top-level Struct, got {:?}", rs.explicit);
-    };
-    let tags = children.get("tags").expect("tags child");
-    assert!(
-        matches!(tags, ExplicitFields::Struct { children } if children.is_empty()),
-        "nested empty Struct must survive migration (legitimate `tags = {{}}` shape); got {:?}",
-        tags
     );
 }
 
@@ -5009,7 +4346,7 @@ fn test_build_state_for_resource_not_found() {
 }
 
 #[test]
-fn v15_loader_classifies_none_present_and_missing_without_flattening() {
+fn current_loader_classifies_none_present_and_missing_without_flattening() {
     use carina_core::resource::Current;
 
     let absent_id = ResourceId::with_provider_identity("mock", "test.resource", "absent", None);
@@ -5026,7 +4363,7 @@ fn v15_loader_classifies_none_present_and_missing_without_flattening() {
     missing_row.set_persisted_attribute("name", serde_json::json!("legacy-without-id"));
     state
         .upsert_resource(missing_row)
-        .expect("identifier-less fixture row is valid v15 state");
+        .expect("identifier-less fixture row is valid current state");
 
     let absent = state.build_state_for_resource(&absent_id);
     let present = state.build_state_for_resource(&present_id);
@@ -5041,11 +4378,12 @@ fn v15_loader_classifies_none_present_and_missing_without_flattening() {
 }
 
 #[test]
-fn v15_none_is_absent_even_when_address_metadata_is_retained() {
+fn current_none_is_absent_even_when_address_metadata_is_retained() {
     use carina_core::resource::Current;
 
     let json = serde_json::json!({
-        "version": 15,
+        "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "exact-shell",
         "carina_version": "test",
@@ -5078,9 +4416,7 @@ fn v15_none_is_absent_even_when_address_metadata_is_retained() {
         ],
         "exports": {}
     });
-    let state = check_and_migrate(&json.to_string())
-        .expect("v15 state must load")
-        .into_state();
+    let state = load_state(&json.to_string()).expect("current state must load");
     let shell = ResourceId::with_provider_identity("mock", "test.Resource", "shell", None);
     let malformed = ResourceId::with_provider_identity("mock", "test.Resource", "malformed", None);
 
@@ -5099,7 +4435,8 @@ fn in_flight_state_keeps_the_persisted_provider_route() {
     use carina_core::resource::Current;
 
     let json = serde_json::json!({
-        "version": 15,
+        "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "persisted-route",
         "carina_version": "test",
@@ -5121,9 +4458,7 @@ fn in_flight_state_keeps_the_persisted_provider_route() {
         }],
         "exports": {}
     });
-    let state = check_and_migrate(&json.to_string())
-        .expect("v15 state must load")
-        .into_state();
+    let state = load_state(&json.to_string()).expect("current state must load");
     let desired =
         ResourceId::with_provider_identity("mock", "test.Resource", "pending", Some("new".into()));
 
@@ -5134,9 +4469,10 @@ fn in_flight_state_keeps_the_persisted_provider_route() {
 }
 
 #[test]
-fn v15_rejects_a_route_embedded_inside_an_in_flight_record() {
+fn current_row_rejects_a_route_embedded_inside_an_in_flight_record() {
     let json = serde_json::json!({
-        "version": 15,
+        "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "mismatched-persisted-route",
         "carina_version": "test",
@@ -5164,15 +4500,16 @@ fn v15_rejects_a_route_embedded_inside_an_in_flight_record() {
     });
 
     assert!(
-        check_and_migrate(&json.to_string()).is_err(),
+        load_state(&json.to_string()).is_err(),
         "the ID-less envelope must derive its route only from the containing state row"
     );
 }
 
 #[test]
-fn v15_rejects_token_plus_attributes_and_identifier_plus_token() {
+fn current_row_rejects_token_plus_attributes_and_identifier_plus_token() {
     let base = serde_json::json!({
-        "version": 15,
+        "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "exclusive-current",
         "carina_version": "test",
@@ -5198,7 +4535,7 @@ fn v15_rejects_token_plus_attributes_and_identifier_plus_token() {
     token_plus_attributes["resources"][0]["current"]["attributes"] =
         serde_json::json!({"name": "must-not-coexist"});
     assert!(
-        check_and_migrate(&token_plus_attributes.to_string()).is_err(),
+        load_state(&token_plus_attributes.to_string()).is_err(),
         "an in-flight current slot cannot also carry resource attributes"
     );
 
@@ -5206,7 +4543,7 @@ fn v15_rejects_token_plus_attributes_and_identifier_plus_token() {
     identifier_plus_token["resources"][0]["current"]["identifier"] =
         serde_json::json!("applied-id");
     assert!(
-        check_and_migrate(&identifier_plus_token.to_string()).is_err(),
+        load_state(&identifier_plus_token.to_string()).is_err(),
         "an in-flight current slot cannot also carry an applied identifier"
     );
 }
@@ -5216,7 +4553,8 @@ fn in_flight_load_preserves_route_started_at_and_deposed_generations() {
     use carina_core::resource::Current;
 
     let json = serde_json::json!({
-        "version": 15,
+        "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "complete-in-flight-load",
         "carina_version": "test",
@@ -5245,9 +4583,7 @@ fn in_flight_load_preserves_route_started_at_and_deposed_generations() {
         }],
         "exports": {}
     });
-    let state = check_and_migrate(&json.to_string())
-        .expect("v15 in-flight state must load")
-        .into_state();
+    let state = load_state(&json.to_string()).expect("current in-flight state must load");
     let desired = ResourceId::with_provider_identity(
         "mock",
         "test.Resource",
@@ -5624,9 +4960,7 @@ fn build_orphans_retains_row_without_identifier_as_typed_invalid_orphan() {
         }],
         "exports": {}
     });
-    let state = check_and_migrate(&json.to_string())
-        .expect("load state JSON")
-        .into_state();
+    let state = load_state(&json.to_string()).expect("load state JSON");
 
     let loaded = state.build_orphans(&HashSet::new());
 
@@ -5726,361 +5060,7 @@ fn orphan_provider_refresh_never_promotes_provider_keys_into_authoring_metadata(
 }
 
 #[test]
-fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
-    let legacy_keys = [
-        "_binding",
-        "_dependency_bindings",
-        "_virtual",
-        "_type",
-        "_default_tag_keys",
-    ];
-    let attributes = serde_json::Map::from_iter(
-        std::iter::once(("name".to_string(), serde_json::json!("kept"))).chain(
-            legacy_keys
-                .iter()
-                .map(|key| ((*key).to_string(), serde_json::json!("legacy"))),
-        ),
-    );
-    let explicit_children = serde_json::Map::from_iter(
-        std::iter::once(("name".to_string(), serde_json::json!({ "kind": "leaf" }))).chain(
-            legacy_keys
-                .iter()
-                .map(|key| ((*key).to_string(), serde_json::json!({ "kind": "leaf" }))),
-        ),
-    );
-    let json = serde_json::json!({
-        "version": 10,
-        "serial": 1,
-        "lineage": "legacy-reserved-attributes",
-        "carina_version": "0.4.0",
-        "resources": [{
-            "resource_type": "test.Resource",
-            "identity": "legacy",
-            "provider": "mock",
-            "identifier": "resource-123",
-            "attributes": attributes,
-            "explicit": {
-                "kind": "struct",
-                "children": explicit_children,
-            },
-            "deposed": [{
-                "key": "old",
-                "identifier": "resource-old",
-                "attributes": {
-                    "name": "old",
-                    "_binding": "legacy_binding",
-                    "_type": "test.Resource",
-                },
-                "dependency_bindings": [],
-            }],
-        }],
-        "exports": {},
-    });
-
-    let state = check_and_migrate(&json.to_string())
-        .expect("legacy state should migrate")
-        .into_state();
-    let desired = Resource::with_provider("mock", "test.Resource", "legacy", None).with_attribute(
-        "name",
-        Value::Concrete(ConcreteValue::String("kept".into())),
-    );
-    let mut schemas = carina_core::schema::SchemaRegistry::new();
-    schemas.insert(
-        "mock",
-        PatternResourceSchema::new("test.Resource")
-            .attribute(
-                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
-            )
-            .validate()
-            .expect("legacy fixture schema is valid"),
-    );
-    let resolved = resolved(&desired);
-    let id = resolved.id.clone();
-    let current = match state.build_state_for_resource(&id) {
-        Current::Absent(state) => carina_core::resource::Current::Absent(state),
-        Current::Present(present) => carina_core::resource::Current::Present(present),
-        Current::CreateInFlight(pending) => carina_core::resource::Current::CreateInFlight(pending),
-        Current::CreateOutcomeUnknown(unknown) => {
-            carina_core::resource::Current::CreateOutcomeUnknown(unknown)
-        }
-        Current::MissingIdentifier(state) => {
-            carina_core::resource::Current::MissingIdentifier(state)
-        }
-    };
-    let plan_input_states = carina_core::resource::into_plan_input_current_map::<
-        carina_core::resource::ModuleSource,
-        carina_core::resource::UnexpandedDependencyFields,
-    >(HashMap::from([(id.clone(), current)]), &schemas, &[]);
-    let plan = carina_core::differ::create_plan_for_test(
-        &[resolved],
-        &[],
-        &carina_core::provider::ProviderRouter::new(),
-        carina_core::differ::PlanPriorStates::new(
-            &plan_input_states,
-            &carina_core::differ::Orphans::new(),
-        ),
-        &state.build_directives(),
-        &schemas,
-        &state.build_saved_attrs().lift(&schemas),
-        &state.build_explicit(),
-        &[],
-    )
-    .expect("legacy state plan should build");
-    assert!(
-        !plan
-            .effects()
-            .iter()
-            .any(|effect| matches!(effect, carina_core::effect::Effect::Update { .. })),
-        "legacy host attributes must not produce an Update or provider patch: {:?}",
-        plan.effects()
-    );
-
-    let row = state
-        .find_resource("mock", "test.Resource", "legacy")
-        .expect("legacy row should remain");
-    assert_eq!(
-        row.persisted_attributes()
-            .expect("legacy row has persisted attributes")
-            .keys()
-            .collect::<Vec<_>>(),
-        vec![&"name".to_string()]
-    );
-    assert_eq!(
-        row.deposed[0]
-            .persisted_attributes()
-            .keys()
-            .collect::<Vec<_>>(),
-        vec![&"name".to_string()]
-    );
-    assert_explicit_struct_keys(&row.explicit, &["name"]);
-    assert!(!row.format_generations_for_state_show().contains("_binding"));
-    assert!(!row.format_generations_for_state_show().contains("_type"));
-
-    let generation = carina_core::effect::EffectGeneration::Deposed(row.deposed[0].key.clone());
-    let delete = carina_core::effect::Effect::Delete {
-        id: carina_core::resource::ResolvedResourceId::new(id.clone()),
-        identifier: crate::fixture_applied_identifier("resource-old"),
-        generation: generation.clone(),
-        directives: Directives::default(),
-        binding: None,
-        dependencies: Default::default(),
-        explicit_dependencies: Default::default(),
-        blocked_by_updates: Default::default(),
-    };
-    let mut delete_plan = carina_core::plan::Plan::new();
-    delete_plan.add(delete.clone());
-    let key = carina_core::effect::DeletedInstanceKey::new(
-        id.clone(),
-        generation,
-        "resource-old".to_string(),
-    );
-    let deleted = HashMap::from([(
-        key,
-        carina_core::resource::SnapshotState::existing(
-            id.clone(),
-            row.deposed[0].persisted_attributes().to_values(),
-        ),
-    )]);
-    let observations = ObservedStateFile::for_test(Some(state.clone()))
-        .authority()
-        .protect(carina_core::value::ObservationInputs::Display {
-            plan: &delete_plan,
-            current: &HashMap::new(),
-            deleted: &deleted,
-        })
-        .unwrap();
-    let historical = carina_core::detail_rows::HistoricalDisplayAttributes::from_observations(
-        &delete_plan,
-        &observations,
-    )
-    .unwrap();
-    let (schemas, provider) = carina_core::provider::comparison_fixture_for_test(
-        &carina_core::schema::SchemaRegistry::new(),
-        std::iter::once(&id),
-    );
-    let delete_rows = carina_core::detail_rows::build_detail_rows_by_instance(
-        &delete,
-        Some(&schemas),
-        carina_core::detail_rows::DetailLevel::Full,
-        &historical,
-        None,
-        &provider,
-        carina_core::detail_rows::DetailComparisons::RecordedEffects,
-    )
-    .expect("delete display must use the production detail-row builder");
-    assert_eq!(
-        delete_rows,
-        vec![carina_core::detail_rows::DetailRow::Attribute {
-            key: "name".to_string(),
-            value: carina_core::value::render_fixture_value(
-                &carina_core::resource::ExpandedValue::Concrete(
-                    carina_core::resource::ExpandedConcreteValue::String("old".into()),
-                ),
-            ),
-            ref_binding: None,
-            annotation: None,
-        }]
-    );
-}
-
-#[test]
-fn v12_persisted_values_migrate_to_tagged_enum_encoding_in_every_state_tree() {
-    let state = finish_legacy_dependency_migration(
-        check_and_migrate(include_str!(
-            "../../tests/fixtures/state-v12-tagged-enum-json.json"
-        ))
-        .expect("v12 fixture should migrate")
-        .into_state(),
-    );
-
-    assert_eq!(state.version, StateFile::CURRENT_VERSION);
-    let row = state
-        .find_resource("mock", "test.Resource", "main")
-        .expect("fixture resource exists");
-
-    for attributes in [
-        row.persisted_attributes()
-            .expect("migrated row has persisted attributes"),
-        row.deposed[0].persisted_attributes(),
-    ] {
-        assert!(matches!(
-            attributes.get("legacy_enum"),
-            Some(Value::Concrete(ConcreteValue::CanonicalEnum(_)))
-        ));
-        assert!(matches!(
-            attributes.get("dollar_map"),
-            Some(Value::Concrete(ConcreteValue::Map(map))) if map.contains_key("$x")
-        ));
-    }
-    assert_eq!(
-        row.format_attribute_for_state_show("dollar_map", true),
-        Some("{\n  \"$x\": \"current\"\n}".to_string())
-    );
-
-    let remote = published_exports_from_state(&state).build_remote_bindings();
-    assert!(matches!(
-        remote.get("legacy_enum"),
-        Some(Value::Concrete(ConcreteValue::CanonicalEnum(_)))
-    ));
-    assert!(matches!(
-        remote.get("dollar_map"),
-        Some(Value::Concrete(ConcreteValue::Map(map))) if map.contains_key("$x")
-    ));
-
-    let migrated_json = serde_json::to_value(&state).expect("migrated state serializes");
-    let current = &migrated_json["resources"][0]["current"]["attributes"];
-    let deposed = &migrated_json["resources"][0]["deposed"][0]["attributes"];
-    let exports = &migrated_json["exports"];
-    for tree in [current, deposed, exports] {
-        assert!(tree["legacy_enum"].get("$enum").is_some());
-        assert!(tree["dollar_map"].get("$$x").is_some());
-        assert!(tree["dollar_map"].get("$x").is_none());
-    }
-}
-
-#[test]
-fn v13_resource_secret_markers_migrate_to_structural_tags_but_exports_stay_literal() {
-    let marker = valid_legacy_marker_shaped_string("v13-self-contained");
-    let digest = marker
-        .strip_prefix("_secret:")
-        .expect("test marker uses the legacy boundary prefix");
-    let fixture = include_str!("../../tests/fixtures/state-v13-structural-secret-marker.json")
-        .replace("__SELF_CONTAINED_MARKER__", &marker);
-    let outcome = check_and_migrate(&fixture).expect("v13 fixture should migrate");
-
-    assert_eq!(
-        outcome.migration(),
-        Some(MigrationInfo {
-            from: 13,
-            to: StateFile::CURRENT_VERSION,
-        })
-    );
-    let state = finish_legacy_dependency_migration(outcome.into_state());
-    let row = state
-        .find_resource("mock", "test.Resource", "main")
-        .expect("fixture resource exists");
-    for attributes in [
-        row.persisted_attributes()
-            .expect("migrated row has persisted attributes"),
-        row.deposed[0].persisted_attributes(),
-    ] {
-        assert!(matches!(
-            attributes.get("self_contained"),
-            Some(Value::Deferred(DeferredValue::Placeholder(
-                SnapshotLeaf::RedactedSecret { .. }
-            )))
-        ));
-        assert!(matches!(
-            attributes.get("raw_legacy"),
-            Some(Value::Deferred(DeferredValue::Placeholder(
-                SnapshotLeaf::RedactedSecret { .. }
-            )))
-        ));
-    }
-    assert!(matches!(
-        row.persisted_attributes()
-            .expect("migrated row has persisted attributes")
-            .get("malformed"),
-        Some(Value::Concrete(ConcreteValue::String(value)))
-            if value.expose_plaintext() == "_secret:argon2:not-a-hash"
-    ));
-    assert!(matches!(
-        row.persisted_attributes()
-            .expect("migrated row has persisted attributes")
-            .get("nested"),
-        Some(Value::Concrete(ConcreteValue::Map(values)))
-            if matches!(
-                values.get("$secret"),
-                Some(Value::Concrete(ConcreteValue::String(value)))
-                    if value.expose_plaintext() == "user-value"
-            )
-    ));
-
-    let encoded = serde_json::to_value(&state).expect("migrated state serializes");
-    let current = &encoded["resources"][0]["current"]["attributes"];
-    let deposed = &encoded["resources"][0]["deposed"][0]["attributes"];
-    assert_eq!(
-        current["self_contained"],
-        serde_json::json!({"$secret": digest})
-    );
-    assert_eq!(
-        deposed["self_contained"],
-        serde_json::json!({"$secret": digest})
-    );
-    assert!(
-        current["explicit_legacy"]["$secret"]
-            .as_str()
-            .is_some_and(|value| value.starts_with("argon2-legacy:"))
-    );
-    assert!(
-        current["raw_legacy"]["$secret"]
-            .as_str()
-            .is_some_and(|value| value.starts_with("argon2-legacy:"))
-    );
-    assert!(current["nested"]["items"][0].get("$secret").is_some());
-    assert!(current["nested"]["map"]["value"].get("$secret").is_some());
-    assert_eq!(current["nested"]["$$secret"], "user-value");
-
-    assert_eq!(encoded["exports"]["self_contained"], marker);
-    assert_eq!(
-        encoded["exports"]["raw_legacy"],
-        "_secret:argon2:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-    );
-    assert_eq!(
-        encoded["exports"]["user_map"]["$$secret"],
-        "export-user-value"
-    );
-    assert!(matches!(
-        published_exports_from_state(&state)
-            .build_remote_bindings()
-            .get("self_contained"),
-        Some(Value::Concrete(ConcreteValue::String(value)))
-            if value.expose_plaintext() == marker
-    ));
-}
-
-#[test]
-fn v13_raw_row_salted_secret_still_verifies_after_structural_migration() {
+fn current_structural_row_salted_legacy_secret_verifies() {
     use argon2::Argon2;
 
     let plaintext = "pre-v12-row-secret";
@@ -6091,35 +5071,32 @@ fn v13_raw_row_salted_secret_still_verifies_after_structural_migration() {
         .hash_password_into(&material, salt, &mut output)
         .expect("hash legacy fixture");
     let json = serde_json::json!({
-        "version": 13,
+        "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
-        "lineage": "v13-row-salt-verification",
+        "lineage": "current-row-salt-verification",
         "carina_version": "0.8.0",
         "resources": [{
             "resource_type": "test.Resource",
             "identity": "main",
             "provider": "mock",
-            "identifier": "current-id",
+            "current": {"kind": "applied", "identifier": "current-id", "nested_write_only": {},
             "attributes": {
-                "raw_legacy": format!("{LEGACY_SECRET_PREFIX}{}", hex::encode(output)),
-            },
+                "raw_legacy": {"$secret": format!("argon2-legacy:{}:{}", hex::encode(salt), hex::encode(output))},
+            }},
         }],
         "exports": {},
     });
-    let state = finish_legacy_dependency_migration(
-        check_and_migrate(&json.to_string())
-            .expect("v13 raw legacy state migrates")
-            .into_state(),
-    );
+    let state = load_state(&json.to_string()).expect("current structural legacy digest loads");
     let hash = state.resources()[0]
         .persisted_attributes()
-        .expect("migrated row has persisted attributes")
+        .expect("row has persisted attributes")
         .redacted_secret_hash("raw_legacy")
         .expect("raw legacy value remains typed");
 
     assert!(hash.verify(&material));
     assert!(
-        serde_json::to_value(&state).expect("serialize migrated state")["resources"][0]["current"]
+        serde_json::to_value(&state).expect("serialize current state")["resources"][0]["current"]
             ["attributes"]["raw_legacy"]
             .get("$secret")
             .is_some()
@@ -6159,8 +5136,8 @@ fn current_state_rejects_unknown_reserved_payloads_in_attributes_and_exports() {
         (attribute_state, "not valid persisted JSON"),
         (export_state, "host-reserved"),
     ] {
-        let error = check_and_migrate(&state.to_string())
-            .expect_err("unknown host payload must fail closed");
+        let error =
+            load_state(&state.to_string()).expect_err("unknown host payload must fail closed");
         assert!(
             error.to_string().contains(expected),
             "unexpected error: {error}"
@@ -6190,7 +5167,7 @@ fn current_state_attribute_errors_include_the_attribute_and_reserved_payload_rea
         "exports": {},
     });
 
-    let message = invalid_state_json_message(check_and_migrate(&state.to_string()));
+    let message = invalid_state_json_message(load_state(&state.to_string()));
     assert!(
         message.contains("persisted attribute \"event_pattern\""),
         "{message}"
@@ -6207,7 +5184,7 @@ fn current_state_attribute_errors_include_the_attribute_and_reserved_payload_rea
         },
         "dependency_bindings": [],
     }]);
-    let message = invalid_state_json_message(check_and_migrate(&state.to_string()));
+    let message = invalid_state_json_message(load_state(&state.to_string()));
     assert!(
         message.contains("persisted attribute \"mode\""),
         "{message}"
@@ -6234,7 +5211,7 @@ fn current_state_export_errors_include_the_export_name_and_payload_reason() {
         },
     });
 
-    let message = invalid_state_message(check_and_migrate(&state.to_string()));
+    let message = invalid_state_message(load_state(&state.to_string()));
     assert!(
         message.contains("persisted export \"broken_mode\""),
         "{message}"
@@ -6246,226 +5223,65 @@ fn current_state_export_errors_include_the_export_name_and_payload_reason() {
 }
 
 #[test]
-fn v8_state_migrates_to_current_with_empty_deposed() {
-    use super::check_and_migrate;
+fn current_deposed_entries_round_trip() {
+    use super::load_state;
 
     let json = r#"{
-        "version": 8,
-        "serial": 5,
-        "lineage": "test-lineage",
-        "carina_version": "0.4.0",
-        "resources": [
-            {
-                "resource_type": "ec2.Vpc",
-                "identity": "vpc",
-                "provider": "awscc",
-                "identifier": "vpc-current",
-                "attributes": { "vpc_id": "vpc-current" }
-            }
-        ]
-    }"#;
-
-    let outcome = check_and_migrate(json).expect("v8 state should migrate to current");
-    let migration = outcome
-        .migration
-        .expect("v8 read should report a migration");
-    assert_eq!(migration.from, 8);
-    assert_eq!(migration.to, StateFile::CURRENT_VERSION);
-    let row = outcome
-        .state
-        .find_resource("awscc", "ec2.Vpc", "vpc")
-        .expect("resource should survive migration");
-    let row_json = serde_json::to_value(row).expect("resource state should serialize");
-    assert!(
-        row_json.get("deposed").is_none(),
-        "empty deposed vec should use serde default and skip serialization"
-    );
-}
-
-#[test]
-fn v11_state_migrates_to_current_and_upgrades_raw_legacy_secrets_at_row_load() {
-    use super::check_and_migrate;
-
-    assert_eq!(StateFile::CURRENT_VERSION, 21);
-    let json = format!(
-        r#"{{
-        "version": 11,
-        "serial": 5,
-        "lineage": "v11-secret-lineage",
-        "carina_version": "0.4.0",
-        "resources": [
-            {{
-                "resource_type": "test.resource",
-                "identity": "legacy",
-                "provider": "mock",
-                "identifier": "legacy-id",
-                "attributes": {{
-                    "comment": "{LEGACY_SECRET_PREFIX}{}"
-                }}
-            }}
-        ]
-    }}"#,
-        "ab".repeat(32),
-    );
-
-    let outcome = check_and_migrate(&json).expect("v11 state should migrate to current");
-    assert_eq!(
-        outcome.migration(),
-        Some(MigrationInfo {
-            from: 11,
-            to: StateFile::CURRENT_VERSION,
-        })
-    );
-    assert_eq!(outcome.state().version, 20);
-    let state = finish_legacy_dependency_migration(outcome.into_state());
-    let row = state
-        .find_resource("mock", "test.resource", "legacy")
-        .expect("legacy row should survive migration");
-    let encoded = row
-        .persisted_attributes()
-        .expect("migrated row has persisted attributes")
-        .encoded_value("comment")
-        .expect("legacy secret should remain persisted")
-        .as_json();
-    let digest = structural_secret_digest(encoded);
-    assert!(
-        digest.starts_with("argon2-legacy:"),
-        "row load must make the legacy digest self-contained: {digest}",
-    );
-}
-
-#[test]
-fn v11_fixture_migrates_nested_tagged_values_and_dollar_keys() {
-    let state = check_and_migrate(include_str!(
-        "../../tests/fixtures/state-v11-nested-persisted-values.json"
-    ))
-    .expect("v11 fixture should migrate")
-    .into_state();
-    let row = state
-        .find_resource("mock", "test.Resource", "main")
-        .expect("fixture resource exists");
-    let settings = row
-        .persisted_attributes()
-        .expect("migrated row has persisted attributes")
-        .get("settings")
-        .expect("settings should decode");
-    let Value::Concrete(ConcreteValue::Map(settings)) = settings else {
-        panic!("settings should remain a map");
-    };
-
-    assert!(matches!(
-        settings.get("$k"),
-        Some(Value::Deferred(DeferredValue::Placeholder(
-            SnapshotLeaf::RedactedSecret { .. }
-        )))
-    ));
-    assert!(matches!(
-        settings.get("legacy_enum"),
-        Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
-            if value.api_value() == "active"
-    ));
-    assert!(matches!(
-        settings.get("items"),
-        Some(Value::Concrete(ConcreteValue::List(items)))
-            if matches!(
-                items.first(),
-                Some(Value::Concrete(ConcreteValue::Map(item)))
-                    if matches!(
-                        item.get("$nested"),
-                        Some(Value::Concrete(ConcreteValue::String(value)))
-                            if value.expose_plaintext() == "preserved"
-                    )
-            )
-    ));
-
-    let encoded = row
-        .persisted_attributes()
-        .expect("migrated row has persisted attributes")
-        .encoded_value("settings")
-        .expect("settings should remain persisted")
-        .as_json();
-    assert!(
-        encoded["$$k"][carina_core::value::PERSISTED_SECRET_KEY]
-            .as_str()
-            .is_some_and(|value| value.starts_with("argon2-legacy:")),
-        "the raw v11 marker should be upgraded after its key is escaped"
-    );
-    assert!(encoded["legacy_enum"].get("$enum").is_some());
-    assert_eq!(encoded["items"][0]["$$nested"], "preserved");
-}
-
-#[test]
-fn state_row_load_rejects_raw_legacy_salt_that_cannot_round_trip() {
-    let json = serde_json::json!({
-        "version": 13,
-        "serial": 1,
-        "lineage": "oversized-legacy-salt",
-        "carina_version": "0.4.0",
-        "resources": [{
-            "resource_type": "test.resource",
-            "identity": "x".repeat(5000),
-            "provider": "mock",
-            "identifier": "legacy-id",
-            "attributes": {
-                "comment": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
-            },
-        }],
-    })
-    .to_string();
-
-    let error = check_and_migrate(&json).expect_err(
-        "state load must reject a legacy salt that its encoded-digest parser cannot reload",
-    );
-    let message = error.to_string();
-    assert!(message.contains("comment"), "{message}");
-    assert!(message.contains("maximum is 4096 bytes"), "{message}");
-}
-
-#[test]
-fn v9_deposed_entries_round_trip() {
-    use super::check_and_migrate;
-
-    let json = r#"{
-        "version": 9,
-        "serial": 7,
-        "lineage": "test-lineage",
-        "carina_version": "0.4.0",
-        "resources": [
-            {
-                "resource_type": "ec2.Vpc",
-                "identity": "vpc",
-                "provider": "awscc",
+    "version": 21,
+    "serial": 7,
+    "lineage": "test-lineage",
+    "carina_version": "0.4.0",
+    "resources": [
+        {
+            "resource_type": "ec2.Vpc",
+            "identity": "vpc",
+            "provider": "awscc",
+            "deposed": [
+                {
+                    "key": "deposed-1",
+                    "identifier": "vpc-old",
+                    "provider_instance": "west",
+                    "attributes": {
+                        "vpc_id": "vpc-old"
+                    },
+                    "dependency_bindings": [
+                        {
+                            "provider": "awscc",
+                            "resource_type": "ec2.InternetGateway",
+                            "identity": "igw"
+                        }
+                    ]
+                }
+            ],
+            "current": {
+                "kind": "applied",
                 "identifier": "vpc-new",
-                "attributes": { "vpc_id": "vpc-new" },
-                "deposed": [
-                    {
-                        "key": "deposed-1",
-                        "identifier": "vpc-old",
-                        "provider_instance": "west",
-                        "attributes": { "vpc_id": "vpc-old" },
-                        "dependency_bindings": ["igw"]
-                    }
-                ]
-            },
-            {
-                "resource_type": "ec2.InternetGateway",
-                "identity": "igw",
-                "provider": "awscc",
+                "attributes": {
+                    "vpc_id": "vpc-new"
+                },
+                "nested_write_only": {}
+            }
+        },
+        {
+            "resource_type": "ec2.InternetGateway",
+            "identity": "igw",
+            "provider": "awscc",
+            "binding": "igw",
+            "current": {
+                "kind": "applied",
                 "identifier": "igw-1",
                 "attributes": {},
-                "binding": "igw"
+                "nested_write_only": {}
             }
-        ]
-    }"#;
+        }
+    ],
+    "exports_version": 1
+}"#;
 
-    let state = finish_legacy_dependency_migration(
-        check_and_migrate(json)
-            .expect("v9 state with deposed entries should load")
-            .into_state(),
-    );
+    let state = load_state(json).expect("current state with deposed entries should load");
     let serialized = serde_json::to_value(&state).expect("state should serialize");
     let reloaded = StateFile::from_json_str(&serialized.to_string())
-        .expect("serialized v9 state should reload");
+        .expect("serialized current state should reload");
     assert_eq!(
         serde_json::to_value(reloaded).expect("reloaded state should serialize"),
         serialized
@@ -6483,49 +5299,168 @@ fn v9_deposed_entries_round_trip() {
 }
 
 #[test]
-fn check_and_migrate_retains_identifier_none_rows_for_typed_classification() {
-    use super::check_and_migrate;
+fn v21_state_round_trips_enum_and_dollar_keys_in_current_and_deposed_attributes() {
+    use carina_core::resource::EnumValueResolver;
+    use carina_core::schema::{CompiledAttributeType as AttributeType, TypeIdentity};
+
+    let encoded_tree = serde_json::json!({
+        "nested": [{
+            "mode": {"$enum": {
+                "identity": {
+                    "provider": "aws",
+                    "segments": ["ec2", "Eip"],
+                    "kind": "Domain"
+                },
+                "api_value": "vpc"
+            }},
+            "$$enum": "user enum key",
+            "$$user": "one dollar",
+            "$$$user": "two dollars"
+        }]
+    });
+    let enum_type = AttributeType::enum_(
+        TypeIdentity::new(Some("aws"), ["ec2", "Eip"], "Domain"),
+        Some(vec!["vpc".to_string()]),
+        Vec::new(),
+        None,
+        None,
+    );
+    let enum_value = EnumValueResolver::new(&enum_type)
+        .resolve_state_text("vpc")
+        .expect("fixture enum value resolves");
+    let expected: SnapshotValue = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "nested".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([
+                (
+                    "mode".to_string(),
+                    Value::Concrete(ConcreteValue::CanonicalEnum(enum_value)),
+                ),
+                (
+                    "$enum".to_string(),
+                    Value::Concrete(ConcreteValue::String("user enum key".into())),
+                ),
+                (
+                    "$user".to_string(),
+                    Value::Concrete(ConcreteValue::String("one dollar".into())),
+                ),
+                (
+                    "$$user".to_string(),
+                    Value::Concrete(ConcreteValue::String("two dollars".into())),
+                ),
+            ])),
+        )])),
+    )])));
+    let json = serde_json::json!({
+        "version": 21,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "enum-and-dollar-key-round-trip",
+        "carina_version": "test",
+        "resources": [{
+            "resource_type": "ec2.Eip",
+            "identity": "main",
+            "provider": "aws",
+            "current": {
+                "kind": "applied",
+                "identifier": "current-id",
+                "attributes": {"tree": encoded_tree},
+                "nested_write_only": {}
+            },
+            "deposed": [{
+                "key": "old-generation",
+                "identifier": "old-id",
+                "attributes": {"tree": encoded_tree},
+                "dependency_bindings": []
+            }]
+        }],
+        "exports": {}
+    });
+
+    let state = load_state(&json.to_string()).expect("v21 attribute trees load");
+    let serialized = serde_json::to_value(&state).expect("v21 state serializes");
+    assert_eq!(serialized["version"], 21);
+    assert_eq!(
+        serialized["resources"][0]["current"]["attributes"]["tree"],
+        encoded_tree
+    );
+    assert_eq!(
+        serialized["resources"][0]["deposed"][0]["attributes"]["tree"],
+        encoded_tree
+    );
+    let reloaded = load_state(&serialized.to_string()).expect("serialized v21 state reloads");
+    for state in [&state, &reloaded] {
+        let row = &state.resources()[0];
+        for attributes in [
+            row.persisted_attributes()
+                .expect("current attributes exist"),
+            row.deposed[0].persisted_attributes(),
+        ] {
+            assert_eq!(attributes.get("tree"), Some(expected.clone()));
+        }
+    }
+    assert_eq!(
+        serde_json::to_value(&reloaded).expect("reloaded v21 state serializes"),
+        serialized
+    );
+}
+
+#[test]
+fn load_state_retains_identifier_none_rows_for_typed_classification() {
+    use super::load_state;
 
     let json = r#"{
-        "version": 9,
-        "serial": 7,
-        "lineage": "test-lineage",
-        "carina_version": "0.4.0",
-        "resources": [
-            {
-                "resource_type": "ec2.Vpc",
-                "identity": "deposed_only",
-                "provider": "awscc",
-                "identifier": null,
-                "attributes": {},
-                "deposed": [
-                    {
-                        "key": "deposed-1",
-                        "identifier": "vpc-old",
-                        "attributes": { "vpc_id": "vpc-old" },
-                        "dependency_bindings": []
-                    }
-                ]
-            },
-            {
-                "resource_type": "ec2.Vpc",
-                "identity": "empty_artifact",
-                "provider": "awscc",
-                "identifier": null,
-                "attributes": {}
+    "version": 21,
+    "serial": 7,
+    "lineage": "test-lineage",
+    "carina_version": "0.4.0",
+    "resources": [
+        {
+            "resource_type": "ec2.Vpc",
+            "identity": "deposed_only",
+            "provider": "awscc",
+            "deposed": [
+                {
+                    "key": "deposed-1",
+                    "identifier": "vpc-old",
+                    "attributes": {
+                        "vpc_id": "vpc-old"
+                    },
+                    "dependency_bindings": []
+                }
+            ],
+            "current": {
+                "kind": "none"
             }
-        ]
-    }"#;
+        },
+        {
+            "resource_type": "ec2.Vpc",
+            "identity": "empty_artifact",
+            "provider": "awscc",
+            "current": {
+                "kind": "missing_identifier",
+                "attributes": {},
+                "nested_write_only": {}
+            }
+        }
+    ],
+    "exports_version": 1
+}"#;
 
-    let state = check_and_migrate(json)
-        .expect("v9 deposed-only row should load")
-        .into_state();
+    let state = load_state(json).expect("current deposed-only row should load");
     assert!(
         state
             .find_resource("awscc", "ec2.Vpc", "deposed_only")
             .is_some(),
         "identifier=None row must survive while deposed entries remain"
     );
+    assert!(matches!(
+        state
+            .find_resource("awscc", "ec2.Vpc", "deposed_only")
+            .unwrap()
+            .current(),
+        CurrentInstance::None
+    ));
     let invalid_id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "empty_artifact", None);
     assert!(
         state
@@ -6560,13 +5495,13 @@ fn test_build_orphans_excludes_desired() {
 }
 
 #[test]
-fn test_check_and_migrate_current_version() {
-    use super::check_and_migrate;
+fn test_load_state_current_version() {
+    use super::load_state;
 
     let state = StateFile::new();
     let json = serde_json::to_string_pretty(&state).unwrap();
-    let result = check_and_migrate(&json).unwrap().into_state();
-    assert_eq!(result.version, StateFile::CURRENT_VERSION);
+    let result = load_state(&json).unwrap();
+    assert_eq!(result.lineage, state.lineage);
     assert_eq!(result.lineage, state.lineage);
 }
 
@@ -6584,32 +5519,16 @@ fn persisted_resource(provider: &str, resource_type: &str, identity: &str) -> se
     })
 }
 
-fn legacy_persisted_resource(
-    provider: &str,
-    resource_type: &str,
-    identity: &str,
-) -> serde_json::Value {
+fn state_json_with_resources(resources: Vec<serde_json::Value>) -> String {
     serde_json::json!({
-        "resource_type": resource_type,
-        "identity": identity,
-        "provider": provider,
-        "identifier": format!("{provider}-{resource_type}-{identity}"),
-        "attributes": {}
-    })
-}
-
-fn state_json_with_resources(version: u32, resources: Vec<serde_json::Value>) -> String {
-    let mut state = serde_json::json!({
-        "version": version,
+        "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "duplicate-identity-test",
         "carina_version": "test",
         "resources": resources
-    });
-    if version >= StateFile::EXPORTS_VERSION_INTRODUCED {
-        state["exports_version"] = serde_json::json!(PublishedExports::CURRENT_VERSION);
-    }
-    state.to_string()
+    })
+    .to_string()
 }
 
 #[test]
@@ -6647,8 +5566,8 @@ fn state_json_wrapper_renders_serde_detail_without_rewording_it() {
     ] {
         let mut resource = persisted_resource("mock", "test.resource", "valid");
         resource["binding"] = binding;
-        let json = state_json_with_resources(StateFile::CURRENT_VERSION, vec![resource]);
-        let error = check_and_migrate(&json)
+        let json = state_json_with_resources(vec![resource]);
+        let error = load_state(&json)
             .expect_err("invalid binding must fail to load")
             .with_state_read_location(
                 &carina_core::paths::DisplayPath::new("/tmp/project/carina.state.json").unwrap(),
@@ -6673,7 +5592,7 @@ fn state_json_wrapper_renders_serde_detail_without_rewording_it() {
     }
 }
 
-fn invalid_state_message(result: Result<MigratedStateFile, BackendError>) -> String {
+fn invalid_state_message(result: Result<StateFile, BackendError>) -> String {
     match result.expect_err("invalid state must be rejected") {
         BackendError::InvalidState(message) => message,
         BackendError::InvalidStateJson(error) => error.to_string(),
@@ -6681,7 +5600,7 @@ fn invalid_state_message(result: Result<MigratedStateFile, BackendError>) -> Str
     }
 }
 
-fn invalid_state_json_message(result: Result<MigratedStateFile, BackendError>) -> String {
+fn invalid_state_json_message(result: Result<StateFile, BackendError>) -> String {
     let error = result.expect_err("invalid persisted JSON must be rejected");
     assert!(
         matches!(&error, BackendError::InvalidStateJson(_error)),
@@ -6704,13 +5623,13 @@ fn invalid_state_json_message(result: Result<MigratedStateFile, BackendError>) -
 }
 
 #[test]
-fn check_and_migrate_rejects_empty_identity_with_actionable_row_context() {
+fn load_state_rejects_empty_identity_with_actionable_row_context() {
     let valid = persisted_resource("mock", "test.resource", "valid");
     let mut invalid = persisted_resource("mock", "test.resource", "");
     invalid["current"]["identifier"] = serde_json::json!("legacy-resource-123");
-    let json = state_json_with_resources(StateFile::CURRENT_VERSION, vec![valid, invalid]);
+    let json = state_json_with_resources(vec![valid, invalid]);
 
-    let error = check_and_migrate(&json).expect_err("empty identities must be rejected on load");
+    let error = load_state(&json).expect_err("empty identities must be rejected on load");
     let message = error.to_string();
 
     assert_eq!(
@@ -6734,12 +5653,11 @@ fn check_and_migrate_rejects_empty_identity_with_actionable_row_context() {
 }
 
 #[test]
-fn check_and_migrate_rejects_duplicate_resource_identity() {
+fn load_state_rejects_duplicate_resource_identity() {
     let resource = persisted_resource("aws", "ec2.Vpc", "network");
-    let json =
-        state_json_with_resources(StateFile::CURRENT_VERSION, vec![resource.clone(), resource]);
+    let json = state_json_with_resources(vec![resource.clone(), resource]);
 
-    let message = invalid_state_message(check_and_migrate(&json));
+    let message = invalid_state_message(load_state(&json));
 
     assert!(message.contains("duplicate resource identity"), "{message}");
     assert!(message.contains("aws"), "{message}");
@@ -6748,34 +5666,30 @@ fn check_and_migrate_rejects_duplicate_resource_identity() {
 }
 
 #[test]
-fn check_and_migrate_rejects_duplicate_resource_identity_across_provider_instances() {
+fn load_state_rejects_duplicate_resource_identity_across_provider_instances() {
     let mut west = persisted_resource("aws", "ec2.Vpc", "network");
     west["directives"] = serde_json::json!({ "provider_instance": "west" });
     let mut east = persisted_resource("aws", "ec2.Vpc", "network");
     east["directives"] = serde_json::json!({ "provider_instance": "east" });
-    let json = state_json_with_resources(StateFile::CURRENT_VERSION, vec![west, east]);
+    let json = state_json_with_resources(vec![west, east]);
 
-    let message = invalid_state_message(check_and_migrate(&json));
+    let message = invalid_state_message(load_state(&json));
 
     assert!(message.contains("duplicate resource identity"), "{message}");
     assert!(message.contains("network"), "{message}");
 }
 
 #[test]
-fn check_and_migrate_accepts_resource_identities_differing_on_each_axis() {
-    let json = state_json_with_resources(
-        StateFile::CURRENT_VERSION,
-        vec![
-            persisted_resource("aws", "ec2.Vpc", "network"),
-            persisted_resource("awscc", "ec2.Vpc", "network"),
-            persisted_resource("aws", "ec2.Subnet", "network"),
-            persisted_resource("aws", "ec2.Vpc", "other-network"),
-        ],
-    );
+fn load_state_accepts_resource_identities_differing_on_each_axis() {
+    let json = state_json_with_resources(vec![
+        persisted_resource("aws", "ec2.Vpc", "network"),
+        persisted_resource("awscc", "ec2.Vpc", "network"),
+        persisted_resource("aws", "ec2.Subnet", "network"),
+        persisted_resource("aws", "ec2.Vpc", "other-network"),
+    ]);
 
-    let state = check_and_migrate(&json)
-        .expect("all three resource identity axes must participate in uniqueness")
-        .into_state();
+    let state =
+        load_state(&json).expect("all three resource identity axes must participate in uniqueness");
 
     assert_eq!(state.resources.len(), 4);
 }
@@ -6797,9 +5711,9 @@ fn v21_state_rejects_destroy_dependencies_that_are_not_managed_rows() {
         let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
         consumer["dependency_bindings"] =
             serde_json::json!([serde_json::to_value(&dependency).expect("encode dependency")]);
-        let json = state_json_with_resources(StateFile::CURRENT_VERSION, vec![consumer]);
+        let json = state_json_with_resources(vec![consumer]);
 
-        let message = invalid_state_message(check_and_migrate(&json));
+        let message = invalid_state_message(load_state(&json));
         assert!(
             message.contains("dependency_bindings") && message.contains("not a managed state row"),
             "{kind} dependency must be rejected with row context: {message}",
@@ -6828,16 +5742,13 @@ fn resource_with_deposed(deposed: Vec<serde_json::Value>) -> serde_json::Value {
 }
 
 #[test]
-fn check_and_migrate_rejects_duplicate_deposed_key() {
-    let json = state_json_with_resources(
-        StateFile::CURRENT_VERSION,
-        vec![resource_with_deposed(vec![
-            deposed_generation("generation-a", "vpc-old-a", Some("west")),
-            deposed_generation("generation-a", "vpc-old-b", Some("east")),
-        ])],
-    );
+fn load_state_rejects_duplicate_deposed_key() {
+    let json = state_json_with_resources(vec![resource_with_deposed(vec![
+        deposed_generation("generation-a", "vpc-old-a", Some("west")),
+        deposed_generation("generation-a", "vpc-old-b", Some("east")),
+    ])]);
 
-    let message = invalid_state_message(check_and_migrate(&json));
+    let message = invalid_state_message(load_state(&json));
 
     assert!(
         message.contains("duplicate deposed generation key"),
@@ -6850,16 +5761,13 @@ fn check_and_migrate_rejects_duplicate_deposed_key() {
 }
 
 #[test]
-fn check_and_migrate_rejects_duplicate_deposed_identifier_and_provider_instance() {
-    let json = state_json_with_resources(
-        StateFile::CURRENT_VERSION,
-        vec![resource_with_deposed(vec![
-            deposed_generation("generation-a", "vpc-old", Some("west")),
-            deposed_generation("generation-b", "vpc-old", Some("west")),
-        ])],
-    );
+fn load_state_rejects_duplicate_deposed_identifier_and_provider_instance() {
+    let json = state_json_with_resources(vec![resource_with_deposed(vec![
+        deposed_generation("generation-a", "vpc-old", Some("west")),
+        deposed_generation("generation-b", "vpc-old", Some("west")),
+    ])]);
 
-    let message = invalid_state_message(check_and_migrate(&json));
+    let message = invalid_state_message(load_state(&json));
 
     assert!(
         message.contains("duplicate deposed generation identity"),
@@ -6873,33 +5781,28 @@ fn check_and_migrate_rejects_duplicate_deposed_identifier_and_provider_instance(
 }
 
 #[test]
-fn check_and_migrate_loads_legacy_name_alias_and_checks_it_for_duplicates() {
+fn load_state_loads_legacy_name_alias_and_checks_it_for_duplicates() {
     let mut legacy = persisted_resource("aws", "s3.Bucket", "logs");
     let identity = legacy.as_object_mut().unwrap().remove("identity").unwrap();
     legacy["name"] = identity;
-    let valid_json = state_json_with_resources(StateFile::CURRENT_VERSION, vec![legacy.clone()]);
+    let valid_json = state_json_with_resources(vec![legacy.clone()]);
 
-    let state = check_and_migrate(&valid_json)
-        .expect("legacy name alias must remain readable")
-        .into_state();
+    let state = load_state(&valid_json).expect("legacy name alias must remain readable");
     assert_eq!(state.resources[0].identity.as_str(), "logs");
 
-    let duplicate_json = state_json_with_resources(
-        StateFile::CURRENT_VERSION,
-        vec![legacy, persisted_resource("aws", "s3.Bucket", "logs")],
-    );
-    let message = invalid_state_message(check_and_migrate(&duplicate_json));
+    let duplicate_json =
+        state_json_with_resources(vec![legacy, persisted_resource("aws", "s3.Bucket", "logs")]);
+    let message = invalid_state_message(load_state(&duplicate_json));
     assert!(message.contains("duplicate resource identity"), "{message}");
     assert!(message.contains("logs"), "{message}");
 }
 
 #[test]
-fn check_and_migrate_bytes_rejects_duplicate_resource_identity() {
+fn load_state_bytes_rejects_duplicate_resource_identity() {
     let resource = persisted_resource("aws", "ec2.Vpc", "network");
-    let json =
-        state_json_with_resources(StateFile::CURRENT_VERSION, vec![resource.clone(), resource]);
+    let json = state_json_with_resources(vec![resource.clone(), resource]);
 
-    let message = invalid_state_message(check_and_migrate_bytes(json.as_bytes()));
+    let message = invalid_state_message(load_state_bytes(json.as_bytes()));
 
     assert!(message.contains("duplicate resource identity"), "{message}");
     assert!(message.contains("network"), "{message}");
@@ -6929,7 +5832,7 @@ fn published_exports_ignore_future_state_version_and_resource_shape() {
         serde_json::json!("123456789012")
     );
 
-    let error = check_and_migrate(&json.to_string())
+    let error = load_state(&json.to_string())
         .expect_err("the full state path must retain its state-version gate");
     assert!(matches!(
         error,
@@ -6963,106 +5866,46 @@ fn published_exports_reject_newer_exports_version() {
 }
 
 #[test]
-fn published_exports_reject_exports_version_before_it_was_introduced() {
-    let json = serde_json::json!({
-        "version": 12,
-        "exports_version": PublishedExports::CURRENT_VERSION,
-        "resources": [],
-        "exports": { "user_map": { "$$user": true } }
-    });
-
-    let error = PublishedExports::from_state_bytes(json.to_string().as_bytes())
-        .expect_err("legacy state must not opt into the current exports decoder");
-    let BackendError::InvalidState(message) = error else {
-        panic!("expected InvalidState, got {error}");
-    };
+fn published_exports_ignore_older_state_body_version() {
+    let exports = PublishedExports::from_state_bytes(
+        br#"{"version":20,"exports_version":1,"exports":{"account_id":"123456789012"}}"#,
+    )
+    .expect("supported exports load independently of the state body version");
     assert_eq!(
-        message,
-        format!(
-            "Failed to parse state file: top-level exports_version is invalid before state version {}",
-            StateFile::EXPORTS_VERSION_INTRODUCED
-        )
+        exports.values()["account_id"].decoded_json(),
+        serde_json::json!("123456789012")
     );
 }
 
 #[test]
-fn full_state_rejects_exports_version_before_it_was_introduced() {
-    let json = serde_json::json!({
-        "version": 14,
-        "exports_version": PublishedExports::CURRENT_VERSION,
-        "serial": 1,
-        "lineage": "invalid-legacy-state",
-        "carina_version": "legacy",
-        "resources": [],
-        "exports": {}
-    });
+fn published_exports_reject_missing_exports_version_regardless_of_state_body_version() {
+    for version in [16, StateFile::CURRENT_VERSION] {
+        let json = serde_json::json!({
+            "version": version,
+            "serial": 1,
+            "lineage": "missing-exports-version",
+            "carina_version": "test",
+            "resources": [],
+            "exports": { "account_id": "123456789012" }
+        });
 
-    let error = check_and_migrate(&json.to_string())
-        .expect_err("legacy state must reject exports_version before migration");
-    let BackendError::InvalidState(message) = error else {
-        panic!("expected InvalidState, got {error}");
-    };
-    assert_eq!(
-        message,
-        format!(
-            "Failed to parse state file: top-level exports_version is invalid before state version {}",
-            StateFile::EXPORTS_VERSION_INTRODUCED
-        )
-    );
+        let error = PublishedExports::from_state_bytes(json.to_string().as_bytes()).expect_err(
+            "exports reads require exports_version regardless of the state body version",
+        );
+        let BackendError::InvalidState(message) = error else {
+            panic!("body version {version}: expected InvalidState, got {error}");
+        };
+        assert_eq!(
+            message, "Failed to parse state file: missing required top-level exports_version",
+            "body version {version}"
+        );
+    }
 }
 
 #[test]
-fn published_exports_load_v16_without_exports_version_through_legacy_migration() {
-    let json = serde_json::json!({
-        "version": 16,
-        "serial": 1,
-        "lineage": "legacy-state",
-        "carina_version": "legacy",
-        "resources": [],
-        "exports": {
-            "enum_value": "aws.ec2.Eip.Domain.vpc",
-            "user_map": { "$$user": true }
-        }
-    });
-
-    let exports = PublishedExports::from_state_bytes(json.to_string().as_bytes())
-        .expect("v16 exports must use the legacy full-state migration path");
-    assert_eq!(
-        exports
-            .values()
-            .get("user_map")
-            .expect("fixture export exists")
-            .decoded_json(),
-        serde_json::json!({ "$user": true })
-    );
-}
-
-#[test]
-fn published_exports_reject_current_state_without_exports_version() {
+fn published_exports_reject_redacted_secret_from_current_state() {
     let json = serde_json::json!({
         "version": StateFile::CURRENT_VERSION,
-        "serial": 1,
-        "lineage": "invalid-current-state",
-        "carina_version": "current",
-        "resources": [],
-        "exports": { "account_id": "123456789012" }
-    });
-
-    let error = PublishedExports::from_state_bytes(json.to_string().as_bytes())
-        .expect_err("v17 and newer state must declare exports_version");
-    let BackendError::InvalidState(message) = error else {
-        panic!("expected InvalidState, got {error}");
-    };
-    assert_eq!(
-        message,
-        "Failed to parse state file: missing required top-level exports_version"
-    );
-}
-
-#[test]
-fn published_exports_reject_redacted_secret_from_v17_state() {
-    let json = serde_json::json!({
-        "version": 17,
         "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "invalid-secret-export",
@@ -7074,7 +5917,7 @@ fn published_exports_reject_redacted_secret_from_v17_state() {
     });
 
     let error = PublishedExports::from_state_bytes(json.to_string().as_bytes())
-        .expect_err("v17 exports must reject redacted secrets");
+        .expect_err("current exports must reject redacted secrets");
     let BackendError::InvalidState(message) = error else {
         panic!("expected invalid state error, got {error}");
     };
@@ -7103,7 +5946,7 @@ fn full_state_and_published_exports_share_the_exports_version_gate() {
             json["exports_version"] = serde_json::json!(exports_version);
         }
 
-        let full_state_error = check_and_migrate(&json.to_string())
+        let full_state_error = load_state(&json.to_string())
             .expect_err("the full-state decoder must reject this exports version");
         let published_exports_error =
             PublishedExports::from_state_bytes(json.to_string().as_bytes())
@@ -7127,9 +5970,7 @@ fn state_file_serializes_current_exports_version_after_reload() {
         PublishedExports::CURRENT_VERSION
     );
 
-    let reloaded = check_and_migrate(&encoded)
-        .expect("written state reloads")
-        .into_state();
+    let reloaded = load_state(&encoded).expect("written state reloads");
     assert_eq!(
         serde_json::to_value(reloaded).expect("reloaded state serializes")["exports_version"],
         PublishedExports::CURRENT_VERSION
@@ -7228,14 +6069,15 @@ fn persisted_exports_encoding_golden() {
     );
 }
 
-fn assert_migration_rejects_canonicalized_duplicate(version: u32) {
-    let mut legacy = legacy_persisted_resource("awscc", "sso.Assignment", "placeholder");
+#[test]
+fn state_load_rejects_duplicate_created_by_canonicalization() {
+    let mut legacy = persisted_resource("awscc", "sso.Assignment", "placeholder");
     legacy["name"] = serde_json::json!("_accounts[\"registry_prod\"]");
     legacy.as_object_mut().unwrap().remove("identity");
-    let current = legacy_persisted_resource("awscc", "sso.Assignment", "_accounts.registry_prod");
-    let json = state_json_with_resources(version, vec![legacy, current]);
+    let current = persisted_resource("awscc", "sso.Assignment", "_accounts.registry_prod");
+    let json = state_json_with_resources(vec![legacy, current]);
 
-    let message = invalid_state_message(check_and_migrate(&json));
+    let message = invalid_state_message(load_state(&json));
 
     assert!(message.contains("duplicate resource identity"), "{message}");
     assert!(message.contains("awscc"), "{message}");
@@ -7244,23 +6086,8 @@ fn assert_migration_rejects_canonicalized_duplicate(version: u32) {
 }
 
 #[test]
-fn v5_migration_rejects_duplicate_created_by_canonicalization() {
-    assert_migration_rejects_canonicalized_duplicate(5);
-}
-
-#[test]
-fn v6_migration_rejects_duplicate_created_by_canonicalization() {
-    assert_migration_rejects_canonicalized_duplicate(6);
-}
-
-#[test]
-fn older_migration_rejects_duplicate_created_by_canonicalization() {
-    assert_migration_rejects_canonicalized_duplicate(3);
-}
-
-#[test]
-fn test_check_and_migrate_future_version_returns_error() {
-    use super::check_and_migrate;
+fn test_load_state_future_version_returns_error() {
+    use super::load_state;
 
     let found = StateFile::CURRENT_VERSION + 1;
     let json = format!(
@@ -7273,7 +6100,7 @@ fn test_check_and_migrate_future_version_returns_error() {
     }}"#
     );
 
-    let error = check_and_migrate(&json).expect_err("future state version must be rejected");
+    let error = load_state(&json).expect_err("future state version must be rejected");
     assert!(
         matches!(
             &error,
@@ -7294,108 +6121,69 @@ fn test_check_and_migrate_future_version_returns_error() {
 }
 
 #[test]
-fn test_check_and_migrate_older_version_migrates() {
-    use super::check_and_migrate;
+fn state_versions_0_through_20_are_rejected_before_exports_or_rows() {
+    for found in 0..=20 {
+        for exports in [Some(serde_json::json!(1)), None] {
+            let mut document = serde_json::json!({
+                "version": found,
+                "serial": 5,
+                "lineage": "old-lineage",
+                "carina_version": "0.0.1",
+                "resources": []
+            });
+            if let Some(exports) = exports {
+                document["exports_version"] = exports;
+            }
+            let error = load_state(&document.to_string())
+                .expect_err("old state must be rejected at the version gate");
+            assert!(
+                matches!(error, BackendError::StateVersionTooOld { found: actual, supported: 21 } if actual == found)
+            );
+            assert_eq!(error.save_failure_kind(), crate::SaveFailureKind::Failed);
+            let message = error.to_string();
+            assert!(message.contains(&format!("version {found}")), "{message}");
+            assert!(message.contains("supported version 21"), "{message}");
+            assert!(message.contains("Rewrite this state with carina v0.15.0 (`apply` or `state refresh`), then retry."), "{message}");
+        }
+    }
+    let malformed_rows = r#"{"version":20,"resources":[{"broken":true}]}"#;
+    let error = load_state(malformed_rows).unwrap_err();
+    assert!(error.to_string().contains("carina v0.15.0"));
+}
 
-    // v3 state file — should be migrated to current version
-    let json = r#"{
-        "version": 3,
-        "serial": 5,
-        "lineage": "old-lineage",
-        "carina_version": "0.0.1",
-        "resources": []
-    }"#;
+#[test]
+fn test_load_state_invalid_json_returns_error() {
+    use super::load_state;
 
-    let result = finish_legacy_dependency_migration(check_and_migrate(json).unwrap().into_state());
+    let error = load_state("not valid json at all")
+        .expect_err("an unreadable state header must fail JSON decoding");
+    assert!(matches!(&error, BackendError::InvalidStateJson(_)));
     assert_eq!(
-        result.version,
-        StateFile::CURRENT_VERSION,
-        "version should be bumped to current"
-    );
-    assert_eq!(result.serial, 5, "serial should be preserved");
-    assert_eq!(result.lineage, "old-lineage", "lineage should be preserved");
-}
-
-#[test]
-fn test_check_and_migrate_invalid_json_returns_error() {
-    use super::check_and_migrate;
-
-    let result = check_and_migrate("not valid json at all");
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("Failed to parse state version"),
-        "error should mention version parsing failure"
+        error.to_string(),
+        "Failed to parse state file: expected ident at line 1 column 2 at JSON location <root>. The state file is corrupted or hand-edited; restore it from a backup.",
+        "the unreadable-header error must preserve the JSON parsing cause"
     );
 }
 
 #[test]
-fn test_check_and_migrate_bytes_works() {
-    use super::check_and_migrate_bytes;
+fn test_load_state_bytes_works() {
+    use super::load_state_bytes;
 
     let state = StateFile::new();
     let json = serde_json::to_string_pretty(&state).unwrap();
-    let result = check_and_migrate_bytes(json.as_bytes())
-        .unwrap()
-        .into_state();
-    assert_eq!(result.version, StateFile::CURRENT_VERSION);
+    let result = load_state_bytes(json.as_bytes()).unwrap();
+    assert_eq!(result.lineage, state.lineage);
 }
 
 #[test]
-fn test_check_and_migrate_bytes_invalid_utf8() {
-    use super::check_and_migrate_bytes;
+fn test_load_state_bytes_invalid_utf8() {
+    use super::load_state_bytes;
 
     let bytes: &[u8] = &[0xff, 0xfe, 0xfd];
-    let result = check_and_migrate_bytes(bytes);
+    let result = load_state_bytes(bytes);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("UTF-8"), "error should mention UTF-8 issue");
-}
-
-// carina#3283: check_and_migrate is library-level and must not write to
-// stderr. The migration event is returned as a typed value so the caller
-// (a backend impl) can decide *when* and *how often* to log it. Without
-// this, every read_state call on the same physical state file emits a
-// fresh "Migrating state file..." line — for `carina plan` that means
-// the warning fires twice (T0 + T1 drift re-read) and even three times
-// when the run also crosses the refresh phase (#3283 repro).
-#[test]
-fn test_check_and_migrate_returns_migration_info_for_older_version() {
-    use super::check_and_migrate;
-
-    let json = r#"{
-        "version": 6,
-        "serial": 14,
-        "lineage": "test-lineage",
-        "carina_version": "0.0.1",
-        "resources": []
-    }"#;
-
-    let outcome = check_and_migrate(json).unwrap();
-    let migration = outcome
-        .migration()
-        .expect("migration info should be present for v6 → v7");
-    assert_eq!(migration.from, 6);
-    assert_eq!(migration.to, StateFile::CURRENT_VERSION);
-    assert_eq!(outcome.state().version, 20);
-    assert_eq!(
-        finish_legacy_dependency_migration(outcome.into_state()).version,
-        StateFile::CURRENT_VERSION
-    );
-}
-
-#[test]
-fn test_check_and_migrate_no_migration_info_for_current_version() {
-    use super::check_and_migrate;
-
-    let state = StateFile::new();
-    let json = serde_json::to_string_pretty(&state).unwrap();
-    let outcome = check_and_migrate(&json).unwrap();
-    assert!(
-        outcome.migration().is_none(),
-        "current-version reads must not report a migration"
-    );
-    assert_eq!(outcome.state().version, StateFile::CURRENT_VERSION);
 }
 
 // `state.resources` has been managed-only since #3181. Historical releases
@@ -7404,33 +6192,47 @@ fn test_check_and_migrate_no_migration_info_for_current_version() {
 // exact row without treating every identifier-less managed row as disposable.
 #[test]
 fn typed_data_source_cleanup_removes_historical_null_identifier_row() {
-    use super::check_and_migrate;
+    use super::load_state;
 
     let json = r#"{
-        "version": 7,
-        "serial": 14,
-        "lineage": "test-lineage",
-        "carina_version": "0.4.0",
-        "resources": [
-            {
-                "resource_type": "iam.Roles",
-                "name": "admin_access_roles",
-                "provider": "aws",
-                "identifier": null,
-                "attributes": { "arns": ["arn:aws:iam::1:role/OLD"] },
-                "binding": "admin_access_roles"
-            },
-            {
-                "resource_type": "s3.Bucket",
-                "name": "log",
-                "provider": "awscc",
-                "identifier": "log-bucket",
-                "attributes": { "name": "log-bucket" }
+    "version": 21,
+    "serial": 14,
+    "lineage": "test-lineage",
+    "carina_version": "0.4.0",
+    "resources": [
+        {
+            "resource_type": "iam.Roles",
+            "name": "admin_access_roles",
+            "provider": "aws",
+            "binding": "admin_access_roles",
+            "current": {
+                "kind": "missing_identifier",
+                "attributes": {
+                    "arns": [
+                        "arn:aws:iam::1:role/OLD"
+                    ]
+                },
+                "nested_write_only": {}
             }
-        ]
-    }"#;
+        },
+        {
+            "resource_type": "s3.Bucket",
+            "name": "log",
+            "provider": "awscc",
+            "current": {
+                "kind": "applied",
+                "identifier": "log-bucket",
+                "attributes": {
+                    "name": "log-bucket"
+                },
+                "nested_write_only": {}
+            }
+        }
+    ],
+    "exports_version": 1
+}"#;
 
-    let mut state = check_and_migrate(json).expect("read").into_state();
+    let mut state = load_state(json).expect("read");
     let data_source: carina_core::resource::DataSource =
         carina_core::resource::DataSource::with_provider(
             "aws",
@@ -7449,26 +6251,33 @@ fn typed_data_source_cleanup_removes_historical_null_identifier_row() {
 
 #[test]
 fn typed_data_source_cleanup_preserves_managed_row_with_identifier() {
-    use super::check_and_migrate;
+    use super::load_state;
 
     let json = r#"{
-        "version": 7,
-        "serial": 14,
-        "lineage": "test-lineage",
-        "carina_version": "0.4.0",
-        "resources": [
-            {
-                "resource_type": "shared.Type",
-                "name": "shared",
-                "provider": "test",
+    "version": 21,
+    "serial": 14,
+    "lineage": "test-lineage",
+    "carina_version": "0.4.0",
+    "resources": [
+        {
+            "resource_type": "shared.Type",
+            "name": "shared",
+            "provider": "test",
+            "binding": "shared",
+            "current": {
+                "kind": "applied",
                 "identifier": "provider-id",
-                "attributes": { "name": "old-managed-value" },
-                "binding": "shared"
+                "attributes": {
+                    "name": "old-managed-value"
+                },
+                "nested_write_only": {}
             }
-        ]
-    }"#;
+        }
+    ],
+    "exports_version": 1
+}"#;
 
-    let mut state = check_and_migrate(json).expect("read").into_state();
+    let mut state = load_state(json).expect("read");
     let data_source: carina_core::resource::DataSource =
         carina_core::resource::DataSource::with_provider("test", "shared.Type", "shared", None);
 
@@ -7822,6 +6631,1399 @@ fn test_from_provider_state_secret_stored_as_hash() {
 }
 
 #[test]
+fn applied_previous_secret_hash_authority_requires_known_public_desired() {
+    use carina_core::resource::{
+        ApplyTimeUnknown, AuthoredAccessPath, FunctionArgument, InterpolationPart,
+    };
+
+    let old = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("old".into()))).into(),
+    ));
+    let previous_value = PersistedValue::encode_desired_value(&old, None).unwrap();
+    let secret_attributes = IndexMap::from([(
+        "computed".to_owned(),
+        Value::Concrete(ConcreteValue::List(vec![old])),
+    )]);
+    assert_eq!(
+        DesiredKey::from_attributes(&secret_attributes, "computed"),
+        DesiredKey::NotKnownPublic,
+        "a concrete container with a known Secret payload is not public"
+    );
+    let previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "computed".to_owned(),
+        previous_value,
+    )]))
+    .unwrap();
+    let provider_material = Value::Concrete(ConcreteValue::String("provider-current".into()));
+    let provider_value = PersistedValue::encode_desired_value(&provider_material, None).unwrap();
+    let reference = Value::Deferred(DeferredValue::ResourceRef {
+        path: AuthoredAccessPath::with_fields("src", "tags", vec!["nested".into()])
+            .resolve_root_for_test(),
+    });
+    let deferred = [
+        ("reference", reference.clone()),
+        (
+            "binding",
+            Value::Deferred(DeferredValue::BindingRef {
+                binding: absolute_binding_address_for_test("src"),
+            }),
+        ),
+        (
+            "unknown",
+            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
+                PendingReRead::incomplete("pending".to_owned()),
+            ))),
+        ),
+        (
+            "call",
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: carina_core::builtins::BuiltinFunction::lower,
+                args: vec![FunctionArgument::from_value(reference.clone())],
+                source_line: 1.into(),
+            }),
+        ),
+        (
+            "nested reference",
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "items".to_owned(),
+                Value::Concrete(ConcreteValue::List(vec![reference])),
+            )]))),
+        ),
+        (
+            "literal interpolation remains deferred",
+            Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Literal("public".into()),
+            ])),
+        ),
+        (
+            "literal coalesce remains deferred",
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(Value::Concrete(ConcreteValue::String("public".into()))),
+                default: Box::new(Value::Concrete(ConcreteValue::String("default".into()))),
+            }),
+        ),
+    ];
+    let public = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "items".to_owned(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("public".into()),
+        )])),
+    )])));
+    let cases = [
+        ("absent", None, true),
+        ("known public tree", Some(public), false),
+        (
+            "plain literal",
+            Some(Value::Concrete(ConcreteValue::String("public".into()))),
+            false,
+        ),
+        (
+            "empty list",
+            Some(Value::Concrete(ConcreteValue::List(vec![]))),
+            false,
+        ),
+        (
+            "empty map",
+            Some(Value::Concrete(ConcreteValue::Map(IndexMap::new()))),
+            false,
+        ),
+    ]
+    .into_iter()
+    .chain(
+        deferred
+            .into_iter()
+            .map(|(label, value)| (label, Some(value), true)),
+    );
+    for (label, desired, protected) in cases {
+        let expected_desired_key = match desired.as_ref() {
+            None => DesiredKey::Absent,
+            Some(_) if protected => DesiredKey::NotKnownPublic,
+            Some(_) => DesiredKey::KnownPublic,
+        };
+        let mut resource = Resource::with_provider("mock", "test.resource", "sink", None);
+        if let Some(desired) = desired {
+            resource = resource.with_attribute("computed", desired);
+        }
+        let mut source = Resource::with_provider("mock", "test.resource", "src", None);
+        source.binding = Some(absolute_binding_address_for_test("src"));
+        let resource = ResolvedResource::collect_resolved([source, resource])
+            .expect("desired references resolve to the source resource")
+            .remove(1);
+        assert_eq!(
+            DesiredKey::from_attributes(&resource.attributes, "computed"),
+            expected_desired_key,
+            "{label}: classify the entire desired value tree"
+        );
+        let request = AcceptedRequest::update_for_test(&["computed"], &[]);
+        for (authority, protected) in [
+            (PreviousSecretHashAuthority::None, false),
+            (
+                PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&previous),
+                true,
+            ),
+            (
+                PreviousSecretHashAuthority::AcceptedWrite {
+                    previous: &previous,
+                    request: &request,
+                    request_attributes: Cow::Borrowed(&resource.attributes),
+                    final_desired: None,
+                },
+                protected,
+            ),
+        ] {
+            let selected = SelectedStateAttributes {
+                encoded: BTreeMap::from([("computed".to_owned(), provider_value.clone())]),
+                write_only_keys: HashSet::new(),
+                retained_write_only: HashSet::new(),
+            }
+            .protect_for_resource(
+                &resource,
+                authority,
+                None,
+                true,
+                Some(desired_value_comparison_for_test(None)),
+            )
+            .expect("protect provider material");
+            let stored = selected
+                .encoded
+                .get("computed")
+                .expect("computed remains stored");
+            if protected {
+                let stored = stored.decode().expect("provider value decodes");
+                assert!(
+                    stored.secret_hash().is_some(),
+                    "{label}: only accepted KnownPublic values release previous hashes"
+                );
+                assert!(
+                    stored.verify_secret(&provider_material).unwrap(),
+                    "{label}: hash describes current provider material"
+                );
+            } else {
+                assert!(
+                    stored == &provider_value,
+                    "{label}: unprotected provider material remains public"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn previous_secret_hash_unsent_update_requires_provider_equality() {
+    let attributes = IndexMap::from([(
+        "computed".to_owned(),
+        Value::Concrete(ConcreteValue::String("public".into())),
+    )]);
+    let old = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+    ));
+    let previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "computed".into(),
+        PersistedValue::encode_desired_value(&old, None).unwrap(),
+    )]))
+    .unwrap();
+    let request = AcceptedRequest::update_for_test(&["other"], &[]);
+    for (provider, expected) in [
+        ("different", PreviousSecretHashDecision::Protect),
+        ("public", PreviousSecretHashDecision::Release),
+    ] {
+        let provider = PersistedValue::encode_desired_value(
+            &Value::Concrete(ConcreteValue::String(provider.into())),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            SelectedStateAttributes::decide_previous_secret_hash(
+                &PreviousSecretHashAuthority::AcceptedWrite {
+                    previous: &previous,
+                    request: &request,
+                    request_attributes: Cow::Borrowed(&attributes),
+                    final_desired: Some(&FinalDesiredAttributes::for_test(attributes.clone())),
+                },
+                "computed",
+                PreviousSecretHashInput::ProviderValue(Some(&provider)),
+                Some(desired_value_comparison_for_test(None)),
+            ),
+            expected,
+            "an unsent key has no accepted-write release witness",
+        );
+    }
+}
+
+fn previous_secret_hash_desired_secret_sibling_fixture(
+    observed_retained: &str,
+) -> (
+    ResolvedResource,
+    PersistedAttributes,
+    SelectedStateAttributes,
+) {
+    let public = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let protected =
+        |text: &str| Value::Deferred(DeferredValue::Secret(Box::new(public(text)).into()));
+    let previous_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("other".into(), protected("fixture-secret-4570-other")),
+        ("retained".into(), protected("fixture-secret-4570")),
+    ])));
+    let previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "tags".into(),
+        PersistedValue::encode_desired_value(&previous_tags, None).unwrap(),
+    )]))
+    .unwrap();
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+            "tags",
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                ("other".into(), protected("fixture-secret-4570-other")),
+                ("retained".into(), public("public")),
+            ]))),
+        ),
+    );
+    let observed = BTreeMap::from([(
+        "tags".into(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("other".into(), public("fixture-secret-4570-other")),
+            ("retained".into(), public(observed_retained)),
+        ]))),
+    )]);
+    let selected =
+        SelectedStateAttributes::from_provider_values_lossy(&observed, None, &[]).unwrap();
+    (resource, previous, selected)
+}
+
+fn assert_retained_leaf_beside_desired_secret_is_protected(
+    selected: SelectedStateAttributes,
+    previous: &PersistedAttributes,
+    observed_retained: &str,
+) {
+    let (attributes, _) = selected.finish().unwrap();
+    let tags = attributes.encoded_value("tags").unwrap().as_json();
+    let previous_tags = previous.encoded_value("tags").unwrap().as_json();
+    assert!(
+        tags["retained"][carina_core::value::PERSISTED_SECRET_KEY].is_string(),
+        "an unsent leaf beside a desired secret must remain hashed"
+    );
+    if observed_retained == "fixture-secret-4570" {
+        assert!(
+            tags["retained"] == previous_tags["retained"],
+            "unchanged observed material must reuse the previous leaf hash"
+        );
+    }
+    assert!(
+        tags["other"] == previous_tags["other"],
+        "the desired secret sibling must keep its hash"
+    );
+    assert!(
+        !serde_json::to_string(&attributes)
+            .unwrap()
+            .contains("fixture-secret-4570"),
+        "written attributes must not contain secret plaintext"
+    );
+}
+
+fn assert_protect_observation_retained_leaf_beside_desired_secret(has_final_desired: bool) {
+    // Even an observed public leaf matching desired cannot release its hash
+    // while the containing key still holds a desired secret.
+    for observed_retained in ["fixture-secret-4570", "public"] {
+        let (resource, previous, selected) =
+            previous_secret_hash_desired_secret_sibling_fixture(observed_retained);
+        let final_desired = FinalDesiredAttributes::for_test(resource.attributes.clone());
+        let selected = selected
+            .protect_observation(
+                &resource,
+                Some(&previous),
+                has_final_desired.then_some(&final_desired),
+                None,
+                Some(desired_value_comparison_for_test(None)),
+            )
+            .unwrap();
+        assert_retained_leaf_beside_desired_secret_is_protected(
+            selected,
+            &previous,
+            observed_retained,
+        );
+    }
+}
+
+#[test]
+fn protect_observation_retained_leaf_beside_desired_secret_with_final_desired_keeps_previous_secret_hash()
+ {
+    assert_protect_observation_retained_leaf_beside_desired_secret(true);
+}
+
+#[test]
+fn protect_observation_retained_leaf_beside_desired_secret_without_final_desired_keeps_previous_secret_hash()
+ {
+    assert_protect_observation_retained_leaf_beside_desired_secret(false);
+}
+
+#[test]
+fn previous_secret_hash_unsent_update_beside_desired_secret_keeps_retained_leaf() {
+    for observed_retained in ["fixture-secret-4570", "public"] {
+        for has_final_desired in [false, true] {
+            let (resource, previous, selected) =
+                previous_secret_hash_desired_secret_sibling_fixture(observed_retained);
+            let final_desired = FinalDesiredAttributes::for_test(resource.attributes.clone());
+            let request = AcceptedRequest::update_for_test(&["other_attribute"], &[]);
+            let selected = selected
+                .protect_for_resource(
+                    &resource,
+                    PreviousSecretHashAuthority::AcceptedWrite {
+                        previous: &previous,
+                        request: &request,
+                        request_attributes: Cow::Borrowed(&resource.attributes),
+                        final_desired: has_final_desired.then_some(&final_desired),
+                    },
+                    None,
+                    true,
+                    Some(desired_value_comparison_for_test(None)),
+                )
+                .unwrap();
+            assert_retained_leaf_beside_desired_secret_is_protected(
+                selected,
+                &previous,
+                observed_retained,
+            );
+        }
+    }
+}
+
+fn previous_secret_hash_sent_map_row() -> ResourceState {
+    let public = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let protected =
+        |text: &str| Value::Deferred(DeferredValue::Secret(Box::new(public(text)).into()));
+    let previous_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("retained".into(), protected("fixture-secret-4570")),
+        ("other".into(), protected("fixture-secret-4570")),
+        ("changing".into(), public("before")),
+    ])));
+    // The accepted map carries the observed ignored leaf alongside public writes.
+    let sent_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("retained".into(), public("fixture-secret-4570")),
+        ("other".into(), public("public")),
+        ("changing".into(), public("after")),
+    ])));
+    previous_secret_hash_grafted_map_row(
+        previous_tags,
+        sent_tags,
+        vec![carina_core::schema::LeafPath::from_segments([
+            carina_core::schema::LeafPathSegment::MapKey("retained".into()),
+        ])],
+    )
+}
+
+fn previous_secret_hash_grafted_map_row(
+    previous_tags: Value,
+    sent_tags: Value,
+    grafted: Vec<carina_core::schema::LeafPath>,
+) -> ResourceState {
+    let previous_tags = PersistedValue::encode_desired_value(&previous_tags, None).unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("tags", previous_tags.as_json().clone());
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None)
+            .with_attribute("tags", sent_tags.clone()),
+    );
+    let state: State = State::existing(
+        resource.id.clone(),
+        HashMap::from([("tags".into(), sent_tags)]),
+    )
+    .with_identifier("sink-id");
+    let request = AcceptedRequest::update_with_grafted_leaves_for_test(&[("tags", grafted)], &[]);
+    ResourceState::from_provider_state_with_final_desired(
+        &resource,
+        &state,
+        Some(&existing),
+        None,
+        RowBasis::Applied(&request),
+        None,
+        None,
+        &exact_comparison_context(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn previous_secret_hash_grafted_leaf_in_sent_map_is_protected() {
+    let row = previous_secret_hash_sent_map_row();
+    let attributes = row.persisted_attributes().unwrap();
+    let tags = attributes.encoded_value("tags").unwrap().as_json();
+    assert!(
+        tags["retained"][carina_core::value::PERSISTED_SECRET_KEY].is_string(),
+        "grafted leaf must retain its previous secret hash"
+    );
+    assert!(
+        !serde_json::to_string(&row)
+            .unwrap()
+            .contains("fixture-secret-4570"),
+        "written row must not contain ignored secret plaintext"
+    );
+    assert!(tags["changing"] == "after", "sent sibling remains public");
+}
+
+#[test]
+fn previous_secret_hash_grafted_leaf_with_desired_secret_sibling_is_protected() {
+    use carina_core::schema::{LeafPath, LeafPathSegment};
+
+    let public = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let protected =
+        |text: &str| Value::Deferred(DeferredValue::Secret(Box::new(public(text)).into()));
+    let marker = "fixture-secret-4570";
+    let previous_tags = PersistedValue::encode_desired_value(
+        &Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("retained".into(), protected(marker)),
+            ("released".into(), protected(marker)),
+            ("changing".into(), public("before")),
+        ]))),
+        None,
+    )
+    .unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("tags", previous_tags.as_json().clone());
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+            "tags",
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                ("retained".into(), public("public")),
+                ("other".into(), protected(marker)),
+                ("released".into(), public("public")),
+                ("changing".into(), public("after")),
+            ]))),
+        ),
+    );
+    let state: State = State::existing(
+        resource.id.clone(),
+        HashMap::from([(
+            "tags".into(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                ("retained".into(), public(marker)),
+                ("other".into(), public(marker)),
+                ("released".into(), public("public")),
+                ("changing".into(), public("after")),
+            ]))),
+        )]),
+    )
+    .with_identifier("sink-id");
+    let request = AcceptedRequest::update_with_grafted_leaves_for_test(
+        &[(
+            "tags",
+            vec![LeafPath::from_segments([LeafPathSegment::MapKey(
+                "retained".into(),
+            )])],
+        )],
+        &[],
+    );
+    let row = ResourceState::from_provider_state_with_final_desired(
+        &resource,
+        &state,
+        Some(&existing),
+        None,
+        RowBasis::Applied(&request),
+        None,
+        None,
+        &exact_comparison_context(),
+    )
+    .unwrap();
+    let attributes = row.persisted_attributes().unwrap();
+    let tags = attributes.encoded_value("tags").unwrap().as_json();
+    assert!(
+        tags["retained"] == previous_tags.as_json()["retained"],
+        "grafted leaf must keep its previous hash beside a desired secret"
+    );
+    assert!(
+        tags["other"][carina_core::value::PERSISTED_SECRET_KEY].is_string(),
+        "desired secret sibling must remain protected"
+    );
+    assert!(
+        tags["released"] == "public" && tags["changing"] == "after",
+        "public sent leaves must not inherit previous hash protection"
+    );
+    assert!(
+        !serde_json::to_string(&row).unwrap().contains(marker),
+        "written row must not contain secret plaintext"
+    );
+}
+
+#[test]
+fn previous_secret_hash_non_grafted_sibling_in_sent_map_is_released() {
+    let row = previous_secret_hash_sent_map_row();
+    let attributes = row.persisted_attributes().unwrap();
+    let tags = attributes.encoded_value("tags").unwrap().as_json();
+    assert!(
+        tags["other"] == "public",
+        "non-grafted leaf must be released"
+    );
+    assert!(tags["changing"] == "after", "sent sibling remains public");
+}
+
+#[test]
+fn previous_secret_hash_grafted_nested_dollar_key_is_leaf_precise() {
+    use carina_core::schema::{LeafPath, LeafPathSegment};
+    let text = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(text("fixture-secret-4570")).into(),
+    ));
+    let nested = |retained, other| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "nested".into(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                ("$retained".into(), retained),
+                ("other".into(), other),
+            ]))),
+        )])))
+    };
+    let row = previous_secret_hash_grafted_map_row(
+        nested(secret.clone(), secret),
+        nested(text("fixture-secret-4570"), text("public")),
+        vec![LeafPath::from_segments([
+            LeafPathSegment::StructField("nested".into()),
+            LeafPathSegment::MapKey("$retained".into()),
+        ])],
+    );
+    let attributes = row.persisted_attributes().unwrap();
+    let tags = attributes.encoded_value("tags").unwrap().as_json();
+    assert!(tags["nested"]["$$retained"][carina_core::value::PERSISTED_SECRET_KEY].is_string());
+    assert!(tags["nested"]["other"] == "public");
+    assert!(
+        !serde_json::to_string(&row)
+            .unwrap()
+            .contains("fixture-secret-4570"),
+        "protected nested material must remain hashed"
+    );
+}
+
+#[test]
+fn previous_secret_hash_grafted_subtree_reuses_list_alignment_policy() {
+    use carina_core::schema::{LeafPath, LeafPathSegment};
+    let text = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(text("fixture-secret-4570")).into(),
+    ));
+    let item = |anchor: &str, payload| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("anchor".into(), text(anchor)),
+            ("payload".into(), payload),
+        ])))
+    };
+    let map = |retained, other| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "retained".into(),
+                Value::Concrete(ConcreteValue::List(retained)),
+            ),
+            ("other".into(), other),
+        ])))
+    };
+    let anchored = vec![
+        item("first", secret.clone()),
+        item("second", text("visible")),
+    ];
+    let observed = vec![
+        item("first", text("fixture-secret-4570")),
+        item("second", text("visible")),
+    ];
+    for (label, previous, provider, whole) in [
+        (
+            "matching anchors",
+            anchored.clone(),
+            observed.clone(),
+            false,
+        ),
+        (
+            "reordered anchors",
+            anchored.clone(),
+            observed.iter().rev().cloned().collect(),
+            true,
+        ),
+        (
+            "different lengths",
+            anchored.clone(),
+            vec![observed[0].clone()],
+            true,
+        ),
+        (
+            "changed anchor",
+            anchored,
+            vec![
+                item("changed", text("fixture-secret-4570")),
+                observed[1].clone(),
+            ],
+            true,
+        ),
+        (
+            "scalar elements",
+            vec![secret.clone(), text("visible")],
+            vec![text("fixture-secret-4570"), text("visible")],
+            true,
+        ),
+        (
+            "no public anchors",
+            vec![Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "payload".into(),
+                secret.clone(),
+            )])))],
+            vec![Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "payload".into(),
+                text("fixture-secret-4570"),
+            )])))],
+            true,
+        ),
+    ] {
+        let row = previous_secret_hash_grafted_map_row(
+            map(previous, secret.clone()),
+            map(provider, text("public")),
+            vec![LeafPath::from_segments([LeafPathSegment::MapKey(
+                "retained".into(),
+            )])],
+        );
+        let attributes = row.persisted_attributes().unwrap();
+        let tags = attributes.encoded_value("tags").unwrap().as_json();
+        assert_eq!(
+            tags["retained"][carina_core::value::PERSISTED_SECRET_KEY].is_string(),
+            whole,
+            "{label}"
+        );
+        if !whole {
+            assert!(
+                tags["retained"][0]["payload"][carina_core::value::PERSISTED_SECRET_KEY]
+                    .is_string(),
+                "{label}"
+            );
+            assert!(
+                tags["retained"][1]["payload"] == "visible",
+                "aligned public members stay public"
+            );
+        }
+        assert!(
+            tags["other"] == "public",
+            "public leaf outside the grafted list is released: {label}"
+        );
+        assert!(
+            !serde_json::to_string(&row)
+                .unwrap()
+                .contains("fixture-secret-4570"),
+            "list protection must not expose protected material: {label}"
+        );
+    }
+}
+
+#[test]
+fn previous_secret_hash_grafted_leaf_under_opaque_ancestor_keeps_whole_hash() {
+    use carina_core::schema::{LeafPath, LeafPathSegment};
+    let text = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let map = |changing: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("retained".into(), text("fixture-secret-4570")),
+            ("changing".into(), text(changing)),
+        ])))
+    };
+    let row = previous_secret_hash_grafted_map_row(
+        Value::Deferred(DeferredValue::Secret(Box::new(map("before")).into())),
+        map("after"),
+        vec![LeafPath::from_segments([LeafPathSegment::MapKey(
+            "retained".into(),
+        )])],
+    );
+    let attributes = row.persisted_attributes().unwrap();
+    let tags = attributes.get("tags").unwrap();
+    assert!(
+        tags.secret_hash().is_some(),
+        "an opaque ancestor cannot be narrowed to one leaf"
+    );
+    assert!(
+        carina_core::value::format_value_user_facing(&tags) == "(secret)",
+        "public members inside the hashed unit are masked too"
+    );
+    assert!(
+        !serde_json::to_string(&row)
+            .unwrap()
+            .contains("fixture-secret-4570"),
+        "opaque protection must not expose protected material"
+    );
+}
+
+#[test]
+fn previous_secret_hash_opaque_ancestor_with_desired_secret_sibling_is_protected() {
+    use carina_core::schema::{LeafPath, LeafPathSegment};
+
+    let public = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let protected = |value: Value| Value::Deferred(DeferredValue::Secret(Box::new(value).into()));
+    let map = |retained, other, changing: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("retained".into(), retained),
+            ("other".into(), other),
+            ("changing".into(), public(changing)),
+        ])))
+    };
+    let marker = "fixture-secret-4570";
+    for nested in [false, true] {
+        let wrap = |value| {
+            if nested {
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "nested".into(),
+                    value,
+                )])))
+            } else {
+                value
+            }
+        };
+        let previous_tags = PersistedValue::encode_desired_value(
+            &wrap(protected(map(
+                public(marker),
+                public("old-other"),
+                "before",
+            ))),
+            None,
+        )
+        .unwrap();
+        let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+            .unwrap()
+            .with_attribute("tags", previous_tags.as_json().clone());
+        let resource = resolved(
+            &Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+                "tags",
+                wrap(map(public("public"), protected(public(marker)), "after")),
+            ),
+        );
+        let state: State = State::existing(
+            resource.id.clone(),
+            HashMap::from([(
+                "tags".into(),
+                wrap(map(public(marker), public(marker), "after")),
+            )]),
+        )
+        .with_identifier("sink-id");
+        let mut grafted = Vec::new();
+        if nested {
+            grafted.push(LeafPathSegment::MapKey("nested".into()));
+        }
+        grafted.push(LeafPathSegment::MapKey("retained".into()));
+        let request = AcceptedRequest::update_with_grafted_leaves_for_test(
+            &[("tags", vec![LeafPath::from_segments(grafted)])],
+            &[],
+        );
+        let final_desired =
+            FinalDesiredValues::for_test([(resource.id.clone(), resource.attributes.clone())]);
+        for witness in [None, Some(&final_desired)] {
+            let row = ResourceState::from_provider_state_with_final_desired(
+                &resource,
+                &state,
+                Some(&existing),
+                None,
+                RowBasis::Applied(&request),
+                witness,
+                None,
+                &exact_comparison_context(),
+            )
+            .expect("an accepted update with masked descendants must remain writable");
+            assert!(
+                row.persisted_attributes().unwrap().encoded_value("tags") == Some(&previous_tags),
+                "an opaque ancestor must keep its whole hash when a descendant is already masked"
+            );
+            assert!(
+                !serde_json::to_string(&row).unwrap().contains(marker),
+                "written row must not contain secret plaintext"
+            );
+        }
+    }
+}
+
+#[test]
+fn previous_secret_hash_wholly_ignored_key_is_protected() {
+    let public = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let previous = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(public("fixture-secret-4570")).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", previous.as_json().clone());
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None)
+            .with_attribute("computed", public("public"))
+            .with_attribute("other", public("after")),
+    );
+    let state: State = State::existing(
+        resource.id.clone(),
+        HashMap::from([
+            ("computed".into(), public("fixture-secret-4570")),
+            ("other".into(), public("after")),
+        ]),
+    )
+    .with_identifier("sink-id");
+    // A wholly ignored key is absent from the accepted patch.
+    let request = AcceptedRequest::update_for_test(&["other"], &[]);
+    let final_desired =
+        FinalDesiredValues::for_test([(resource.id.clone(), resource.attributes.clone())]);
+    for witness in [None, Some(&final_desired)] {
+        let row = ResourceState::from_provider_state_with_final_desired(
+            &resource,
+            &state,
+            Some(&existing),
+            None,
+            RowBasis::Applied(&request),
+            witness,
+            None,
+            &exact_comparison_context(),
+        )
+        .unwrap();
+        let attributes = row.persisted_attributes().unwrap();
+        assert!(attributes.get("computed").unwrap().secret_hash().is_some());
+        assert!(
+            !serde_json::to_string(&row)
+                .unwrap()
+                .contains("fixture-secret-4570"),
+            "unsent key must not expose its previous secret"
+        );
+    }
+}
+
+#[test]
+fn previous_secret_hash_decision_matrix() {
+    use carina_core::resource::{AuthoredAccessPath, FunctionArgument, InterpolationPart};
+    let reference = Value::Deferred(DeferredValue::ResourceRef {
+        path: AuthoredAccessPath::with_fields("src", "computed", vec![]).resolve_root_for_test(),
+    });
+    let call = Value::Deferred(DeferredValue::FunctionCall {
+        name: carina_core::builtins::BuiltinFunction::lower,
+        args: vec![FunctionArgument::from_value(reference.clone())],
+        source_line: 1.into(),
+    });
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+    ));
+    let previous_value = PersistedValue::encode_desired_value(&secret, None).unwrap();
+    let previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "computed".to_owned(),
+        previous_value.clone(),
+    )]))
+    .unwrap();
+    let plain = PersistedValue::encode_desired_value(
+        &Value::Concrete(ConcreteValue::String("public".into())),
+        None,
+    )
+    .unwrap();
+    let retained_hash = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("public".into()))).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let public_map = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "leaf".into(),
+        Value::Concrete(ConcreteValue::String("public".into())),
+    )])));
+    let nested_previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "computed".to_owned(),
+        PersistedValue::encode_desired_value(
+            &Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "hidden".into(),
+                    Value::Deferred(DeferredValue::Secret(
+                        Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+                    )),
+                ),
+                (
+                    "public".into(),
+                    Value::Concrete(ConcreteValue::String("public".into())),
+                ),
+            ]))),
+            None,
+        )
+        .unwrap(),
+    )]))
+    .unwrap();
+    let cases = [
+        ("absent", None, Some(plain.clone()), false, false),
+        (
+            "known public equal",
+            Some(Value::Concrete(ConcreteValue::String("public".into()))),
+            Some(plain.clone()),
+            true,
+            true,
+        ),
+        (
+            "known public different",
+            Some(Value::Concrete(ConcreteValue::String("different".into()))),
+            Some(plain.clone()),
+            true,
+            false,
+        ),
+        (
+            "reference",
+            Some(reference.clone()),
+            Some(plain.clone()),
+            false,
+            false,
+        ),
+        (
+            "retained call",
+            Some(call.clone()),
+            Some(plain.clone()),
+            false,
+            false,
+        ),
+        ("secret", Some(secret), Some(plain.clone()), false, false),
+        (
+            "map with reference leaf",
+            Some(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "leaf".into(),
+                reference.clone(),
+            )])))),
+            Some(PersistedValue::encode_desired_value(&public_map, None).unwrap()),
+            false,
+            false,
+        ),
+        (
+            "list with deferred interpolation",
+            Some(Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
+                DeferredValue::Interpolation(vec![InterpolationPart::Literal("public".into())]),
+            )]))),
+            Some(
+                PersistedValue::encode_desired_value(
+                    &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                        ConcreteValue::String("public".into()),
+                    )])),
+                    None,
+                )
+                .unwrap(),
+            ),
+            false,
+            false,
+        ),
+        (
+            "map with one secret leaf",
+            Some(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "leaf".into(),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String("public".into()))).into(),
+                )),
+            )])))),
+            Some(PersistedValue::encode_desired_value(&public_map, None).unwrap()),
+            false,
+            false,
+        ),
+        (
+            "whole public map equal",
+            Some(public_map.clone()),
+            Some(PersistedValue::encode_desired_value(&public_map, None).unwrap()),
+            true,
+            true,
+        ),
+        (
+            "retained write-only hash has no plaintext",
+            Some(Value::Concrete(ConcreteValue::String("public".into()))),
+            Some(retained_hash),
+            true,
+            false,
+        ),
+        (
+            "omitted public literal",
+            Some(Value::Concrete(ConcreteValue::String("public".into()))),
+            None,
+            true,
+            false,
+        ),
+        ("omitted reference", Some(reference), None, false, false),
+        ("omitted call", Some(call), None, false, false),
+    ];
+    let request = AcceptedRequest::update_for_test(&["computed"], &[]);
+    for previous in [&previous, &nested_previous] {
+        for (label, desired, provider, applied_release, read_release) in &cases {
+            let attributes = desired
+                .clone()
+                .into_iter()
+                .map(|v| ("computed".to_owned(), v))
+                .collect::<IndexMap<_, _>>();
+            if *label == "list with deferred interpolation" {
+                assert_eq!(
+                    DesiredKey::from_attributes(&attributes, "computed"),
+                    DesiredKey::NotKnownPublic
+                );
+            }
+            let final_desired = FinalDesiredAttributes::for_test(attributes.clone());
+            for (basis, applied) in [("applied", true), ("carried", false), ("imported", false)] {
+                let authority = if applied {
+                    PreviousSecretHashAuthority::AcceptedWrite {
+                        previous,
+                        request: &request,
+                        request_attributes: Cow::Borrowed(&attributes),
+                        final_desired: Some(&final_desired),
+                    }
+                } else {
+                    PreviousSecretHashAuthority::MatchingFinalDesiredValue {
+                        previous,
+                        desired: &final_desired,
+                    }
+                };
+                let decision = SelectedStateAttributes::decide_previous_secret_hash(
+                    &authority,
+                    "computed",
+                    PreviousSecretHashInput::ProviderValue(provider.as_ref()),
+                    Some(desired_value_comparison_for_test(None)),
+                );
+                let release = if applied {
+                    *applied_release
+                } else {
+                    *read_release
+                };
+                let expected = if release {
+                    PreviousSecretHashDecision::Release
+                } else {
+                    PreviousSecretHashDecision::Protect
+                };
+                assert_eq!(decision, expected, "{basis}, {label}");
+                assert_eq!(
+                    SelectedStateAttributes::decide_previous_secret_hash(
+                        &PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous),
+                        "computed",
+                        PreviousSecretHashInput::ProviderValue(provider.as_ref()),
+                        Some(desired_value_comparison_for_test(None)),
+                    ),
+                    PreviousSecretHashDecision::Protect,
+                    "a bare previous map never grants equality release",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn previous_secret_hash_carried_imported_release_uses_only_final_desired() {
+    let resource = Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+        "computed",
+        Value::Concrete(ConcreteValue::String("authored".into())),
+    );
+    let resource = resolved(&resource);
+    let public = Value::Concrete(ConcreteValue::String("public".into()));
+    let previous = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", previous.as_json().clone());
+    let state: State = State::existing(
+        resource.id.clone(),
+        HashMap::from([("computed".into(), public.clone())]),
+    )
+    .with_identifier("sink-id");
+    let desired = FinalDesiredValues::for_test([(
+        resource.id.clone(),
+        IndexMap::from([("computed".into(), public.clone())]),
+    )]);
+    for basis in [RowBasis::Carried, RowBasis::Imported] {
+        for witness in [None, Some(&desired)] {
+            let row = ResourceState::from_provider_state_with_final_desired(
+                &resource,
+                &state,
+                Some(&existing),
+                None,
+                basis,
+                witness,
+                None,
+                &exact_comparison_context(),
+            )
+            .unwrap();
+            let stored = row.persisted_attributes().unwrap().get("computed").unwrap();
+            assert_eq!(
+                stored.secret_hash().is_some(),
+                witness.is_none(),
+                "authored desired cannot grant equality release; final desired can"
+            );
+        }
+    }
+}
+
+#[test]
+fn previous_secret_hash_unsent_update_uses_final_plan_desired() {
+    let resource = Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+        "computed",
+        Value::Concrete(ConcreteValue::String("apply-normalized".into())),
+    );
+    let resource = resolved(&resource);
+    let public = Value::Concrete(ConcreteValue::String("public".into()));
+    let previous = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", previous.as_json().clone());
+    let state: State = State::existing(
+        resource.id.clone(),
+        HashMap::from([("computed".into(), public.clone())]),
+    )
+    .with_identifier("sink-id");
+    let desired = FinalDesiredValues::for_test([(
+        resource.id.clone(),
+        IndexMap::from([("computed".into(), public)]),
+    )]);
+    let request = AcceptedRequest::update_for_test(&["other"], &[]);
+    let row = ResourceState::from_provider_state_with_final_desired(
+        &resource,
+        &state,
+        Some(&existing),
+        None,
+        RowBasis::Applied(&request),
+        Some(&desired),
+        None,
+        &exact_comparison_context(),
+    )
+    .unwrap();
+    assert!(
+        row.persisted_attributes()
+            .unwrap()
+            .get("computed")
+            .unwrap()
+            .secret_hash()
+            .is_none(),
+        "an unsent key uses final plan desired for equality, not an apply projection"
+    );
+}
+
+#[test]
+fn observation_previous_secret_hashes_without_final_desired_always_protect() {
+    let resource = Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+        "computed",
+        Value::Concrete(ConcreteValue::String("public".into())),
+    );
+    let previous_value = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "computed".into(),
+        previous_value,
+    )]))
+    .unwrap();
+    let public = Value::Concrete(ConcreteValue::String("public".into()));
+    let selected = SelectedStateAttributes {
+        encoded: BTreeMap::from([(
+            "computed".into(),
+            PersistedValue::encode_desired_value(&public, None).unwrap(),
+        )]),
+        write_only_keys: HashSet::new(),
+        retained_write_only: HashSet::new(),
+    }
+    .protect_observation(
+        &resolved(&resource),
+        Some(&previous),
+        None,
+        None,
+        Some(desired_value_comparison_for_test(None)),
+    )
+    .unwrap();
+    let stored = selected.encoded["computed"].decode().unwrap();
+    assert!(stored.secret_hash().is_some());
+    assert!(stored.verify_secret(&public).unwrap());
+}
+
+#[test]
+fn previous_secret_hash_is_kept_when_provider_omits_reference_or_call() {
+    use carina_core::resource::{AuthoredAccessPath, FunctionArgument};
+    let reference = Value::Deferred(DeferredValue::ResourceRef {
+        path: AuthoredAccessPath::with_fields("src", "computed", vec![]).resolve_root_for_test(),
+    });
+    let call = Value::Deferred(DeferredValue::FunctionCall {
+        name: carina_core::builtins::BuiltinFunction::lower,
+        args: vec![FunctionArgument::from_value(reference.clone())],
+        source_line: 1.into(),
+    });
+    let previous_value = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", previous_value.as_json().clone());
+    for desired in [reference, call] {
+        let mut source = Resource::with_provider("mock", "test.resource", "src", None);
+        source.binding = Some(absolute_binding_address_for_test("src"));
+        let resource = Resource::with_provider("mock", "test.resource", "sink", None)
+            .with_attribute("computed", desired);
+        let resource = ResolvedResource::collect_resolved([source, resource])
+            .unwrap()
+            .remove(1);
+        let provider: State =
+            State::existing(resource.id.clone(), BTreeMap::new()).with_identifier("sink-id");
+        for basis in [RowBasis::Carried, RowBasis::Imported] {
+            let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
+                &resource,
+                &provider,
+                Some(&existing),
+                None,
+                basis,
+                None,
+            )
+            .unwrap();
+            assert!(
+                row.persisted_attributes()
+                    .unwrap()
+                    .encoded_value("computed")
+                    == Some(&previous_value),
+                "an omitted deferred key keeps the previous hash"
+            );
+        }
+    }
+}
+
+#[test]
+fn retained_write_only_previous_hash_cannot_prove_plaintext_equality() {
+    let resource = Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+        "computed",
+        Value::Concrete(ConcreteValue::String("public".into())),
+    );
+    let previous_value = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("public".into()))).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "computed".into(),
+        previous_value.clone(),
+    )]))
+    .unwrap();
+    let selected = SelectedStateAttributes {
+        encoded: BTreeMap::from([("computed".into(), previous_value.clone())]),
+        write_only_keys: HashSet::from(["computed".into()]),
+        retained_write_only: HashSet::from(["computed".into()]),
+    }
+    .protect_for_resource(
+        &resolved(&resource),
+        PreviousSecretHashAuthority::MatchingFinalDesiredValue {
+            previous: &previous,
+            desired: &FinalDesiredAttributes::for_test(resource.attributes.clone()),
+        },
+        None,
+        true,
+        Some(desired_value_comparison_for_test(None)),
+    )
+    .unwrap();
+    assert!(selected.encoded.get("computed") == Some(&previous_value));
+}
+
+#[test]
+fn observation_previous_secret_hashes_release_only_equal_public_values() {
+    use carina_core::provider::{
+        AppliedIdentifier, AppliedState, CreateFailureKind, HostCreateObservation,
+        HostIdentifiedCreate, Observation, PendingToken, ProviderError, ReadOutcome,
+    };
+
+    // Observations cannot accept an accepted-write authority.
+    type ObservationProtection = fn(
+        SelectedStateAttributes,
+        &ResolvedResource<()>,
+        Option<&PersistedAttributes>,
+        Option<&FinalDesiredAttributes>,
+        Option<&PersistedAttributes>,
+        Option<DesiredValueComparison<'_>>,
+    ) -> Result<SelectedStateAttributes, SerializationError>;
+    const _: ObservationProtection = SelectedStateAttributes::protect_observation::<()>;
+
+    let resource = Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+        "computed",
+        Value::Concrete(ConcreteValue::String("public".into())),
+    );
+    let previous_value = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+        )),
+        None,
+    )
+    .unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", previous_value.as_json().clone());
+    for (persisted, equal) in [(false, false), (false, true), (true, false), (true, true)] {
+        let provider_value = if equal { "public" } else { "provider-current" };
+        let identifier = AppliedIdentifier::new("sink-id").unwrap();
+        let observed = || {
+            AppliedState::new(
+                resource.id.clone(),
+                identifier.as_str(),
+                HashMap::from([(
+                    "computed".to_owned(),
+                    Value::Concrete(ConcreteValue::String(provider_value.into())),
+                )]),
+            )
+            .unwrap()
+        };
+        let identified = if persisted {
+            let pending = create_attempt_for_test(resource.id.clone())
+                .issued(identifier.clone(), Sent::AllRequestAttributes)
+                .pending(PendingToken::new("pending"), 1)
+                .persist(
+                    PersistedAttributes::default(),
+                    PersistedAttributes::default(),
+                );
+            HostIdentifiedCreate::from_in_flight_for_test(
+                pending,
+                identifier.clone(),
+                HostCreateObservation::Observed(observed()),
+            )
+        } else {
+            let failure = create_attempt_for_test(resource.id.clone())
+                .issued(identifier.clone(), Sent::AllRequestAttributes)
+                .identifier_reported(
+                    Observation::Read(ReadOutcome::found(observed())),
+                    ProviderError::internal("synthetic post-create finishing failure"),
+                );
+            match failure.into_host_for_test().into_kind() {
+                CreateFailureKind::IdentifierReported { identified, .. } => identified,
+                _ => panic!("fixture must produce an identifier-reported create"),
+            }
+        };
+        let row = resource_state_from_observation_for_test(
+            &resolved(&resource),
+            &identified,
+            Some(&existing),
+            None,
+            None,
+        )
+        .unwrap();
+        let stored = row.persisted_attributes().unwrap().get("computed").unwrap();
+        assert!(
+            stored.secret_hash().is_some() != equal,
+            "observation (persisted={persisted}, equal={equal}) releases only equal public values"
+        );
+        if equal {
+            assert!(
+                stored
+                    == Value::Concrete(ConcreteValue::String(provider_value.into())).to_snapshot()
+            );
+        } else {
+            assert!(
+                stored
+                    .verify_secret(&Value::Concrete(ConcreteValue::String(
+                        provider_value.into()
+                    )))
+                    .unwrap()
+            );
+        }
+    }
+}
+
+#[test]
 fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
@@ -7866,7 +8068,7 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
 }
 
 #[test]
-fn deposed_encoders_return_unavailable_secret_errors() {
+fn deposed_encoders_keep_opaque_previous_hash_above_masked_subtree() {
     use carina_core::resource::{ConcreteValue, Resource, SnapshotValue};
     let resource = resolved(&Resource::with_provider(
         "mock",
@@ -7900,16 +8102,14 @@ fn deposed_encoders_return_unavailable_secret_errors() {
             &resource,
             None,
             &attributes,
-            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&previous),
+            Some(&previous),
         ),
     ] {
-        let error = result.expect_err("unavailable material must be returned, not panic");
-        assert!(matches!(error, ResourceStateEncodingError::Serialization(
-            SerializationError::UnavailableSecret(ref error)
-        ) if error.path() == "(secret)"));
-        for rendered in [error.to_string(), format!("{error:?}")] {
-            assert!(!rendered.contains("nested"), "{rendered}");
-        }
+        let stored = result.expect("an opaque previous hash must cover masked descendants");
+        assert!(
+            stored.as_persisted().get("password") == previous.get("password"),
+            "both deposed writeback paths must retain the previous whole hash"
+        );
     }
 }
 
@@ -7931,7 +8131,7 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
         &resolved(&resource),
         None,
         &attrs,
-        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
+        Some(&existing),
     )
     .expect("deposed attributes must encode");
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
@@ -8838,7 +9038,7 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
         &resolved(&resource),
         None,
         &attrs,
-        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
+        Some(&existing),
     )
     .expect("deposed attributes must encode");
 
@@ -8847,49 +9047,77 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
 }
 
 #[test]
-fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
-    use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
-
-    let resource = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
-        "password",
-        Value::Concrete(ConcreteValue::String("plain-secret".into())),
+fn from_provider_state_imported_demotion_releases_only_equal_public_value() {
+    let resource = Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+        "computed",
+        Value::Concrete(ConcreteValue::String("public".into())),
     );
-    let existing = ResourceState::try_applied("db.Instance", "main", "awscc", "db-old")
-        .expect("fixture identifier is non-empty")
-        .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
-    let provider_state: carina_core::resource::State = ProviderState {
-        id: resource.id.clone(),
-        identifier: Some("db-old".to_string()),
-        attributes: [(
-            "password".to_string(),
-            Value::Concrete(ConcreteValue::String("plain-secret".into())),
-        )]
-        .into_iter()
-        .collect(),
-        exists: true,
-        dependency_bindings: Default::default(),
-
-        partial_read: None,
-    };
-
-    let rs = resource_state_from_provider_state_for_resource_and_schema_for_test(
-        &resolved(&resource),
-        &provider_state,
-        Some(&existing),
-        None,
-        RowBasis::Imported,
-        None,
-    )
-    .expect("provider state should serialize");
-
-    assert_eq!(
-        persisted_json_attribute(
-            rs.persisted_attributes()
-                .expect("provider row has persisted attributes"),
-            "password",
-        ),
-        Some(serde_json::json!("plain-secret"))
-    );
+    let old = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+    ));
+    let previous_value = PersistedValue::encode_desired_value(&old, None).unwrap();
+    let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", previous_value.as_json().clone());
+    for equal in [false, true] {
+        let material = if equal { "public" } else { "provider-current" };
+        let provider: State = State::existing(
+            resource.id.clone(),
+            HashMap::from([(
+                "computed".into(),
+                Value::Concrete(ConcreteValue::String(material.into())),
+            )]),
+        )
+        .with_identifier("sink-id");
+        let imported = resource_state_from_provider_state_for_resource_and_schema_for_test(
+            &resolved(&resource),
+            &provider,
+            Some(&existing),
+            None,
+            RowBasis::Imported,
+            None,
+        )
+        .unwrap();
+        let stored = imported
+            .persisted_attributes()
+            .unwrap()
+            .get("computed")
+            .unwrap();
+        assert!(
+            stored.secret_hash().is_some() != equal,
+            "Imported releases iff the public value is equal"
+        );
+        if equal {
+            assert!(
+                stored == Value::Concrete(ConcreteValue::String(material.into())).to_snapshot()
+            );
+        } else {
+            assert!(
+                stored
+                    .verify_secret(&Value::Concrete(ConcreteValue::String(material.into())))
+                    .unwrap()
+            );
+        }
+        let request = AcceptedRequest::update_for_test(&["computed"], &[]);
+        let applied = resource_state_from_provider_state_for_resource_and_schema_for_test(
+            &resolved(&resource),
+            &provider,
+            Some(&imported),
+            None,
+            RowBasis::Applied(&request),
+            None,
+        )
+        .unwrap();
+        assert!(
+            applied
+                .persisted_attributes()
+                .unwrap()
+                .get("computed")
+                .unwrap()
+                == Value::Concrete(ConcreteValue::String(material.into())).to_snapshot(),
+            "accepted public writes release even a different provider value"
+        );
+    }
 }
 
 #[test]
@@ -9141,7 +9369,7 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         &resolved(&resource),
         None,
         &attrs,
-        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
+        Some(&existing),
     )
     .expect("deposed attributes must encode");
     let stored_json = state_json_from_persisted_attributes(stored.as_persisted());
@@ -9170,7 +9398,7 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         &resolved(&resource),
         None,
         &attrs,
-        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&second_existing),
+        Some(&second_existing),
     )
     .expect("deposed attributes must encode");
     assert_eq!(
@@ -9200,7 +9428,7 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
         &resolved(&resource),
         None,
         &attrs,
-        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
+        Some(&existing),
     )
     .expect("deposed attributes must encode");
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
@@ -9268,7 +9496,7 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
         &resolved(&resource),
         None,
         &attrs,
-        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
+        Some(&existing),
     )
     .expect("deposed attributes must encode");
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
@@ -9517,40 +9745,33 @@ fn full_state_load_preserves_nested_null_exports_for_reapply() {
         "object": {"id": null, "active": true},
         "absent": null,
     });
-    for version in [StateFile::CURRENT_VERSION, 16] {
-        let mut json = serde_json::to_value(StateFile::new()).unwrap();
-        json["exports"] = exports.clone();
-        json["version"] = serde_json::json!(version);
-        if version < StateFile::EXPORTS_VERSION_INTRODUCED {
-            json.as_object_mut().unwrap().remove("exports_version");
-        }
-        let bytes = serde_json::to_vec(&json).unwrap();
-        let loaded = check_and_migrate_bytes(&bytes)
-            .expect("full-state loading must allow reapply to replace nested-null exports")
-            .into_state();
-        assert_eq!(serde_json::to_value(&loaded.exports).unwrap(), exports);
+    let mut json = serde_json::to_value(StateFile::new()).unwrap();
+    json["exports"] = exports.clone();
+    let bytes = serde_json::to_vec(&json).unwrap();
+    let loaded = load_state_bytes(&bytes)
+        .expect("full-state loading must allow reapply to replace nested-null exports");
+    assert_eq!(serde_json::to_value(&loaded.exports).unwrap(), exports);
 
-        let displayed = PublishedExports::from_state_bytes(&bytes)
-            .expect("export display must preserve encoded nulls");
-        assert_eq!(serde_json::to_value(displayed.values()).unwrap(), exports);
-        let published = PublishedExports::from_state_bytes(&bytes).unwrap();
-        let context =
-            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-        assert!(
-            carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
-                carina_core::upstream_exports::ResolvedUpstreamSource::for_test("upstream", None)
-                    .decode_and_admit(
-                        published
-                            .values()
-                            .iter()
-                            .map(|(key, value)| (key.clone(), value)),
-                        session,
-                    )
-            })
-            .is_err(),
-            "installed remote exports must reject nested nulls after legacy migration"
-        );
-    }
+    let displayed = PublishedExports::from_state_bytes(&bytes)
+        .expect("export display must preserve encoded nulls");
+    assert_eq!(serde_json::to_value(displayed.values()).unwrap(), exports);
+    let published = PublishedExports::from_state_bytes(&bytes).unwrap();
+    let context =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    assert!(
+        carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+            carina_core::upstream_exports::ResolvedUpstreamSource::for_test("upstream", None)
+                .decode_and_admit(
+                    published
+                        .values()
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value)),
+                    session,
+                )
+        })
+        .is_err(),
+        "installed remote exports must reject nested nulls when binding exports"
+    );
 }
 
 #[test]
@@ -9733,67 +9954,34 @@ fn published_exports_build_remote_bindings_ignores_resource_bindings() {
 }
 
 #[test]
-fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
-    // State files written by older Carina builds embed the map key in
-    // `binding["key"]` form. After #1903 the canonical address is the
-    // dot form for identifier-safe keys; non-identifier-safe keys move
-    // from double quotes to single. The `check_and_migrate` load path
-    // rewrites these so existing state resolves against new emissions
-    // without a `moved` block.
-    let json = format!(
-        r#"{{
-            "version": {ver},
-            "serial": 1,
-            "lineage": "abc",
-            "carina_version": "test",
-            "resources": [
-                {{
-                    "resource_type": "test.Dependency",
-                    "name": "other[\"a\"]",
-                    "provider": "mock",
-                    "identifier": "other-a",
-                    "attributes": {{}},
-                    "binding": "other[\"a\"]"
-                }},
-                {{
-                    "resource_type": "test.Dependency",
-                    "name": "_envs[\"prod-east\"]",
-                    "provider": "mock",
-                    "identifier": "prod-east",
-                    "attributes": {{}},
-                    "binding": "_envs[\"prod-east\"]"
-                }},
-                {{
-                    "resource_type": "sso.Assignment",
-                    "name": "_accounts[\"registry_prod\"]",
-                    "provider": "awscc",
-                    "identifier": "x",
-                    "attributes": {{}},
-                    "binding": "_accounts[\"registry_prod\"]",
-                    "dependency_bindings": ["other[\"a\"]", "_envs[\"prod-east\"]"]
-                }}
-            ]
-        }}"#,
-        ver = 14,
-    );
-    let state = finish_legacy_dependency_migration(
-        check_and_migrate(&json).expect("load state").into_state(),
-    );
-    let r = state
+fn load_state_canonicalizes_map_key_addresses() {
+    let mut other = persisted_resource("mock", "test.Dependency", "other[\"a\"]");
+    other["binding"] = serde_json::json!("other[\"a\"]");
+    let mut env = persisted_resource("mock", "test.Dependency", "_envs[\"prod-east\"]");
+    env["binding"] = serde_json::json!("_envs[\"prod-east\"]");
+    let mut assignment =
+        persisted_resource("awscc", "sso.Assignment", "_accounts[\"registry_prod\"]");
+    assignment["binding"] = serde_json::json!("_accounts[\"registry_prod\"]");
+    assignment["dependency_bindings"] = serde_json::json!([
+        {"provider":"mock","resource_type":"test.Dependency","identity":"other[\"a\"]"},
+        {"provider":"mock","resource_type":"test.Dependency","identity":"_envs[\"prod-east\"]"}
+    ]);
+    let state = load_state(&state_json_with_resources(vec![other, env, assignment])).unwrap();
+    let row = state
         .resources
         .iter()
         .find(|row| row.resource_type == "sso.Assignment")
-        .expect("assignment row");
-    assert_eq!(r.identity.as_str(), "_accounts.registry_prod");
+        .unwrap();
+    assert_eq!(row.identity.as_str(), "_accounts.registry_prod");
     assert_eq!(
-        r.binding.as_ref().map(AbsoluteBindingAddress::as_str),
+        row.binding.as_ref().map(AbsoluteBindingAddress::as_str),
         Some("_accounts.registry_prod")
     );
-    let deps: Vec<&str> = r
+    let deps = row
         .dependency_bindings
         .iter()
         .map(ResolvedResourceId::identity_str)
-        .collect();
+        .collect::<Vec<_>>();
     assert!(deps.contains(&"other.a"));
     assert!(deps.contains(&"_envs['prod-east']"));
 }
@@ -9847,56 +10035,6 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
 }
 
 #[test]
-fn v5_state_read_converts_desired_keys_to_explicit_leaves() {
-    // A v5 state file carries a `"desired_keys": ["..."]` array.
-    // Reading it under v6 must (a) bump the version to 6 and
-    // (b) lift each top-level key to a `Leaf` child of the root
-    // `ExplicitFields::Struct`.
-    // carina#3266: production v5 managed rows carry an identifier (the
-    // provider returns one on every successful apply). Historical data-source
-    // rows are pruned later, once the parser supplies their typed addresses;
-    // migration itself must preserve this production-shaped managed row.
-    let v5 = r#"{
-        "version": 5,
-        "serial": 0,
-        "lineage": "test-lineage",
-        "carina_version": "0.4.0",
-        "resources": [{
-            "resource_type": "s3.Bucket",
-            "name": "my-bucket",
-            "provider": "aws",
-            "identifier": "my-bucket",
-            "attributes": {"region": "ap-northeast-1"},
-            "protected": false,
-            "directives": {},
-            "prefixes": {},
-            "name_overrides": {},
-            "desired_keys": ["region", "tags"],
-            "binding": null,
-            "dependency_bindings": []
-        }]
-    }"#;
-
-    let state = finish_legacy_dependency_migration(
-        check_and_migrate(v5)
-            .expect("migration must succeed")
-            .into_state(),
-    );
-    assert_eq!(state.version, StateFile::CURRENT_VERSION);
-    assert_eq!(state.resources.len(), 1);
-
-    let ExplicitFields::Struct { children } = &state.resources[0].explicit else {
-        panic!(
-            "v5 desired_keys should lift to ExplicitFields::Struct, got: {:?}",
-            state.resources[0].explicit
-        );
-    };
-    assert_eq!(children.len(), 2);
-    assert!(matches!(children["region"], ExplicitFields::Leaf));
-    assert!(matches!(children["tags"], ExplicitFields::Leaf));
-}
-
-#[test]
 fn current_state_writes_and_reads_full_explicit_tree() {
     // A current-version state file with a nested `explicit` tree
     // round-trips through serde without loss.
@@ -9926,8 +10064,11 @@ fn current_state_writes_and_reads_full_explicit_tree() {
         .expect("test state setup must be valid");
 
     let json = serde_json::to_string(&state).expect("serialize");
-    let back = check_and_migrate(&json).expect("read").into_state();
-    assert_eq!(back.version, StateFile::CURRENT_VERSION);
+    let back = load_state(&json).expect("read");
+    assert_eq!(
+        serde_json::to_value(&back).unwrap()["version"],
+        StateFile::CURRENT_VERSION
+    );
     assert_eq!(back.resources[0].explicit, state.resources[0].explicit);
 }
 
@@ -9955,33 +10096,30 @@ fn current_list_elements_state_round_trip_preserves_empty_and_populated_vectors(
     let json = serde_json::to_string(&state).unwrap();
     assert!(json.contains(r#""kind":"list-elements""#));
     assert!(json.contains(r#""elements":[]"#));
-    let back = check_and_migrate(&json).unwrap().into_state();
+    let back = load_state(&json).unwrap();
 
-    assert_eq!(back.version, StateFile::CURRENT_VERSION);
+    assert_eq!(
+        serde_json::to_value(&back).unwrap()["version"],
+        StateFile::CURRENT_VERSION
+    );
     assert_eq!(back.resources[0].explicit, state.resources[0].explicit);
     assert_eq!(back.resources[1].explicit, state.resources[1].explicit);
 }
 
 #[test]
-fn v9_legacy_list_survives_current_lift_stays_conservative_and_self_heals_on_writeback() {
+fn conservative_list_authoring_round_trips_and_recovers_on_writeback() {
     use carina_core::differ::Diff;
 
     let json = r#"{
-        "version": 9,
-        "serial": 1,
-        "lineage": "test-lineage",
-        "carina_version": "0.4.0",
-        "resources": [{
+    "version": 21,
+    "serial": 1,
+    "lineage": "test-lineage",
+    "carina_version": "0.4.0",
+    "resources": [
+        {
             "resource_type": "listener.Listener",
             "identity": "listener",
             "provider": "mock",
-            "identifier": "listener-id",
-            "attributes": {
-                "rules": [
-                    {"port": 80, "description": "web"},
-                    {"port": 443, "description": "provider-default"}
-                ]
-            },
             "explicit": {
                 "kind": "struct",
                 "children": {
@@ -9990,19 +10128,40 @@ fn v9_legacy_list_survives_current_lift_stays_conservative_and_self_heals_on_wri
                         "element": {
                             "kind": "struct",
                             "children": {
-                                "port": {"kind": "leaf"},
-                                "description": {"kind": "leaf"}
+                                "port": {
+                                    "kind": "leaf"
+                                },
+                                "description": {
+                                    "kind": "leaf"
+                                }
                             }
                         }
                     }
                 }
+            },
+            "current": {
+                "kind": "applied",
+                "identifier": "listener-id",
+                "attributes": {
+                    "rules": [
+                        {
+                            "port": 80,
+                            "description": "web"
+                        },
+                        {
+                            "port": 443,
+                            "description": "provider-default"
+                        }
+                    ]
+                },
+                "nested_write_only": {}
             }
-        }]
-    }"#;
-    let outcome = check_and_migrate(json).expect("v9 state must lift without a custom migration");
-    assert_eq!(outcome.migration.unwrap().from, 9);
-    assert_eq!(outcome.state.version, 20);
-    let state = finish_legacy_dependency_migration(outcome.state);
+        }
+    ],
+    "exports_version": 1
+}"#;
+    let outcome = load_state(json).expect("current state retains conservative list authoring");
+    let state = outcome;
     let row = state
         .find_resource("mock", "listener.Listener", "listener")
         .expect("legacy row");
@@ -10013,7 +10172,7 @@ fn v9_legacy_list_survives_current_lift_stays_conservative_and_self_heals_on_wri
     assert!(matches!(children["rules"], ExplicitFields::List { .. }));
 
     let serialized = serde_json::to_string(&state).unwrap();
-    let round_tripped = check_and_migrate(&serialized).unwrap().into_state();
+    let round_tripped = load_state(&serialized).unwrap();
     assert_eq!(round_tripped.resources[0].explicit, legacy_explicit);
 
     let desired = Resource::with_provider("mock", "listener.Listener", "listener", None)
@@ -10066,7 +10225,7 @@ fn v9_legacy_list_survives_current_lift_stays_conservative_and_self_heals_on_wri
         panic!("expected rewritten root Struct");
     };
     let ExplicitFields::ListElements { elements } = &children["rules"] else {
-        panic!("v10 writeback must replace legacy List with ListElements");
+        panic!("current writeback must replace conservative List with ListElements");
     };
     assert_eq!(elements.len(), 2);
     assert_explicit_struct_keys(&elements[0], &["port"]);
@@ -10299,7 +10458,7 @@ fn partial_read_marker_round_trips_through_state_json() {
         .expect("test state setup must be valid");
 
     let json = serde_json::to_string(&state).expect("serialize");
-    let back = check_and_migrate(&json).expect("read").into_state();
+    let back = load_state(&json).expect("read");
 
     assert_eq!(
         back.resources[0].partial_read(),
@@ -10310,29 +10469,41 @@ fn partial_read_marker_round_trips_through_state_json() {
 #[test]
 fn missing_partial_read_field_defaults_to_none() {
     let json = r#"{
-        "version": 7,
-        "serial": 0,
-        "lineage": "test-lineage",
-        "carina_version": "0.4.0",
-        "resources": [{
+    "version": 21,
+    "serial": 0,
+    "lineage": "test-lineage",
+    "carina_version": "0.4.0",
+    "resources": [
+        {
             "resource_type": "test.resource",
             "name": "r1",
             "provider": "mock",
-            "identifier": "mock-id",
-            "attributes": {"name": "r1"},
             "protected": false,
             "directives": {},
             "prefixes": {},
             "name_overrides": {},
             "desired_keys": [],
-            "explicit": {"kind": "struct", "children": {}},
+            "explicit": {
+                "kind": "struct",
+                "children": {}
+            },
             "binding": null,
             "dependency_bindings": [],
-            "write_only_attributes": []
-        }]
-    }"#;
+            "current": {
+                "kind": "applied",
+                "identifier": "mock-id",
+                "attributes": {
+                    "name": "r1"
+                },
+                "write_only_attributes": [],
+                "nested_write_only": {}
+            }
+        }
+    ],
+    "exports_version": 1
+}"#;
 
-    let state = check_and_migrate(json).expect("read").into_state();
+    let state = load_state(json).expect("read");
 
     assert_eq!(state.resources.len(), 1);
     assert_eq!(state.resources[0].partial_read(), None);
@@ -10367,527 +10538,6 @@ fn fixture_persisted_dependencies<const N: usize>(
             .into_iter()
             .map(|identity| resolved_dependency("mock", "test.Dependency", identity, None)),
     )
-}
-
-#[test]
-fn legacy_dependency_spellings_do_not_double_an_existing_scope_prefix() {
-    assert_eq!(
-        legacy_dependency_spellings(&["module_instance"], "module_instance.target"),
-        vec!["module_instance.target"],
-    );
-    assert_eq!(
-        legacy_dependency_spellings(&["module_instance"], "target"),
-        vec!["module_instance.target", "target"],
-    );
-    assert_eq!(legacy_dependency_spellings(&[], "target"), vec!["target"],);
-}
-
-#[test]
-fn v20_without_dependency_names_can_complete_before_a_mutating_command_early_write() {
-    let json = state_json_with_resources(
-        20,
-        vec![persisted_resource("mock", "test.Resource", "independent")],
-    );
-    let state = check_and_migrate(&json)
-        .expect("v20 state without dependency names must load")
-        .into_state();
-
-    assert!(state.requires_legacy_dependency_migration());
-    assert!(serde_json::to_value(&state).is_err());
-    let (state, report) = migrate_legacy_with_config(state, &[])
-        .expect("even empty legacy state crosses graph validation before the early write");
-    assert!(report.warnings().is_empty());
-    assert!(!state.requires_legacy_dependency_migration());
-    assert!(serde_json::to_value(&state).is_ok());
-    assert!(!state.has_legacy_dependency_names());
-}
-
-#[test]
-fn v20_dependency_migration_resolves_root_module_loop_origin_and_deposed_edges() {
-    let mut root = persisted_resource("mock", "test.Root", "root_target");
-    root["binding"] = serde_json::json!("root_target");
-
-    let mut module = persisted_resource("mock", "test.Module", "module_instance.target");
-    module["binding"] = serde_json::json!("module_instance.target");
-    module["directives"] = serde_json::json!({ "provider_instance": "west" });
-
-    let mut loop_target = persisted_resource("mock", "test.Loop", "module_instance.items[0]");
-    loop_target["binding"] = serde_json::json!("module_instance.items[0]");
-
-    let origin = persisted_resource("mock", "test.Origin", "moved_origin");
-
-    let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
-    consumer["binding"] = serde_json::json!("consumer");
-    consumer["dependency_bindings"] = serde_json::json!([
-        "root_target",
-        "module_instance.target",
-        "module_instance.items[0]",
-        "moved_origin"
-    ]);
-    consumer["directives"] = serde_json::json!({
-        "depends_on": ["module_instance.target"]
-    });
-    consumer["deposed"] = serde_json::json!([{
-        "key": "old-generation",
-        "identifier": "consumer-old",
-        "attributes": {},
-        "dependency_bindings": ["module_instance.items[0]"]
-    }]);
-
-    let json = state_json_with_resources(20, vec![root, module, loop_target, origin, consumer]);
-    let loaded = check_and_migrate(&json)
-        .expect("legacy dependency names must load into the unwritable typestate")
-        .into_state();
-    assert!(loaded.requires_legacy_dependency_migration());
-    assert!(serde_json::to_value(&loaded).is_err());
-    let configured_consumer = Resource::with_provider("mock", "test.Consumer", "consumer", None)
-        .with_absolute_binding(absolute_binding("consumer"));
-    let (migrated, report) = migrate_legacy_with_config(loaded, &[configured_consumer])
-        .expect("every legacy address has one exact persisted origin");
-    assert!(report.warnings().is_empty());
-    let consumer = &migrated.resources()[4];
-    let expected = PersistedDestroyDependencies::from_test_dependencies([
-        resolved_dependency("mock", "test.Root", "root_target", None),
-        resolved_dependency(
-            "mock",
-            "test.Module",
-            "module_instance.target",
-            Some("west"),
-        ),
-        resolved_dependency("mock", "test.Loop", "module_instance.items[0]", None),
-        resolved_dependency("mock", "test.Origin", "moved_origin", None),
-    ]);
-    assert_eq!(consumer.dependency_bindings, expected);
-    assert_eq!(
-        consumer.directives.depends_on,
-        PersistedDestroyDependencies::from_test_dependencies([resolved_dependency(
-            "mock",
-            "test.Module",
-            "module_instance.target",
-            Some("west"),
-        )])
-    );
-    assert_eq!(
-        consumer.deposed[0].dependency_bindings,
-        PersistedDestroyDependencies::from_test_dependencies([resolved_dependency(
-            "mock",
-            "test.Loop",
-            "module_instance.items[0]",
-            None,
-        )])
-    );
-
-    let encoded = serde_json::to_value(&migrated).expect("migrated state serializes");
-    assert!(encoded["resources"][4]["dependency_bindings"][0].is_object());
-    assert!(encoded["resources"][4]["directives"]["depends_on"][0].is_object());
-    assert!(encoded["resources"][4]["deposed"][0]["dependency_bindings"][0].is_object());
-}
-
-#[test]
-fn v20_dependency_migration_rejects_missing_target_with_row_and_text() {
-    let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
-    consumer["binding"] = serde_json::json!("consumer");
-    consumer["dependency_bindings"] = serde_json::json!(["gone_target"]);
-    let json = state_json_with_resources(20, vec![consumer]);
-
-    let state = check_and_migrate(&json)
-        .expect("legacy strings load before configuration-aware classification")
-        .into_state();
-    let configured = Resource::with_provider("mock", "test.Consumer", "consumer", None)
-        .with_absolute_binding(absolute_binding("consumer"));
-    let error = migrate_legacy_with_config(state, &[configured])
-        .expect_err("missing edges on configured rows must never be dropped");
-    assert!(matches!(
-        error,
-        LegacyDependencyMigrationError::Missing {
-            row_index: 0,
-            ref row,
-            ref location,
-            ref dependency,
-        } if row.contains("test.Consumer")
-            && location == "resources[0].dependency_bindings"
-            && dependency == "gone_target"
-    ));
-}
-
-#[test]
-fn v20_dependency_migration_preserves_matchable_resolution_cause() {
-    let mut target = persisted_resource("mock", "__wait", "invalid_target");
-    target["binding"] = serde_json::json!("invalid_target");
-    let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
-    consumer["binding"] = serde_json::json!("consumer");
-    consumer["dependency_bindings"] = serde_json::json!(["invalid_target"]);
-    let state = check_and_migrate(&state_json_with_resources(20, vec![target, consumer]))
-        .expect("legacy rows load before dependency projection")
-        .into_state();
-    let configured = Resource::with_provider("mock", "test.Consumer", "consumer", None)
-        .with_absolute_binding(absolute_binding("consumer"));
-    let error = migrate_legacy_with_config(state, &[configured])
-        .expect_err("a synthetic address cannot become a persisted destroy edge");
-    assert!(std::error::Error::source(&error).is_none());
-    let LegacyDependencyMigrationError::InvalidStateDependency { reason, .. } = &error else {
-        panic!("migration must retain the typed decode error: {error:?}");
-    };
-    let carina_core::resource::NotAManagedRow(cause) = reason.as_ref();
-    assert_eq!(
-        cause,
-        &resolved_dependency("mock", "__wait", "invalid_target", None),
-        "the typed decode error must survive migration context: {error:?}",
-    );
-    assert_eq!(error.to_string().matches(&reason.to_string()).count(), 1);
-}
-
-#[test]
-fn legacy_dependency_resolution_error_retains_typed_cause_without_duplicate_source() {
-    let error = LegacyDependencyMigrationError::Resolution {
-        row_index: 0,
-        row: "consumer".to_string(),
-        location: "resources[0].dependency_bindings".to_string(),
-        dependency: "target".to_string(),
-        reason: Box::new(ExpandedGraphResolutionError::DataSourceHandle {
-            owner: "consumer".to_string(),
-            reference: "target".to_string(),
-        }),
-    };
-    assert_eq!(
-        error.to_string(),
-        "resources[0].dependency_bindings on consumer could not classify legacy dependency \
-         \"target\": consumer: expected a managed resource handle; 'target' is a data source"
-    );
-    assert!(std::error::Error::source(&error).is_none());
-    let LegacyDependencyMigrationError::Resolution { reason, .. } = error else {
-        panic!("migration must retain the typed graph resolution error");
-    };
-    assert!(matches!(
-        reason.as_ref(),
-        ExpandedGraphResolutionError::DataSourceHandle { owner, reference }
-            if owner == "consumer" && reference == "target"
-    ));
-}
-
-#[test]
-fn legacy_dependency_graph_validation_error_retains_typed_cause_without_duplicate_source() {
-    let cause = ExpandedGraphResolutionError::MissingDependency {
-        owner: "consumer".to_string(),
-        reference: "target".to_string(),
-    };
-    let error = LegacyDependencyMigrationError::from(cause.clone());
-    assert_eq!(error.to_string(), cause.to_string());
-    assert!(std::error::Error::source(&error).is_none());
-    let LegacyDependencyMigrationError::GraphValidation(reason) = error else {
-        panic!("migration must retain the typed graph validation error");
-    };
-    assert!(matches!(
-        reason.as_ref(),
-        ExpandedGraphResolutionError::MissingDependency { owner, reference }
-            if owner == "consumer" && reference == "target"
-    ));
-}
-
-#[test]
-fn v20_dependency_migration_classifies_moved_row_as_configured() {
-    assert_moved_legacy_row_scope("other_instance.consumer", "other_instance.target", true);
-}
-
-#[test]
-fn v20_dependency_migration_uses_destination_scope_for_moved_orphan_and_deposed_rows() {
-    assert_moved_legacy_row_scope("other_instance.consumer", "other_instance.target", false);
-}
-
-#[test]
-fn v20_dependency_migration_uses_root_scope_for_row_moved_out_of_module() {
-    assert_moved_legacy_row_scope("consumer", "target", true);
-}
-
-#[test]
-fn v20_dependency_migration_uses_destination_ancestors_without_splitting_quoted_map_keys() {
-    assert_moved_legacy_row_scope(
-        "other_instance[\"west.example\"].inner.consumer",
-        "other_instance[\"west.example\"].target",
-        true,
-    );
-}
-
-#[test]
-fn with_legacy_classification_rejects_stale_sources() {
-    let mut target = persisted_resource("mock", "test.Target", "target");
-    target["binding"] = serde_json::json!("target");
-    let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
-    consumer["binding"] = serde_json::json!("consumer");
-    consumer["dependency_bindings"] = serde_json::json!(["target"]);
-    let original = check_and_migrate(&state_json_with_resources(
-        20,
-        vec![target.clone(), consumer.clone()],
-    ))
-    .expect("original v20 state loads")
-    .into_state();
-
-    let configured = [
-        Resource::with_provider("mock", "test.Target", "target", None)
-            .with_absolute_binding(absolute_binding("target")),
-        Resource::with_provider("mock", "test.Consumer", "consumer", None)
-            .with_absolute_binding(absolute_binding("consumer")),
-    ];
-    let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
-    let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
-        let mut configuration = parsed;
-        configuration.resources = configured.to_vec();
-        configuration.data_sources = [].to_vec();
-        configuration.into()
-    })
-    .expect("stale-classification graph resolves");
-    let no_move_plan: carina_core::plan::Plan = carina_core::plan::Plan::new();
-    let moved_pairs =
-        carina_core::effect::ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
-    let classification = expect_classified(
-        original
-            .clone()
-            .classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())
-            .expect("original source classifies"),
-    )
-    .report_and_validate(|_| panic!("fixture has no warnings"))
-    .expect("the graph must validate")
-    .classification;
-
-    consumer["dependency_bindings"] = serde_json::json!(["different_target"]);
-    let changed = check_and_migrate(&state_json_with_resources(20, vec![target, consumer]))
-        .expect("changed v20 state loads")
-        .into_state();
-    let error = changed
-        .clone()
-        .replay_legacy_graph(classification)
-        .report_and_validate(|_| {})
-        .err()
-        .expect("changed source names must reject the saved classification");
-
-    assert_eq!(error, LegacyDependencyMigrationError::StaleClassification);
-    assert_eq!(changed.version, 20);
-    assert!(changed.requires_legacy_dependency_migration());
-}
-
-#[test]
-fn v20_dependency_migration_rejects_ambiguous_binding_with_row_and_text() {
-    let mut first = persisted_resource("mock", "test.First", "first");
-    first["binding"] = serde_json::json!("shared");
-    let mut second = persisted_resource("mock", "test.Second", "second");
-    second["binding"] = serde_json::json!("shared");
-    let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
-    consumer["binding"] = serde_json::json!("consumer");
-    consumer["directives"] = serde_json::json!({ "depends_on": ["shared"] });
-    let json = state_json_with_resources(20, vec![first, second, consumer]);
-
-    let state = check_and_migrate(&json)
-        .expect("legacy strings load before configuration-aware classification")
-        .into_state();
-    let configured = Resource::with_provider("mock", "test.Consumer", "consumer", None)
-        .with_absolute_binding(absolute_binding("consumer"));
-    let error = migrate_legacy_with_config(state, &[configured])
-        .expect_err("ambiguous edges on configured rows must never be guessed");
-    assert!(matches!(
-        error,
-        LegacyDependencyMigrationError::Ambiguous {
-            row_index: 2,
-            ref row,
-            ref location,
-            ref dependency,
-            ref candidates,
-        } if row.contains("test.Consumer")
-            && location == "resources[2].directives.depends_on"
-            && dependency == "shared"
-            && candidates.len() == 2
-    ));
-}
-
-#[test]
-fn v20_dependency_migration_keeps_known_orphan_edges_and_reports_each_unknown_generation() {
-    let mut target = persisted_resource("mock", "test.Target", "remaining");
-    target["binding"] = serde_json::json!("remaining");
-    let mut orphan = persisted_resource("mock", "test.Orphan", "removed_module.consumer");
-    orphan["binding"] = serde_json::json!("removed_module.consumer");
-    orphan["dependency_bindings"] = serde_json::json!(["remaining", "removed_module.gone"]);
-    orphan["deposed"] = serde_json::json!([{
-        "key": "old-generation",
-        "identifier": "orphan-old",
-        "attributes": {},
-        "dependency_bindings": ["removed_module.old_gone"]
-    }]);
-    let json = state_json_with_resources(20, vec![target, orphan]);
-    let state = check_and_migrate(&json)
-        .expect("orphan legacy names load into the migration typestate")
-        .into_state();
-    let configured_target = Resource::with_provider("mock", "test.Target", "remaining", None)
-        .with_absolute_binding(absolute_binding("remaining"));
-
-    let (migrated, report) = migrate_legacy_with_config(state, &[configured_target])
-        .expect("unresolved orphan names are warnings rather than migration failures");
-    assert_eq!(report.warnings().len(), 2);
-    assert!(report.warnings().iter().any(|warning| {
-        warning.generation.is_none()
-            && warning.legacy_names == BTreeSet::from(["removed_module.gone".to_string()])
-    }));
-    assert!(report.warnings().iter().any(|warning| {
-        warning
-            .generation
-            .as_ref()
-            .is_some_and(|key| key.as_str() == "old-generation")
-            && warning.legacy_names == BTreeSet::from(["removed_module.old_gone".to_string()])
-    }));
-
-    let orphan = &migrated.resources()[1];
-    assert_eq!(
-        orphan.dependency_bindings,
-        PersistedDestroyDependencies::from_test_dependencies([resolved_dependency(
-            "mock",
-            "test.Target",
-            "remaining",
-            None,
-        )])
-    );
-    assert!(orphan.deposed[0].dependency_bindings.is_empty());
-    let encoded = serde_json::to_string(&migrated).expect("v21 state must be writable");
-    assert!(!encoded.contains("removed_module.gone"));
-    assert!(!encoded.contains("removed_module.old_gone"));
-}
-
-#[test]
-fn report_invokes_sink_for_every_current_and_deposed_warning_before_returning_state() {
-    let mut orphan = persisted_resource("mock", "test.Orphan", "removed.consumer");
-    orphan["binding"] = serde_json::json!("removed.consumer");
-    orphan["dependency_bindings"] = serde_json::json!(["gone-current"]);
-    orphan["deposed"] = serde_json::json!([{
-        "key": "old-generation",
-        "identifier": "orphan-old",
-        "attributes": {},
-        "dependency_bindings": ["gone-deposed"]
-    }]);
-    let state = check_and_migrate(&state_json_with_resources(20, vec![orphan]))
-        .expect("warning fixture loads into the migration typestate")
-        .into_state();
-    let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
-    let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
-        let mut configuration = parsed;
-        configuration.resources = [].to_vec();
-        configuration.data_sources = [].to_vec();
-        configuration.into()
-    })
-    .expect("empty warning graph resolves");
-    let no_move_plan: carina_core::plan::Plan = carina_core::plan::Plan::new();
-    let moved_pairs =
-        carina_core::effect::ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
-    let migration = expect_classified(
-        state
-            .classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())
-            .expect("orphan unknown names classify as warnings"),
-    );
-
-    let mut reported = Vec::new();
-    let state = migration
-        .report_and_validate(|warning| {
-            reported.push((
-                warning
-                    .generation
-                    .as_ref()
-                    .map(|key| key.as_str().to_string()),
-                warning.legacy_names.clone(),
-            ));
-        })
-        .expect("the warning graph must validate")
-        .state;
-
-    assert_eq!(reported.len(), 2);
-    assert!(reported.iter().any(|(generation, names)| {
-        generation.is_none() && names == &BTreeSet::from(["gone-current".to_string()])
-    }));
-    assert!(reported.iter().any(|(generation, names)| {
-        generation.as_deref() == Some("old-generation")
-            && names == &BTreeSet::from(["gone-deposed".to_string()])
-    }));
-    assert_eq!(state.version, StateFile::CURRENT_VERSION);
-}
-
-fn assert_moved_legacy_row_scope(
-    destination: &'static str,
-    expected_target: &'static str,
-    configured: bool,
-) {
-    let mut target = persisted_resource("mock", "test.Target", "module_instance.target");
-    target["binding"] = serde_json::json!("module_instance.target");
-    let mut root_target = persisted_resource("mock", "test.Target", "target");
-    root_target["binding"] = serde_json::json!("target");
-    let mut consumer = persisted_resource("mock", "test.Consumer", "module_instance.old_consumer");
-    consumer["binding"] = serde_json::json!("module_instance.old_consumer");
-    consumer["dependency_bindings"] = serde_json::json!(["target"]);
-    consumer["directives"] = serde_json::json!({"depends_on": ["target"]});
-    consumer["deposed"] = serde_json::json!([{
-        "key": "old-generation",
-        "identifier": "consumer-old",
-        "attributes": {},
-        "dependency_bindings": ["target"]
-    }]);
-    let json = state_json_with_resources(20, vec![target, root_target, consumer]);
-    let state = check_and_migrate(&json)
-        .expect("moved-row fixture must load as pending migration")
-        .into_state();
-
-    let mut graph_resources: Vec<Resource> = vec![
-        Resource::with_provider("mock", "test.Target", "module_instance.target", None)
-            .with_absolute_binding(absolute_binding("module_instance.target")),
-        Resource::with_provider("mock", "test.Target", expected_target, None)
-            .with_absolute_binding(absolute_binding(expected_target)),
-    ];
-    if configured {
-        graph_resources.push(
-            Resource::with_provider("mock", "test.Consumer", destination, None)
-                .with_absolute_binding(absolute_binding(destination)),
-        );
-    }
-    let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
-    let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
-        let mut configuration = parsed;
-        configuration.resources = graph_resources.to_vec();
-        configuration.data_sources = [].to_vec();
-        configuration.into()
-    })
-    .expect("moved-row graph resolves");
-    let from = resolved_dependency(
-        "mock",
-        "test.Consumer",
-        "module_instance.old_consumer",
-        None,
-    );
-    let to = resolved_dependency("mock", "test.Consumer", destination, None);
-
-    let mut move_plan: carina_core::plan::Plan<SavedModuleSource> =
-        carina_core::plan::Plan::default();
-    move_plan.add(carina_core::effect::Effect::Move {
-        from,
-        to,
-        origin: None,
-    });
-    let moved_pairs =
-        carina_core::effect::ResolvedMovePairs::from_saved_plan(move_plan.move_effects());
-    let migration = expect_classified(
-        state
-            .classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())
-            .expect("the moved row must classify with its resolved destination scope"),
-    );
-    assert!(migration.warnings().is_empty());
-    let state = migration
-        .report_and_validate(|_| panic!("fixture must not report warnings"))
-        .expect("the graph must validate")
-        .state;
-    let row = state
-        .find_resource("mock", "test.Consumer", "module_instance.old_consumer")
-        .expect("migration classifies but does not itself move the row");
-    let expected = PersistedDestroyDependencies::from_test_dependencies([resolved_dependency(
-        "mock",
-        "test.Target",
-        expected_target,
-        None,
-    )]);
-    assert_eq!(row.dependency_bindings, expected);
-    assert_eq!(row.directives.depends_on, expected);
-    assert_eq!(row.deposed[0].dependency_bindings, expected);
 }
 
 #[tokio::test]
@@ -10947,186 +10597,169 @@ async fn loaded_observation_authority_survives_an_omitted_mutable_file_view() {
 }
 
 #[tokio::test]
-async fn legacy_observation_authority_loads_all_dependency_arrays_and_plans_normally() {
+async fn current_observation_authority_loads_resolved_dependencies_and_plans_normally() {
     let secret: Value = Value::Deferred(DeferredValue::Secret(
         Box::new(Value::Concrete(ConcreteValue::String("private".into()))).into(),
     ));
     let persisted = PersistedValue::encode_provider_value(&secret, None).unwrap();
-    for version in [19, 20] {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("state.json");
-        let mut document = serde_json::json!({
-            "version": version,
-            "serial": 17,
-            "lineage": "legacy-observation-lineage",
-            "carina_version": "legacy",
-            "exports": {},
-            "resources": [{
-                "provider": "mock", "resource_type": "test.Resource", "identity": "target",
-                "binding": "target",
-                "current": {
-                    "kind": "applied", "identifier": "target-id",
-                    "attributes": {}, "nested_write_only": {}
-                }
-            }, {
-                "provider": "mock", "resource_type": "test.Resource",
-                "identity": "items[\"west\"]", "binding": "consumer",
-                "current": {
-                    "kind": "applied", "identifier": "consumer-id",
-                    "attributes": {"payload": persisted.as_json()}, "nested_write_only": {}
-                },
-                "dependency_bindings": ["target"],
-                "directives": {"depends_on": ["target"]},
-                "deposed": [{
-                    "key": "old", "identifier": "old-id",
-                    "attributes": {"payload": persisted.as_json()},
-                    "dependency_bindings": ["target"]
-                }]
-            }]
-        });
-        if version >= StateFile::EXPORTS_VERSION_INTRODUCED {
-            document["exports_version"] = serde_json::json!(PublishedExports::CURRENT_VERSION);
-        }
-        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
-        let backend = crate::local_backend_for_test(path);
-        let (loaded, authority) = ObservationStateAuthority::load(backend.as_ref())
-            .await
-            .unwrap();
-        let Some(LoadedState::Migrated { state, info }) = loaded else {
-            panic!("v{version} must retain its pending migration");
-        };
-        assert_eq!(
-            info,
-            MigrationInfo {
-                from: version,
-                to: StateFile::CURRENT_VERSION
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    let document = serde_json::json!({
+        "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 17,
+        "lineage": "current-observation-lineage",
+        "carina_version": "test",
+        "exports": {},
+        "resources": [{
+            "provider": "mock", "resource_type": "test.Resource", "identity": "target",
+            "binding": "target",
+            "current": {
+                "kind": "applied", "identifier": "target-id",
+                "attributes": {}, "nested_write_only": {}
             }
-        );
-        assert_eq!(state.serial, 17);
-        assert_eq!(state.lineage, "legacy-observation-lineage");
-        let id = ResourceId::with_provider_identity("mock", "test.Resource", "items.west", None);
-        let legacy = &state.legacy_dependencies[&ResolvedResourceId::new(id.clone())];
-        assert_eq!(
-            legacy.value_dependencies.iter().collect::<Vec<_>>(),
-            ["target"]
-        );
-        assert_eq!(
-            legacy.explicit_dependencies.iter().collect::<Vec<_>>(),
-            ["target"]
-        );
-        assert_eq!(
-            legacy.deposed_dependencies
-                [&serde_json::from_value::<DeposedKey>(serde_json::json!("old")).unwrap()]
-                .iter()
-                .collect::<Vec<_>>(),
-            ["target"]
-        );
-
-        let desired = [
-            Resource::with_provider("mock", "test.Resource", "target", None)
-                .with_absolute_binding(absolute_binding("target")),
-            Resource::with_provider("mock", "test.Resource", "items.west", None)
-                .with_absolute_binding(absolute_binding("consumer"))
-                .with_attribute("payload", secret.clone()),
-        ];
-        let (state, report) = migrate_legacy_with_config(state, &desired).unwrap();
-        assert!(report.warnings().is_empty());
-        let mut schemas = SchemaRegistry::new();
-        schemas.insert(
-            "mock",
-            PatternResourceSchema::new("test.Resource")
-                .attribute(
-                    PatternAttributeSchema::optional("payload", PatternAttributeType::string())
-                        .build(),
-                )
-                .validate()
-                .unwrap(),
-        );
-        let desired = desired.iter().map(resolved).collect::<Vec<_>>();
-        let current = desired
-            .iter()
-            .map(|resource| {
-                (
-                    resource.id.clone(),
-                    state.build_state_for_resource(&resource.id),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let plan_inputs = carina_core::resource::into_plan_input_current_map::<
-            carina_core::resource::ModuleSource,
-            carina_core::resource::UnexpandedDependencyFields,
-        >(current, &schemas, &[]);
-        let plan = carina_core::differ::create_plan_for_test(
-            &desired,
-            &[],
-            &carina_core::provider::ProviderRouter::new(),
-            carina_core::differ::PlanPriorStates::new(
-                &plan_inputs,
-                &carina_core::differ::Orphans::new(),
-            ),
-            &state.build_directives(),
-            &schemas,
-            &state.build_saved_attrs().lift(&schemas),
-            &state.build_explicit(),
-            &[],
-        )
+        }, {
+            "provider": "mock", "resource_type": "test.Resource",
+            "identity": "items[\"west\"]", "binding": "consumer",
+            "current": {
+                "kind": "applied", "identifier": "consumer-id",
+                "attributes": {"payload": persisted.as_json()}, "nested_write_only": {}
+            },
+            "dependency_bindings": [{"provider":"mock","resource_type":"test.Resource","identity":"target"}],
+            "directives": {"depends_on": [{"provider":"mock","resource_type":"test.Resource","identity":"target"}]},
+            "deposed": [{
+                "key": "old", "identifier": "old-id",
+                "attributes": {"payload": persisted.as_json()},
+                "dependency_bindings": [{"provider":"mock","resource_type":"test.Resource","identity":"target"}]
+            }]
+        }]
+    });
+    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let backend = crate::local_backend_for_test(path);
+    let (loaded, authority) = ObservationStateAuthority::load(backend.as_ref())
+        .await
         .unwrap();
-        assert!(!plan.has_errors(), "v{version}: {:?}", plan.errors());
-        assert!(!plan.has_mutations(), "v{version}: {:?}", plan.effects());
+    let state = loaded.unwrap();
+    assert_eq!(state.serial, 17);
+    assert_eq!(state.lineage, "current-observation-lineage");
+    let id = ResourceId::with_provider_identity("mock", "test.Resource", "items.west", None);
+    let row = state.find_resource_for_id(&id).unwrap();
+    let target =
+        ResolvedResourceId::with_provider_identity("mock", "test.Resource", "target", None);
+    assert_eq!(
+        row.dependency_bindings.iter().collect::<Vec<_>>(),
+        [&target]
+    );
+    assert_eq!(
+        row.directives.depends_on.iter().collect::<Vec<_>>(),
+        [&target]
+    );
+    assert_eq!(
+        row.deposed[0]
+            .dependency_bindings
+            .iter()
+            .collect::<Vec<_>>(),
+        [&target]
+    );
 
-        let observed: Value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::String("observed-private".into()),
-        )]));
-        let current = HashMap::from([(
-            id.clone(),
-            Current::from_state(
-                State::existing(
-                    id.clone(),
-                    HashMap::from([("payload".into(), observed.clone())]),
-                )
-                .with_identifier("consumer-id"),
-            ),
-        )]);
-        let products = authority
-            .protect(carina_core::value::ObservationInputs::Display {
-                plan: &carina_core::plan::Plan::new(),
-                current: &current,
-                deleted: &HashMap::new(),
-            })
-            .unwrap();
-        let snapshot = products.managed_for(&id).unwrap().snapshot().unwrap();
-        assert!(
-            snapshot.attributes["payload"]
-                .verify_secret(&observed)
-                .unwrap(),
-            "v{version} must retain first-decoded secret evidence at the canonical identity"
-        );
-    }
+    let desired = [
+        Resource::with_provider("mock", "test.Resource", "target", None)
+            .with_absolute_binding(absolute_binding("target")),
+        Resource::with_provider("mock", "test.Resource", "items.west", None)
+            .with_absolute_binding(absolute_binding("consumer"))
+            .with_attribute("payload", secret.clone()),
+    ];
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Resource")
+            .attribute(
+                PatternAttributeSchema::optional("payload", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let desired = desired.iter().map(resolved).collect::<Vec<_>>();
+    let current = desired
+        .iter()
+        .map(|resource| {
+            (
+                resource.id.clone(),
+                state.build_state_for_resource(&resource.id),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let plan_inputs = carina_core::resource::into_plan_input_current_map::<
+        carina_core::resource::ModuleSource,
+        carina_core::resource::UnexpandedDependencyFields,
+    >(current, &schemas, &[]);
+    let plan = carina_core::differ::create_plan_for_test(
+        &desired,
+        &[],
+        &carina_core::provider::ProviderRouter::new(),
+        carina_core::differ::PlanPriorStates::new(
+            &plan_inputs,
+            &carina_core::differ::Orphans::new(),
+        ),
+        &state.build_directives(),
+        &schemas,
+        &state.build_saved_attrs().lift(&schemas),
+        &state.build_explicit(),
+        &[],
+    )
+    .unwrap();
+    assert!(!plan.has_errors(), "current state: {:?}", plan.errors());
+    assert!(!plan.has_mutations(), "current state: {:?}", plan.effects());
+
+    let observed: Value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::String("observed-private".into()),
+    )]));
+    let current = HashMap::from([(
+        id.clone(),
+        Current::from_state(
+            State::existing(
+                id.clone(),
+                HashMap::from([("payload".into(), observed.clone())]),
+            )
+            .with_identifier("consumer-id"),
+        ),
+    )]);
+    let products = authority
+        .protect(carina_core::value::ObservationInputs::Display {
+            plan: &carina_core::plan::Plan::new(),
+            current: &current,
+            deleted: &HashMap::new(),
+        })
+        .unwrap();
+    let snapshot = products.managed_for(&id).unwrap().snapshot().unwrap();
+    assert!(
+        snapshot.attributes["payload"]
+            .verify_secret(&observed)
+            .unwrap(),
+        "current state must retain first-decoded secret evidence at the canonical identity"
+    );
 }
 
 #[tokio::test]
 async fn observation_load_reuses_first_decode_and_its_field_order() {
-    for version in [20, StateFile::CURRENT_VERSION] {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("state.json");
-        let mut document = serde_json::to_value(StateFile::new()).unwrap();
-        document["version"] = serde_json::json!(version);
-        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
-        let backend = crate::local_backend_for_test(path);
-        let (loaded, authority) = ObservationStateAuthority::load(backend.as_ref())
-            .await
-            .unwrap();
-        let state = loaded.unwrap().into_state();
-        assert!(std::sync::Arc::ptr_eq(
-            &state.loaded_observation.as_ref().unwrap().state,
-            &authority.state,
-        ));
-        let document = authority.state.as_ref().clone().into_document();
-        assert!(std::sync::Arc::ptr_eq(
-            state.wire_order.as_ref().unwrap(),
-            &document.wire_order
-        ));
-    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    let document = serde_json::to_value(StateFile::new()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let backend = crate::local_backend_for_test(path);
+    let (loaded, authority) = ObservationStateAuthority::load(backend.as_ref())
+        .await
+        .unwrap();
+    let state = loaded.unwrap();
+    assert!(std::sync::Arc::ptr_eq(
+        &state.loaded_observation.as_ref().unwrap().state,
+        &authority.state,
+    ));
+    let document = authority.state.as_ref().clone().into_document();
+    assert!(std::sync::Arc::ptr_eq(
+        state.wire_order.as_ref().unwrap(),
+        &document.wire_order
+    ));
 }
 
 #[tokio::test]
@@ -11157,4 +10790,492 @@ async fn observation_load_keeps_the_state_json_error_source() {
             .unwrap()
             .is::<serde_json::Error>()
     );
+}
+
+#[test]
+fn previous_secret_hash_omitted_public_value_keeps_root_and_nested_hashes() {
+    let string = |raw: &str| Value::Concrete(ConcreteValue::String(raw.into()));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string("prior")).into()));
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None)
+            .with_attribute("computed", string("public")),
+    );
+    let provider: State =
+        State::existing(resource.id.clone(), BTreeMap::new()).with_identifier("sink-id");
+    let request = AcceptedRequest::update_for_test(&["other"], &[]);
+    for previous in [
+        secret.clone(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("hidden".into(), secret),
+            ("public".into(), string("public")),
+        ]))),
+    ] {
+        let previous = PersistedValue::encode_desired_value(&previous, None).unwrap();
+        let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+            .unwrap()
+            .with_attribute("computed", previous.as_json().clone());
+        for basis in [
+            RowBasis::Carried,
+            RowBasis::Imported,
+            RowBasis::Applied(&request),
+        ] {
+            let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
+                &resource,
+                &provider,
+                Some(&existing),
+                None,
+                basis,
+                None,
+            )
+            .unwrap();
+            assert!(
+                row.persisted_attributes()
+                    .unwrap()
+                    .encoded_value("computed")
+                    == Some(&previous),
+                "a missing provider value cannot prove equality to a public literal"
+            );
+        }
+    }
+}
+
+#[test]
+fn deposed_public_desired_cannot_release_previous_secret_hash() {
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None).with_attribute(
+            "computed",
+            Value::Concrete(ConcreteValue::String("public".into())),
+        ),
+    );
+    let old = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("prior".into()))).into(),
+    ));
+    let previous = PersistedAttributes::from_persisted_values(BTreeMap::from([(
+        "computed".into(),
+        PersistedValue::encode_desired_value(&old, None).unwrap(),
+    )]))
+    .unwrap();
+    let attributes: BTreeMap<String, Value> = BTreeMap::from([(
+        "computed".into(),
+        Value::Concrete(ConcreteValue::String("public".into())),
+    )]);
+    let stored = ResourceState::deposed_attributes_without_previous(
+        &resource,
+        None,
+        &attributes,
+        Some(&previous),
+    )
+    .unwrap();
+    assert!(
+        stored
+            .as_persisted()
+            .get("computed")
+            .unwrap()
+            .secret_hash()
+            .is_some()
+    );
+}
+
+#[test]
+fn previous_secret_hash_carried_float_uses_fresh_plan_numeric_comparison() {
+    let desired = Value::Concrete(ConcreteValue::Int(1));
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None)
+            .with_attribute("computed", desired.clone()),
+    );
+    let old = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(Box::new(desired.clone()).into())),
+        None,
+    )
+    .unwrap();
+    let previous = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", old.as_json().clone());
+    let schema = PatternResourceSchema::new("test.resource")
+        .attribute(
+            PatternAttributeSchema::optional("computed", PatternAttributeType::float()).build(),
+        )
+        .validate()
+        .unwrap();
+    let provider: State = State::existing(
+        resource.id.clone(),
+        HashMap::from([(
+            "computed".into(),
+            Value::Concrete(ConcreteValue::Float(1.0.try_into().unwrap())),
+        )]),
+    )
+    .with_identifier("sink-id");
+    let final_desired = FinalDesiredValues::for_test([(
+        resource.id.clone(),
+        IndexMap::from([("computed".into(), desired)]),
+    )]);
+    let row = ResourceState::from_provider_state_with_final_desired(
+        &resource,
+        &provider,
+        Some(&previous),
+        Some(schema.as_schema()),
+        RowBasis::Carried,
+        Some(&final_desired),
+        None,
+        &exact_comparison_context(),
+    )
+    .unwrap();
+    assert!(
+        row.persisted_attributes()
+            .unwrap()
+            .get("computed")
+            .unwrap()
+            .secret_hash()
+            .is_none(),
+        "the same typed Int/Float equality as a fresh plan must release the hash"
+    );
+}
+
+#[test]
+fn previous_secret_hash_release_follows_fresh_plan_comparison() {
+    use PreviousSecretHashDecision::{Protect, Release};
+    let string = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let list = |items: &[&str]| {
+        Value::Concrete(ConcreteValue::List(
+            items.iter().map(|text| string(text)).collect(),
+        ))
+    };
+    let desired_map = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "name".into(),
+        string("public"),
+    )])));
+    let provider_map = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("name".into(), string("public")),
+        ("defaulted".into(), string("default")),
+    ])));
+    let map_type = PatternAttributeType::struct_(
+        "Config",
+        vec![
+            PatternStructField::optional("name", PatternAttributeType::string()).build(),
+            PatternStructField::optional("defaulted", PatternAttributeType::string()).build(),
+        ],
+    );
+    let cases = [
+        (
+            "identical public string",
+            string("public"),
+            string("public"),
+            Some(PatternAttributeType::string()),
+            Release,
+        ),
+        (
+            "genuinely different public string",
+            string("public"),
+            string("different"),
+            Some(PatternAttributeType::string()),
+            Protect,
+        ),
+        (
+            "ordered reordered list",
+            list(&["public", "other"]),
+            list(&["other", "public"]),
+            Some(PatternAttributeType::list(PatternAttributeType::string())),
+            Protect,
+        ),
+        (
+            "unordered reordered list",
+            list(&["public", "other"]),
+            list(&["other", "public"]),
+            Some(PatternAttributeType::unordered_list(
+                PatternAttributeType::string(),
+            )),
+            Release,
+        ),
+        // The differ's existing schemaless list comparison is an unordered multiset.
+        (
+            "schemaless reordered list",
+            list(&["public", "other"]),
+            list(&["other", "public"]),
+            None,
+            Release,
+        ),
+        (
+            "Int for Float slot",
+            Value::Concrete(ConcreteValue::Int(1)),
+            Value::Concrete(ConcreteValue::Float(1.0.try_into().unwrap())),
+            Some(PatternAttributeType::float()),
+            Release,
+        ),
+        // Command-path measurements pin these two as unequal at the state seam.
+        (
+            "Duration versus persisted number",
+            Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60))),
+            Value::Concrete(ConcreteValue::Int(60)),
+            Some(PatternAttributeType::duration()),
+            Protect,
+        ),
+        (
+            "non-empty provider-defaulted field",
+            desired_map,
+            provider_map,
+            Some(map_type),
+            Protect,
+        ),
+    ];
+    for (label, desired, material, attr_type, expected) in cases {
+        let resource = resolved(
+            &Resource::with_provider("mock", "test.resource", "sink", None)
+                .with_attribute("computed", desired),
+        );
+        let schema = attr_type.map(|attr_type| {
+            PatternResourceSchema::new("test.resource")
+                .attribute(PatternAttributeSchema::optional("computed", attr_type).build())
+                .validate()
+                .unwrap()
+        });
+        let previous = PersistedValue::encode_desired_value(
+            &Value::Deferred(DeferredValue::Secret(Box::new(string("prior")).into())),
+            None,
+        )
+        .unwrap();
+        let existing = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+            .unwrap()
+            .with_attribute("computed", previous.as_json().clone());
+        let provider: State = State::existing(
+            resource.id.clone(),
+            HashMap::from([("computed".into(), material)]),
+        )
+        .with_identifier("sink-id");
+        let desired =
+            FinalDesiredValues::for_test([(resource.id.clone(), resource.attributes.clone())]);
+        for basis in [RowBasis::Carried, RowBasis::Imported] {
+            let row = ResourceState::from_provider_state_with_final_desired(
+                &resource,
+                &provider,
+                Some(&existing),
+                schema.as_ref().map(|schema| schema.as_schema()),
+                basis,
+                Some(&desired),
+                None,
+                &exact_comparison_context(),
+            )
+            .unwrap();
+            let released = row
+                .persisted_attributes()
+                .unwrap()
+                .get("computed")
+                .unwrap()
+                .secret_hash()
+                .is_none();
+            assert_eq!(
+                released,
+                expected == Release,
+                "{label}, {basis:?}: release follows the fresh-plan comparison"
+            );
+        }
+    }
+}
+
+#[test]
+fn current_state_round_trips_instance_variants() {
+    let json = serde_json::json!({
+        "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 4,
+        "lineage": "test-lineage",
+        "carina_version": "test",
+        "resources": [
+            {
+                "resource_type": "test.Resource",
+                "identity": "none",
+                "provider": "mock",
+                "current": { "kind": "none" },
+                "deposed": [{
+                    "key": "00000000-0000-4000-8000-000000000001",
+                    "identifier": "old",
+                    "attributes": {},
+                    "dependency_bindings": []
+                }]
+            },
+            {
+                "resource_type": "test.Resource",
+                "identity": "applied",
+                "provider": "mock",
+                "current": {
+                    "kind": "applied",
+                    "identifier": "cloud-id",
+                    "attributes": { "name": "example" },
+                    "write_only_attributes": ["password"],
+                    "partial_read": null, "nested_write_only": {}
+                }
+            },
+            {
+                "resource_type": "test.Resource",
+                "identity": "pending",
+                "provider": "mock",
+                "current": {
+                    "kind": "create_in_flight",
+                    "envelope": {
+                        "token": "opaque-token",
+                        "identifier": null,
+                        "write_only": {},
+                        "secrets": {}
+                    },
+                    "started_at": "2026-10-23T08:00:00Z"
+                }
+            },
+            {
+                "resource_type": "test.Resource",
+                "identity": "missing",
+                "provider": "mock",
+                "current": {
+                    "kind": "missing_identifier",
+                    "attributes": { "name": "unknown-owner" }, "nested_write_only": {}
+                }
+            }
+        ],
+        "exports": {}
+    });
+
+    let state = load_state(&json.to_string()).expect("current state loads");
+    assert!(matches!(
+        state.resources()[0].current(),
+        CurrentInstance::None
+    ));
+    assert!(matches!(
+        state.resources()[1].current(),
+        CurrentInstance::Applied { .. }
+    ));
+    assert!(matches!(
+        state.resources()[2].current(),
+        CurrentInstance::CreateInFlight { .. }
+    ));
+    assert!(matches!(
+        state.resources()[3].current(),
+        CurrentInstance::MissingIdentifier { .. }
+    ));
+
+    let encoded = serde_json::to_string(&state).expect("current state must serialize");
+    let reloaded = load_state(&encoded).expect("serialized current state must reload");
+    assert_eq!(
+        serde_json::to_value(&state).unwrap(),
+        serde_json::to_value(&reloaded).unwrap()
+    );
+}
+
+#[test]
+fn current_state_preserves_write_only_partial_and_deposed_fields() {
+    let mut row = persisted_resource("mock", "test.Resource", "main");
+    row["current"]["identifier"] = serde_json::json!("cloud-id");
+    row["current"]["attributes"] = serde_json::json!({"name":"example", "password":"masked"});
+    row["current"]["write_only_attributes"] = serde_json::json!(["password"]);
+    row["current"]["partial_read"] = serde_json::json!({
+        "pending": {"reason": {"kind":"incomplete", "detail":"provider read omitted status"}},
+        "missing_attributes": ["status"]
+    });
+    row["directives"] = serde_json::json!({"depends_on":[{
+        "provider":"mock", "resource_type":"test.Dependency", "identity":"upstream"
+    }]});
+    row["deposed"] = serde_json::json!([{
+        "key":"00000000-0000-4000-8000-000000000002", "identifier":"old-id",
+        "attributes":{"name":"old"}, "dependency_bindings":[]
+    }]);
+    let state = load_state(&state_json_with_resources(vec![row])).unwrap();
+    let CurrentInstance::Applied {
+        identifier,
+        attributes,
+        write_only_attributes,
+        nested_write_only,
+        partial_read,
+    } = state.resources()[0].current()
+    else {
+        panic!("current row must be applied")
+    };
+    assert_eq!(identifier.as_str(), "cloud-id");
+    assert!(attributes.contains_key("password"));
+    assert_eq!(write_only_attributes, &["password"]);
+    assert!(nested_write_only.is_empty());
+    assert!(partial_read.is_some());
+    assert_eq!(state.resources()[0].deposed.len(), 1);
+    assert_eq!(
+        state.resources()[0].directives.depends_on,
+        fixture_persisted_dependencies(["upstream"])
+    );
+    let reloaded = load_state(&serde_json::to_string(&state).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(state).unwrap(),
+        serde_json::to_value(reloaded).unwrap()
+    );
+}
+
+#[test]
+fn previous_secret_hash_release_uses_prepared_final_comparison() {
+    use carina_core::validation::admission::final_input::FinalPlanInputs;
+
+    let desired = Value::Concrete(ConcreteValue::Int(1));
+    let resource = resolved(
+        &Resource::with_provider("mock", "test.resource", "sink", None)
+            .with_attribute("computed", desired.clone()),
+    );
+    let schema = PatternResourceSchema::new("test.resource")
+        .attribute(
+            PatternAttributeSchema::optional("computed", PatternAttributeType::float()).build(),
+        )
+        .validate()
+        .unwrap();
+    let mut schemas = carina_core::schema::SchemaRegistry::new();
+    schemas.insert("mock", schema.clone());
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let final_desired = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            // This production constructor attaches Some(resource, references),
+            // unlike FinalDesiredValues::for_test's observation fallback.
+            FinalPlanInputs::admit_for_test(
+                vec![resource.clone()],
+                vec![],
+                &schemas,
+                &bindings,
+                session,
+            )
+            .unwrap()
+            .desired_values(&carina_core::references::prepare_empty_for_tests())
+        },
+    );
+    let old = PersistedValue::encode_desired_value(
+        &Value::Deferred(DeferredValue::Secret(Box::new(desired).into())),
+        None,
+    )
+    .unwrap();
+    let previous = ResourceState::try_applied("test.resource", "sink", "mock", "sink-id")
+        .unwrap()
+        .with_attribute("computed", old.as_json().clone());
+    for basis in [RowBasis::Carried, RowBasis::Imported] {
+        for (number, protected) in [(1.0, false), (2.0, true)] {
+            let provider: State = State::existing(
+                resource.id.clone(),
+                HashMap::from([(
+                    "computed".into(),
+                    Value::Concrete(ConcreteValue::Float(number.try_into().unwrap())),
+                )]),
+            )
+            .with_identifier("sink-id");
+            let row = ResourceState::from_provider_state_with_final_desired(
+                &resource,
+                &provider,
+                Some(&previous),
+                Some(schema.as_schema()),
+                basis,
+                Some(&final_desired),
+                None,
+                &exact_comparison_context(),
+            )
+            .unwrap();
+            assert_eq!(
+                row.persisted_attributes()
+                    .unwrap()
+                    .get("computed")
+                    .unwrap()
+                    .secret_hash()
+                    .is_some(),
+                protected,
+                "prepared comparison must release typed equality and protect inequality"
+            );
+        }
+    }
 }

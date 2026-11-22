@@ -1069,7 +1069,7 @@ impl<'a> ExpressionMode<'a> {
                     UnexpandedStructuralHandleKind::Resource(resource_type) => {
                         Some(resource_type.clone())
                     }
-                    UnexpandedStructuralHandleKind::For
+                    UnexpandedStructuralHandleKind::For(_)
                     | UnexpandedStructuralHandleKind::If
                     | UnexpandedStructuralHandleKind::Use
                     | UnexpandedStructuralHandleKind::Module

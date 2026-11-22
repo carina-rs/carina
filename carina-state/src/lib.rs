@@ -54,14 +54,6 @@
 
 #![deny(clippy::iter_over_hash_type)]
 
-#[cfg(test)]
-fn fixture_applied_identifier(
-    identifier: impl Into<String>,
-) -> carina_core::provider::AppliedIdentifier {
-    carina_core::provider::AppliedIdentifier::new(identifier)
-        .expect("fixture provider identifier must be non-empty")
-}
-
 pub mod backend;
 mod backend_config;
 pub mod backend_lock;
@@ -96,9 +88,9 @@ pub use backend_selection::{
     inspect_backend_drift,
 };
 pub use backends::{
-    GitHubBackend, GitHubError, LocalBackend, LocalStateFile, S3AutoCreate, S3AutoCreateDisabled,
-    S3Bootstrap, S3BootstrapInfo, StateUrl, anchored_local_path,
-    load_encoded_published_exports_from_url, load_local_state_file, load_state_from_url,
+    GitHubBackend, GitHubError, LocalBackend, S3AutoCreate, S3AutoCreateDisabled, S3Bootstrap,
+    S3BootstrapInfo, StateUrl, anchored_local_path, load_encoded_published_exports_from_url,
+    load_state_from_url,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use backends::{local_backend_for_test, s3_backend_for_test};
@@ -106,14 +98,10 @@ pub use heartbeat::{HeartbeatGuard, LockHeartbeat, LockLost, LockedStateWriter};
 pub use lock::LockInfo;
 pub use state::{
     ApplyDecision, CurrentInstance, DeposedAttributes, DeposedInstance, DeposedKey,
-    ImportTargetDisposition, LegacyClassificationOutcome, LegacyDependencyClassification,
-    LegacyDependencyMigrationError, LegacyDependencyNames, LegacyDestroyOrderingWarning,
-    LegacyReadRequiredRow, LegacyReadRequiredRows, LoadedOrphans, LoadedState, MigratedStateFile,
-    MigrationInfo, NameOverride, NotOutcomeUnknown, NotOutcomeUnknownKind,
-    ObservationStateAuthority, ObservedStateFile, OutcomeUnknownRow, PreviousSecretHashAuthority,
-    PublishedExports, ResourceState, ResourceStateEncodingError, RowBasis, StateFile,
-    UnreportedMigratedState, UnvalidatedLegacyMigration, ValidatedLegacyMigration,
-    check_and_migrate, check_and_migrate_bytes, log_state_migration_once, should_apply_override,
+    ImportTargetDisposition, LoadedOrphans, NameOverride, NotOutcomeUnknown, NotOutcomeUnknownKind,
+    ObservationStateAuthority, ObservedStateFile, OutcomeUnknownRow, PublishedExports,
+    ResourceState, ResourceStateEncodingError, ResourceStateWrite, RowBasis, StateFile, load_state,
+    load_state_bytes, should_apply_override,
 };
 
 #[cfg(any(test, feature = "test-utils"))]

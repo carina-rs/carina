@@ -20,7 +20,7 @@ name = "plan-fixture"
 path = "examples/plan-fixture.rs"
 
 [features]
-test-utils = ["carina-core/test-utils", "carina-provider-resolver/test-utils", "carina-state/test-utils"]
+test-utils = ["carina-core/test-utils", "carina-plugin-host/test-utils", "carina-provider-resolver/test-utils", "carina-state/test-utils"]
 
 [dependencies]
 carina-core = { path = "../carina-core", features = ["provider-host"] }
@@ -57,6 +57,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-
 tokio-util = "0.7"
 
 [dev-dependencies]
+proc-macro2 = "1"
+syn = { version = "3", features = ["full", "visit"] }
 carina-provider-protocol = { path = "../carina-provider-protocol" }
 argon2 = "0.5"
 async-trait = "0.1"

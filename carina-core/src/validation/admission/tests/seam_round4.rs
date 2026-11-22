@@ -413,7 +413,8 @@ fn round5_module_body_slots_keep_per_instance_authored_roots() {
                     &mut coverage,
                 );
                 assert!(outcome.classification_diagnostics.0.is_empty());
-                outcome.values
+                let (values, _prefixes_for_test) = outcome.values.into_parts();
+                values
             };
             assert_eq!(report.errors().count(), 0, "{report:?}");
             assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");

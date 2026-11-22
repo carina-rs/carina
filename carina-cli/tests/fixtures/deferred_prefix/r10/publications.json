@@ -1,0 +1,2117 @@
+{
+  "m1a_empty": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "lets.crn": []
+    },
+    "main.crn": {
+      "main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 17,
+              "line": 1
+            },
+            "start": {
+              "character": 0,
+              "line": 1
+            }
+          },
+          "severity": 1,
+          "message": "mock.test.resource.<pending>: 'name_prefix' cannot be empty"
+        }
+      ]
+    },
+    "providers.crn": {
+      "providers.crn": []
+    }
+  },
+  "m1a2_conflict": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 53,
+              "line": 0
+            },
+            "start": {
+              "character": 33,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 53,
+              "line": 0
+            },
+            "start": {
+              "character": 33,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "lets.crn": []
+    },
+    "main.crn": {
+      "main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 19,
+              "line": 1
+            },
+            "start": {
+              "character": 0,
+              "line": 1
+            }
+          },
+          "severity": 1,
+          "message": "mock.test.resource.<pending>: cannot specify both 'name_prefix' and 'name'"
+        }
+      ]
+    },
+    "providers.crn": {
+      "providers.crn": []
+    }
+  },
+  "m1b_secret": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "lets.crn": []
+    },
+    "main.crn": {
+      "main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 26,
+              "line": 1
+            },
+            "start": {
+              "character": 0,
+              "line": 1
+            }
+          },
+          "severity": 1,
+          "message": "mock.test.resource.<pending>: Required attribute 'name' is missing"
+        },
+        {
+          "range": {
+            "end": {
+              "character": 26,
+              "line": 1
+            },
+            "start": {
+              "character": 0,
+              "line": 1
+            }
+          },
+          "severity": 1,
+          "message": "mock.test.resource.<pending>: Unknown attribute 'name_prefix'"
+        }
+      ]
+    },
+    "providers.crn": {
+      "providers.crn": []
+    }
+  },
+  "m1c_parse": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "lets.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 5,
+              "line": 0
+            },
+            "start": {
+              "character": 4,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": " --> 1:5\n  |\n1 | let = \n  |     ^---\n  |\n  = expected discard_pattern or identifier"
+        }
+      ]
+    },
+    "main.crn": {
+      "main.crn": []
+    },
+    "providers.crn": {
+      "providers.crn": []
+    },
+    "source.crn": {
+      "source.crn": []
+    }
+  },
+  "m1c_upstream_missing_state": {
+    "backend.crn": {
+      "backend.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ]
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ],
+      "lets.crn": []
+    },
+    "main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ],
+      "main.crn": []
+    },
+    "providers.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ],
+      "providers.crn": []
+    },
+    "upstream/backend.crn": {
+      "upstream/backend.crn": []
+    },
+    "upstream/exports.crn": {
+      "upstream/exports.crn": []
+    }
+  },
+  "m1c_upstream_missing_source": {
+    "backend.crn": {
+      "backend.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ]
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ],
+      "lets.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 48,
+              "line": 1
+            },
+            "start": {
+              "character": 36,
+              "line": 1
+            }
+          },
+          "severity": 1,
+          "message": "upstream_state 'net': source './upstream' does not exist"
+        }
+      ]
+    },
+    "main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ],
+      "main.crn": []
+    },
+    "providers.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ],
+      "providers.crn": []
+    }
+  },
+  "m1c_upstream_missing_export": {
+    "backend.crn": {
+      "backend.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ]
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ],
+      "lets.crn": []
+    },
+    "main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ],
+      "main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 39,
+              "line": 2
+            },
+            "start": {
+              "character": 32,
+              "line": 2
+            }
+          },
+          "severity": 2,
+          "message": "upstream_state `net` does not export `missing`."
+        }
+      ]
+    },
+    "providers.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ],
+      "providers.crn": []
+    },
+    "upstream/backend.crn": {
+      "upstream/backend.crn": []
+    },
+    "upstream/exports.crn": {
+      "upstream/exports.crn": []
+    }
+  },
+  "m2_two_roots": {
+    "envs/a/backend.crn": {
+      "envs/a/backend.crn": []
+    },
+    "envs/a/lets.crn": {
+      "envs/a/lets.crn": []
+    },
+    "envs/a/main.crn": {
+      "envs/a/main.crn": []
+    },
+    "envs/a/providers.crn": {
+      "envs/a/providers.crn": []
+    },
+    "envs/b/backend.crn": {
+      "envs/b/backend.crn": [],
+      "modules/app/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ]
+    },
+    "envs/b/lets.crn": {
+      "envs/b/lets.crn": [],
+      "modules/app/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ]
+    },
+    "envs/b/main.crn": {
+      "envs/b/main.crn": [],
+      "modules/app/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ]
+    },
+    "envs/b/providers.crn": {
+      "envs/b/providers.crn": [],
+      "modules/app/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ]
+    },
+    "modules/app/arguments.crn": {
+      "modules/app/arguments.crn": [],
+      "modules/app/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "modules/app/main.crn": {
+      "modules/app/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    }
+  },
+  "m2_ancestor_provider": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "envs/a/backend.crn": {
+      "envs/a/backend.crn": []
+    },
+    "envs/a/lets.crn": {
+      "envs/a/lets.crn": []
+    },
+    "envs/a/main.crn": {
+      "envs/a/main.crn": []
+    },
+    "envs/a/providers.crn": {
+      "envs/a/providers.crn": []
+    },
+    "envs/b/backend.crn": {
+      "envs/b/backend.crn": [],
+      "modules/app/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ]
+    },
+    "envs/b/lets.crn": {
+      "envs/b/lets.crn": [],
+      "modules/app/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ]
+    },
+    "envs/b/main.crn": {
+      "envs/b/main.crn": [],
+      "modules/app/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ]
+    },
+    "envs/b/providers.crn": {
+      "envs/b/providers.crn": [],
+      "modules/app/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"
+        }
+      ]
+    },
+    "main.crn": {
+      "main.crn": []
+    },
+    "modules/app/arguments.crn": {
+      "modules/app/arguments.crn": [],
+      "modules/app/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "modules/app/main.crn": {
+      "modules/app/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "providers.crn": {
+      "providers.crn": []
+    }
+  },
+  "m3_invalid_attribute": {
+    "backend.crn": {
+      "backend.crn": [],
+      "main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.id', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "lets.crn": [],
+      "main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.id', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "main.crn": {
+      "main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.id', which is not resolved when names are generated"
+        },
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 39,
+              "line": 0
+            }
+          },
+          "severity": 2,
+          "message": "Unknown attribute 'id' on 'src' (type 'test.resource')"
+        }
+      ]
+    },
+    "providers.crn": {
+      "main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.id', which is not resolved when names are generated"
+        }
+      ],
+      "providers.crn": []
+    }
+  },
+  "m3_undefined_binding": {
+    "backend.crn": {
+      "backend.crn": [],
+      "main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 52,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'nosuch.identifier', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "lets.crn": [],
+      "main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 52,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'nosuch.identifier', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "main.crn": {
+      "main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 52,
+              "line": 0
+            },
+            "start": {
+              "character": 35,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "Undefined resource: 'nosuch'. Define it with 'let nosuch = aws...'"
+        },
+        {
+          "range": {
+            "end": {
+              "character": 52,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'nosuch.identifier', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "providers.crn": {
+      "main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 52,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'nosuch.identifier', which is not resolved when names are generated"
+        }
+      ],
+      "providers.crn": []
+    }
+  },
+  "m4_unimported_child": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "lets.crn": []
+    },
+    "main.crn": {
+      "main.crn": []
+    },
+    "providers.crn": {
+      "providers.crn": []
+    }
+  },
+  "m4_standalone_with_provider": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 0
+            },
+            "start": {
+              "character": 0,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "arguments blocks are only valid inside module definitions, not in root configurations."
+        }
+      ],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/providers.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ],
+      "child/providers.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 13,
+              "line": 0
+            },
+            "start": {
+              "character": 0,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "provider blocks are not allowed inside modules. Define providers at the root configuration level."
+        }
+      ]
+    },
+    "main.crn": {
+      "main.crn": []
+    },
+    "providers.crn": {
+      "providers.crn": []
+    }
+  },
+  "m4_bad_argument_type": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "lets.crn": []
+    },
+    "main.crn": {
+      "main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 14,
+              "line": 1
+            },
+            "start": {
+              "character": 13,
+              "line": 1
+            }
+          },
+          "severity": 1,
+          "message": "module call 'c (anonymous call)': argument 'prefix': expected String, got int (1)"
+        }
+      ]
+    },
+    "providers.crn": {
+      "providers.crn": []
+    }
+  },
+  "m4_missing_argument": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "lets.crn": []
+    },
+    "main.crn": {
+      "main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 4,
+              "line": 1
+            },
+            "start": {
+              "character": 0,
+              "line": 1
+            }
+          },
+          "severity": 1,
+          "message": "Missing required argument 'prefix' for module 'c'"
+        }
+      ]
+    },
+    "providers.crn": {
+      "providers.crn": []
+    }
+  },
+  "m4_standalone_with_backend": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 0
+            },
+            "start": {
+              "character": 0,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "arguments blocks are only valid inside module definitions, not in root configurations."
+        }
+      ],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/backend.crn": {
+      "child/backend.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 7,
+              "line": 0
+            },
+            "start": {
+              "character": 0,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "backend blocks are not allowed inside modules. Define the backend at the root configuration level."
+        }
+      ],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/providers.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ],
+      "child/providers.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 13,
+              "line": 0
+            },
+            "start": {
+              "character": 0,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "provider blocks are not allowed inside modules. Define providers at the root configuration level."
+        }
+      ]
+    },
+    "main.crn": {
+      "main.crn": []
+    },
+    "providers.crn": {
+      "providers.crn": []
+    }
+  },
+  "m1c_upstream_prefix_missing_export": {
+    "backend.crn": {
+      "backend.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.missing', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.missing', which is not resolved when names are generated"
+        }
+      ],
+      "lets.crn": []
+    },
+    "main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.missing', which is not resolved when names are generated"
+        }
+      ],
+      "main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 24,
+              "line": 1
+            },
+            "start": {
+              "character": 13,
+              "line": 1
+            }
+          },
+          "severity": 1,
+          "message": "module call 'c (anonymous call)': upstream_state `net` does not export `missing`."
+        }
+      ]
+    },
+    "providers.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.missing', which is not resolved when names are generated"
+        }
+      ],
+      "providers.crn": []
+    },
+    "upstream/backend.crn": {
+      "upstream/backend.crn": []
+    },
+    "upstream/exports.crn": {
+      "upstream/exports.crn": []
+    }
+  },
+  "m1c_upstream_prefix_missing_source": {
+    "backend.crn": {
+      "backend.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.first', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.first', which is not resolved when names are generated"
+        }
+      ],
+      "lets.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 48,
+              "line": 0
+            },
+            "start": {
+              "character": 36,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "upstream_state 'net': source './upstream' does not exist"
+        }
+      ]
+    },
+    "main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.first', which is not resolved when names are generated"
+        }
+      ],
+      "main.crn": []
+    },
+    "providers.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.first', which is not resolved when names are generated"
+        }
+      ],
+      "providers.crn": []
+    }
+  },
+  "r7b_formal_bare": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "lets.crn": []
+    },
+    "main.crn": {
+      "main.crn": []
+    },
+    "providers.crn": {
+      "providers.crn": []
+    }
+  },
+  "r7b_formal_alias": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 36,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix' (through 'p'), which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/lets.crn": {
+      "child/lets.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 36,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix' (through 'p'), which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 36,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix' (through 'p'), which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "lets.crn": []
+    },
+    "main.crn": {
+      "main.crn": []
+    },
+    "providers.crn": {
+      "providers.crn": []
+    }
+  },
+  "r7b_formal_interpolation": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 48,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 48,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "lets.crn": []
+    },
+    "main.crn": {
+      "main.crn": []
+    },
+    "providers.crn": {
+      "providers.crn": []
+    }
+  },
+  "r7b_formal_secret": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 49,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on '(secret)', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 49,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on '(secret)', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "lets.crn": []
+    },
+    "main.crn": {
+      "main.crn": []
+    },
+    "providers.crn": {
+      "providers.crn": []
+    }
+  },
+  "r7b_formal_several": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 55,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'first' and 'second', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 55,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'first' and 'second', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "lets.crn": []
+    },
+    "main.crn": {
+      "main.crn": []
+    },
+    "providers.crn": {
+      "providers.crn": []
+    }
+  },
+  "r9_literal_only": {
+    "backend.crn": {
+      "backend.crn": []
+    },
+    "child/arguments.crn": {
+      "child/arguments.crn": [],
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "child/main.crn": {
+      "child/main.crn": [
+        {
+          "range": {
+            "end": {
+              "character": 41,
+              "line": 0
+            },
+            "start": {
+              "character": 21,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        }
+      ]
+    },
+    "lets.crn": {
+      "lets.crn": []
+    },
+    "main.crn": {
+      "main.crn": []
+    },
+    "providers.crn": {
+      "providers.crn": []
+    }
+  }
+}

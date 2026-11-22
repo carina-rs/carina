@@ -366,7 +366,8 @@ fn canonical_attribute_wins_an_equal_distance_block_alias() {
             >::new(judged.report());
             let outcome = validation.admit_resource(request);
             assert!(outcome.classification_diagnostics.0.is_empty());
-            outcome.values
+            let (values, _prefixes_for_test) = outcome.values.into_parts();
+            values
         };
         let errors = report.errors().collect::<Vec<_>>();
         assert_eq!(errors.len(), 1, "{errors:?}");

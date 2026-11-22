@@ -819,7 +819,7 @@ mod tests {
         let deferred = DeferredForExpression::new(
             None,
             1,
-            "for x in (up.items ?? fallback.items)".to_string(),
+            "for (_, x) in (up.items ?? fallback.items)".to_string(),
             crate::parser::DeferredForTarget::bound(
                 crate::resource::absolute_binding_address_for_test("children"),
             )
@@ -828,7 +828,7 @@ mod tests {
                 value: Box::new(Value::root_resource_ref("up", "items", Vec::new())),
                 default: Box::new(Value::root_resource_ref("fallback", "items", Vec::new())),
             }),
-            ForBinding::Simple("x".to_string()),
+            ForBinding::Indexed("_".into(), "x".to_string()),
             template_resource,
         );
 
@@ -1195,13 +1195,13 @@ mod tests {
         let deferred = DeferredForExpression::new(
             None,
             1,
-            "for opt in cert.domain_validation_options".to_string(),
+            "for (_, opt) in cert.domain_validation_options".to_string(),
             crate::parser::DeferredForTarget::bound(
                 crate::resource::absolute_binding_address_for_test("validation_records"),
             )
             .expect("fixture binding is valid"),
             Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Simple("opt".to_string()),
+            ForBinding::Indexed("_".into(), "opt".to_string()),
             template_resource,
         );
 
@@ -1270,13 +1270,13 @@ mod tests {
         let deferred = DeferredForExpression::new(
             None,
             1,
-            "for opt in cert.domain_validation_options".to_string(),
+            "for (_, opt) in cert.domain_validation_options".to_string(),
             crate::parser::DeferredForTarget::bound(
                 crate::resource::absolute_binding_address_for_test("validation_records"),
             )
             .expect("fixture binding is valid"),
             Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Simple("opt".to_string()),
+            ForBinding::Indexed("_".into(), "opt".to_string()),
             template_resource,
         );
 

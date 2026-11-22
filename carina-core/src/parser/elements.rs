@@ -33,6 +33,14 @@ impl AttributeKeyLocation {
     pub(crate) fn assignment_location(&self) -> &DeclarationLocation {
         &self.assignment
     }
+    /// Keyed findings include a single-line assignment, but never a multiline value.
+    pub(crate) fn finding_location(&self) -> &DeclarationLocation {
+        if self.assignment.span().start_line() == self.assignment.span().end_line() {
+            &self.assignment
+        } else {
+            &self.location
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

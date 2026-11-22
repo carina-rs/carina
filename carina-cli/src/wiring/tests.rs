@@ -16,6 +16,45 @@ fn test_github_source(value: &str) -> carina_core::provider_source::GithubSource
 
 use super::*;
 
+#[test]
+fn prefix_pair_resolution_cannot_drop_a_deferred_finding() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        carina_core::schema::ResourceSchema::new("Sink")
+            .attribute(
+                carina_core::schema::AttributeSchema::required(
+                    "name",
+                    carina_core::schema::AttributeType::string(),
+                )
+                .build(),
+            )
+            .attribute(
+                carina_core::schema::AttributeSchema::provider_populated(
+                    "identifier",
+                    carina_core::schema::AttributeType::string(),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let context =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let parsed = carina_core::parser::parse_file_and_resolve(
+        "let src = mock.Sink { name = 'source' }\nmock.Sink { name_prefix = src.identifier }",
+        std::path::Path::new("test.crn"),
+        &context,
+    )
+    .unwrap();
+    let pair = CanonicalResourcePair::for_test(resolve_file_for_test(parsed), Vec::new());
+    let error = pair.resolve_attr_prefixes(&schemas).expect_err(
+        "a pair with a deferred companion must return its finding, never silent success",
+    );
+    assert_eq!(error.lines().count(), 1);
+    assert!(error.contains("'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply"));
+}
+
 #[tokio::test]
 async fn issue_4304_3a_review2_read_only_validation_preserves_authored_defaults() {
     let project = tempfile::tempdir().unwrap();
@@ -902,12 +941,7 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
         &[],
     );
     let resources = canonical_unresolved(Vec::new(), context.schemas());
-    let materialization =
-        DeferredForExpansionWitness::after_expansion(resources.parsed().deferred_for_expressions());
-    let expanded_resources = ExpandedCanonicalResources {
-        resources,
-        materialization,
-    };
+    let expanded_resources = ExpandedCanonicalResources { resources };
     let residual_deferred_for = expanded_resources
         .parsed()
         .deferred_for_expressions()
@@ -1300,11 +1334,10 @@ async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() 
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
@@ -1396,11 +1429,10 @@ async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_stat
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
@@ -1514,11 +1546,10 @@ fn anonymous_to_named_fixed_point_uses_state_origin_after_undeclared_hash_projec
         serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
     )
     .expect("write real state fixture");
-    let state_file = carina_state::state::check_and_migrate(
+    let state_file = carina_state::state::load_state(
         &std::fs::read_to_string(&state_path).expect("read real state fixture"),
     )
-    .expect("decode real state fixture")
-    .into_state();
+    .expect("decode real state fixture");
     let state_origin =
         ResolvedResourceId::with_provider_identity("test", "thing", STATE_ORIGIN, None);
     let projected_hash =
@@ -1618,11 +1649,10 @@ let first = test.thing {
         )
         .expect("write real state fixture");
         let state_file = Some(
-            carina_state::state::check_and_migrate(
+            carina_state::state::load_state(
                 &std::fs::read_to_string(&state_path).expect("read real state fixture"),
             )
-            .expect("decode real state fixture")
-            .into_state(),
+            .expect("decode real state fixture"),
         );
 
         let planned = create_plan_from_parsed_with_upstream_with_ctx(
@@ -1745,11 +1775,10 @@ let direct = awscc.ec2.Route {
         )
         .expect("write real state fixture");
         let state_file = Some(
-            carina_state::state::check_and_migrate(
+            carina_state::state::load_state(
                 &std::fs::read_to_string(&state_path).expect("read real state fixture"),
             )
-            .expect("decode real state fixture")
-            .into_state(),
+            .expect("decode real state fixture"),
         );
 
         let planned = create_plan_from_parsed_with_upstream_with_ctx(
@@ -6783,9 +6812,9 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
 
     let resource = Resource::with_provider("mock", "test.Resource", "unknown", None);
     let address = StateBlockAddress::new("mock", "test.Resource", "unknown");
-    let state = carina_state::check_and_migrate(
+    let state = carina_state::load_state(
         &serde_json::json!({
-            "version": 20,
+            "version": 21,
             "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
             "serial": 1,
             "lineage": "import-unknown",
@@ -6794,6 +6823,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
                 "resource_type": "test.Resource",
                 "identity": "unknown",
                 "provider": "mock",
+                "dependency_bindings": [],
                 "current": {
                     "kind": "create_outcome_unknown",
                     "started_at": "2026-10-23T08:00:00Z"
@@ -6803,8 +6833,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
         })
         .to_string(),
     )
-    .unwrap()
-    .into_state();
+    .unwrap();
     let state_file = Some(state);
     let state_blocks = vec![StateBlock::Import {
         to: address.clone(),
@@ -6905,9 +6934,9 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
         "shared",
         Some("unknown".to_string()),
     );
-    let state = carina_state::check_and_migrate(
+    let state = carina_state::load_state(
         &serde_json::json!({
-            "version": 20,
+            "version": 21,
             "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
             "serial": 1,
             "lineage": "import-other-instance",
@@ -6916,6 +6945,7 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
                 "resource_type": "test.Resource",
                 "identity": "shared",
                 "provider": "mock",
+                "dependency_bindings": [],
                 "current": {
                     "kind": "create_outcome_unknown",
                     "started_at": "2026-10-23T08:00:00Z"
@@ -6926,8 +6956,7 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
         })
         .to_string(),
     )
-    .unwrap()
-    .into_state();
+    .unwrap();
     let state_file = Some(state);
     let state_blocks = vec![StateBlock::Import {
         to: StateBlockAddress::new("mock", "test.Resource", "shared"),
@@ -8381,11 +8410,10 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let canonical_resources = canonical_pair_from_resolved(
@@ -8562,29 +8590,19 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     let mut loop_children = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
-            carina_core::parser::expand_deferred_children(
-                anonymous_loop,
-                match (Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::String("route".into()),
-                )])))
-                .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
-                .map(|proof| proof.into_classification())
-                .unwrap()
-                {
-                    carina_core::resource::knowledge::Classification::Known(value) => {
-                        carina_core::resource::knowledge::PlanIterable::from_known(value).unwrap()
-                    }
-                    carina_core::resource::knowledge::Classification::ShapeKnown(value) => {
-                        carina_core::resource::knowledge::PlanIterable::from_shape(value).unwrap()
-                    }
-                    carina_core::resource::knowledge::Classification::Pending(_)
-                    | carina_core::resource::knowledge::Classification::Failed(_) => {
-                        panic!("fixture collection has exact shape")
-                    }
-                },
-                carina_core::resource::AccessMissPolicy::Error,
+            let mut file = carina_core::parser::ExpandedParsedFile::default();
+            file.replace_deferred_for_expressions(
+                carina_core::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                    anonymous_loop.clone(),
+                ]),
+            );
+            file.expand_deferred_for_expressions(
+                &carina_core::binding_index::IterableBindings::from_upstream_only(
+                    expanded_remote_bindings.clone(),
+                ),
                 session,
             )
+            .map(|()| file.resources)
         },
     )
     .expect("deferred route loop expands");
@@ -8640,11 +8658,10 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let canonical_resources = canonical_pair_from_resolved(
@@ -8706,7 +8723,7 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     moves.sort();
     let mut expected = vec![
         ("_for0[0]".to_string(), loop_destination),
-        (named_orphan.to_string(), "named[0]".to_string()),
+        (named_orphan.to_string(), "named.named".to_string()),
     ];
     expected.sort();
     assert_eq!(
@@ -10923,7 +10940,8 @@ fn dependency_chain_wrappers_return_vec_app_error() {
     let mut resources: Vec<Resource> = Vec::new();
     let providers: Vec<carina_core::parser::ExpandedProviderConfig> = Vec::new();
 
-    let errors = resolve_attr_prefixes_with_ctx(&ctx, &mut resources);
+    let mut file = carina_core::parser::ExpandedParsedFile::default();
+    let errors = resolve_attr_prefixes_with_ctx(&ctx, &mut file);
     assert!(errors.is_empty(), "resolve_attr_prefixes: got {errors:?}");
 
     let canonical_resources =
@@ -11079,11 +11097,11 @@ fn deferred_block_name_conflict_reports_materialized_template_address() {
     let deferred = carina_core::parser::DeferredForExpression::new(
         Some("main.crn".to_string()),
         4,
-        "for item in pending.items".to_string(),
+        "for (_, item) in pending.items".to_string(),
         carina_core::parser::DeferredForTarget::bound(absolute_binding("rs"))
             .expect("fixture binding is valid"),
         Value::resource_ref("pending", "items", Vec::new()).resolve_root_for_test(),
-        carina_core::parser::ForBinding::Simple("item".to_string()),
+        carina_core::parser::ForBinding::Indexed("_".into(), "item".to_string()),
         template_resource,
     );
     let unresolved = carina_core::parser::ParsedFile::default();
@@ -11967,33 +11985,29 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("deferred map-loop fixture has no parser placeholders");
+    let iterables = carina_core::binding_index::IterableBindings::from_upstream_only(
+        carina_core::upstream_exports::remote_bindings_for_test(HashMap::from([(
+            "upstream".into(),
+            HashMap::from([(
+                "subnets".into(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "alpha".into(),
+                    Value::Concrete(ConcreteValue::String("subnet-a".into())),
+                )]))),
+            )]),
+        )])),
+    );
     let children = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
-            carina_core::parser::expand_deferred_children(
-                &parsed.deferred_for_expressions()[0],
-                match (Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-                    "alpha".to_string(),
-                    Value::Concrete(ConcreteValue::String("subnet-a".into())),
-                )]))))
-                .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
-                .map(|proof| proof.into_classification())
-                .unwrap()
-                {
-                    carina_core::resource::knowledge::Classification::Known(value) => {
-                        carina_core::resource::knowledge::PlanIterable::from_known(value).unwrap()
-                    }
-                    carina_core::resource::knowledge::Classification::ShapeKnown(value) => {
-                        carina_core::resource::knowledge::PlanIterable::from_shape(value).unwrap()
-                    }
-                    carina_core::resource::knowledge::Classification::Pending(_)
-                    | carina_core::resource::knowledge::Classification::Failed(_) => {
-                        panic!("fixture collection has exact shape")
-                    }
-                },
-                carina_core::resource::AccessMissPolicy::Error,
-                session,
-            )
+            let mut file = carina_core::parser::ExpandedParsedFile::default();
+            file.replace_deferred_for_expressions(
+                carina_core::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                    parsed.deferred_for_expressions()[0].clone(),
+                ]),
+            );
+            file.expand_deferred_for_expressions(&iterables, session)
+                .map(|()| file.resources)
         },
     )
     .expect("planning-time upstream map expands");
@@ -15108,6 +15122,7 @@ mod resolved_value_constraint_gate {
             &data_source_origins,
         )
         .await
+        .map(|_| ())
         .map_err(into_plan_errors)
     }
 
@@ -15217,6 +15232,7 @@ mod resolved_value_constraint_gate {
                 &[],
             )
             .await
+            .map(|_| ())
             .map_err(into_plan_errors)
     }
 

@@ -48,6 +48,7 @@ pub(crate) enum ResourceParseTarget {
     Bound {
         binding: String,
     },
+    LoopChild(crate::resource::BoundForAddress<RelativeBindingName>),
     DeferredForTemplate {
         target: BoundDeferredTarget<RelativeBindingName>,
     },
@@ -82,6 +83,12 @@ pub(crate) fn parse_resource_for_target(
             provider,
             resource_type.clone(),
             ResourceIdentity::new(binding.clone()),
+            None,
+        ),
+        ResourceParseTarget::LoopChild(address) => ResourceId::with_provider_identity(
+            provider,
+            resource_type.clone(),
+            address.identity(),
             None,
         ),
         ResourceParseTarget::DeferredForTemplate { target } => {
@@ -142,6 +149,16 @@ pub(crate) fn parse_resource_for_target(
                 directives.provider_instance.clone(),
             ),
             Some(RelativeBindingName::new(binding)),
+            LoopProvenance::default(),
+        ),
+        ResourceParseTarget::LoopChild(address) => (
+            ResourceId::with_provider_identity(
+                provider,
+                resource_type,
+                address.identity(),
+                directives.provider_instance.clone(),
+            ),
+            Some(address.binding_address().clone()),
             LoopProvenance::default(),
         ),
         ResourceParseTarget::DeferredForTemplate { target } => (

@@ -285,8 +285,8 @@ fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outc
             let bindings = judged.parsed().binding_index(&catalog);
             let mut validation: ConversionValidation = ConversionValidation::new(judged.report());
             carina_core::validation::deferred_types::with_session_for_test(&catalog, |session| {
-                let findings = validation.admit_resource(ResourceAdmissionRequest::new(resource, resource.quoted_string_attrs(), inputs,
-                    carina_core::validation::admission::attributes::ValidationEvaluation::None, &bindings, session).unwrap()).values;
+                let (findings, _prefixes_for_test) = validation.admit_resource(ResourceAdmissionRequest::new(resource, resource.quoted_string_attrs(), inputs,
+                    carina_core::validation::admission::attributes::ValidationEvaluation::None, &bindings, session).unwrap()).values.into_parts();
                 ordinary.push(
                     findings
                         .errors()

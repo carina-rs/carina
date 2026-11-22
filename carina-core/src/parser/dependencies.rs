@@ -239,7 +239,7 @@ impl UnexpandedDependencies<RelativeBindingName> {
         source: &std::path::Path,
         context: &super::context::ParseContext<'_>,
     ) -> Result<(), super::ParseError> {
-        use crate::resource::{PathSegment, Subscript, binding_address};
+        use crate::resource::binding_address::BindingLookup;
         let mut bindings = std::collections::HashSet::new();
         for value in attributes.values() {
             value.visit_binding_refs(&mut |binding| {
@@ -259,7 +259,7 @@ impl UnexpandedDependencies<RelativeBindingName> {
             let Some(name) = parts.next() else {
                 continue;
             };
-            let mut binding = match context.lookup_binding(name.as_str()) {
+            let binding = match context.lookup_binding(name.as_str()) {
                 super::context::ParseBindingRef::Structural(handle) => {
                     handle.canonical_binding().clone()
                 }
@@ -268,33 +268,24 @@ impl UnexpandedDependencies<RelativeBindingName> {
                     RelativeBindingName::new(name.as_str())
                 }
             };
-            let selected_prefix = format!("{}[", binding.as_str());
             if !bindings.contains(&crate::resource::DependencyKey::new(binding.clone()))
                 && !bindings
                     .iter()
-                    .any(|binding| binding.starts_with(&selected_prefix))
+                    .any(|selected| selected.is_descendant_of(&binding))
             {
                 continue;
             }
+            let mut lookup = BindingLookup::new(&binding);
             for step in parts {
-                binding =
-                    match super::expressions::primary::parse_postfix_path_segment(step, context)? {
-                        PathSegment::Subscript {
-                            index: Subscript::Int { index },
-                        } => binding_address::binding_with_index(&binding, index),
-                        PathSegment::Subscript {
-                            index: Subscript::Str { key },
-                        } => binding_address::binding_with_map_key(&binding, &key),
-                        PathSegment::Field { name } => {
-                            binding_address::binding_selected_attribute(&binding, &name)
-                        }
-                    };
+                lookup = lookup.step(&super::expressions::primary::parse_postfix_path_segment(
+                    step, context,
+                )?);
             }
-            if bindings.contains(&crate::resource::DependencyKey::new(binding.clone())) {
-                self.binding_reference_origins.push(super::Located::new(
+            if bindings.contains(&lookup.dependency()) {
+                lookup.record_origin(
                     super::DeclarationLocation::from_pair(&reference, file, source),
-                    binding,
-                ));
+                    &mut self.binding_reference_origins,
+                );
             }
         }
         Ok(())

@@ -251,7 +251,7 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
     let config = context();
     let expanded = expand_directory(root.path());
     let analysis = AnalysisTree::try_from_file(&expanded)?;
-    assert_eq!(analysis.resources().count(), 20);
+    assert_eq!(analysis.resources().count(), 21);
     let child_path = root.path().join("child/sibling.crn");
     let caller_path = root.path().join("sibling.crn");
     for item in analysis.resources() {
@@ -287,9 +287,11 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
                             "read mock.test.Lookup { name = 'then read' }"
                         }
                         "selected_read" => "read mock.test.Lookup { name = 'else read' }",
-                        "generated[?]" => "mock.test.Resource { name = n }",
+                        "generated.a" | "generated.b" | "generated.c" => {
+                            "mock.test.Resource { name = n }"
+                        }
                         "later[?]" => "mock.test.Resource { deferred_name = n }",
-                        "generated_reads[0]" | "generated_reads[1]" => {
+                        "generated_reads.a" | "generated_reads.b" => {
                             "read mock.test.Lookup { name = n }"
                         }
                         other => panic!("unexpected expanded binding {other}"),
@@ -319,8 +321,9 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
             "second.selected_read",
             "read mock.test.Lookup { name = 'else read' }",
         ),
-        ("first.generated[?]", "mock.test.Resource { name = n }"),
-        ("second.generated[?]", "mock.test.Resource { name = n }"),
+        ("first.generated.a", "mock.test.Resource { name = n }"),
+        ("first.generated.b", "mock.test.Resource { name = n }"),
+        ("second.generated.c", "mock.test.Resource { name = n }"),
     ] {
         let item = analysis
             .resources()
@@ -337,30 +340,25 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
                 "materialized".into(),
             )),
         ]));
+    let iterables = carina_core::binding_index::IterableBindings::from_upstream_only(
+        carina_core::upstream_exports::remote_bindings_for_test(std::collections::HashMap::from([
+            (
+                "remote".into(),
+                std::collections::HashMap::from([("items".into(), concrete)]),
+            ),
+        ])),
+    );
     for deferred in expanded.deferred_for_expressions().iter() {
         let children = TypeCheckSession::run(&config, |session| {
-            carina_core::parser::expand_deferred_children(
-                deferred,
-                match concrete
-                    .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
-                    .map(|proof| proof.into_classification())
-                    .unwrap()
-                {
-                    carina_core::resource::knowledge::Classification::Known(value) => {
-                        carina_core::resource::knowledge::PlanIterable::from_known(value).unwrap()
-                    }
-                    carina_core::resource::knowledge::Classification::ShapeKnown(value) => {
-                        carina_core::resource::knowledge::PlanIterable::from_shape(value).unwrap()
-                    }
-                    carina_core::resource::knowledge::Classification::Pending(_)
-                    | carina_core::resource::knowledge::Classification::Failed(_) => {
-                        panic!("fixture collection has exact shape")
-                    }
-                },
-                carina_core::resource::AccessMissPolicy::Error,
-                session,
-            )
-            .unwrap()
+            let mut file = carina_core::parser::ExpandedParsedFile::default();
+            file.replace_deferred_for_expressions(
+                carina_core::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                    deferred.clone(),
+                ]),
+            );
+            file.expand_deferred_for_expressions(&iterables, session)
+                .unwrap();
+            file.resources
         })
         .publish(&mut NoTypeErrors);
         let mut child_tree = carina_core::parser::ExpandedParsedFile::default();
@@ -368,7 +366,7 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
         let analysis = AnalysisTree::try_from_file(&child_tree)?;
         let item = analysis.resources().next().unwrap();
         assert_ne!(item.id(), deferred.template_resource_id());
-        let declaration = if item.binding().unwrap().contains(".generated[") {
+        let declaration = if deferred.attributes().contains_key("name") {
             "mock.test.Resource { name = n }"
         } else {
             "mock.test.Resource { deferred_name = n }"

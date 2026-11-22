@@ -1,55 +1,52 @@
 //! State file structures for persisting infrastructure state
 
+use std::borrow::Cow;
+
 use carina_core::binding_index::SecretPreservingAttributes;
 use carina_core::differ::{ComparisonContext, Orphan, ReferenceEquality};
-use carina_core::effect::{MoveAuthority, ReleaseListKeysEffect, ResolvedMovePairs};
+use carina_core::effect::{MoveAuthority, ReleaseListKeysEffect};
 use carina_core::executor::{AcceptedRequest, AcceptedRequestKind};
 use carina_core::explicit::{self, ExplicitFields};
 use carina_core::name_override::NameOverrideSource;
 pub use carina_core::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use carina_core::parser::StateBlockAddress;
 use carina_core::plan::ReplacementPreviousAttributesForStateWriteback;
-pub use carina_core::provider::PreviousSecretHashAuthority;
 use carina_core::provider::{
     AppliedIdentifier, EmptyAppliedIdentifier, HostCreateObservation, HostIdentifiedCreate,
     InFlightCreate, InFlightPersistence, NestedWriteOnlyRecord, PersistedAttributes,
     PersistedAttributesError, RawSavedAttrs, Sent, SentDesiredAttributes, SentRecord,
     StateTransformMap, UnknownCreateOutcome, merge_previous_secret_hashes_into_provider_value,
-    previous_hash,
-};
-use carina_core::resolved_graph::{
-    ConfiguredResources, ExpandedBindingIndex, ExpandedGraphResolutionError,
-    LegacyClassificationGraph, ResolvedExpandedGraph,
+    previous_hash, restrict_previous_secret_hashes_to_leaves,
 };
 pub use carina_core::resource::DeposedKey;
 #[cfg(test)]
 use carina_core::resource::Resource;
+use carina_core::resource::knowledge::is_known_public;
 use carina_core::resource::{
     AbsoluteBindingAddress, ConcreteValue, Current, DataSource, PartialReadMarker, PendingReRead,
-    PersistedDestroyDependencies, PersistedDestroyDependencyProjection, PersistedDirectives,
-    ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity, SnapshotState,
-    SnapshotValue, State, StateValueLeaf, UnavailableSecretError, Value,
+    PersistedDestroyDependencies, PersistedDirectives, ResolvedResource, ResolvedResourceId,
+    ResourceId, ResourceIdentity, SnapshotState, SnapshotValue, State, StateValueLeaf,
+    UnavailableSecretError, Value,
 };
 use carina_core::schema::{
-    CompiledResourceSchema as ResourceSchema, FieldName, SchemaKind, SchemaRegistry,
+    CompiledResourceSchema as ResourceSchema, FieldName, LeafPath, SchemaKind, SchemaRegistry,
     schema_write_only_keys,
 };
+use carina_core::validation::admission::final_input::{FinalDesiredAttributes, FinalDesiredValues};
 use carina_core::value::{
     PersistedExportValue, PersistedValue, SerializationError, contains_unredacted_secret,
     merge_secrets_into_observation_json, merge_secrets_into_provider_json,
     union_secret_shapes_after_resolution,
 };
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::backend::{BackendError, InvalidResourceIdentityError, InvalidStateJsonError};
-pub use carina_core::state_document::{CurrentInstance, LegacyDependencyNames};
+pub use carina_core::state_document::CurrentInstance;
 use carina_core::state_document::{
-    ExportsVersionClassification, LegacyRowDependencies,
-    StateDocumentDecodeError as StateFileDecodeError, StateDocumentVersion,
-    classify_exports_version, decode_persisted_exports, validate_deposed_identities,
-    validate_resource_identities,
+    StateDocumentDecodeError as StateFileDecodeError, decode_persisted_exports,
+    validate_deposed_identities, validate_exports_version, validate_resource_identities,
 };
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -76,6 +73,62 @@ fn recorded_write_only_keys(
     keys.extend(orphan_recorded.iter().cloned());
     keys.retain(|key| attributes.contains_key(key));
     keys
+}
+
+// Release authority is private to the row serialization seam. Public row
+// writers receive previous attributes and cannot choose a releasing policy.
+enum PreviousSecretHashAuthority<'a> {
+    None,
+    AllPreviouslyHashedKeys(&'a PersistedAttributes),
+    MatchingFinalDesiredValue {
+        previous: &'a PersistedAttributes,
+        desired: &'a FinalDesiredAttributes,
+    },
+    AcceptedWrite {
+        previous: &'a PersistedAttributes,
+        request: &'a AcceptedRequest,
+        request_attributes: Cow<'a, IndexMap<String, Value>>,
+        final_desired: Option<&'a FinalDesiredAttributes>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct DesiredValueComparison<'a> {
+    schema: Option<&'a ResourceSchema>,
+    context: carina_core::differ::ComparisonSchema<'a>,
+}
+
+/// Whether desired provides a fully concrete public value for an attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesiredKey {
+    Absent,
+    KnownPublic,
+    NotKnownPublic,
+}
+
+impl DesiredKey {
+    fn from_attributes(attributes: &IndexMap<String, Value>, key: &str) -> Self {
+        // Known proofs can contain protected Secret nodes; exclude those too.
+        match attributes.get(key) {
+            None => Self::Absent,
+            Some(value) if is_known_public(value) => Self::KnownPublic,
+            Some(_) => Self::NotKnownPublic,
+        }
+    }
+}
+
+/// Whether desired-secret masking has already protected the provider value.
+#[derive(Clone, Copy)]
+enum PreviousSecretHashInput<'a> {
+    ProviderValue(Option<&'a PersistedValue>),
+    DesiredSecretsMasked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviousSecretHashDecision<'a> {
+    Release,
+    Protect,
+    ProtectLeaves(&'a [LeafPath]),
 }
 
 /// Provider values selected for a state row before secret protection.
@@ -212,51 +265,135 @@ impl SelectedStateAttributes {
         }
     }
 
-    fn authority_attributes(
-        authority: PreviousSecretHashAuthority<'_>,
-    ) -> Option<&PersistedAttributes> {
+    fn authority_attributes<'a>(
+        authority: &'a PreviousSecretHashAuthority<'_>,
+    ) -> Option<&'a PersistedAttributes> {
         match authority {
             PreviousSecretHashAuthority::None => None,
             PreviousSecretHashAuthority::AllPreviouslyHashedKeys(attributes)
-            | PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired(attributes) => {
-                Some(attributes)
+            | PreviousSecretHashAuthority::MatchingFinalDesiredValue {
+                previous: attributes,
+                ..
             }
+            | PreviousSecretHashAuthority::AcceptedWrite {
+                previous: attributes,
+                ..
+            } => Some(attributes),
         }
     }
 
-    fn authority_protects_key(
-        authority: PreviousSecretHashAuthority<'_>,
-        key_is_desired: bool,
-    ) -> bool {
-        match authority {
-            PreviousSecretHashAuthority::None => false,
-            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(_) => true,
-            PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired(_) => !key_is_desired,
+    fn decide_previous_secret_hash<'a>(
+        authority: &'a PreviousSecretHashAuthority<'_>,
+        key: &str,
+        input: PreviousSecretHashInput<'_>,
+        comparison: Option<DesiredValueComparison<'_>>,
+    ) -> PreviousSecretHashDecision<'a> {
+        if let PreviousSecretHashAuthority::AcceptedWrite {
+            request,
+            request_attributes,
+            ..
+        } = authority
+            && (matches!(input, PreviousSecretHashInput::DesiredSecretsMasked)
+                || DesiredKey::from_attributes(request_attributes, key) == DesiredKey::KnownPublic)
+        {
+            match request.kind() {
+                AcceptedRequestKind::Create => return PreviousSecretHashDecision::Release,
+                AcceptedRequestKind::Update { sent, removed: _ } => {
+                    if let Some(sent) = sent.get(key) {
+                        return if sent.grafted_leaves().is_empty() {
+                            PreviousSecretHashDecision::Release
+                        } else {
+                            PreviousSecretHashDecision::ProtectLeaves(sent.grafted_leaves())
+                        };
+                    }
+                }
+            }
+        }
+        let provider_value = match input {
+            PreviousSecretHashInput::ProviderValue(value) => value,
+            // Only accepted public writes above can release previous leaf
+            // hashes. Otherwise merge them into the already-masked value.
+            PreviousSecretHashInput::DesiredSecretsMasked => {
+                return if matches!(authority, PreviousSecretHashAuthority::None) {
+                    PreviousSecretHashDecision::Release
+                } else {
+                    PreviousSecretHashDecision::Protect
+                };
+            }
+        };
+        let final_desired = match authority {
+            PreviousSecretHashAuthority::None => return PreviousSecretHashDecision::Release,
+            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(_) => {
+                return PreviousSecretHashDecision::Protect;
+            }
+            PreviousSecretHashAuthority::AcceptedWrite { final_desired, .. } => match final_desired
+            {
+                Some(desired) => *desired,
+                None => return PreviousSecretHashDecision::Protect,
+            },
+            PreviousSecretHashAuthority::MatchingFinalDesiredValue { desired, .. } => *desired,
+        };
+        let desired_attributes = final_desired.attributes();
+        if DesiredKey::from_attributes(desired_attributes, key) != DesiredKey::KnownPublic {
+            return PreviousSecretHashDecision::Protect;
+        }
+        // Decode through the existing state projection. A retained hash has no
+        // plaintext projection and cannot prove equality to a final public value.
+        // Neither comparison operand nor projection error leaves this seam.
+        let provider_plaintext = provider_value
+            .and_then(PersistedValue::decode)
+            .and_then(|value| value.to_value_at(key).ok());
+        if provider_plaintext
+            .as_ref()
+            .zip(comparison)
+            .is_some_and(|(provider, comparison)| {
+                carina_core::differ::public_final_desired_matches_provider(
+                    provider,
+                    final_desired,
+                    key,
+                    comparison.schema,
+                    &comparison.context,
+                )
+            })
+        {
+            PreviousSecretHashDecision::Release
+        } else {
+            PreviousSecretHashDecision::Protect
         }
     }
 
     fn protect_previous_secret_hashes(
         &mut self,
-        authority: PreviousSecretHashAuthority<'_>,
-        mut is_desired_key: impl FnMut(&str) -> bool,
+        authority: &PreviousSecretHashAuthority<'_>,
         protected_secret_keys: &mut HashSet<String>,
+        comparison: Option<DesiredValueComparison<'_>>,
     ) -> Result<(), SerializationError> {
         let Some(previous) = Self::authority_attributes(authority) else {
             return Ok(());
         };
         let keys = previous.keys().cloned().collect::<Vec<_>>();
         for key in keys {
-            if protected_secret_keys.contains(&key)
-                || !Self::authority_protects_key(authority, is_desired_key(&key))
-                || (self.write_only_keys.contains(&key) && !self.retained_write_only.contains(&key))
-            {
+            if self.write_only_keys.contains(&key) && !self.retained_write_only.contains(&key) {
                 continue;
             }
             let Some(previous_value) = previous.encoded_value(&key) else {
                 continue;
             };
+            let input = if protected_secret_keys.contains(&key) {
+                PreviousSecretHashInput::DesiredSecretsMasked
+            } else {
+                PreviousSecretHashInput::ProviderValue(self.encoded.get(&key))
+            };
+            let previous_value =
+                match Self::decide_previous_secret_hash(authority, &key, input, comparison) {
+                    PreviousSecretHashDecision::Release => continue,
+                    PreviousSecretHashDecision::Protect => Cow::Borrowed(previous_value),
+                    PreviousSecretHashDecision::ProtectLeaves(leaves) => Cow::Owned(
+                        restrict_previous_secret_hashes_to_leaves(previous_value, leaves)?,
+                    ),
+                };
             let Some(masked) = merge_previous_secret_hashes_into_provider_value(
-                previous_value,
+                &previous_value,
                 self.encoded.get(&key),
             )?
             else {
@@ -274,6 +411,7 @@ impl SelectedStateAttributes {
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
         preferred_hashes: Option<&PersistedAttributes>,
         strict_desired: bool,
+        comparison: Option<DesiredValueComparison<'_>>,
     ) -> Result<Self, SerializationError> {
         let mut protected_secret_keys = HashSet::new();
         for (key, desired_value) in &resource.attributes {
@@ -287,7 +425,7 @@ impl SelectedStateAttributes {
             }
             let previous = previous_hash(
                 preferred_hashes,
-                Self::authority_attributes(previous_hash_authority),
+                Self::authority_attributes(&previous_hash_authority),
                 key,
             );
             let masked = match self.encoded.get(key).cloned() {
@@ -317,9 +455,9 @@ impl SelectedStateAttributes {
             }
         }
         self.protect_previous_secret_hashes(
-            previous_hash_authority,
-            |key| resource.attributes.contains_key(key),
+            &previous_hash_authority,
             &mut protected_secret_keys,
+            comparison,
         )?;
         Ok(self)
     }
@@ -327,8 +465,10 @@ impl SelectedStateAttributes {
     fn protect_observation<S>(
         mut self,
         resource: &ResolvedResource<S>,
-        previous_hash_authority: PreviousSecretHashAuthority<'_>,
+        previous_attributes: Option<&PersistedAttributes>,
+        final_desired: Option<&FinalDesiredAttributes>,
         preferred_hashes: Option<&PersistedAttributes>,
+        comparison: Option<DesiredValueComparison<'_>>,
     ) -> Result<Self, SerializationError> {
         let mut protected_secret_keys = HashSet::new();
         for (key, desired_value) in &resource.attributes {
@@ -338,11 +478,7 @@ impl SelectedStateAttributes {
             let Some(observed_or_sent_value) = self.encoded.get(key).cloned() else {
                 continue;
             };
-            let previous = previous_hash(
-                preferred_hashes,
-                Self::authority_attributes(previous_hash_authority),
-                key,
-            );
+            let previous = previous_hash(preferred_hashes, previous_attributes, key);
             let masked = merge_secrets_into_observation_json(
                 desired_value,
                 &observed_or_sent_value,
@@ -354,9 +490,17 @@ impl SelectedStateAttributes {
 
         let present_keys = self.encoded.keys().cloned().collect::<HashSet<_>>();
         self.protect_previous_secret_hashes(
-            previous_hash_authority,
-            |key| resource.attributes.contains_key(key),
+            &match (previous_attributes, final_desired) {
+                (Some(previous), Some(desired)) => {
+                    PreviousSecretHashAuthority::MatchingFinalDesiredValue { previous, desired }
+                }
+                (Some(previous), None) => {
+                    PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous)
+                }
+                (None, _) => PreviousSecretHashAuthority::None,
+            },
             &mut protected_secret_keys,
+            comparison,
         )?;
         self.encoded.retain(|key, _| present_keys.contains(key));
         Ok(self)
@@ -367,9 +511,9 @@ impl SelectedStateAttributes {
         previous: &PersistedAttributes,
     ) -> Result<Self, SerializationError> {
         self.protect_previous_secret_hashes(
-            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous),
-            |_| false,
+            &PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous),
             &mut HashSet::new(),
+            None,
         )?;
         Ok(self)
     }
@@ -418,6 +562,16 @@ pub enum RowBasis<'a> {
     Carried,
 }
 
+/// Provenance of a row rebuilt from provider material. An observation never
+/// carries an accepted request; only the provider branch has a RowBasis.
+pub enum ResourceStateWrite<'a> {
+    Provider {
+        state: &'a SnapshotState,
+        basis: RowBasis<'a>,
+    },
+    Observation(&'a HostIdentifiedCreate),
+}
+
 #[derive(Debug, Clone)]
 enum DesiredAuthoringBasis<'a> {
     Sent(SentDesiredAttributes<'a>),
@@ -437,7 +591,6 @@ pub struct PublishedExports {
 
 #[derive(Deserialize)]
 struct PublishedExportsEnvelope {
-    version: u32,
     exports_version: Option<u32>,
     #[serde(default)]
     exports: HashMap<String, serde_json::Value>,
@@ -446,48 +599,21 @@ struct PublishedExportsEnvelope {
 impl PublishedExports {
     /// Current persisted exports encoding version.
     ///
-    /// Bump this only when [`PersistedExportValue`]'s encoding changes. The
-    /// state-format changes in v12, v13, and v14 would each have required an
-    /// exports-version bump if this independent contract had existed then.
+    /// Bump this only when [`PersistedExportValue`]'s encoding changes.
     pub const CURRENT_VERSION: u32 = carina_core::state_document::CURRENT_EXPORTS_VERSION;
 
-    /// Read the published-exports envelope from raw state-file bytes.
-    ///
-    /// Current exports encodings are decoded directly without deserializing
-    /// resource rows or checking [`StateFile::CURRENT_VERSION`]. State files
-    /// written before the independent exports version existed are migrated
-    /// through the legacy full-state path because their value encoding may
-    /// require the v12-v14 migrations.
+    /// Read exports without decoding resource rows or checking their state version.
     pub fn from_state_bytes(bytes: &[u8]) -> Result<Self, BackendError> {
-        Self::decode_state_bytes(bytes).map(|(exports, _)| exports)
-    }
-
-    pub(crate) fn decode_state_bytes(
-        bytes: &[u8],
-    ) -> Result<(Self, Option<MigrationInfo>), BackendError> {
         let envelope: PublishedExportsEnvelope =
             serde_json::from_slice(bytes).map_err(|error| {
                 BackendError::InvalidState(format!(
                     "Failed to parse published exports envelope: {error}"
                 ))
             })?;
-
-        match classify_exports_version(envelope.version, envelope.exports_version)
-            .map_err(|error| map_state_file_decode_error(error, None))?
-        {
-            ExportsVersionClassification::Current => decode_persisted_exports(envelope.exports)
-                .map(|values| (Self { values }, None))
-                .map_err(|error| map_state_file_decode_error(error, None)),
-            ExportsVersionClassification::Legacy => {
-                let (state, migration) = check_and_migrate_bytes(bytes)?.into_parts();
-                Ok((
-                    Self {
-                        values: state.exports,
-                    },
-                    migration,
-                ))
-            }
-        }
+        validate_exports_version(envelope.exports_version).map_err(map_state_file_decode_error)?;
+        decode_persisted_exports(envelope.exports)
+            .map(|values| Self { values })
+            .map_err(map_state_file_decode_error)
     }
 
     pub fn values(&self) -> &HashMap<String, PersistedExportValue> {
@@ -495,24 +621,9 @@ impl PublishedExports {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CurrentExportsVersion;
-
-impl Serialize for CurrentExportsVersion {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_u32(PublishedExports::CURRENT_VERSION)
-    }
-}
-
 /// The main state file structure that persists to the backend
 #[derive(Debug, Clone)]
 pub struct StateFile {
-    /// State file format version
-    pub version: u32,
-    exports_version_marker: CurrentExportsVersion,
     /// Monotonically increasing number for each state modification
     pub serial: u64,
     /// Unique identifier for this state lineage (prevents accidental overwrites)
@@ -523,11 +634,6 @@ pub struct StateFile {
     resources: Vec<ResourceState>,
     /// Published exports for remote_state consumers
     pub exports: HashMap<String, PersistedExportValue>,
-    /// Pre-v21 kind-blind binding snapshots. These are deliberately outside
-    /// [`ResourceState`]: source-less commands may inspect them, but only the
-    /// expanded-graph classifier can clear them and make the file writable.
-    legacy_dependencies: BTreeMap<ResolvedResourceId, LegacyRowDependencies>,
-    dependency_encoding: DependencyEncoding,
     /// Loaded field order; typed values and lifecycle state remain authoritative.
     wire_order: Option<std::sync::Arc<carina_core::json_field_order::JsonFieldOrder>>,
     /// Immutable evidence produced by the original decode, before mutations
@@ -542,17 +648,10 @@ impl carina_core::value::BindingState for StateFile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DependencyEncoding {
-    PendingLegacy,
-    Current,
-}
-
 #[derive(Serialize)]
 struct WritableStateFile<'a> {
     version: u32,
-    #[serde(rename = "exports_version")]
-    exports_version_marker: CurrentExportsVersion,
+    exports_version: u32,
     serial: u64,
     lineage: &'a str,
     carina_version: &'a str,
@@ -566,17 +665,9 @@ impl Serialize for StateFile {
     where
         S: serde::Serializer,
     {
-        if self.dependency_encoding != DependencyEncoding::Current
-            || self.version != Self::CURRENT_VERSION
-            || !self.legacy_dependencies.is_empty()
-        {
-            return Err(serde::ser::Error::custom(
-                "pre-v21 dependency names require configuration-aware migration before state can be written",
-            ));
-        }
         let wire = WritableStateFile {
-            version: self.version,
-            exports_version_marker: self.exports_version_marker,
+            version: Self::CURRENT_VERSION,
+            exports_version: PublishedExports::CURRENT_VERSION,
             serial: self.serial,
             lineage: &self.lineage,
             carina_version: &self.carina_version,
@@ -748,13 +839,16 @@ impl FromIterator<(ResolvedResourceId, Orphan)> for LoadedOrphans {
     }
 }
 
-fn map_state_file_decode_error(
-    error: StateFileDecodeError,
-    migration_from: Option<u32>,
-) -> BackendError {
+fn map_state_file_decode_error(error: StateFileDecodeError) -> BackendError {
     match error {
         StateFileDecodeError::ExportsVersionTooNew { found, supported } => {
             BackendError::ExportsVersionTooNew { found, supported }
+        }
+        StateFileDecodeError::StateVersionTooOld { found, supported } => {
+            BackendError::StateVersionTooOld { found, supported }
+        }
+        StateFileDecodeError::StateVersionTooNew { found, supported } => {
+            BackendError::StateVersionTooNew { found, supported }
         }
         StateFileDecodeError::InvalidResourceIdentity {
             resource_index,
@@ -770,22 +864,12 @@ fn map_state_file_decode_error(
             source,
         )
         .into(),
-        StateFileDecodeError::StateVersionTooNew { found, supported } => {
-            BackendError::StateVersionTooNew { found, supported }
+        StateFileDecodeError::Json { json_path, source } => BackendError::InvalidStateJson(
+            InvalidStateJsonError::new("Failed to parse state file".to_string(), json_path, source),
+        ),
+        StateFileDecodeError::Validation(message) => {
+            BackendError::InvalidState(format!("Failed to parse state file: {message}"))
         }
-        StateFileDecodeError::Json { json_path, source } => {
-            let context = match migration_from {
-                Some(version) => format!("Failed to migrate state file from v{version}"),
-                None => "Failed to parse state file".to_string(),
-            };
-            BackendError::InvalidStateJson(InvalidStateJsonError::new(context, json_path, source))
-        }
-        StateFileDecodeError::Validation(message) => match migration_from {
-            Some(version) => BackendError::InvalidState(format!(
-                "Failed to migrate state file from v{version}: {message}"
-            )),
-            None => BackendError::InvalidState(format!("Failed to parse state file: {message}")),
-        },
     }
 }
 
@@ -795,8 +879,6 @@ impl StateFile {
         &self,
     ) -> Result<ObservationStateAuthority, StateFileDecodeError> {
         // Synthetic fixtures can mutate or construct their entire history.
-        // Their rows already use current dependency types, even if the fixture
-        // retains a pending legacy migration outside those rows.
         #[derive(Serialize)]
         struct ObservationFile<'a> {
             version: u32,
@@ -826,8 +908,8 @@ impl StateFile {
 
     /// Crate-private validated parse seam. `StateFile` intentionally has no
     /// public `Deserialize` impl: every external parse must go through the
-    /// version gate ([`check_and_migrate`] or [`check_and_migrate_bytes`]), so
-    /// consumers cannot read future-version or unmigrated state files
+    /// version gate ([`load_state`] or [`load_state_bytes`]), so
+    /// consumers can read only current-version state files
     /// (carina#3731). Parsing here still validates duplicate identities on
     /// every parse (carina#2858).
     pub(crate) fn from_json_str(content: &str) -> Result<Self, StateFileDecodeError> {
@@ -835,8 +917,6 @@ impl StateFile {
             carina_core::value::ObservationState::read_state_file(content.as_bytes())?
                 .into_document_and_authority();
         Ok(Self {
-            version: document.version,
-            exports_version_marker: CurrentExportsVersion,
             serial: document.serial,
             lineage: document.lineage,
             carina_version: document.carina_version,
@@ -846,12 +926,6 @@ impl StateFile {
                 .map(ResourceState::from_decoded)
                 .collect(),
             exports: document.exports,
-            legacy_dependencies: document.legacy_dependencies,
-            dependency_encoding: if document.version < Self::CURRENT_VERSION {
-                DependencyEncoding::PendingLegacy
-            } else {
-                DependencyEncoding::Current
-            },
             wire_order: Some(document.wire_order),
             loaded_observation: Some(ObservationStateAuthority {
                 state: std::sync::Arc::new(authority),
@@ -859,70 +933,18 @@ impl StateFile {
         })
     }
 
-    /// Current state file format version
-    /// v2: Added identifier field to ResourceState
-    /// v3: Added binding and dependency_bindings fields to ResourceState
-    /// v4: Instance path addressing (dot notation instead of underscore prefix)
-    /// v5: Added exports field for remote_state output
-    /// v6: Replaced flat `desired_keys: Vec<String>` with recursive
-    ///     `explicit: ExplicitFields` (refs awscc#206). Reads of v5
-    ///     state lift each top-level key to a `Leaf` child of the
-    ///     root `Struct`; a later applied/imported desired write rebuilds
-    ///     a full tree from the resource's authored `Value`.
-    /// v7: Replaced top-level empty `ExplicitFields::Struct` with
-    ///     `ExplicitFields::Unrecorded`.
-    /// v8: Renamed `ResourceState.name` to `ResourceState.identity`.
-    /// v9: Added `ResourceState.deposed` (pre-replacement instances
-    ///     pending delete, including provider-instance routing); rows
-    ///     with `identifier: None` are retained while `deposed` is
-    ///     non-empty.
-    /// v10: Added `ExplicitFields::ListElements`, aligned by index with the
-    ///      stored list value in the same resource row.
-    /// v11: Removed legacy host-reserved `_`-prefixed keys from current and
-    ///      deposed provider attributes and from the top-level explicit tree.
-    /// v12: Persisted secret strings carry their own salt. Raw v11 legacy
-    ///      strings are upgraded using their resource-row identity.
-    /// v13: Persisted canonical enums use the host-reserved `$enum` tag and
-    ///      user map keys beginning with `$` are escaped with one extra `$`.
-    /// v14: Redacted secrets use the host-reserved `$secret` tag. Legacy
-    ///      marker strings are migrated only in resource attribute trees.
-    /// v15: Current instance is a tagged union. An applied identifier and a
-    ///      pending create continuation cannot coexist in one row.
-    /// v16: Added `ExplicitFields::WholeValue` with validated authored-path
-    ///      evidence for carried ambiguous-list removals. Older rows need no
-    ///      structural rewrite because they cannot contain the new marker.
-    /// v17: Added top-level `exports_version` so published exports have a
-    ///      compatibility contract independent of managed resource rows. See
-    ///      [`Self::EXPORTS_VERSION_INTRODUCED`].
-    /// v18: Added per-instance nested write-only leaf provenance. The v17
-    ///      migration initializes the record to empty.
-    /// v19: Replaced the partial-read marker's untyped detail with a typed
-    ///      pending re-read reason. The v18 migration classifies legacy
-    ///      details as incomplete reads.
-    /// v20: Added a token-less create-outcome-unknown current instance and
-    ///      made `prevent_destroy` tri-state so explicit false remains
-    ///      distinct from an unspecified schema-defaulted value.
-    /// v21: Replaced binding-text dependency records on current/deposed
-    ///      instances and persisted directives with complete resolved IDs.
+    /// Current state format: tagged current instances, structural persisted values,
+    /// independently versioned exports, and resolved managed-row dependencies.
     pub const CURRENT_VERSION: u32 = carina_core::state_document::CURRENT_STATE_VERSION;
-
-    /// State file version that introduced the independent exports version.
-    /// This value is fixed forever.
-    pub const EXPORTS_VERSION_INTRODUCED: u32 =
-        carina_core::state_document::EXPORTS_VERSION_INTRODUCED;
 
     /// Create a new empty state file
     pub fn new() -> Self {
         Self {
-            version: Self::CURRENT_VERSION,
-            exports_version_marker: CurrentExportsVersion,
             serial: 0,
             lineage: uuid::Uuid::new_v4().to_string(),
             carina_version: env!("CARGO_PKG_VERSION").to_string(),
             resources: Vec::new(),
             exports: HashMap::new(),
-            legacy_dependencies: BTreeMap::new(),
-            dependency_encoding: DependencyEncoding::Current,
             wire_order: None,
             loaded_observation: None,
         }
@@ -976,12 +998,8 @@ impl StateFile {
     /// Create a new state file with a specific lineage (for initialization)
     pub fn with_lineage(lineage: String) -> Self {
         Self {
-            version: Self::CURRENT_VERSION,
-            exports_version_marker: CurrentExportsVersion,
             serial: 0,
             lineage,
-            legacy_dependencies: BTreeMap::new(),
-            dependency_encoding: DependencyEncoding::Current,
             wire_order: None,
             loaded_observation: None,
             carina_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1073,290 +1091,6 @@ impl StateFile {
     /// APIs rather than exposing the backing vector.
     pub fn resources(&self) -> &[ResourceState] {
         &self.resources
-    }
-
-    /// Whether this file still carries the unwritable pre-v21 dependency
-    /// typestate. Even a v20 file whose dependency arrays were empty must
-    /// cross the graph-aware transition before it can be written as v21.
-    pub fn requires_legacy_dependency_migration(&self) -> bool {
-        self.version < Self::CURRENT_VERSION
-    }
-
-    /// Complete the pending transition when no current or deposed rows remain.
-    /// Nonempty state still requires graph-aware classification, even when its
-    /// legacy dependency arrays are empty. Mutating commands call this before
-    /// deciding whether they can persist a loaded migration under their lock.
-    pub fn finish_rowless_dependency_migration(&mut self) {
-        if self.resources.is_empty()
-            && self.legacy_dependencies.is_empty()
-            && self.requires_legacy_dependency_migration()
-        {
-            // With no current or deposed rows there are no dependency names
-            // to classify. Lock-held no-op commands can persist this state.
-            self.version = Self::CURRENT_VERSION;
-            self.dependency_encoding = DependencyEncoding::Current;
-        }
-    }
-
-    /// Whether graph projection is needed to classify any pre-v21 names.
-    pub fn has_legacy_dependency_names(&self) -> bool {
-        !self.legacy_dependencies.is_empty()
-    }
-
-    /// Names source-less commands should display for one row while migration
-    /// is pending.
-    pub fn legacy_dependency_names_for(
-        &self,
-        row: &ResourceState,
-    ) -> Option<LegacyDependencyNames> {
-        let id = ResolvedResourceId::new(Self::id_for_resource_state(row));
-        self.legacy_dependencies
-            .get(&id)
-            .map(LegacyRowDependencies::all_names)
-            .filter(|names| !names.is_empty())
-    }
-
-    /// Classify pre-v21 dependency names without mutating the loaded state.
-    ///
-    /// State rows win over current graph names. Resolved move destinations supply
-    /// instance scopes; unmoved rows retain their persisted binding's scopes,
-    /// including orphan and deposed rows. Configured rows fail closed on missing
-    /// or ambiguous names; orphan and deposed deletes retain known edges and
-    /// return explicit display warnings for the rest.
-    fn classify_legacy_dependencies(
-        &self,
-        input: &LegacyMigrationInput<'_>,
-    ) -> Result<
-        LegacyClassificationOutcome<LegacyDependencyClassification>,
-        LegacyDependencyMigrationError,
-    > {
-        use carina_core::utils::canonicalize_map_key_address;
-
-        if !self.requires_legacy_dependency_migration() {
-            return Ok(LegacyClassificationOutcome::Classified(
-                LegacyDependencyClassification {
-                    lineage: self.lineage.clone(),
-                    sources: BTreeMap::new(),
-                    rows: BTreeMap::new(),
-                    warnings: Vec::new(),
-                },
-            ));
-        }
-
-        let mut unread_rows = self
-            .resources
-            .iter()
-            .enumerate()
-            .filter_map(|(row_index, row)| {
-                let row_id = ResolvedResourceId::new(Self::id_for_resource_state(row));
-                if !self.legacy_dependencies.contains_key(&row_id) {
-                    return None;
-                }
-                let classified_id = input
-                    .moved_pairs
-                    .iter()
-                    .find_map(|(from, to)| (from == &row_id).then_some(to))
-                    .unwrap_or(&row_id);
-                let owned_by_residual_loop = !input.configured.contains(classified_id)
-                    && input.offline_unmaterialized.iter().any(|prefix| {
-                        [
-                            Some(row.identity.as_str()),
-                            row.binding.as_ref().map(AbsoluteBindingAddress::as_str),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .any(|address| {
-                            address == prefix
-                                || address.strip_prefix(prefix).is_some_and(|suffix| {
-                                    suffix.starts_with('[') || suffix.starts_with('.')
-                                })
-                        })
-                    });
-                owned_by_residual_loop.then_some(LegacyReadRequiredRow {
-                    row_index,
-                    row: row_id,
-                })
-            });
-        if let Some(first) = unread_rows.next() {
-            return Ok(LegacyClassificationOutcome::RequiresReads(
-                LegacyReadRequiredRows {
-                    first,
-                    rest: unread_rows.collect(),
-                },
-            ));
-        }
-
-        let mut state_candidates: HashMap<String, Vec<LegacyStateCandidate>> = HashMap::new();
-        for (row_index, row) in self.resources.iter().enumerate() {
-            let id = ResolvedResourceId::new(Self::id_for_resource_state(row));
-            let display = format!(
-                "resources[{row_index}] ({}.{} {:?}, binding {:?})",
-                row.provider,
-                row.resource_type,
-                row.identity.as_str(),
-                row.binding
-            );
-            let mut names = BTreeSet::from([canonicalize_map_key_address(row.identity.as_str())]);
-            if let Some(binding) = &row.binding {
-                names.insert(canonicalize_map_key_address(binding.as_str()));
-            }
-            for name in names {
-                state_candidates
-                    .entry(name)
-                    .or_default()
-                    .push(LegacyStateCandidate {
-                        id: id.clone(),
-                        display: display.clone(),
-                    });
-            }
-        }
-        #[allow(clippy::iter_over_hash_type)]
-        // keyed rebuild: candidates are independently sorted and deduplicated in stable row order
-        for candidates in state_candidates.values_mut() {
-            candidates.sort_by(|left, right| left.id.cmp(&right.id));
-            candidates.dedup_by(|left, right| left.id == right.id);
-        }
-
-        let mut migrated = BTreeMap::new();
-        let mut warnings = Vec::new();
-
-        for (row_index, row) in self.resources.iter().enumerate() {
-            let row_id = ResolvedResourceId::new(Self::id_for_resource_state(row));
-            let Some(legacy) = self.legacy_dependencies.get(&row_id) else {
-                continue;
-            };
-            let move_destination = input
-                .moved_pairs
-                .iter()
-                .find_map(|(from, to)| (from == &row_id).then_some(to));
-            let classified_id = move_destination.unwrap_or(&row_id);
-            let configured = input.configured.contains(classified_id);
-            let scopes = legacy_row_scopes(row, move_destination);
-            let row_description = format!(
-                "resources[{row_index}] ({}.{} {:?})",
-                row.provider,
-                row.resource_type,
-                row.identity.as_str()
-            );
-            let strict = configured;
-            let (value_dependencies, value_unknown) = classify_legacy_names(
-                input.graph,
-                &legacy.value_dependencies,
-                LegacyNameClassificationContext {
-                    scopes: &scopes,
-                    state_candidates: &state_candidates,
-                    strict,
-                    row_index,
-                    row: &row_description,
-                    location: format!("resources[{row_index}].dependency_bindings"),
-                },
-            )?;
-            let (explicit_dependencies, explicit_unknown) = classify_legacy_names(
-                input.graph,
-                &legacy.explicit_dependencies,
-                LegacyNameClassificationContext {
-                    scopes: &scopes,
-                    state_candidates: &state_candidates,
-                    strict,
-                    row_index,
-                    row: &row_description,
-                    location: format!("resources[{row_index}].directives.depends_on"),
-                },
-            )?;
-            let current_unknown = value_unknown
-                .into_iter()
-                .chain(explicit_unknown)
-                .collect::<BTreeSet<_>>();
-            if !current_unknown.is_empty() {
-                warnings.push(LegacyDestroyOrderingWarning {
-                    row: classified_id.clone(),
-                    generation: None,
-                    legacy_names: current_unknown,
-                });
-            }
-
-            let mut deposed_dependencies = HashMap::new();
-            #[allow(clippy::iter_over_hash_type)]
-            // order reaches output; migration tracked in #4414
-            for (key, names) in &legacy.deposed_dependencies {
-                let (known, unknown) = classify_legacy_names(
-                    input.graph,
-                    names,
-                    LegacyNameClassificationContext {
-                        scopes: &scopes,
-                        state_candidates: &state_candidates,
-                        strict: false,
-                        row_index,
-                        row: &row_description,
-                        location: format!(
-                            "resources[{row_index}].deposed[{key}].dependency_bindings"
-                        ),
-                    },
-                )?;
-                deposed_dependencies.insert(key.clone(), known);
-                if !unknown.is_empty() {
-                    warnings.push(LegacyDestroyOrderingWarning {
-                        row: classified_id.clone(),
-                        generation: Some(key.clone()),
-                        legacy_names: unknown,
-                    });
-                }
-            }
-            migrated.insert(
-                row_id,
-                MigratedLegacyRowDependencies {
-                    value_dependencies,
-                    explicit_dependencies,
-                    deposed_dependencies,
-                },
-            );
-        }
-
-        Ok(LegacyClassificationOutcome::Classified(
-            LegacyDependencyClassification {
-                lineage: self.lineage.clone(),
-                sources: self.legacy_dependencies.clone(),
-                rows: migrated,
-                warnings,
-            },
-        ))
-    }
-
-    /// Apply a classification only to the exact legacy source snapshot from
-    /// which it was produced.
-    fn with_legacy_classification(
-        mut self,
-        classification: LegacyDependencyClassification,
-    ) -> Result<StateFile, LegacyDependencyMigrationError> {
-        if self.lineage != classification.lineage
-            || self.legacy_dependencies != classification.sources
-        {
-            return Err(LegacyDependencyMigrationError::StaleClassification);
-        }
-
-        let LegacyDependencyClassification {
-            lineage: _,
-            sources: _,
-            rows: mut migrated,
-            warnings: _,
-        } = classification;
-        for row in &mut self.resources {
-            let row_id = ResolvedResourceId::new(Self::id_for_resource_state(row));
-            let Some(migration) = migrated.remove(&row_id) else {
-                continue;
-            };
-            row.dependency_bindings = migration.value_dependencies;
-            row.directives.depends_on = migration.explicit_dependencies;
-            for deposed in &mut row.deposed {
-                if let Some(dependencies) = migration.deposed_dependencies.get(&deposed.key) {
-                    deposed.dependency_bindings = dependencies.clone();
-                }
-            }
-        }
-        self.legacy_dependencies.clear();
-        self.version = Self::CURRENT_VERSION;
-        self.dependency_encoding = DependencyEncoding::Current;
-        Ok(self)
     }
 
     /// Insert already-encoded export JSON in cross-crate tests while still
@@ -1687,16 +1421,6 @@ impl StateFile {
                     | CurrentInstance::CreateOutcomeUnknown { .. }
             ) || !data_source_ids.contains(&Self::id_for_resource_state(row))
         });
-        if self.resources.len() != original_len {
-            let surviving_ids = self
-                .resources
-                .iter()
-                .map(|row| ResolvedResourceId::new(Self::id_for_resource_state(row)))
-                .collect::<HashSet<_>>();
-            self.legacy_dependencies
-                .retain(|id, _dependencies| surviving_ids.contains(id));
-            self.finish_rowless_dependency_migration();
-        }
         original_len - self.resources.len()
     }
 
@@ -1882,7 +1606,7 @@ impl StateFile {
                     Orphan::missing_identifier(state, rs.binding.clone(), rs.directives.clone())
                 }
             };
-            orphan.set_destroy_metadata(rs.dependency_bindings.clone(), rs.directives.clone());
+            orphan.set_dependency_bindings(rs.dependency_bindings.clone());
             loaded.insert(id, orphan);
         }
         loaded
@@ -1964,23 +1688,6 @@ impl StateFile {
                 )?;
             }
         }
-        let mut canonical_legacy = BTreeMap::new();
-        for (row, dependencies) in std::mem::take(&mut self.legacy_dependencies) {
-            let mut id = row.into_inner();
-            let canonical = canonicalize_map_key_address(
-                id.identity_str()
-                    .expect("legacy row dependency owner always has an identity"),
-            );
-            let identity = ResourceIdentity::try_from(canonical).map_err(|error| {
-                BackendError::InvalidStateIdentity {
-                    context: "cannot canonicalize legacy dependency owner".to_string(),
-                    error,
-                }
-            })?;
-            id.set_identity(identity);
-            canonical_legacy.insert(ResolvedResourceId::new(id), dependencies);
-        }
-        self.legacy_dependencies = canonical_legacy;
         Ok(())
     }
 
@@ -2242,8 +1949,6 @@ fn canonicalize_resolved_dependencies(
     })
 }
 
-const _: () = assert!(StateFile::EXPORTS_VERSION_INTRODUCED <= StateFile::CURRENT_VERSION);
-
 impl Default for StateFile {
     fn default() -> Self {
         Self::new()
@@ -2325,716 +2030,22 @@ impl NameOverrideSource for StateFile {
     }
 }
 
-/// Minimal struct for extracting the compatibility markers from a state file.
-/// Reports an in-memory schema upgrade applied to a state file by
-/// [`check_and_migrate`]. The function itself never writes to stderr —
-/// the caller (a backend impl) decides whether and how often to log,
-/// which lets `carina plan` emit the migration warning exactly once
-/// per run even when state is read multiple times (T0 snapshot +
-/// post-plan drift re-read, see carina#3283).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MigrationInfo {
-    /// On-disk version that was read.
-    pub from: u32,
-    /// Version the state was migrated to (always `StateFile::CURRENT_VERSION`).
-    pub to: u32,
-}
-
-/// A legacy string dependency could not be converted to one complete state
-/// address. The row and JSON field identify the owner of the bad edge; the
-/// original dependency text is retained verbatim for repair tooling.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum LegacyDependencyMigrationError {
-    #[error(transparent)]
-    GraphValidation(Box<ExpandedGraphResolutionError>),
-    #[error("legacy dependency classification is stale for this state")]
-    StaleClassification,
-    #[error(
-        "{location} on {row} references legacy dependency {dependency:?}, but it matches neither a state row nor the current expanded graph"
-    )]
-    Missing {
-        row_index: usize,
-        row: String,
-        location: String,
-        dependency: String,
-    },
-    #[error(
-        "{location} on {row} references ambiguous legacy dependency {dependency:?}; matching rows: {candidates:?}"
-    )]
-    Ambiguous {
-        row_index: usize,
-        row: String,
-        location: String,
-        dependency: String,
-        candidates: Vec<String>,
-    },
-    #[error("{location} on {row} could not classify legacy dependency {dependency:?}: {reason}")]
-    Resolution {
-        row_index: usize,
-        row: String,
-        location: String,
-        dependency: String,
-        reason: Box<ExpandedGraphResolutionError>,
-    },
-    #[error("{location} on {row} could not classify legacy dependency {dependency:?}: {reason}")]
-    InvalidStateDependency {
-        row_index: usize,
-        row: String,
-        location: String,
-        dependency: String,
-        reason: Box<carina_core::resource::NotAManagedRow>,
-    },
-}
-
-impl From<ExpandedGraphResolutionError> for LegacyDependencyMigrationError {
-    fn from(error: ExpandedGraphResolutionError) -> Self {
-        Self::GraphValidation(Box::new(error))
-    }
-}
-
-/// One delete whose historical ordering could be recovered only partially.
-/// Known managed edges are still scheduled; these names are display-only and
-/// are never written to v21 state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyDestroyOrderingWarning {
-    pub row: ResolvedResourceId,
-    pub generation: Option<DeposedKey>,
-    pub legacy_names: BTreeSet<String>,
-}
-
-#[derive(Debug, Clone)]
-struct LegacyStateCandidate {
-    id: ResolvedResourceId,
-    display: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct MigratedLegacyRowDependencies {
-    #[serde(deserialize_with = "deserialize_destroy_dependencies")]
-    value_dependencies: PersistedDestroyDependencies,
-    #[serde(deserialize_with = "deserialize_destroy_dependencies")]
-    explicit_dependencies: PersistedDestroyDependencies,
-    #[serde(deserialize_with = "deserialize_deposed_destroy_dependencies")]
-    deposed_dependencies: HashMap<DeposedKey, PersistedDestroyDependencies>,
-}
-
-fn deserialize_destroy_dependencies<'de, D>(
-    deserializer: D,
-) -> Result<PersistedDestroyDependencies, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let dependencies = BTreeSet::<ResolvedResourceId>::deserialize(deserializer)?;
-    PersistedDestroyDependencies::decode_persisted(dependencies).map_err(serde::de::Error::custom)
-}
-
-fn deserialize_deposed_destroy_dependencies<'de, D>(
-    deserializer: D,
-) -> Result<HashMap<DeposedKey, PersistedDestroyDependencies>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    HashMap::<DeposedKey, BTreeSet<ResolvedResourceId>>::deserialize(deserializer)?
-        .into_iter()
-        .map(|(key, dependencies)| {
-            PersistedDestroyDependencies::decode_persisted(dependencies)
-                .map(|dependencies| (key, dependencies))
-        })
-        .collect::<Result<HashMap<_, _>, _>>()
-        .map_err(serde::de::Error::custom)
-}
-
-/// Classification either retains the complete result or identifies every row
-/// whose configured ownership cannot be established without materializing loops.
-/// Commands supply their own recovery advice for `RequiresReads`.
-#[derive(Debug)]
-pub enum LegacyClassificationOutcome<T> {
-    Classified(T),
-    RequiresReads(LegacyReadRequiredRows),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegacyReadRequiredRow {
-    pub row_index: usize,
-    pub row: ResolvedResourceId,
-}
-
-/// A nonempty collection of state rows requiring loop materialization.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegacyReadRequiredRows {
-    first: LegacyReadRequiredRow,
-    rest: Vec<LegacyReadRequiredRow>,
-}
-
-impl LegacyReadRequiredRows {
-    pub fn iter(&self) -> impl Iterator<Item = &LegacyReadRequiredRow> {
-        std::iter::once(&self.first).chain(&self.rest)
-    }
-}
-
-impl std::fmt::Display for LegacyReadRequiredRows {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (index, row) in self.iter().enumerate() {
-            if index != 0 {
-                formatter.write_str(", ")?;
-            }
-            write!(formatter, "resources[{}] ({})", row.row_index, row.row)?;
-        }
-        Ok(())
-    }
-}
-
-/// Pure, replayable result of classifying every pre-v21 dependency spelling.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyDependencyClassification {
-    lineage: String,
-    #[serde(
-        serialize_with = "serialize_legacy_source_rows",
-        deserialize_with = "deserialize_legacy_source_rows"
-    )]
-    sources: BTreeMap<ResolvedResourceId, LegacyRowDependencies>,
-    #[serde(
-        serialize_with = "serialize_migrated_legacy_rows",
-        deserialize_with = "deserialize_migrated_legacy_rows"
-    )]
-    rows: BTreeMap<ResolvedResourceId, MigratedLegacyRowDependencies>,
-    warnings: Vec<LegacyDestroyOrderingWarning>,
-}
-
-fn serialize_legacy_source_rows<S>(
-    rows: &BTreeMap<ResolvedResourceId, LegacyRowDependencies>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    rows.iter().collect::<Vec<_>>().serialize(serializer)
-}
-
-fn deserialize_legacy_source_rows<'de, D>(
-    deserializer: D,
-) -> Result<BTreeMap<ResolvedResourceId, LegacyRowDependencies>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let rows = Vec::<(ResolvedResourceId, LegacyRowDependencies)>::deserialize(deserializer)?;
-    collect_unique_legacy_rows(rows, "legacy dependency classification source")
-}
-
-fn serialize_migrated_legacy_rows<S>(
-    rows: &BTreeMap<ResolvedResourceId, MigratedLegacyRowDependencies>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    rows.iter().collect::<Vec<_>>().serialize(serializer)
-}
-
-fn deserialize_migrated_legacy_rows<'de, D>(
-    deserializer: D,
-) -> Result<BTreeMap<ResolvedResourceId, MigratedLegacyRowDependencies>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let rows =
-        Vec::<(ResolvedResourceId, MigratedLegacyRowDependencies)>::deserialize(deserializer)?;
-    collect_unique_legacy_rows(rows, "legacy dependency classification row")
-}
-
-fn collect_unique_legacy_rows<E, V>(
-    rows: Vec<(ResolvedResourceId, V)>,
-    label: &str,
-) -> Result<BTreeMap<ResolvedResourceId, V>, E>
-where
-    E: serde::de::Error,
-{
-    let mut collected = BTreeMap::new();
-    for (id, row) in rows {
-        if collected.insert(id.clone(), row).is_some() {
-            return Err(E::custom(format!("duplicate {label} `{id}`")));
-        }
-    }
-    Ok(collected)
-}
-
-impl LegacyDependencyClassification {
-    pub fn warnings(&self) -> &[LegacyDestroyOrderingWarning] {
-        &self.warnings
-    }
-
-    pub fn row_ids(&self) -> impl Iterator<Item = &ResolvedResourceId> {
-        self.rows.keys()
-    }
-
-    pub fn source_row_ids(&self) -> impl Iterator<Item = &ResolvedResourceId> {
-        self.sources.keys()
-    }
-}
-
-/// Configuration and move evidence bound to one legacy-classification run.
-struct LegacyMigrationInput<'a> {
-    graph: &'a ExpandedBindingIndex,
-    configured: &'a ConfiguredResources,
-    moved_pairs: &'a ResolvedMovePairs,
-    offline_unmaterialized: BTreeSet<String>,
-}
-
-struct LegacyNameClassificationContext<'a> {
-    scopes: &'a [&'a str],
-    state_candidates: &'a HashMap<String, Vec<LegacyStateCandidate>>,
-    strict: bool,
-    row_index: usize,
-    row: &'a str,
-    location: String,
-}
-
-/// A resolved move classifies every generation in its destination's scope, even
-/// before the move executes. Otherwise persisted bindings retain module ancestry
-/// after the module has disappeared from configuration. Probe enclosing address
-/// scopes from inside out; dots within a quoted map key belong to that key.
-fn legacy_row_scopes<'a>(
-    row: &'a ResourceState,
-    move_destination: Option<&'a ResolvedResourceId>,
-) -> Vec<&'a str> {
-    let address = move_destination
-        .map(ResolvedResourceId::identity_str)
-        .unwrap_or_else(|| {
-            row.binding
-                .as_ref()
-                .map(AbsoluteBindingAddress::as_str)
-                .unwrap_or(row.identity.as_str())
-        });
-    let mut brackets = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    let mut scopes = Vec::new();
-    for (offset, ch) in address.char_indices() {
-        if let Some(delimiter) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == delimiter {
-                quote = None;
-            }
-        } else {
-            match ch {
-                '\'' | '"' if brackets > 0 => quote = Some(ch),
-                '[' => brackets += 1,
-                ']' => brackets = brackets.saturating_sub(1),
-                '.' if brackets == 0 => scopes.push(&address[..offset]),
-                _ => {}
-            }
-        }
-    }
-    scopes.reverse();
-    scopes
-}
-
-fn legacy_dependency_spellings<'a>(scopes: &[&str], dependency: &'a str) -> Vec<Cow<'a, str>> {
-    if scopes.iter().any(|scope| {
-        dependency == *scope
-            || dependency
-                .strip_prefix(*scope)
-                .is_some_and(|suffix| suffix.starts_with('.'))
-    }) {
-        return vec![Cow::Borrowed(dependency)];
-    }
-    scopes
-        .iter()
-        .map(|scope| Cow::Owned(format!("{scope}.{dependency}")))
-        .chain(std::iter::once(Cow::Borrowed(dependency)))
-        .collect()
-}
-
-fn classify_legacy_names(
-    graph: &ExpandedBindingIndex,
-    names: &LegacyDependencyNames,
-    context: LegacyNameClassificationContext<'_>,
-) -> Result<(PersistedDestroyDependencies, BTreeSet<String>), LegacyDependencyMigrationError> {
-    use carina_core::resolved_graph::ExpandedGraphResolutionError;
-
-    let LegacyNameClassificationContext {
-        scopes,
-        state_candidates,
-        strict,
-        row_index,
-        row,
-        location,
-    } = context;
-
-    let mut known = PersistedDestroyDependencies::default();
-    let mut unknown = BTreeSet::new();
-    for dependency in names.iter() {
-        let mut classified = None;
-        for spelling in legacy_dependency_spellings(scopes, dependency) {
-            if let Some(candidates) = state_candidates.get(spelling.as_ref()) {
-                match candidates.as_slice() {
-                    [candidate] => {
-                        let dependencies =
-                            PersistedDestroyDependencies::decode_persisted(BTreeSet::from([
-                                candidate.id.clone(),
-                            ]))
-                            .map_err(|error| {
-                                LegacyDependencyMigrationError::InvalidStateDependency {
-                                    row_index,
-                                    row: row.to_string(),
-                                    location: location.clone(),
-                                    dependency: dependency.to_string(),
-                                    reason: Box::new(error),
-                                }
-                            })?;
-                        classified =
-                            Some(PersistedDestroyDependencyProjection::Managed(dependencies));
-                        break;
-                    }
-                    [] => {}
-                    many => {
-                        let mut candidates = many
-                            .iter()
-                            .map(|candidate| candidate.display.clone())
-                            .collect::<Vec<_>>();
-                        candidates.sort();
-                        candidates.dedup();
-                        if strict {
-                            return Err(LegacyDependencyMigrationError::Ambiguous {
-                                row_index,
-                                row: row.to_string(),
-                                location,
-                                dependency: dependency.to_string(),
-                                candidates,
-                            });
-                        }
-                        unknown.insert(dependency.to_string());
-                        classified = Some(PersistedDestroyDependencyProjection::NoLocalDestroyEdge);
-                        break;
-                    }
-                }
-            }
-            match graph.project_legacy_dependency(spelling.as_ref(), row) {
-                Ok(projection) => {
-                    classified = Some(projection);
-                    break;
-                }
-                Err(ExpandedGraphResolutionError::MissingDependency { .. }) => {}
-                Err(error) => {
-                    return Err(LegacyDependencyMigrationError::Resolution {
-                        row_index,
-                        row: row.to_string(),
-                        location,
-                        dependency: dependency.to_string(),
-                        reason: Box::new(error),
-                    });
-                }
-            }
-        }
-
-        match classified {
-            Some(PersistedDestroyDependencyProjection::Managed(dependencies)) => {
-                known.extend_projected(&dependencies);
-            }
-            Some(PersistedDestroyDependencyProjection::NoLocalDestroyEdge) => {}
-            None if strict => {
-                return Err(LegacyDependencyMigrationError::Missing {
-                    row_index,
-                    row: row.to_string(),
-                    location,
-                    dependency: dependency.to_string(),
-                });
-            }
-            None => {
-                unknown.insert(dependency.to_string());
-            }
-        }
-    }
-    Ok((known, unknown))
-}
-
-/// Successful outcome of [`check_and_migrate`].
-///
-/// Always carries the parsed (and possibly schema-upgraded) state.
-/// `migration` is `Some` iff the on-disk version was older than
-/// [`StateFile::CURRENT_VERSION`] and an in-memory upgrade was applied;
-/// `None` for state files that were already current.
-///
-/// Intentionally not `Clone`: a [`StateFile`] can hold every resource
-/// in the deployment, so accidentally cloning the wrapper would clone
-/// the full state. The wrapper is consumed at the backend boundary
-/// (`read_state` → caller takes `.into_parts()` or `.into_state()`). Its
-/// fields are private so only the validating load seam can construct one.
-#[derive(Debug)]
-pub struct MigratedStateFile {
-    state: StateFile,
-    migration: Option<MigrationInfo>,
-}
-
-impl MigratedStateFile {
-    /// Borrow the validated, fully migrated state.
-    pub fn state(&self) -> &StateFile {
-        &self.state
-    }
-
-    /// Report the in-memory schema migration, if one was applied.
-    pub fn migration(&self) -> Option<MigrationInfo> {
-        self.migration
-    }
-
-    /// Consume the validated outcome into its state and migration metadata.
-    pub fn into_parts(self) -> (StateFile, Option<MigrationInfo>) {
-        (self.state, self.migration)
-    }
-
-    /// Discard the migration info and return just the state. Convenience
-    /// for call sites (e.g. unit tests, fixture loaders) that only need
-    /// the parsed `StateFile` and never log the migration.
-    pub fn into_state(self) -> StateFile {
-        self.state
-    }
-}
-
-/// A state file just read from a backend, tagged with whether
-/// `check_and_migrate` had to lift the on-disk schema in memory.
-/// Returned from [`crate::backend::StateBackend::read_state`].
-///
-/// The two-variant shape (rather than `StateFile + Option<MigrationInfo>`)
-/// forces every consumer to `match` on the pristine vs. migrated case
-/// at the boundary. Lock-held call sites (`apply`, `destroy`,
-/// `state refresh`) bind the `Migrated { state, info }` arm and
-/// persist the upgraded shape before any short-circuit return, so the
-/// carina#3283 warning ("Disk state will be rewritten during the next
-/// apply or state refresh of that project") matches reality —
-/// carina#3315. Read-only full-state call sites (`plan`, `state
-/// list/show/lookup`, etc.) bind both arms identically and discard
-/// `info` explicitly — the discard is visible in the source rather
-/// than hidden inside an `Option::None`.
-///
-/// Intentionally not `Clone`: a [`StateFile`] can hold every resource
-/// in the deployment, so accidentally cloning the wrapper would clone
-/// the full state. Consume the wrapper at the call site via
-/// [`Self::into_state`] (read-only paths) or by destructuring the
-/// enum directly (lock-held paths that need the `MigrationInfo`).
-#[derive(Debug)]
-#[must_use = "a loaded state must be either persisted (lock-held paths) or \
-              explicitly consumed via .into_state() (read-only paths); \
-              see LoadedState docs for the carina#3315 invariant"]
-pub enum LoadedState {
-    /// The on-disk state already matched [`StateFile::CURRENT_VERSION`];
-    /// no in-memory migration was applied.
-    Pristine(StateFile),
-    /// `check_and_migrate` lifted the on-disk state to
-    /// [`StateFile::CURRENT_VERSION`] in memory. Lock-held callers
-    /// must persist `state` so the disk reflects the new schema.
-    Migrated {
-        state: StateFile,
-        info: MigrationInfo,
-    },
-}
-
-impl LoadedState {
-    /// Consume the wrapper, returning the state and dropping any
-    /// pending-migration indicator. Use this for read-only paths
-    /// (`plan`, `state list/show/lookup`) where the on-disk
-    /// version is reported via a separate warning and not persisted.
-    /// Lock-held paths destructure the enum directly so the
-    /// `MigrationInfo` is a named binding rather than a hidden drop.
-    pub fn into_state(self) -> StateFile {
-        match self {
-            Self::Pristine(s) => s,
-            Self::Migrated { state, .. } => state,
-        }
-    }
-}
-
-/// Emit the state-schema migration warning to stderr at most once for
-/// the given `OnceLock`-protected slot. Backends call this from
-/// `read_state` so a single `carina plan` run — which reads state
-/// twice (T0 snapshot plus post-plan drift re-read, carina#3283) —
-/// surfaces the warning exactly once per backend instance.
-///
-/// `display_target` should identify the underlying state file (e.g. a
-/// local path or `s3://bucket/key`) so an operator running with
-/// `upstream_state` chains or multiple backends in one process can
-/// tell which file the warning refers to.
-///
-/// Dedupe is per-backend-instance, not per `(from, to)` pair: once
-/// any migration has been logged through this slot, no subsequent
-/// `read_state` on the same backend logs again, even if a later read
-/// observed a different `from` version. This matches the only
-/// realistic case (each backend points at one physical state file)
-/// and keeps the API trivially correct.
-pub fn log_state_migration_once(
-    slot: &std::sync::OnceLock<MigrationInfo>,
-    info: MigrationInfo,
-    display_target: &str,
-) {
-    if slot.set(info).is_ok() {
-        log_state_migration(info, display_target);
-    }
-}
-
-pub(crate) fn log_state_migration(info: MigrationInfo, display_target: &str) {
-    eprintln!(
-        "Warning: state file {} is v{} on disk; migration toward v{} \
-         was loaded in memory. Legacy dependency names, if present, \
-         will be classified against the expanded configuration and the \
-         disk state will be rewritten by the next apply, destroy, or state refresh.",
-        display_target, info.from, info.to
-    );
-}
-
-/// Deserialize a state file from a JSON string, checking the version and
-/// migrating from older formats if necessary.
-///
-/// - Current version: deserialized directly; returned with `migration = None`.
-/// - Future version (newer than supported): returns a clear error asking the
-///   user to upgrade Carina.
-/// - Older version: attempts deserialization with serde defaults and bumps
-///   the version to current. The from/to versions are returned as
-///   [`MigrationInfo`] so the caller can log the event (carina#3283).
-/// - Invalid JSON: returns a parse error.
-pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendError> {
-    let check = StateDocumentVersion::read(content.as_bytes()).map_err(|error| match error {
-        StateFileDecodeError::Json { source, .. } => {
-            BackendError::InvalidState(format!("Failed to parse state version: {source}"))
-        }
-        other => map_state_file_decode_error(other, None),
-    })?;
-
-    let mut migration: Option<MigrationInfo> = None;
-    let mut state: StateFile = match check.version {
-        v if v == StateFile::CURRENT_VERSION => StateFile::from_json_str(content)
-            .map_err(|error| map_state_file_decode_error(error, None))?,
-        v => {
-            migration = Some(MigrationInfo {
-                from: v,
-                to: StateFile::CURRENT_VERSION,
-            });
-            let pre_value_migration = content;
-            // v12 → v13: migrate every value tree before typed state
-            // deserialization validates the reserved `$` namespace.
-            let migrated_v12 = if v <= 12 {
-                Some(migrate_v12_persisted_values(pre_value_migration)?)
-            } else {
-                None
-            };
-            let pre_secret_migration = migrated_v12.as_deref().unwrap_or(pre_value_migration);
-            let migrated_v13 = if v <= 13 {
-                Some(migrate_v13_resource_secret_markers(pre_secret_migration)?)
-            } else {
-                None
-            };
-            let pre_current_migration = migrated_v13.as_deref().unwrap_or(pre_secret_migration);
-            let migrated_v14 = if v <= 14 {
-                Some(migrate_v14_current_instance(pre_current_migration)?)
-            } else {
-                None
-            };
-            let pre_nested_write_only_migration =
-                migrated_v14.as_deref().unwrap_or(pre_current_migration);
-            let migrated_v17 = if v <= 17 {
-                Some(migrate_v17_nested_write_only(
-                    pre_nested_write_only_migration,
-                )?)
-            } else {
-                None
-            };
-            let pre_partial_read_migration = migrated_v17
-                .as_deref()
-                .unwrap_or(pre_nested_write_only_migration);
-            let migrated_v18 = if v <= 18 {
-                Some(migrate_v18_partial_read_reason(pre_partial_read_migration)?)
-            } else {
-                None
-            };
-            let pre_outcome_unknown_migration = migrated_v18
-                .as_deref()
-                .unwrap_or(pre_partial_read_migration);
-            let migrated_v19 = if v <= 19 {
-                Some(migrate_v19_create_outcome_unknown(
-                    pre_outcome_unknown_migration,
-                )?)
-            } else {
-                None
-            };
-            let migrated_content = migrated_v19
-                .as_deref()
-                .unwrap_or(pre_outcome_unknown_migration);
-            let mut state = StateFile::from_json_str(migrated_content)
-                .map_err(|error| map_state_file_decode_error(error, Some(v)))?;
-            // v5 → v6: lift the flat `desired_keys: Vec<String>` field
-            // (already discarded by serde because the v6 struct no longer
-            // declares it) back from the source JSON, and use it to
-            // construct a top-level `ExplicitFields::Struct` whose
-            // children are all `Leaf`. Mirrors the design's "first plan
-            // after upgrade still surfaces nested-field spurious diffs;
-            // first apply rebuilds the full tree" behavior.
-            if v <= 5 {
-                migrate_v5_desired_keys_to_explicit(content, &mut state)?;
-            }
-            // v6 → v7 (carina#3280): a top-level
-            // `ExplicitFields::Struct { children: {} }` row is the
-            // legacy-corruption shape produced by an older for-loop
-            // expansion path. Rewriting every top-level empty Struct
-            // from v6 to `Unrecorded` preserves that legacy meaning.
-            // Current-version desired-backed writes legitimately emit an
-            // empty Struct when the user authored no attributes;
-            // this migration is version-gated and never rewrites them.
-            if v <= 6 {
-                migrate_v6_empty_struct_to_unrecorded(&mut state);
-            }
-            // v10 → v11: host metadata used to be stored inside provider
-            // attributes. Once consumers stopped filtering `_`-prefixed keys,
-            // those legacy values became provider-visible removals. Strip them
-            // once at the state load boundary, including historical/deposed
-            // display data and the matching top-level authoring record.
-            if v <= 10 {
-                migrate_v10_reserved_attributes(&mut state);
-            }
-            // v11 → v12 secret strings and v13 → v14 structural secret tags
-            // were migrated in raw JSON before typed deserialization above.
-            // v12 → v13 key/tag migration ran first so a newly inserted
-            // `$secret` host tag could not be mistaken for a user key.
-            // v19 → v20 is the last source-independent transition. The v20
-            // kind-blind dependency names remain in an unwritable in-memory
-            // typestate until an expanded graph performs the v20 → v21
-            // classification.
-            state.version = 20;
-            state.dependency_encoding = DependencyEncoding::PendingLegacy;
-            state
-        }
-    };
-    // Map-key addresses written under the legacy `["..."]` shape are
-    // rewritten to the canonical form on read so existing state files
-    // resolve cleanly against new emissions. See #1903.
+/// Load exactly the current state format and canonicalize its addresses.
+pub fn load_state(content: &str) -> Result<StateFile, BackendError> {
+    let mut state = StateFile::from_json_str(content).map_err(map_state_file_decode_error)?;
     state.canonicalize_addresses()?;
-    // `state.resources` is managed-only by invariant (since #3181). Do not
-    // classify rows by identifier absence here: a malformed managed row must
-    // survive to `build_state_for_resource` so planning fails closed instead
-    // of recreating the live resource. Once the parsed configuration supplies
-    // typed data-source addresses, `remove_legacy_data_source_rows` removes
-    // matching pre-#3181 artifacts without conflating the two row kinds. The
-    // one legitimate null-identifier shape, an empty deposed-only shell, is
-    // classified explicitly by the resource loader.
-    // Identity spellings can converge during migration (notably legacy map-key
-    // address canonicalization), so the serde-time check is not sufficient.
-    // Validate the fully migrated shape immediately before it crosses the load
-    // boundary.
     state
         .validate_unique_identities()
         .map_err(BackendError::InvalidState)?;
-    Ok(MigratedStateFile { state, migration })
+    Ok(state)
 }
 
-/// Deserialize a state file from a byte slice, checking the version and
-/// migrating from older formats if necessary.
-///
-/// This is the byte-slice equivalent of [`check_and_migrate`] for backends
-/// that read raw bytes (e.g., S3).
-pub fn check_and_migrate_bytes(bytes: &[u8]) -> Result<MigratedStateFile, BackendError> {
-    let content = std::str::from_utf8(bytes)
-        .map_err(|e| BackendError::InvalidState(format!("State file is not valid UTF-8: {}", e)))?;
-    check_and_migrate(content)
+/// Load a current state document from backend bytes.
+pub fn load_state_bytes(bytes: &[u8]) -> Result<StateFile, BackendError> {
+    let content = std::str::from_utf8(bytes).map_err(|error| {
+        BackendError::InvalidState(format!("State file is not valid UTF-8: {error}"))
+    })?;
+    load_state(content)
 }
 
 /// Pre-replacement instance that still needs a successful Delete.
@@ -3160,6 +2171,7 @@ impl DeposedInstance {
             PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&self.attributes),
             None,
             false,
+            None,
         )?;
         let (selected, _write_only_attributes) = selected.finish()?;
         Ok(DeposedAttributes(selected))
@@ -3216,10 +2228,7 @@ pub struct ResourceState {
     /// shape so server-side default fields the user never wrote stop
     /// appearing as spurious removals (refs awscc#206).
     ///
-    /// Replaces the flat `desired_keys: Vec<String>` (state ≤ v5);
-    /// the v5 reader lifts each top-level key to a `Leaf` child of
-    /// the root `Struct`. Later writes rebuild a full tree from the resource's
-    /// authored `Value` via an evidence-specific aligned builder.
+    /// Writes rebuild the tree from authored values using an aligned builder.
     #[serde(default, skip_serializing_if = "is_empty_explicit")]
     pub explicit: ExplicitFields,
     /// The binding name for this resource (from `let` bindings in DSL).
@@ -3230,9 +2239,7 @@ pub struct ResourceState {
     /// Stored so orphan Delete effects can have tree structure.
     ///
     /// Set semantics are provided by
-    /// [`carina_core::resource::ResolvedDependencies`]. State v20 and
-    /// older string arrays are converted by the version-gated raw migration
-    /// before this current representation is deserialized.
+    /// [`carina_core::resource::ResolvedDependencies`].
     #[serde(default)]
     pub dependency_bindings: PersistedDestroyDependencies,
 }
@@ -3848,11 +2855,14 @@ impl ResourceState {
         resource: &ResolvedResource<S>,
         schema: Option<&ResourceSchema>,
         attributes: &BTreeMap<String, Value<P>>,
-        previous_hash_authority: PreviousSecretHashAuthority<'_>,
+        previous_attributes: Option<&PersistedAttributes>,
     ) -> Result<DeposedAttributes, ResourceStateEncodingError> {
+        let previous_hash_authority = previous_attributes
+            .map(PreviousSecretHashAuthority::AllPreviouslyHashedKeys)
+            .unwrap_or(PreviousSecretHashAuthority::None);
         let selected =
             SelectedStateAttributes::from_provider_values_lossy(attributes, schema, &[])?
-                .protect_for_resource(resource, previous_hash_authority, None, false)?;
+                .protect_for_resource(resource, previous_hash_authority, None, false, None)?;
         let (selected, _write_only_attributes) = selected.finish()?;
         Ok(DeposedAttributes(selected))
     }
@@ -3863,14 +2873,17 @@ impl ResourceState {
         resource: &ResolvedResource<S>,
         schema: Option<&ResourceSchema>,
         previous: ReplacementPreviousAttributesForStateWriteback<'_>,
-        previous_hash_authority: PreviousSecretHashAuthority<'_>,
+        previous_attributes: Option<&PersistedAttributes>,
     ) -> Result<DeposedAttributes, ResourceStateEncodingError> {
+        let previous_hash_authority = previous_attributes
+            .map(PreviousSecretHashAuthority::AllPreviouslyHashedKeys)
+            .unwrap_or(PreviousSecretHashAuthority::None);
         let selected = SelectedStateAttributes::from_provider_values_lossy(
             previous.provider_attributes(),
             schema,
             &[],
         )?
-        .protect_for_resource(resource, previous_hash_authority, None, false)?;
+        .protect_for_resource(resource, previous_hash_authority, None, false, None)?;
         let (selected, _write_only_attributes) = selected.finish()?;
         Ok(DeposedAttributes(selected))
     }
@@ -3889,6 +2902,7 @@ impl ResourceState {
             PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&previous),
             None,
             false,
+            None,
         )?;
         let (selected, _write_only_attributes) = selected.finish()?;
         Ok(DeposedAttributes(selected))
@@ -4034,6 +3048,66 @@ impl ResourceState {
         preferred_hashes: Option<&PersistedAttributes>,
         comparison: &ComparisonContext<'_, R>,
     ) -> Result<Self, ResourceStateEncodingError> {
+        Self::from_observation_with_final_desired(
+            resource,
+            identified,
+            existing,
+            schema,
+            None,
+            preferred_hashes,
+            comparison,
+        )
+    }
+
+    /// Common row-write entry for consumers that hold optional final desired
+    /// evidence. The source preserves accepted-write versus observation authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_write_with_final_desired<S: Clone, R: ReferenceEquality>(
+        resource: &ResolvedResource<S>,
+        source: ResourceStateWrite<'_>,
+        existing: Option<&ResourceState>,
+        schema: Option<&ResourceSchema>,
+        final_desired: Option<&FinalDesiredValues>,
+        preferred_hashes: Option<&PersistedAttributes>,
+        comparison: &ComparisonContext<'_, R>,
+    ) -> Result<Self, ResourceStateEncodingError> {
+        match source {
+            ResourceStateWrite::Provider { state, basis } => {
+                Self::from_provider_state_with_final_desired(
+                    resource,
+                    state,
+                    existing,
+                    schema,
+                    basis,
+                    final_desired,
+                    preferred_hashes,
+                    comparison,
+                )
+            }
+            ResourceStateWrite::Observation(observed) => Self::from_observation_with_final_desired(
+                resource,
+                observed,
+                existing,
+                schema,
+                final_desired,
+                preferred_hashes,
+                comparison,
+            ),
+        }
+    }
+
+    /// Observations have no accepted-request authority. Only final plan
+    /// inputs can prove that a public desired value equals the observed value.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_observation_with_final_desired<S: Clone, R: ReferenceEquality>(
+        resource: &ResolvedResource<S>,
+        identified: &HostIdentifiedCreate,
+        existing: Option<&ResourceState>,
+        schema: Option<&ResourceSchema>,
+        final_desired: Option<&FinalDesiredValues>,
+        preferred_hashes: Option<&PersistedAttributes>,
+        comparison: &ComparisonContext<'_, R>,
+    ) -> Result<Self, ResourceStateEncodingError> {
         let applied_desired = identified
             .resolved_desired_attributes()
             .map(|attributes| resource_with_secret_shape_union(resource, attributes))
@@ -4082,13 +3156,15 @@ impl ResourceState {
         };
         let sent_keys_for_nested_write_only = sent_values.keys().cloned().collect::<Vec<_>>();
         selected.overlay_sent(&sent_values, &sent_write_only);
-        let previous_hash_authority = previous
-            .map(PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired)
-            .unwrap_or(PreviousSecretHashAuthority::None);
         let selected = selected.protect_observation(
             writeback_resource,
-            previous_hash_authority,
+            previous,
+            final_desired.and_then(|values| values.get(&resource.id)),
             preferred_hashes,
+            Some(DesiredValueComparison {
+                schema,
+                context: comparison.schema(),
+            }),
         )?;
         let (attributes, write_only_attributes) = selected.finish()?;
         let partial_read = identified
@@ -4156,7 +3232,7 @@ impl ResourceState {
         Ok(row)
     }
 
-    /// Build the mutually-exclusive v15 continuation row. A persisted re-pend
+    /// Build the mutually exclusive continuation row. A persisted re-pend
     /// keeps the prior envelope, timestamp, and host metadata, including a
     /// known authoring record. A legacy `Unrecorded` authoring record is seeded
     /// from desired keys. A freshly sent create encodes sent write-only and
@@ -4289,7 +3365,8 @@ impl ResourceState {
     ///
     /// Provider attributes are serialized into state JSON, desired secret
     /// values are masked before storage, and previously-stored secret hashes
-    /// can protect keys removed from desired state. `row_basis` couples
+    /// protect any key not released by an accepted sent public value or by
+    /// known-public desired/provider equality. `row_basis` couples
     /// write-only and authoring provenance so a successful request cannot
     /// retain a stale authoring record. When `existing` is provided,
     /// protected/name override metadata and existing deposed generations are
@@ -4306,6 +3383,36 @@ impl ResourceState {
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
         row_basis: RowBasis<'_>,
+        preferred_hashes: Option<&PersistedAttributes>,
+        comparison: &ComparisonContext<'_, R>,
+    ) -> Result<Self, ResourceStateEncodingError> {
+        Self::from_provider_state_with_final_desired(
+            resource,
+            state,
+            existing,
+            schema,
+            row_basis,
+            None,
+            preferred_hashes,
+            comparison,
+        )
+    }
+
+    /// A carried/imported row can release only against the final desired side
+    /// produced by plan preparation. Without that witness it protects every
+    /// previous hash. Applied rows retain their accepted-request authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_provider_state_with_final_desired<
+        S: Clone,
+        R: ReferenceEquality,
+        P: StateValueLeaf,
+    >(
+        resource: &ResolvedResource<S>,
+        state: &State<P>,
+        existing: Option<&ResourceState>,
+        schema: Option<&ResourceSchema>,
+        row_basis: RowBasis<'_>,
+        final_desired: Option<&FinalDesiredValues>,
         preferred_hashes: Option<&PersistedAttributes>,
         comparison: &ComparisonContext<'_, R>,
     ) -> Result<Self, ResourceStateEncodingError> {
@@ -4349,7 +3456,7 @@ impl ResourceState {
                 }
                 AcceptedRequestKind::Update { sent, .. } => {
                     accepted.extend(
-                        sent.iter()
+                        sent.keys()
                             .filter(|key| {
                                 desired_keys.contains(*key) && schema_write_only.contains(*key)
                             })
@@ -4406,15 +3513,51 @@ impl ResourceState {
             }
         }
 
-        let previous_hash_authority = existing
-            .and_then(ResourceState::persisted_attributes)
-            .map(PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired)
-            .unwrap_or(PreviousSecretHashAuthority::None);
+        let previous_hash_authority = match (previous, row_basis) {
+            (Some(previous), RowBasis::Applied(request)) => {
+                // Rule 1 reads only the accepted request projection and sent set.
+                // Rule 2 uses the final plan witness, including for unsent keys.
+                let request_attributes = match request.resolved_desired_attributes() {
+                    Some(attributes) => Cow::Owned(
+                        attributes
+                            .values()
+                            .iter()
+                            .map(|(key, value)| {
+                                value.to_value_at(key).map(|value| (key.clone(), value))
+                            })
+                            .collect::<Result<IndexMap<_, _>, _>>()
+                            .map_err(SerializationError::UnavailableSecret)?,
+                    ),
+                    // Bootstrap and fixture accepted requests already carry
+                    // a resolved writeback resource.
+                    None => Cow::Borrowed(&writeback_resource.attributes),
+                };
+                PreviousSecretHashAuthority::AcceptedWrite {
+                    previous,
+                    request,
+                    request_attributes,
+                    final_desired: final_desired.and_then(|values| values.get(&resource.id)),
+                }
+            }
+            (Some(previous), RowBasis::Carried | RowBasis::Imported) => {
+                match final_desired.and_then(|values| values.get(&resource.id)) {
+                    Some(desired) => {
+                        PreviousSecretHashAuthority::MatchingFinalDesiredValue { previous, desired }
+                    }
+                    None => PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous),
+                }
+            }
+            (None, _) => PreviousSecretHashAuthority::None,
+        };
         let selected = selected.protect_for_resource(
             writeback_resource,
             previous_hash_authority,
             preferred_hashes,
             true,
+            Some(DesiredValueComparison {
+                schema,
+                context: comparison.schema(),
+            }),
         )?;
         let (attributes, write_only_attributes) = selected.finish()?;
         let previous_nested_write_only = existing
@@ -4436,7 +3579,7 @@ impl ResourceState {
                     for key in removed {
                         record.remove_attribute(key);
                     }
-                    (record, sent.iter().map(String::as_str).collect::<Vec<_>>())
+                    (record, sent.keys().map(String::as_str).collect::<Vec<_>>())
                 }
             },
             RowBasis::Imported => (NestedWriteOnlyRecord::default(), Vec::new()),
@@ -4497,690 +3640,8 @@ fn is_empty_explicit(e: &ExplicitFields) -> bool {
     matches!(e, ExplicitFields::Leaf)
 }
 
-/// Exact v14 row shape used only at the v14 → v15 migration boundary.
-/// Keeping this DTO separate from [`ResourceState`] prevents the current
-/// loader from accepting the legacy parallel identifier/attribute fields.
-#[derive(Debug, Default, Deserialize, PartialEq)]
-struct LegacyPersistedDirectives {
-    #[serde(default)]
-    force_delete: bool,
-    #[serde(default)]
-    create_before_destroy: bool,
-    #[serde(default)]
-    prevent_destroy: bool,
-    #[serde(default)]
-    depends_on: Vec<AbsoluteBindingAddress>,
-    #[serde(default)]
-    provider_instance: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ResourceStateV14CurrentDto {
-    #[serde(default)]
-    identifier: Option<String>,
-    #[serde(default)]
-    attributes: BTreeMap<String, serde_json::Value>,
-    #[serde(default)]
-    deposed: Vec<serde_json::Value>,
-    #[serde(default)]
-    protected: bool,
-    #[serde(default)]
-    directives: LegacyPersistedDirectives,
-    #[serde(default)]
-    prefixes: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
-    name_overrides: HashMap<String, NameOverride>,
-    #[serde(default)]
-    explicit: ExplicitFields,
-    #[serde(default)]
-    binding: Option<String>,
-    #[serde(default)]
-    dependency_bindings: BTreeSet<String>,
-    #[serde(default)]
-    write_only_attributes: Vec<String>,
-    #[serde(default)]
-    partial_read: Option<serde_json::Value>,
-}
-
-fn migrate_v14_current_instance(content: &str) -> Result<String, BackendError> {
-    let mut root: serde_json::Value = serde_json::from_str(content).map_err(|error| {
-        BackendError::InvalidState(format!("Failed to migrate state file from v14: {error}"))
-    })?;
-    let resources = root
-        .get_mut("resources")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| {
-            BackendError::InvalidState(
-                "Failed to migrate state file from v14: resources must be an array".to_string(),
-            )
-        })?;
-    for resource in resources {
-        let legacy: ResourceStateV14CurrentDto =
-            serde_json::from_value(resource.clone()).map_err(|error| {
-                BackendError::InvalidState(format!(
-                    "Failed to migrate state file from v14: {error}"
-                ))
-            })?;
-        let shell_directives = LegacyPersistedDirectives {
-            provider_instance: legacy.directives.provider_instance.clone(),
-            ..LegacyPersistedDirectives::default()
-        };
-        let is_deposed_only_shell = legacy.identifier.is_none()
-            && !legacy.deposed.is_empty()
-            && legacy.attributes.is_empty()
-            && !legacy.protected
-            && legacy.directives == shell_directives
-            && legacy.prefixes.is_empty()
-            && legacy.name_overrides.is_empty()
-            && is_empty_explicit(&legacy.explicit)
-            && legacy.binding.is_none()
-            && legacy.dependency_bindings.is_empty()
-            && legacy.write_only_attributes.is_empty()
-            && legacy.partial_read.is_none();
-        let current = match legacy
-            .identifier
-            .filter(|identifier| !identifier.is_empty())
-        {
-            Some(identifier) => serde_json::json!({
-                "kind": "applied",
-                "identifier": identifier,
-                "attributes": legacy.attributes,
-                "write_only_attributes": legacy.write_only_attributes,
-                "partial_read": legacy.partial_read,
-            }),
-            None if is_deposed_only_shell => serde_json::json!({ "kind": "none" }),
-            None => serde_json::json!({
-                "kind": "missing_identifier",
-                "attributes": legacy.attributes,
-                "write_only_attributes": legacy.write_only_attributes,
-                "partial_read": legacy.partial_read,
-            }),
-        };
-        let object = resource.as_object_mut().ok_or_else(|| {
-            BackendError::InvalidState(
-                "Failed to migrate state file from v14: resource must be an object".to_string(),
-            )
-        })?;
-        object.remove("identifier");
-        object.remove("attributes");
-        object.remove("write_only_attributes");
-        object.remove("partial_read");
-        object.insert("current".to_string(), current);
-    }
-    root["version"] = serde_json::json!(StateFile::CURRENT_VERSION);
-    root["exports_version"] = serde_json::json!(PublishedExports::CURRENT_VERSION);
-    serde_json::to_string(&root).map_err(|error| {
-        BackendError::InvalidState(format!("Failed to migrate state file from v14: {error}"))
-    })
-}
-
-/// v17 → v18: initialize leaf provenance on every attribute-bearing current
-/// instance. In-flight and deposed-only rows have no accepted applied values.
-fn migrate_v17_nested_write_only(content: &str) -> Result<String, BackendError> {
-    let mut root: serde_json::Value = serde_json::from_str(content).map_err(|error| {
-        BackendError::InvalidState(format!("Failed to migrate state file from v17: {error}"))
-    })?;
-    let resources = root
-        .get_mut("resources")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| {
-            BackendError::InvalidState(
-                "Failed to migrate state file from v17: resources must be an array".to_string(),
-            )
-        })?;
-    for resource in resources {
-        let Some(current) = resource
-            .get_mut("current")
-            .and_then(serde_json::Value::as_object_mut)
-        else {
-            continue;
-        };
-        if matches!(
-            current.get("kind").and_then(serde_json::Value::as_str),
-            Some("applied" | "missing_identifier")
-        ) {
-            current
-                .entry("nested_write_only".to_string())
-                .or_insert_with(|| serde_json::json!({}));
-        }
-    }
-    root["version"] = serde_json::json!(StateFile::CURRENT_VERSION);
-    root.as_object_mut()
-        .expect("a state file root validated as an object")
-        .entry("exports_version".to_string())
-        .or_insert_with(|| serde_json::json!(PublishedExports::CURRENT_VERSION));
-    serde_json::to_string(&root).map_err(|error| {
-        BackendError::InvalidState(format!("Failed to migrate state file from v17: {error}"))
-    })
-}
-
-/// v18 → v19: wrap the legacy marker detail in the typed incomplete-read
-/// reason used by current state and runtime unknowns.
-fn migrate_v18_partial_read_reason(content: &str) -> Result<String, BackendError> {
-    let mut root: serde_json::Value = serde_json::from_str(content).map_err(|error| {
-        BackendError::InvalidState(format!("Failed to migrate state file from v18: {error}"))
-    })?;
-    let resources = root
-        .get_mut("resources")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| {
-            BackendError::InvalidState(
-                "Failed to migrate state file from v18: resources must be an array".to_string(),
-            )
-        })?;
-    for resource in resources {
-        let Some(current) = resource
-            .get_mut("current")
-            .and_then(serde_json::Value::as_object_mut)
-        else {
-            continue;
-        };
-        let empty_partial_read = current
-            .get("partial_read")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|marker| marker.get("missing_attributes"))
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(Vec::is_empty);
-        if empty_partial_read {
-            current.remove("partial_read");
-            continue;
-        }
-        let Some(partial_read) = current.get_mut("partial_read") else {
-            continue;
-        };
-        if partial_read.is_null() {
-            continue;
-        }
-        let marker = partial_read.as_object_mut().ok_or_else(|| {
-            BackendError::InvalidState(
-                "Failed to migrate state file from v18: partial_read must be an object".to_string(),
-            )
-        })?;
-        let detail = marker
-            .remove("detail")
-            .and_then(|detail| detail.as_str().map(str::to_owned))
-            .ok_or_else(|| {
-                BackendError::InvalidState(
-                    "Failed to migrate state file from v18: partial_read.detail must be a string"
-                        .to_string(),
-                )
-            })?;
-        marker.insert(
-            "pending".to_string(),
-            serde_json::json!({
-                "reason": {
-                    "kind": "incomplete",
-                    "detail": detail,
-                }
-            }),
-        );
-    }
-    root["version"] = serde_json::json!(19);
-    root.as_object_mut()
-        .expect("a state file root validated as an object")
-        .entry("exports_version".to_string())
-        .or_insert_with(|| serde_json::json!(PublishedExports::CURRENT_VERSION));
-    serde_json::to_string(&root).map_err(|error| {
-        BackendError::InvalidState(format!("Failed to migrate state file from v18: {error}"))
-    })
-}
-
-/// v19 → v20: reserve the token-less create-outcome-unknown current kind and
-/// make destruction protection tri-state. Legacy `true` remains explicit;
-/// legacy `false` or a missing field becomes unspecified so a schema default
-/// can protect the resource.
-fn migrate_v19_create_outcome_unknown(content: &str) -> Result<String, BackendError> {
-    let mut root: serde_json::Value = serde_json::from_str(content).map_err(|error| {
-        BackendError::InvalidState(format!("Failed to migrate state file from v19: {error}"))
-    })?;
-    let resources = root
-        .get_mut("resources")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| {
-            BackendError::InvalidState(
-                "Failed to migrate state file from v19: resources must be an array".to_string(),
-            )
-        })?;
-    for resource in resources {
-        let resource = resource.as_object_mut().ok_or_else(|| {
-            BackendError::InvalidState(
-                "Failed to migrate state file from v19: resource must be an object".to_string(),
-            )
-        })?;
-        let directives = resource
-            .entry("directives".to_string())
-            .or_insert_with(|| serde_json::json!({}))
-            .as_object_mut()
-            .ok_or_else(|| {
-                BackendError::InvalidState(
-                    "Failed to migrate state file from v19: directives must be an object"
-                        .to_string(),
-                )
-            })?;
-        let legacy = match directives.remove("prevent_destroy") {
-            Some(serde_json::Value::Bool(value)) => value,
-            None => false,
-            Some(_) => {
-                return Err(BackendError::InvalidState(
-                    "Failed to migrate state file from v19: directives.prevent_destroy must be a boolean"
-                        .to_string(),
-                ));
-            }
-        };
-        let migrated = if legacy {
-            serde_json::json!({"kind": "explicit", "value": true})
-        } else {
-            serde_json::json!({"kind": "unspecified"})
-        };
-        directives.insert("prevent_destroy".to_string(), migrated);
-    }
-    // This transition must stop at v20. The graph-aware v20 -> v21
-    // dependency classification is a separate, configuration-aware step.
-    root["version"] = serde_json::json!(20);
-    serde_json::to_string(&root).map_err(|error| {
-        BackendError::InvalidState(format!("Failed to migrate state file from v19: {error}"))
-    })
-}
-
-/// v12 → v13: migrate every JSON tree that is later decoded as a Carina
-/// `Value`. Host metadata is deliberately left untouched.
-fn migrate_v12_persisted_values(content: &str) -> Result<String, BackendError> {
-    let mut raw: serde_json::Value = serde_json::from_str(content).map_err(|error| {
-        BackendError::InvalidState(format!(
-            "Failed to re-parse state file for v12 persisted-value migration: {error}"
-        ))
-    })?;
-
-    if let Some(exports) = raw
-        .get_mut("exports")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        for value in exports.values_mut() {
-            carina_core::value::migrate_legacy_persisted_json(value);
-        }
-    }
-
-    if let Some(resources) = raw
-        .get_mut("resources")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        for resource in resources {
-            if let Some(attributes) = resource
-                .get_mut("attributes")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                for value in attributes.values_mut() {
-                    carina_core::value::migrate_legacy_persisted_json(value);
-                }
-            }
-            if let Some(deposed) = resource
-                .get_mut("deposed")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                for generation in deposed {
-                    if let Some(attributes) = generation
-                        .get_mut("attributes")
-                        .and_then(serde_json::Value::as_object_mut)
-                    {
-                        for value in attributes.values_mut() {
-                            carina_core::value::migrate_legacy_persisted_json(value);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    serde_json::to_string(&raw).map_err(|error| {
-        BackendError::InvalidState(format!(
-            "Failed to serialize state file after v12 persisted-value migration: {error}"
-        ))
-    })
-}
-
-/// v13 → v14: migrate legacy secret strings only inside current and deposed
-/// resource attributes. Export strings never had resource-state marker
-/// semantics and deliberately remain literal.
-fn migrate_v13_resource_secret_markers(content: &str) -> Result<String, BackendError> {
-    let mut raw: serde_json::Value = serde_json::from_str(content).map_err(|error| {
-        BackendError::InvalidState(format!(
-            "Failed to re-parse state file for v13 secret migration: {error}"
-        ))
-    })?;
-    carina_core::resource::legacy_secret_migration::migrate_state_document_v13(&mut raw).map_err(
-        |error| {
-            BackendError::InvalidState(format!("Failed to migrate v13 resource secrets: {error}"))
-        },
-    )?;
-
-    serde_json::to_string(&raw).map_err(|error| {
-        BackendError::InvalidState(format!(
-            "Failed to serialize state file after v13 secret migration: {error}"
-        ))
-    })
-}
-
-/// v5 → v6: state files written under v5 carry a `"desired_keys"`
-/// array per resource (flat list of top-level user-authored keys).
-/// v6's `ResourceState` no longer has that field, so serde silently
-/// discards it during the initial deserialization. This helper
-/// re-reads the source JSON to recover those arrays and lifts each
-/// entry into a `Leaf` child of the v6 `explicit: ExplicitFields::Struct`
-/// tree.
-///
-/// Resources are matched by `(provider, resource_type, identity)` because
-/// state files use that triple as the canonical identity.
-fn migrate_v5_desired_keys_to_explicit(
-    content: &str,
-    state: &mut StateFile,
-) -> Result<(), BackendError> {
-    let raw: serde_json::Value = serde_json::from_str(content).map_err(|e| {
-        BackendError::InvalidState(format!(
-            "Failed to re-parse state file for v5 desired_keys recovery: {}",
-            e
-        ))
-    })?;
-    let Some(raw_resources) = raw.get("resources").and_then(|v| v.as_array()) else {
-        return Ok(());
-    };
-    for raw_rs in raw_resources {
-        let provider = raw_rs.get("provider").and_then(|v| v.as_str());
-        let resource_type = raw_rs.get("resource_type").and_then(|v| v.as_str());
-        let identity = raw_rs
-            .get("identity")
-            .or_else(|| raw_rs.get("name"))
-            .and_then(|v| v.as_str());
-        let Some(((provider, resource_type), identity)) = provider.zip(resource_type).zip(identity)
-        else {
-            continue;
-        };
-        let Some(keys) = raw_rs.get("desired_keys").and_then(|v| v.as_array()) else {
-            continue;
-        };
-        let children: std::collections::HashMap<String, ExplicitFields> = keys
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| (s.to_string(), ExplicitFields::Leaf)))
-            .collect();
-        if children.is_empty() {
-            continue;
-        }
-        if let Some(rs) = state.resources.iter_mut().find(|rs| {
-            rs.provider == provider
-                && rs.resource_type == resource_type
-                && rs.identity.as_str() == identity
-        }) {
-            rs.explicit = ExplicitFields::Struct { children };
-        }
-    }
-    Ok(())
-}
-
-/// v6 → v7 (carina#3280): rewrite every top-level
-/// `ExplicitFields::Struct { children: {} }` row to
-/// `ExplicitFields::Unrecorded`. In v6 the empty-Struct shape on disk
-/// represented the legacy-corruption pattern (the older for-loop expansion
-/// path that lost child attributes before reaching writeback). Current-version
-/// rows may legitimately use an empty Struct to record that the desired
-/// resource authored no attributes; the migration remains version-gated so
-/// those rows are not rewritten.
-fn migrate_v6_empty_struct_to_unrecorded(state: &mut StateFile) {
-    for rs in state.resources.iter_mut() {
-        if let ExplicitFields::Struct { children } = &rs.explicit
-            && children.is_empty()
-        {
-            rs.explicit = ExplicitFields::Unrecorded;
-        }
-    }
-}
-
-/// v10 → v11: remove host-reserved top-level attributes written by older
-/// Carina versions and the built-in mock provider.
-fn migrate_v10_reserved_attributes(state: &mut StateFile) {
-    for resource in &mut state.resources {
-        match &mut resource.current {
-            CurrentInstance::Applied { attributes, .. }
-            | CurrentInstance::MissingIdentifier { attributes, .. } => {
-                attributes.retain_keys(|key| !key.starts_with('_'));
-            }
-            CurrentInstance::None
-            | CurrentInstance::CreateInFlight { .. }
-            | CurrentInstance::CreateOutcomeUnknown { .. } => {}
-        }
-        for deposed in &mut resource.deposed {
-            deposed.attributes.retain_keys(|key| !key.starts_with('_'));
-        }
-        if let ExplicitFields::Struct { children } = &mut resource.explicit {
-            children.retain(|key, _| !key.starts_with('_'));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests;
-
-impl StateFile {
-    /// Bind classification to the consumed graph until reporting and strict
-    /// validation release both the saved classification and writable state.
-    pub fn classify_legacy_graph<E, D>(
-        self,
-        graph: LegacyClassificationGraph<E, D>,
-        moves: &ResolvedMovePairs,
-        offline_unmaterialized: BTreeSet<String>,
-    ) -> Result<
-        LegacyClassificationOutcome<UnvalidatedLegacyMigration<LegacyClassificationGraph<E, D>>>,
-        LegacyDependencyMigrationError,
-    > {
-        let input = LegacyMigrationInput {
-            graph: graph.classification_index(),
-            configured: graph.configured(),
-            moved_pairs: moves,
-            offline_unmaterialized,
-        };
-        match self.classify_legacy_dependencies(&input)? {
-            LegacyClassificationOutcome::Classified(classification) => Ok(
-                LegacyClassificationOutcome::Classified(UnvalidatedLegacyMigration {
-                    graph,
-                    classification,
-                    state: self,
-                }),
-            ),
-            LegacyClassificationOutcome::RequiresReads(rows) => {
-                Ok(LegacyClassificationOutcome::RequiresReads(rows))
-            }
-        }
-    }
-
-    /// Replay the complete managed-row graph persisted by a strictly validated
-    /// plan. It crosses the same reporting and validation owner as a live graph;
-    /// source fingerprints are checked before any writable state is produced.
-    pub fn replay_legacy_graph(
-        self,
-        classification: LegacyDependencyClassification,
-    ) -> UnvalidatedLegacyMigration<LegacyDependencyClassification> {
-        UnvalidatedLegacyMigration {
-            graph: classification.clone(),
-            classification,
-            state: self,
-        }
-    }
-}
-
-/// Neither its classification nor its state may escape before strict graph
-/// validation. Warnings remain inspectable so read-only checks can count them.
-///
-/// Raw classification is private, so callers cannot detach it from the graph
-/// that must later pass strict validation:
-///
-/// ```compile_fail,E0624
-/// use carina_state::StateFile;
-///
-/// fn classify_without_graph(state: StateFile) {
-///     let _ = state.classify_legacy_dependencies(todo!());
-/// }
-/// ```
-///
-/// Consume the graph through the public pathway instead:
-///
-/// ```
-/// use carina_core::{effect::ResolvedMovePairs, resolved_graph::LegacyClassificationGraph};
-/// use carina_state::{LegacyClassificationOutcome, LegacyDependencyMigrationError, StateFile, UnvalidatedLegacyMigration};
-///
-/// fn classify<E, D>(
-///     state: StateFile,
-///     graph: LegacyClassificationGraph<E, D>,
-///     moves: &ResolvedMovePairs,
-/// ) -> Result<LegacyClassificationOutcome<UnvalidatedLegacyMigration<LegacyClassificationGraph<E, D>>>, LegacyDependencyMigrationError> {
-///     state.classify_legacy_graph(graph, moves, Default::default())
-/// }
-/// ```
-///
-/// Raw writeback cannot release a writable state from a saved classification:
-///
-/// ```compile_fail,E0624
-/// use carina_state::{LegacyDependencyClassification, StateFile};
-///
-/// fn write_without_validation(state: StateFile, classification: LegacyDependencyClassification) {
-///     let _ = state.with_legacy_classification(classification);
-/// }
-/// ```
-///
-/// Saved-plan replay also reports warnings and validates before releasing state:
-///
-/// ```
-/// use carina_state::{LegacyDependencyClassification, LegacyDependencyMigrationError, StateFile};
-///
-/// fn replay(
-///     state: StateFile,
-///     classification: LegacyDependencyClassification,
-/// ) -> Result<StateFile, LegacyDependencyMigrationError> {
-///     let validated = state.replay_legacy_graph(classification)
-///         .report_and_validate(|warning| eprintln!("{warning:?}"))?;
-///     Ok(validated.state)
-/// }
-/// ```
-///
-/// The raw input type is private; downstream callers cannot construct their own
-/// classification input through the former planned/offline constructors:
-///
-/// ```compile_fail,E0603
-/// use carina_state::state::LegacyMigrationInput;
-/// ```
-///
-/// Build the graph from configuration and let the pathway create its input:
-///
-/// ```
-/// use carina_core::{
-///     effect::{AddressedMoves, ResolvedMovePairs},
-///     parser::ExpandedParsedFile,
-///     resolved_graph::resolve_expanded_graph_for_legacy_classification,
-/// };
-/// use carina_state::{LegacyClassificationOutcome, StateFile};
-///
-/// let configuration = ExpandedParsedFile::default();
-/// let moves = ResolvedMovePairs::from_addressed_moves(
-///     AddressedMoves::preserve_addresses(&configuration.state_blocks),
-/// );
-/// let graph = resolve_expanded_graph_for_legacy_classification(configuration.into()).unwrap();
-/// let outcome = StateFile::new()
-///     .classify_legacy_graph(graph, &moves, Default::default()).unwrap();
-/// match outcome {
-///     LegacyClassificationOutcome::Classified(pending) => assert!(pending.warnings().is_empty()),
-///     LegacyClassificationOutcome::RequiresReads(rows) => panic!("unexpected unread rows: {rows}"),
-/// }
-/// ```
-///
-/// Reporting alone cannot release the state; the pending owner has no
-/// report-only transition:
-///
-/// ```compile_fail,E0599
-/// use carina_state::{StateFile, UnvalidatedLegacyMigration};
-///
-/// fn skip_validation<G>(migration: UnvalidatedLegacyMigration<G>) -> StateFile {
-///     migration.report(|_| {})
-/// }
-/// ```
-///
-/// Consume the pending owner through reporting and strict graph validation:
-///
-/// ```
-/// use carina_core::resolved_graph::LegacyClassificationGraph;
-/// use carina_state::{LegacyDependencyMigrationError, StateFile, UnvalidatedLegacyMigration};
-///
-/// fn validate<E, D>(
-///     migration: UnvalidatedLegacyMigration<LegacyClassificationGraph<E, D>>,
-/// ) -> Result<StateFile, LegacyDependencyMigrationError> {
-///     let validated = migration.report_and_validate(|warning| eprintln!("{warning:?}"))?;
-///     Ok(validated.state)
-/// }
-/// ```
-pub type UnvalidatedLegacyMigration<G> = UnreportedMigratedState<G>;
-
-pub struct UnreportedMigratedState<G> {
-    graph: G,
-    classification: LegacyDependencyClassification,
-    state: StateFile,
-}
-
-pub struct ValidatedLegacyMigration<G> {
-    pub graph: G,
-    pub classification: LegacyDependencyClassification,
-    pub state: StateFile,
-}
-
-impl<G> UnreportedMigratedState<G> {
-    pub fn migrated_rows(&self) -> usize {
-        self.classification.sources.len()
-    }
-    pub fn warnings(&self) -> &[LegacyDestroyOrderingWarning] {
-        self.classification.warnings()
-    }
-
-    fn finish<V>(
-        self,
-        mut sink: impl FnMut(&LegacyDestroyOrderingWarning),
-        validate: impl FnOnce(G) -> Result<V, LegacyDependencyMigrationError>,
-    ) -> Result<ValidatedLegacyMigration<V>, LegacyDependencyMigrationError> {
-        for warning in self.classification.warnings() {
-            sink(warning);
-        }
-        let graph = validate(self.graph)?;
-        let state = self
-            .state
-            .with_legacy_classification(self.classification.clone())?;
-        Ok(ValidatedLegacyMigration {
-            graph,
-            classification: self.classification,
-            state,
-        })
-    }
-}
-
-impl<E, D> UnvalidatedLegacyMigration<LegacyClassificationGraph<E, D>> {
-    pub fn report_and_validate(
-        self,
-        sink: impl FnMut(&LegacyDestroyOrderingWarning),
-    ) -> Result<ValidatedLegacyMigration<ResolvedExpandedGraph<E, D>>, LegacyDependencyMigrationError>
-    {
-        self.finish(sink, |graph| graph.validate().map_err(Into::into))
-    }
-}
-
-impl UnvalidatedLegacyMigration<LegacyDependencyClassification> {
-    pub fn report_and_validate(
-        self,
-        sink: impl FnMut(&LegacyDestroyOrderingWarning),
-    ) -> Result<
-        ValidatedLegacyMigration<LegacyDependencyClassification>,
-        LegacyDependencyMigrationError,
-    > {
-        self.finish(sink, |graph| {
-            if !graph.sources.keys().eq(graph.rows.keys()) {
-                return Err(LegacyDependencyMigrationError::StaleClassification);
-            }
-            Ok(graph)
-        })
-    }
-}
 
 /// State-load wrapper retaining immutable core authority, including a
 /// backend-confirmed absence. Its fields and raw constructors are private.
@@ -5200,7 +3661,7 @@ pub struct ObservationStateAuthority {
 impl ObservationStateAuthority {
     pub async fn load(
         backend: &dyn crate::backend::StateBackend,
-    ) -> crate::backend::BackendResult<(Option<LoadedState>, Self)> {
+    ) -> crate::backend::BackendResult<(Option<StateFile>, Self)> {
         let loaded = backend.read_state().await?;
         Self::from_backend_load(loaded)
     }
@@ -5210,24 +3671,22 @@ impl ObservationStateAuthority {
         Self::from_backend_load(None).map(|(_, authority)| authority)
     }
     fn from_backend_load(
-        loaded: Option<LoadedState>,
-    ) -> crate::backend::BackendResult<(Option<LoadedState>, Self)> {
+        loaded: Option<StateFile>,
+    ) -> crate::backend::BackendResult<(Option<StateFile>, Self)> {
         let authority = match loaded.as_ref() {
-            Some(LoadedState::Pristine(state) | LoadedState::Migrated { state, .. }) => {
-                match &state.loaded_observation {
-                    Some(authority) => authority.clone(),
-                    #[cfg(any(test, feature = "test-utils"))]
-                    None => state
-                        .fixture_observation_authority()
-                        .map_err(|error| map_state_file_decode_error(error, None))?,
-                    #[cfg(not(any(test, feature = "test-utils")))]
-                    None => {
-                        return Err(BackendError::InvalidState(
-                            "cannot load observation authority from state file".into(),
-                        ));
-                    }
+            Some(state) => match &state.loaded_observation {
+                Some(authority) => authority.clone(),
+                #[cfg(any(test, feature = "test-utils"))]
+                None => state
+                    .fixture_observation_authority()
+                    .map_err(map_state_file_decode_error)?,
+                #[cfg(not(any(test, feature = "test-utils")))]
+                None => {
+                    return Err(BackendError::InvalidState(
+                        "cannot load observation authority from state file".into(),
+                    ));
                 }
-            }
+            },
             None => {
                 let bytes = format!(
                     "{{\"version\":{},\"exports_version\":{},\"serial\":0,\"lineage\":\"absent\",\"carina_version\":\"absent\",\"resources\":[],\"exports\":{{}}}}",
@@ -5237,7 +3696,7 @@ impl ObservationStateAuthority {
                 Self {
                     state: std::sync::Arc::new(
                         carina_core::value::ObservationState::read_state_file(bytes.as_bytes())
-                            .map_err(|error| map_state_file_decode_error(error, None))?,
+                            .map_err(map_state_file_decode_error)?,
                     ),
                 }
             }
@@ -5260,7 +3719,7 @@ impl ObservationStateAuthority {
     }
 }
 /// Mutable working state paired with immutable observation evidence from a
-/// backend load. The working file may be migrated, updated, or replaced after
+/// backend load. The working file may be updated or replaced after
 /// loading; this wrapper does not authenticate its contents against that snapshot.
 #[derive(Debug, Clone)]
 pub struct ObservedStateFile {

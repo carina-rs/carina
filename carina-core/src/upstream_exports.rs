@@ -3273,7 +3273,7 @@ mod tests {
         for (expression, field_error) in [("up.missing", true), ("up.names['bad']", false)] {
             let parsed = parse_project_with_provider(
                 &format!(
-                    "let up = upstream_state {{ source = './up' }}\nlet copies = for n in [1, 2] {{ test.r.res {{ name = {expression} }} }}\n"
+                    "let up = upstream_state {{ source = './up' }}\nlet copies = for (_, n) in [1, 2] {{ test.r.res {{ name = {expression} }} }}\n"
                 ),
                 "test",
             );

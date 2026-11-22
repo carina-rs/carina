@@ -88,7 +88,7 @@ fn anonymous_loop_attribute_derived_error() {
             "identified safely because multiple 'mock.test.Thing' elements derive identity ",
             "from mutable attributes.\n",
             "Rewrite the loop with a binding and migrate its existing state addresses:\n\n",
-            "let thing = for name in ['alpha', 'beta'] {\n",
+            "let thing = for (_, name) in ['alpha', 'beta'] {\n",
             "  mock.test.Thing {\n",
             "    name = name\n",
             "  }\n",
@@ -138,8 +138,16 @@ fn anonymous_loop_sibling_conflicts_report_every_loop_in_validate_and_plan() {
             stderr.contains("at b.crn:1"),
             "missing b.crn error: {stderr}"
         );
-        assert!(stderr.contains("let thing = for name"), "{stderr}");
-        assert!(stderr.contains("let thing_2 = for name"), "{stderr}");
+        assert!(stderr.contains("let thing = for (_, name)"), "{stderr}");
+        assert!(stderr.contains("let thing_2 = for (_, name)"), "{stderr}");
+        assert!(
+            stderr.contains("to = mock.test.Thing 'thing[0]'"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("to = mock.test.Thing 'thing_2[0]'"),
+            "{stderr}"
+        );
     }
 }
 
@@ -177,10 +185,14 @@ fn anonymous_plain_and_single_loop_conflict_reach_validate_and_plan() {
             args[0],
         );
         assert!(stderr.contains("at main.crn:5"), "{stderr}");
-        assert!(stderr.contains("let thing = for name"), "{stderr}");
+        assert!(stderr.contains("let thing = for (_, name)"), "{stderr}");
         assert!(
             stderr.contains("from = mock.test.Thing '_for0[0]'"),
             "{stderr}",
+        );
+        assert!(
+            stderr.contains("to = mock.test.Thing 'thing[0]'"),
+            "{stderr}"
         );
     }
 }
@@ -194,7 +206,7 @@ fn anonymous_loop_identical_identity_error() {
             "identified safely because multiple 'mock.test.resource' elements have identical ",
             "stable identity inputs.\n",
             "Rewrite the loop with a binding and migrate its existing state addresses:\n\n",
-            "let resource = for name in ['same', 'same'] {\n",
+            "let resource = for (_, name) in ['same', 'same'] {\n",
             "  mock.test.resource {\n",
             "    name = name\n",
             "  }\n",

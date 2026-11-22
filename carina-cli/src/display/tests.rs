@@ -1065,13 +1065,13 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
     let deferred = carina_core::parser::DeferredForExpression::new(
         None,
         1,
-        "for opt in cert.domain_validation_options".to_string(),
+        "for (_, opt) in cert.domain_validation_options".to_string(),
         carina_core::parser::DeferredForTarget::bound(
             carina_core::resource::absolute_binding_address_for_test("validation_records"),
         )
         .expect("fixture binding is valid"),
         root_resource_ref("cert", "domain_validation_options"),
-        carina_core::parser::ForBinding::Simple("opt".to_string()),
+        carina_core::parser::ForBinding::Indexed("_".into(), "opt".to_string()),
         template_resource,
     );
 
@@ -1101,7 +1101,7 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
     Execution Plan:
 
       + aws.route53.Record validation_records[*] (N records after cert resolves)
-          <- for opt in cert.domain_validation_options
+          <- for (_, opt) in cert.domain_validation_options
           name: (known after cert resolves)
 
     Plan: 0 to add, 0 to change, 0 to destroy.
@@ -1122,13 +1122,13 @@ fn deferred_validation_records_effect() -> Effect {
     let deferred = carina_core::parser::DeferredForExpression::new(
         None,
         1,
-        "for opt in cert.domain_validation_options".to_string(),
+        "for (_, opt) in cert.domain_validation_options".to_string(),
         carina_core::parser::DeferredForTarget::bound(
             carina_core::resource::absolute_binding_address_for_test("validation_records"),
         )
         .expect("fixture binding is valid"),
         root_resource_ref("cert", "domain_validation_options"),
-        carina_core::parser::ForBinding::Simple("opt".to_string()),
+        carina_core::parser::ForBinding::Indexed("_".into(), "opt".to_string()),
         template_resource,
     );
 
@@ -1279,7 +1279,7 @@ fn test_deferred_replace_renders_top_level() {
     Execution Plan:
 
       -/+ aws.route53.Record validation_records[*] (N records after cert resolves)
-          <- for opt in cert.domain_validation_options
+          <- for (_, opt) in cert.domain_validation_options
           name: (known after cert resolves)
 
     Plan: 0 to add, 0 to change, 0 to destroy.
@@ -1330,7 +1330,7 @@ fn test_deferred_replace_renders_dependent_children() {
     Execution Plan:
 
       +/- aws.route53.Record validation_records[*] (N records after cert resolves)
-          <- for opt in cert.domain_validation_options
+          <- for (_, opt) in cert.domain_validation_options
           name: (known after cert resolves)
             │
             └─ + acm.CertificateValidation cert-validation
@@ -1371,7 +1371,7 @@ fn test_deferred_replace_keeps_unrelated_same_type_delete() {
 
       + acm.Certificate cert
             ├─ -/+ aws.route53.Record validation_records[*] (N records after cert applies)
-            │     <- for opt in cert.domain_validation_options
+            │     <- for (_, opt) in cert.domain_validation_options
             │     name: (known after cert applies)
             │
             └─ - route53.Record old_record

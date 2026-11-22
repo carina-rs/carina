@@ -15,7 +15,8 @@ impl From<AuthoredInputUnavailable> for crate::provider::HostError {
 }
 
 /// Immutable authored evidence. Parser and admission owners mint this snapshot;
-/// public AST edits cannot change it or manufacture another complete input.
+/// deferred-for expansion re-attaches it with checked child rows. Public AST
+/// edits cannot change it or manufacture another complete input.
 #[derive(Clone)]
 pub struct AuthoredInputs {
     selection: super::union_fits::InputSelectionAuthority,

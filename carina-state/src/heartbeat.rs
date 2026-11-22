@@ -288,7 +288,7 @@ mod tests {
     use tokio::sync::{Notify, Semaphore, oneshot};
 
     use super::LockHeartbeat;
-    use crate::{BackendError, BackendResult, LoadedState, LockInfo, StateBackend, StateFile};
+    use crate::{BackendError, BackendResult, LockInfo, StateBackend, StateFile};
 
     struct WarningLogger {
         messages: Mutex<Vec<String>>,
@@ -395,7 +395,7 @@ mod tests {
             carina_core::shutdown::CleanupBudget::TWO_SECOND
         }
 
-        async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
+        async fn read_state(&self) -> BackendResult<Option<StateFile>> {
             Ok(None)
         }
 

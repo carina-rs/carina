@@ -8047,8 +8047,8 @@ fn format_field_group_violation(path: &FieldPath, group: &FieldGroup) -> String 
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
-    #[error(transparent)]
-    AttributePrefix(Box<crate::identifier::AttributePrefixError>),
+    #[error("{}", .0.diagnostic_message())]
+    AttributePrefix(Box<crate::identifier::AttributePrefixFinding>),
 
     #[error("Type mismatch: {types}")]
     TypeMismatch { types: MismatchTypeNames },
@@ -10095,6 +10095,11 @@ impl<'a> EffectiveType<'a> {
             path: Vec::new(),
             field_ancestry: FieldAncestry::WRITABLE,
         }
+    }
+
+    /// Whether this exact projected type inherits provider-populated mode.
+    pub(crate) fn is_provider_populated(&self) -> bool {
+        self.field_ancestry.provider_populated
     }
 
     pub fn as_type(&self) -> &'a PatternAttributeType<Compiled> {
@@ -13148,9 +13153,9 @@ impl<R: PatternForm> PatternResourceSchema<R> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ValueEntryValidation {
-    FullInput,
+#[derive(Clone, Copy)]
+enum ValueEntryValidation<'a> {
+    FullInput(&'a crate::identifier::PrefixObligations),
     KnownWritableOnly,
 }
 
@@ -16659,6 +16664,7 @@ impl PatternResourceSchema<Compiled> {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_admission_report<
         'a,
         'v: 'a,
@@ -16672,11 +16678,41 @@ impl PatternResourceSchema<Compiled> {
         is_string_literal: &dyn Fn(&str) -> bool,
         admission: &value_validation::AttributeAdmission<'_, 'v, P, B, T>,
     ) -> ResourceValueValidation {
+        let (report, _empty_prefixes) = self
+            .validate_admission_report_with_obligations(
+                attributes,
+                entries,
+                is_string_literal,
+                admission,
+                &Default::default(),
+            )
+            .into_parts();
+        report
+    }
+
+    pub(crate) fn validate_admission_report_with_obligations<
+        'a,
+        'v: 'a,
+        P: PlaceholderKind,
+        B: BindingAddress,
+        T: StructuralPending<'v, P, B>,
+    >(
+        &self,
+        attributes: &'a indexmap::IndexMap<String, Classification<'v, P, B, T>>,
+        entries: impl IntoIterator<Item = (&'a String, &'a Classification<'v, P, B, T>)>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        admission: &value_validation::AttributeAdmission<'_, 'v, P, B, T>,
+        awaiting: &crate::identifier::PrefixObligations,
+    ) -> crate::identifier::PrefixAdmitted<ResourceValueValidation> {
         let mut report = ResourceValueValidation::default();
 
         // Check required attributes
         for (name, schema) in &self.attributes {
-            if schema.is_required() && !attributes.contains_key(name) && schema.default.is_none() {
+            if schema.is_required()
+                && !attributes.contains_key(name)
+                && !awaiting.awaits_base(name)
+                && schema.default.is_none()
+            {
                 report
                     .errors
                     .push(SchemaDiagnostic::unlocated(TypeError::MissingRequired {
@@ -16688,7 +16724,7 @@ impl PatternResourceSchema<Compiled> {
         let values = self.validate_value_entries(
             entries,
             is_string_literal,
-            ValueEntryValidation::FullInput,
+            ValueEntryValidation::FullInput(awaiting),
             None,
             admission,
         );
@@ -16698,7 +16734,7 @@ impl PatternResourceSchema<Compiled> {
             let present = group
                 .fields()
                 .iter()
-                .filter(|name| attributes.contains_key(name.as_str()))
+                .filter(|name| attributes.contains_key(name.as_str()) || awaiting.awaits_base(name))
                 .count();
             if !group.is_satisfied_by_count(present) {
                 report.errors.push(SchemaDiagnostic::unlocated(
@@ -16732,7 +16768,7 @@ impl PatternResourceSchema<Compiled> {
             );
         }
 
-        report
+        awaiting.clone().admit(report)
     }
 
     pub(crate) fn validate_resolved_admission_report<
@@ -16805,7 +16841,7 @@ impl PatternResourceSchema<Compiled> {
         &self,
         entries: impl IntoIterator<Item = (&'a String, &'a Classification<'v, P, B, T>)>,
         is_string_literal: &dyn Fn(&str) -> bool,
-        mode: ValueEntryValidation,
+        mode: ValueEntryValidation<'_>,
         selected: Option<&HashSet<String>>,
         admission: &value_validation::AttributeAdmission<'_, 'v, P, B, T>,
     ) -> ResourceValueValidation {
@@ -16840,7 +16876,7 @@ impl PatternResourceSchema<Compiled> {
                 // `read_only` attributes are provider-populated, so accepting a user
                 // value would silently drop it. Reject before type checking so the
                 // diagnostic reports writability instead of a confusing type error.
-                if schema.is_read_only() && mode == ValueEntryValidation::FullInput {
+                if schema.is_read_only() && matches!(mode, ValueEntryValidation::FullInput(_)) {
                     report
                         .errors
                         .push(SchemaDiagnostic::unlocated(TypeError::ReadOnlyAttribute {
@@ -16880,15 +16916,19 @@ impl PatternResourceSchema<Compiled> {
                     ));
                 }
                 report.insert_attribute(name.clone(), findings);
-            } else if mode == ValueEntryValidation::FullInput {
+            } else if let ValueEntryValidation::FullInput(companions) = mode {
                 if let Some(admit) = admission.unknown {
                     report.insert_attribute(name.clone(), admit(name, value));
                 }
-                report.errors.push(SchemaDiagnostic::from_value(
-                    name,
-                    LeafPath::from_segments([]),
-                    TypeError::unknown_attribute(name, &known, &aliases),
-                ));
+                // A recognized companion still admits its expression, including
+                // reference/resolution errors. Only its unknown-key judgement waits.
+                if !companions.awaits_prefix(name) {
+                    report.errors.push(SchemaDiagnostic::from_value(
+                        name,
+                        LeafPath::from_segments([]),
+                        TypeError::unknown_attribute(name, &known, &aliases),
+                    ));
+                }
             }
         }
 

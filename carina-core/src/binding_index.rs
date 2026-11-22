@@ -702,9 +702,11 @@ fn suggestion_suffix(unknown: &str, known: &[&str]) -> String {
 #[derive(Debug)]
 pub struct BindingIndex<'a, B: BindingAddress = RelativeBindingName> {
     schemas: &'a SchemaRegistry,
+    upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports<B>>,
     provider_context: crate::parser::ProviderContext,
     session: Option<&'a dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     entries: HashMap<String, BindingEntry<'a, B>>,
+    module_argument_loops: HashMap<String, BindingEntry<'a, B>>,
     known_names: std::collections::HashSet<String>,
     unavailable_upstreams: std::collections::HashSet<String>,
     resource_handles: HashMap<String, AttributeType>,
@@ -1068,11 +1070,46 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
                 unavailable_upstreams.insert(upstream.binding.to_string());
             }
         }
+        let mut module_argument_loops = HashMap::new();
+        for site in parsed.deferred_for_sites() {
+            if !matches!(site.binding, crate::parser::ForBinding::Simple(_)) {
+                continue;
+            }
+            let Some(bound) = site.target.bound_binding_address() else {
+                continue;
+            };
+            let crate::parser::DeferredForTarget::Bound(target) = site.target else {
+                continue;
+            };
+            if let Some(resource) =
+                parsed
+                    .iter_all_resources()
+                    .find_map(|resource| match resource {
+                        crate::parser::ResourceRef::Deferred { resource, .. }
+                            if resource.id().identity_str()
+                                == Some(target.template_address().resource_identity().as_str()) =>
+                        {
+                            Some(resource)
+                        }
+                        _ => None,
+                    })
+                && let Some(schema) = registry.get_for(resource.as_resource())
+            {
+                module_argument_loops.insert(
+                    bound.to_string(),
+                    BindingEntry {
+                        target: BindingTarget::Schema(schema.schema().as_schema()),
+                    },
+                );
+            }
+        }
         Self {
+            upstream_exports,
             schemas: registry,
             provider_context: provider_context.clone(),
             session: None,
             entries,
+            module_argument_loops,
             known_names,
             unavailable_upstreams,
             resource_handles,
@@ -1083,7 +1120,19 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     }
 
     pub fn get(&self, name: &str) -> Option<&BindingEntry<'a, B>> {
-        self.entries.get(name)
+        self.entries.get(name).or_else(|| {
+            let address = crate::resource::decompose_binding_address(name)?;
+            address.candidate_ancestors().find_map(|parent| {
+                address
+                    .is_direct_child_of(parent)
+                    .then(|| self.module_argument_loops.get(parent))
+                    .flatten()
+            })
+        })
+    }
+
+    pub(crate) fn upstream_exports(&self) -> Option<&crate::upstream_exports::UpstreamExports<B>> {
+        self.upstream_exports
     }
 
     pub(crate) fn provider_context(&self) -> &crate::parser::ProviderContext {
@@ -1221,7 +1270,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
             return result;
         }
 
-        let result = match self.entries.get(reference.binding()) {
+        let result = match self.get(reference.binding()) {
             None if self.known_names.contains(reference.binding()) => RefType::Unchecked,
             None => RefType::UnknownBinding {
                 binding: reference.binding().to_string(),

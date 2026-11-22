@@ -35,8 +35,8 @@ use carina_core::value::PersistedExportValue;
 #[cfg(test)]
 use carina_core::value::PersistedValue;
 use carina_state::{
-    BackendError, DeposedAttributes, DeposedInstance, DeposedKey, PreviousSecretHashAuthority,
-    ResourceState, RowBasis, StateBackend, StateFile,
+    BackendError, DeposedAttributes, DeposedInstance, DeposedKey, ResourceState, RowBasis,
+    StateBackend, StateFile,
 };
 use serde::{Deserialize, Serialize};
 
@@ -305,6 +305,7 @@ pub(crate) struct ApplyStateSaveInputs<S = ModuleSource> {
     planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
     comparisons: ResolvedComparisonTable,
     references: Option<carina_core::references::ResolvedReferences>,
+    final_desired: Option<crate::wiring::ReleaseWitness>,
 }
 
 impl<S: Clone> ApplyStateSaveInputs<S> {
@@ -324,6 +325,7 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
             planned_secret_hashes,
             comparisons,
             references: None,
+            final_desired: None,
         })
     }
 
@@ -332,6 +334,11 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
         references: Option<carina_core::references::ResolvedReferences>,
     ) -> Self {
         self.references = references;
+        self
+    }
+
+    pub(crate) fn with_final_desired(mut self, desired: crate::wiring::ReleaseWitness) -> Self {
+        self.final_desired = Some(desired);
         self
     }
 
@@ -385,6 +392,7 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
             self.references.as_ref(),
             &result.permanent_name_overrides,
             &result.replacement_writeback,
+            self.final_desired.as_ref(),
         )
     }
 }
@@ -1277,22 +1285,19 @@ fn planned_depose<S>(
         // provider-echoed write-only value enter this snapshot.
         existing.deposed_attributes_from_current_generation(desired_resource, schema)
     } else {
-        let previous_hash_authority = existing_attributes
-            .map(PreviousSecretHashAuthority::AllPreviouslyHashedKeys)
-            .unwrap_or(PreviousSecretHashAuthority::None);
         if let Some(previous) = delete.previous_attributes {
             ResourceState::deposed_attributes_from_replacement_history(
                 desired_resource,
                 schema,
                 previous,
-                previous_hash_authority,
+                existing_attributes,
             )
         } else if let Some(current) = current_state {
             ResourceState::deposed_attributes_without_previous(
                 desired_resource,
                 schema,
                 &current.attributes,
-                previous_hash_authority,
+                existing_attributes,
             )
         } else {
             Ok(DeposedAttributes::default())
@@ -1749,6 +1754,7 @@ pub(crate) fn build_state_after_apply<S: Clone>(
         None,
         &HashMap::new(),
         &[],
+        None,
     )
 }
 
@@ -1762,6 +1768,7 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
         HashMap<String, carina_core::name_override::NameOverride>,
     >,
     runtime_replacements: &[carina_core::replacement::ReplacementWriteback],
+    final_desired: Option<&crate::wiring::ReleaseWitness>,
 ) -> Result<StateFile, AppError> {
     let ApplyStateSave {
         state_file,
@@ -1815,12 +1822,15 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
                 let schema = Some(owner_schema.schema().as_schema());
                 Ok::<_, AppError>(match &planned.source {
                     UpsertSource::Complete { state, request } => {
-                        ResourceState::from_provider_state_for_resource_and_schema(
+                        crate::wiring::write_resource_state(
                             resource,
-                            state,
+                            carina_state::ResourceStateWrite::Provider {
+                                state,
+                                basis: RowBasis::Applied(request),
+                            },
                             existing,
                             schema,
-                            RowBasis::Applied(request),
+                            final_desired,
                             preferred_hashes,
                             comparison,
                         )
@@ -1832,12 +1842,15 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
                         // Import sends no resource attributes, so it establishes no
                         // write-only baseline. An updatable key is sent by the next
                         // plan; a create-only key remains subject to the #1232 guard.
-                        ResourceState::from_provider_state_for_resource_and_schema(
+                        crate::wiring::write_resource_state(
                             resource,
-                            state,
+                            carina_state::ResourceStateWrite::Provider {
+                                state,
+                                basis: RowBasis::Imported,
+                            },
                             existing,
                             schema,
-                            RowBasis::Imported,
+                            final_desired,
                             preferred_hashes,
                             comparison,
                         )
@@ -1847,12 +1860,15 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
                     }
                     UpsertSource::CurrentPresent(state)
                     | UpsertSource::CurrentMissingIdentifier(state) => {
-                        ResourceState::from_provider_state_for_resource_and_schema(
+                        crate::wiring::write_resource_state(
                             resource,
-                            state,
+                            carina_state::ResourceStateWrite::Provider {
+                                state,
+                                basis: RowBasis::Carried,
+                            },
                             existing,
                             schema,
-                            RowBasis::Carried,
+                            final_desired,
                             preferred_hashes,
                             comparison,
                         )
@@ -1860,11 +1876,12 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
                             AppError::from_resource_state_encoding(id.clone(), source)
                         })?
                     }
-                    UpsertSource::Observed(identified) => ResourceState::from_observation(
+                    UpsertSource::Observed(identified) => crate::wiring::write_resource_state(
                         resource,
-                        identified,
+                        carina_state::ResourceStateWrite::Observation(identified),
                         existing,
                         schema,
+                        final_desired,
                         preferred_hashes,
                         comparison,
                     )
@@ -2131,23 +2148,26 @@ mod post_apply_states_tests {
 
         // state.resources carries the POST-apply value — this must win.
         let json = serde_json::json!({
-            "version": 5,
+            "version": 21,
+            "exports_version": 1,
             "serial": 1,
             "lineage": "test",
             "carina_version": "0.4.0",
             "resources": [
                 {
                     "resource_type": "s3.Bucket",
-                    "name": "log",
-                    "identifier": "log-bucket",
+                    "identity": "log",
                     "provider": "awscc",
-                    "attributes": { "versioning": "Enabled" }
+                    "current": {
+                        "kind": "applied",
+                        "identifier": "log-bucket",
+                        "attributes": { "versioning": "Enabled" },
+                        "nested_write_only": {}
+                    }
                 }
             ]
         });
-        let state = carina_state::check_and_migrate(&json.to_string())
-            .unwrap()
-            .into_state();
+        let state = carina_state::load_state(&json.to_string()).unwrap();
 
         let managed_current = crate::managed_current_from_states(managed_states);
         let post = PostApplyStates::from_current_and_state(
@@ -2717,13 +2737,13 @@ mod apply_state_save_tests {
         let template = DeferredForExpression::new(
             Some("main.crn".to_string()),
             1,
-            "for opt in cert.domain_validation_options".to_string(),
+            "for (_, opt) in cert.domain_validation_options".to_string(),
             carina_core::parser::DeferredForTarget::bound(
                 carina_core::resource::absolute_binding_address_for_test("validation_records"),
             )
             .expect("fixture binding is valid"),
             root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Simple("opt".to_string()),
+            ForBinding::Indexed("_".into(), "opt".to_string()),
             // Comparison pre-resolution keys the materialized template by
             // provider instance and type before any runtime child exists.
             Resource::pending_with_provider("aws", "route53.Record", None),
@@ -5099,9 +5119,7 @@ mod apply_state_save_tests {
 
         assert_aligned(&state);
         let serialized = serde_json::to_string(&state).expect("serialize state");
-        let round_tripped = carina_state::check_and_migrate(&serialized)
-            .expect("deserialize state")
-            .into_state();
+        let round_tripped = carina_state::load_state(&serialized).expect("deserialize state");
         assert_aligned(&round_tripped);
 
         let listener_current = round_tripped.build_state_for_resource(&id);
@@ -5418,13 +5436,13 @@ mod apply_state_save_tests {
         let template = DeferredForExpression::new(
             Some("main.crn".to_string()),
             1,
-            "for opt in cert.domain_validation_options".to_string(),
+            "for (_, opt) in cert.domain_validation_options".to_string(),
             carina_core::parser::DeferredForTarget::bound(
                 carina_core::resource::absolute_binding_address_for_test("validation_records"),
             )
             .expect("fixture binding is valid"),
             root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Simple("opt".to_string()),
+            ForBinding::Indexed("_".into(), "opt".to_string()),
             Resource::with_provider("aws", "route53.Record", "validation_records", None)
                 .with_test_binding("validation_records"),
         );
@@ -5496,13 +5514,13 @@ mod apply_state_save_tests {
             Box::new(DeferredForExpression::new(
                 Some("main.crn".to_string()),
                 1,
-                "for opt in cert.domain_validation_options".to_string(),
+                "for (_, opt) in cert.domain_validation_options".to_string(),
                 carina_core::parser::DeferredForTarget::bound(
                     carina_core::resource::absolute_binding_address_for_test("validation_records"),
                 )
                 .expect("fixture binding is valid"),
                 root_resource_ref("cert", "domain_validation_options", Vec::new()),
-                ForBinding::Simple("opt".to_string()),
+                ForBinding::Indexed("_".into(), "opt".to_string()),
                 template_resource,
             )),
         )))

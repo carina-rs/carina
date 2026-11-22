@@ -1,60 +1,75 @@
 {
-  "version": 18,
-  "exports_version": 1,
-  "serial": 1,
-  "lineage": "test-moved-hint-ambiguous",
   "carina_version": "0.7.1",
+  "exports_version": 1,
+  "lineage": "test-moved-hint-ambiguous",
   "resources": [
     {
-      "resource_type": "ec2.Vpc",
-      "identity": "old_a",
-      "provider": "awscc",
+      "binding": "old_a",
       "current": {
-        "kind": "applied",
-        "identifier": "vpc-old-a",
         "attributes": {
           "cidr_block": "10.0.0.0/16"
         },
+        "identifier": "vpc-old-a",
+        "kind": "applied",
         "nested_write_only": {}
       },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
-      "explicit": {
-        "kind": "struct",
-        "children": {
-          "cidr_block": { "kind": "leaf" }
-        }
+      "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
       },
-      "binding": "old_a",
-      "dependency_bindings": []
+      "explicit": {
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "old_a",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Vpc"
     },
     {
-      "resource_type": "ec2.Vpc",
-      "identity": "old_b",
-      "provider": "awscc",
+      "binding": "old_b",
       "current": {
-        "kind": "applied",
-        "identifier": "vpc-old-b",
         "attributes": {
           "cidr_block": "10.0.0.0/16"
         },
+        "identifier": "vpc-old-b",
+        "kind": "applied",
         "nested_write_only": {}
       },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
-      "explicit": {
-        "kind": "struct",
-        "children": {
-          "cidr_block": { "kind": "leaf" }
-        }
+      "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
       },
-      "binding": "old_b",
-      "dependency_bindings": []
+      "explicit": {
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "old_b",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Vpc"
     }
   ],
-  "exports": {}
+  "serial": 1,
+  "version": 21
 }
