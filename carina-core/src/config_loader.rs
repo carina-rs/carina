@@ -2130,12 +2130,17 @@ pub(crate) fn parse_directory_files_located_from_root(
             &bindings_current.variables,
             &bindings_current.metadata,
         );
+        // Compile declarations with the typed structural scope before calls
+        // can capture their bodies. The bootstrap table contains only typed
+        // provisional heads where a For handle was not yet available.
+        let functions = parser::top_level_user_functions_with_bindings(files, config, &seeds)
+            .map_err(LocatedParseError::directory_wide)?;
         let mut bindings_next = parse_local_variable_union(
             files,
             config,
             &seeds,
             &pass_1a_local_variables,
-            &directory_functions,
+            &functions,
         )?;
         // The fixed point recomputes value-shaped `let` bindings only.
         // Resource handles, Ref-typed module arguments, and structural aliases
@@ -2148,11 +2153,14 @@ pub(crate) fn parse_directory_files_located_from_root(
         parser::reject_cyclic_let_bindings_in_variables(&bindings_next.variables, &structural)
             .map_err(LocatedParseError::directory_wide)?;
 
-        if bindings_next == bindings_current {
+        let reached_fixed_point = bindings_next == bindings_current;
+        // Deferred-call equality ignores captured definitions. Keep the newest
+        // classified function payload even when value identity is unchanged.
+        bindings_current = bindings_next;
+        if reached_fixed_point {
             converged = true;
             break;
         }
-        bindings_current = bindings_next;
     }
 
     // Paranoid backstop only. The fixed-point sequence is monotone for
@@ -2178,6 +2186,10 @@ pub(crate) fn parse_directory_files_located_from_root(
         &bindings_current.variables,
         &bindings_current.metadata,
     );
+
+    let directory_functions =
+        parser::top_level_user_functions_with_bindings(files, config, &final_seeds)
+            .map_err(LocatedParseError::directory_wide)?;
 
     // Pass 2: re-parse each file with the sibling-aware union seeded into `ctx`.
     let mut out = Vec::with_capacity(files.len());

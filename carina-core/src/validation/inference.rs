@@ -909,10 +909,11 @@ pub fn attached_inference_failures<'a, B: BindingAddress>(
             ExportStaticType::Inferred(StaticType::Unchecked(
                 InferredUncheckedReason::InferenceFailed(error),
             )) => {
-                // An expression failure already owns its diagnostic. Adding an
-                // export annotation cannot repair it, so do not report it twice.
+                // Only the typed loop selector owns this attached duplicate.
+                // Ordinary expressions retain main's independent export error.
                 if parameter.judgement().is_ok_and(|expression| {
-                    expression.check_owner() == crate::parser::retained::ExpressionCheckOwner::Reported
+                    expression.loop_selector_owns_failure()
+                        && expression.check_owner() == crate::parser::retained::ExpressionCheckOwner::Reported
                         && matches!(expression.static_type(), Err(InferenceIssue::Failed(reported)) if &reported == error)
                 }) {
                     return None;

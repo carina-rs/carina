@@ -3968,6 +3968,15 @@ pub struct UserFunction<B: BindingAddress = RelativeBindingName> {
 }
 
 impl<B: BindingAddress> UserFunction<B> {
+    pub(crate) fn has_provisional_reference_heads(&self) -> bool {
+        self.params
+            .iter()
+            .filter_map(|parameter| parameter.default.as_ref())
+            .chain(self.local_lets.iter().map(|(_, value, _)| value))
+            .chain(std::iter::once(&self.body.value))
+            .any(super::functions::contains_provisional_function_head)
+    }
+
     pub(crate) fn map_bindings<T: BindingAddress>(
         self,
         map: &mut impl FnMut(B) -> T,

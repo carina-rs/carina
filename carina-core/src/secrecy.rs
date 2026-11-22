@@ -3767,7 +3767,8 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                             values.push(None);
                         }
                     }
-                    ParserPlaceholder::Loop(_)
+                    ParserPlaceholder::FunctionHead(_)
+                    | ParserPlaceholder::Loop(_)
                     | ParserPlaceholder::EmptyInterpolation { source: _ } => values.push(None),
                 },
                 DeferredValue::ModuleIf(conditional) => {

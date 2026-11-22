@@ -56,6 +56,54 @@ fn loop_dot_review_round1_unrelated_cli_scope() {
     run_case_table(|row| matches!(row.id, "2-20" | "2-21"));
 }
 
+#[test]
+fn loop_dot_review_round2_deferred_function_contexts() {
+    run_case_table(|row| row.id == "2-22" || row.positions.contains(&"deferred function body"));
+}
+
+#[test]
+fn loop_dot_review_round2_unrelated_export_failure() {
+    run_case_table(|row| row.id == "2-23");
+}
+
+#[test]
+fn loop_dot_review_round2_module_arguments() {
+    run_case_table(|row| matches!(row.id, "2-2" | "2-17"));
+}
+
+#[test]
+fn loop_dot_review_round2_non_loop_module_access_matches_main() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let row = cases::rows()
+        .into_iter()
+        .find(|row| row.id == "2-23")
+        .unwrap();
+    cases::fixture(root, &row);
+    cases::write(
+        root,
+        "main.crn",
+        "let child = use { source = './child' }\nlet m = child { value = 'x' }\n",
+    );
+    assert!(run(root, &["init", "."]).status.success());
+    for (reader, expected) in [
+        ("(m).x", vec![]),
+        (
+            "(m).missing",
+            vec!["unknown attribute 'missing' on 'm' in reference m.missing"],
+        ),
+    ] {
+        cases::write(
+            root,
+            "other.crn",
+            &format!("let other = mock.test.resource {{ name = 'other' comment = {reader} }}\n"),
+        );
+        let (valid, errors) = diagnostics(root);
+        assert_eq!(valid, expected.is_empty(), "{reader}");
+        assert_eq!(errors, expected, "{reader}");
+    }
+}
+
 fn run_case_table(include: impl Fn(&cases::Row) -> bool) {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
@@ -104,7 +152,14 @@ fn run_case_table(include: impl Fn(&cases::Row) -> bool) {
                             observed.1[0] = observed.1[0].replace(reader, "<reader>");
                         }
                     }
-                    if dot != bracket || (!matches!(row.id, "2-4" | "2-6a") && !dot.0) {
+                    if row.id == "2-22" && position == "deferred function body" {
+                        assert_eq!(
+                            bracket.1,
+                            ["missing dependency edge to children.a provenance in ./other.crn"; 2],
+                            "#4597 remains the subscript control"
+                        );
+                    }
+                    if dot != bracket || (!matches!(row.id, "2-4" | "2-6a" | "2-22") && !dot.0) {
                         failures.push(format!("{label}: dot {dot:?}, subscript {bracket:?}"));
                     } else if row.id == "2-6a" && dot.0 {
                         failures.push(format!("{label}: simple map iteration must be rejected"));

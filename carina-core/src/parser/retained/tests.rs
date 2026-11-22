@@ -347,6 +347,19 @@ fn keyed_loop_addressing_agrees_across_judgement_validation_and_expansion() {
 }
 
 #[test]
+fn loop_dot_review_round2_parenthesized_non_loop_module_keeps_generic_access() {
+    let (_, report) = source_schema_report(
+        "let child = use { source = './child' }\nlet m = child {}\nlet selected = (m).x\nlet missing = (m).missing\n",
+    );
+    let base = report.binding(&RelativeBindingName::new("m")).unwrap();
+    for name in ["selected", "missing"] {
+        let selected = report.binding(&RelativeBindingName::new(name)).unwrap();
+        assert_eq!(selected.static_type(), base.static_type(), "{name}");
+        assert_eq!(selected.check_owner(), base.check_owner(), "{name}");
+    }
+}
+
+#[test]
 fn loop_dot_retained_heads_match_subscript_diagnostics() {
     for (pattern, iterable) in [("k, v", "({ a = 'x' })"), ("v", "['a']")] {
         for alias in [false, true] {

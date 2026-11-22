@@ -439,10 +439,12 @@ fn parse_namespaced_id_value(
         {
             value = apply_postfix_path_segment(value, segment, &location)?;
         }
-        if let EvalValue::User(Value::Deferred(DeferredValue::ResourceRef { path })) = &mut value {
-            path.set_reference_locations(ctx.reference_locations(&pair));
-        }
-        return Ok(value);
+        return Ok(match value {
+            EvalValue::User(value) => EvalValue::from_value(
+                value.with_reference_locations(&ctx.reference_locations(&pair)),
+            ),
+            other => other,
+        });
     }
 
     match head_binding {
@@ -491,6 +493,22 @@ fn parse_namespaced_id_value(
             return Ok(value);
         }
         ParseBindingRef::Unbound => {}
+    }
+
+    if let Some(mut value) = ctx.provisional_function_head(parts[0]) {
+        // Classified parsing resolves the typed head through For authority
+        // before any resource attribute can be formed.
+        let location = ctx.declaration_location(&pair);
+        for step in parts[1..]
+            .iter()
+            .map(|name| PathSegment::Field {
+                name: (*name).to_owned(),
+            })
+            .chain(trailing_segments)
+        {
+            value = apply_postfix_path_segment(value, step, &location)?;
+        }
+        return Ok(value);
     }
 
     // Trailing segments (`a.b['k']`, `a.b[0]`, `a.b.c[0].d`)
@@ -918,6 +936,10 @@ fn parse_primary_eval_with_mode_inner(
 
             // Collect all access steps (field or index)
             let access_steps: Vec<pest::iterators::Pair<Rule>> = parts.collect();
+
+            if let Some(head) = ctx.provisional_function_head(first_ident) {
+                return apply_postfix_steps(head, access_steps, ctx);
+            }
 
             if access_steps.is_empty() {
                 // Simple variable reference (no access chain)

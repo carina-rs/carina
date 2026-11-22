@@ -15,6 +15,91 @@ fn loop_dot_review_round1_function_contexts() {
 }
 
 #[test]
+fn loop_dot_review_round2_deferred_function_contexts() {
+    run_loop_dot_case_table(|row| {
+        row.id == "2-22" || row.positions.contains(&"deferred function body")
+    });
+}
+
+#[test]
+fn loop_dot_review_round2_unrelated_export_failure() {
+    run_loop_dot_case_table(|row| row.id == "2-23");
+}
+
+#[test]
+fn loop_dot_review_round2_module_arguments() {
+    run_loop_dot_case_table(|row| matches!(row.id, "2-2" | "2-17"));
+}
+
+#[test]
+fn loop_dot_review_round2_bare_child_diagnostic_locations_match_subscript() {
+    let directory = Directory::new(&[]);
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let root = directory.root.path();
+    for row in loop_dot_cases::rows()
+        .into_iter()
+        .filter(|row| row.id == "2-4")
+    {
+        loop_dot_cases::fixture(root, &row);
+        for &position in row.positions {
+            let mut observations = Vec::new();
+            for reader in ["children.a", "children['a']"] {
+                let owner = loop_dot_cases::reader(root, position, reader);
+                let path = root.join(owner);
+                let source = std::fs::read_to_string(&path).unwrap();
+                let reader_start = source.find(reader).unwrap();
+                let reader_end = reader_start + reader.len();
+                let offset = |point: tower_lsp::lsp_types::Position| {
+                    let line_start: usize = source
+                        .split_inclusive('\n')
+                        .take(point.line as usize)
+                        .map(str::len)
+                        .sum();
+                    let byte = line_start + point.character as usize;
+                    // Remove only the subscript punctuation difference. Keep
+                    // root, key, and whole-expression anchors distinct.
+                    let suffix = reader_start + "children".len();
+                    if reader == "children.a" || byte <= suffix {
+                        byte
+                    } else if byte >= reader_end {
+                        byte - 3
+                    } else {
+                        suffix + if byte - suffix <= 2 { 1 } else { 2 }
+                    }
+                };
+                observations.push(
+                    engine
+                        .analyze(&create_document_at(&source, path.clone()), Some(&path))
+                        .into_iter()
+                        .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+                        .map(|diagnostic| {
+                            (
+                                diagnostic.message,
+                                offset(diagnostic.range.start),
+                                offset(diagnostic.range.end),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            assert_eq!(
+                observations[0], observations[1],
+                "{:?}, {position}",
+                row.kind
+            );
+        }
+    }
+}
+
+#[test]
 fn loop_dot_review_round1_unrelated_lsp_wording_matches_main() {
     run_loop_dot_case_table(|row| matches!(row.id, "2-20" | "2-21"));
 }
@@ -165,13 +250,19 @@ fn run_loop_dot_case_table(include: impl Fn(&loop_dot_cases::Row) -> bool) {
         vec!["mock".into()],
     );
     let root = directory.root.path();
-    let observe = |owner: &str| {
+    let observe = |owner: &str, include_inference_warning: bool| {
         let path = root.join(owner);
         let source = std::fs::read_to_string(&path).unwrap();
         engine
             .analyze(&create_document_at(&source, path.clone()), Some(&path))
             .into_iter()
-            .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+            .filter(|diagnostic| {
+                diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+                    || (include_inference_warning
+                        && diagnostic
+                            .message
+                            .starts_with("export 'out': type annotation required:"))
+            })
             .map(|diagnostic| diagnostic.message)
             .collect::<Vec<_>>()
     };
@@ -180,7 +271,7 @@ fn run_loop_dot_case_table(include: impl Fn(&loop_dot_cases::Row) -> bool) {
         loop_dot_cases::fixture(root, &row);
         for &position in row.positions {
             let owner = loop_dot_cases::reader(root, position, row.reader);
-            let dot = observe(owner);
+            let dot = observe(owner, row.id == "2-23");
             let expected = match row.expected {
                 loop_dot_cases::Outcome::Validates => Vec::new(),
                 loop_dot_cases::Outcome::Error(errors) => {
@@ -192,7 +283,7 @@ fn run_loop_dot_case_table(include: impl Fn(&loop_dot_cases::Row) -> bool) {
                 }
                 loop_dot_cases::Outcome::SameAsSubscript(subscript) => {
                     loop_dot_cases::reader(root, position, subscript);
-                    let bracket = observe(owner);
+                    let bracket = observe(owner, false);
                     // Bare-child exports retain independent annotation errors
                     // from the shared core boundary pass, alongside expression errors.
                     let expected: Vec<String> = if row.id == "2-4" {
@@ -223,6 +314,8 @@ fn run_loop_dot_case_table(include: impl Fn(&loop_dot_cases::Row) -> bool) {
                         .into_iter()
                         .map(str::to_owned)
                         .collect()
+                    } else if row.id == "2-22" {
+                        bracket.clone()
                     } else if row.id == "2-6a" {
                         vec![format!(
                             "deferred-for iterable `{subscript}`: expected list iterable, got map"

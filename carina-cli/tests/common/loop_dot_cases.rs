@@ -164,9 +164,17 @@ pub fn rows() -> Vec<Row> {
                 ]),
             ),
             (
-                &["export", "export plain"][..],
+                &["export"][..],
                 Error(&[
                     "Undefined identifier `key`. In-scope names: children, children['my-key'], items (let / upstream_state / read / module / function / for / fn / arguments)",
+                    "operator '-': left operand must be Int, got mock.test.resource",
+                ]),
+            ),
+            (
+                &["export plain"][..],
+                Error(&[
+                    "Undefined identifier `key`. In-scope names: children, children['my-key'], items (let / upstream_state / read / module / function / for / fn / arguments)",
+                    "./exports.crn:1:11: export 'out': type annotation required: operator '-': left operand must be Int, got mock.test.resource",
                     "operator '-': left operand must be Int, got mock.test.resource",
                 ]),
             ),
@@ -234,6 +242,18 @@ pub fn rows() -> Vec<Row> {
     });
     for kind in [Map, ValueKeyed, Indexed] {
         rows.push(Row {
+            id: if kind == Indexed { "2-19" } else { "2-22" },
+            kind,
+            key: "a",
+            reader: "children.a.name",
+            positions: &["deferred function body", "deferred parameter default"],
+            expected: if kind == Indexed {
+                Error(&["cannot apply access .a to list(mock.test.resource)"])
+            } else {
+                SameAsSubscript("children['a'].name")
+            },
+        });
+        rows.push(Row {
             id: "2-20",
             kind,
             key: "a",
@@ -249,6 +269,23 @@ pub fn rows() -> Vec<Row> {
             },
         });
     }
+    rows.push(Row {
+        id: "2-23",
+        kind: NoLoop,
+        key: "a",
+        reader: "r.name + 1",
+        positions: &["unrelated export failure"],
+        expected: SurfaceErrors {
+            cli: &[
+                "./exports.crn:1:11: export 'out': type annotation required: operator '+': left operand must be Int, got String",
+                "operator '+': left operand must be Int, got String",
+            ],
+            lsp: &[
+                "operator '+': left operand must be Int, got String",
+                "export 'out': type annotation required: operator '+': left operand must be Int, got String",
+            ],
+        },
+    });
     for kind in [NoLoop, Map, ValueKeyed, Indexed] {
         rows.push(Row {
             id: "2-21",
@@ -332,6 +369,7 @@ pub fn fixture(root: &Path, row: &Row) {
     for (name, body) in [
         ("main.crn", main.as_str()),
         ("other.crn", ""),
+        ("callee.crn", ""),
         ("exports.crn", "exports {}\n"),
         ("providers.crn", "provider mock {}\n"),
         (
@@ -362,6 +400,28 @@ pub fn reader(root: &Path, position: &str, reader: &str) -> &'static str {
         _ => reader.to_owned(),
     };
     let (other, exports, owner) = match position {
+        "deferred function body" | "deferred parameter default" => {
+            write(root, "callee.crn", "fn g(): String { 'gee' }\n");
+            let function = if position == "deferred function body" {
+                format!("fn selected(x: String): String {{ \"${{x}}-${{{expression}}}\" }}")
+            } else {
+                format!(
+                    "fn selected(x: String, value: String = {expression}): String {{ \"${{x}}-${{value}}\" }}"
+                )
+            };
+            (
+                format!(
+                    "{function}\nlet other = mock.test.resource {{ name = 'other' comment = selected(g()) }}\n"
+                ),
+                "exports {}\n".to_owned(),
+                "other.crn",
+            )
+        }
+        "unrelated export failure" => (
+            "let r = mock.test.resource { name = 'r' }\n".to_owned(),
+            format!("exports {{ out = {expression} }}\n"),
+            "exports.crn",
+        ),
         "function body"
         | "parameter default"
         | "unused function body"

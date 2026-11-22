@@ -1489,26 +1489,13 @@ impl Expressions<crate::resource::AbsoluteBindingAddress> {
                             } => Value::Deferred(crate::resource::DeferredValue::BindingRef {
                                 binding: resolve(RelativeBindingName::new(name)),
                             }),
-                            ParserPlaceholder::FnParam { name } => {
-                                Value::Deferred(crate::resource::DeferredValue::Placeholder(
-                                    ParserPlaceholder::FnParam { name },
-                                ))
-                            }
-                            ParserPlaceholder::FnLocal { name } => {
-                                Value::Deferred(crate::resource::DeferredValue::Placeholder(
-                                    ParserPlaceholder::FnLocal { name },
-                                ))
-                            }
-                            ParserPlaceholder::Loop(slot) => {
-                                Value::Deferred(crate::resource::DeferredValue::Placeholder(
-                                    ParserPlaceholder::Loop(slot),
-                                ))
-                            }
-                            ParserPlaceholder::EmptyInterpolation { source } => {
-                                Value::Deferred(crate::resource::DeferredValue::Placeholder(
-                                    ParserPlaceholder::EmptyInterpolation { source },
-                                ))
-                            }
+                            placeholder @ (ParserPlaceholder::FunctionHead(_)
+                            | ParserPlaceholder::FnParam { .. }
+                            | ParserPlaceholder::FnLocal { .. }
+                            | ParserPlaceholder::Loop(_)
+                            | ParserPlaceholder::EmptyInterpolation { .. }) => Value::Deferred(
+                                crate::resource::DeferredValue::Placeholder(placeholder),
+                            ),
                         })
                     },
                 )
@@ -3703,6 +3690,11 @@ mod judgement {
         }
     }
 
+    /// Minted only by a rejected typed loop selection. This ownership follows
+    /// the failure through containing expressions and shared export checks.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct LoopSelectorFailure;
+
     #[doc(hidden)]
     #[derive(Clone)]
     pub struct JudgedExprData {
@@ -3718,6 +3710,7 @@ mod judgement {
         fields: Arc<crate::parser::ConfigurationAttributes<JudgedExpr>>,
         converted: Option<Arc<conversion::ConversionTypeJudgement>>,
         structural_source: bool,
+        selector_failure: Option<LoopSelectorFailure>,
         static_source: Option<Arc<StaticSourceReceipt>>,
     }
 
@@ -3731,6 +3724,7 @@ mod judgement {
                 .field("origin", &self.origin)
                 .field("boundary_owner", &self.boundary_owner)
                 .field("judgement", &self.judgement)
+                .field("selector_failure", &self.selector_failure)
                 .field("authority", &self.authority)
                 .field("coalesce", &self.coalesce)
                 .field("alternatives", &self.alternatives)
@@ -3747,6 +3741,7 @@ mod judgement {
                 && self.origin == other.origin
                 && self.boundary_owner == other.boundary_owner
                 && self.judgement == other.judgement
+                && self.selector_failure == other.selector_failure
                 && match (&self.authority, &other.authority) {
                     (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                     (None, None) => true,
@@ -4204,6 +4199,9 @@ mod judgement {
                 self.judgement,
                 ExprJudgement::ValueDependent { shape: None, .. }
             )
+        }
+        pub(crate) fn loop_selector_owns_failure(&self) -> bool {
+            self.selector_failure.is_some()
         }
         pub fn check_owner(&self) -> ExpressionCheckOwner {
             match &self.judgement {
@@ -6574,6 +6572,7 @@ mod judgement {
                 };
                 result.mark_failed(error.clone(), owner);
                 result.data_mut().boundary_owner = failed.boundary_owner.clone();
+                result.data_mut().selector_failure = failed.selector_failure;
             }
             if let ExprJudgement::Failed {
                 error,
@@ -6928,33 +6927,31 @@ mod judgement {
                 })
         }
 
-        /// Preserve typed head authority through lexical definitions and
-        /// selections. Collection shapes never grant loop-group authority.
-        fn structural_head(
+        /// Only loop groups and selections descended from them use the
+        /// selector/module-output path. Other heads retain generic access.
+        fn loop_access_head(
             &self,
             expression: &ExprValue<ParserPlaceholder, B>,
         ) -> Option<ResolvedHead<'a, B>> {
             use crate::resource::binding_address::BindingLookup;
             let root = &expression.authored;
-            if let Some(handle) = self
+            if let Some(group) = self
                 .structural_definitions
                 .get(&(root.location.instance.clone(), root.id))
+                .and_then(|handle| handle.loop_group())
             {
-                return Some(Self::head_for_handle(handle, handle.canonical_binding()));
+                return Some(ResolvedHead::LoopGroup(group));
             }
             match &root.kind {
                 ExprKind::Binding { binding, .. } => match self.resolve_head(binding) {
-                    ResolvedHead::Binding {
-                        kind: BindingHeadKind::Ordinary,
-                        ..
-                    } => None,
-                    head => Some(head),
+                    head @ ResolvedHead::LoopGroup(_) => Some(head),
+                    ResolvedHead::Binding { .. } => None,
                 },
                 ExprKind::Definition | ExprKind::Alias | ExprKind::Parens => {
-                    self.structural_head(root.children.first()?)
+                    self.loop_access_head(root.children.first()?)
                 }
                 ExprKind::Access(step) => {
-                    let head = self.structural_head(root.children.first()?)?;
+                    let head = self.loop_access_head(root.children.first()?)?;
                     match step {
                         PathSegment::Subscript { index } => {
                             let lookup = match head {
@@ -7009,7 +7006,9 @@ mod judgement {
                 .as_deref()
                 .map(|member| member.type_description())
                 .unwrap_or_else(|| "value-dependent expression".into());
-            declared(Err(rejected.error(&member_type).into()), false)
+            let mut failure = declared(Err(rejected.error(&member_type).into()), false);
+            failure.data_mut().selector_failure = Some(LoopSelectorFailure);
+            failure
         }
 
         fn access_path(
@@ -7460,7 +7459,7 @@ mod judgement {
                     }
                 }
                 ExprKind::Access(step) => {
-                    if let Some(head) = self.structural_head(&root.children[0])
+                    if let Some(head) = self.loop_access_head(&root.children[0])
                         && let PathSegment::Field { name } = step
                     {
                         match head {
@@ -8159,6 +8158,7 @@ mod judgement {
                 fields: Arc::default(),
                 converted: None,
                 structural_source: false,
+                selector_failure: None,
                 static_source: None,
             }),
         }

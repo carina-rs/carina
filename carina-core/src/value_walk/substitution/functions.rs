@@ -9,83 +9,6 @@ type FunctionSubstitutionPosition = RewritePosition;
 type ParserStageValue<B> = Value<ParserPlaceholder, B>;
 type ParserStageFunctionArgument<B> = FunctionArgument<ParserPlaceholder, B>;
 
-/// Resolve provisional loop heads after an isolated function parse. This is
-/// structural rewriting: dormant defaults and function calls are not evaluated.
-pub(crate) fn resolve_loop_dot_references<'ctx, B: BindingAddress>(
-    value: &ParserStageValue<B>,
-    heads: &HashMap<&'ctx str, &'ctx crate::eval_value::UnexpandedStructuralHandle<B>>,
-    source_line: usize,
-) -> Result<ParserStageValue<B>, ParseError> {
-    rewrite_parser_value(
-        value,
-        RewritePosition::Value,
-        &mut LoopReferenceRewrite { heads, source_line },
-    )
-}
-
-struct LoopReferenceRewrite<'policy, 'ctx, B: BindingAddress> {
-    heads: &'policy HashMap<&'ctx str, &'ctx crate::eval_value::UnexpandedStructuralHandle<B>>,
-    source_line: usize,
-}
-
-impl<B: BindingAddress> ParserRewrite<B> for LoopReferenceRewrite<'_, '_, B> {
-    type Error = ParseError;
-
-    fn error(&mut self, error: ParseError) -> ParseError {
-        error
-    }
-    fn source_line(&self) -> usize {
-        self.source_line
-    }
-    fn set_source_line(&mut self, line: usize) {
-        self.source_line = line;
-    }
-
-    fn leaf(
-        &mut self,
-        input: &LeafInput<'_, Transform, ParserPlaceholder, B>,
-        _: RewritePosition,
-    ) -> Result<Option<ParserStageValue<B>>, ParseError> {
-        let LeafInput::ResourceRef(path) = input else {
-            return Ok(None);
-        };
-        let Some(group) = self
-            .heads
-            .get(path.binding())
-            .and_then(|handle| handle.loop_group())
-        else {
-            return Ok(None);
-        };
-        let line = path
-            .reference_locations()
-            .map_or(self.source_line, |locations| {
-                locations.occurrence().span().start_line()
-            });
-        let binding = group.binding();
-        let mut selected = match crate::eval_value::select_dot(group, path.attribute()) {
-            Ok(child) => child.into_lookup().reference(),
-            Err(rejected) => rejected.preserve(binding, line),
-        };
-        for segment in path.segments() {
-            selected = crate::resource::apply_value_path_segment(
-                selected,
-                segment.clone(),
-                line,
-                crate::resource::AccessMissPolicy::Error,
-            )
-            .and_then(crate::resource::ValuePathSegmentResult::into_value)
-            .map_err(|error| ParseError::InvalidExpression {
-                line,
-                message: error.to_string(),
-            })?;
-        }
-        Ok(Some(match path.reference_locations() {
-            Some(locations) => selected.with_reference_locations(locations),
-            None => selected,
-        }))
-    }
-}
-
 pub(crate) fn substitute_function_parameters<B: BindingAddress>(
     value: &ParserStageValue<B>,
     substitutions: &HashMap<String, ParserStageFunctionArgument<B>>,
@@ -155,6 +78,45 @@ impl<B: BindingAddress> ParserRewrite<B> for FunctionParameterRewrite<'_, B> {
         self.source_line = line;
     }
 
+    fn access(
+        &mut self,
+        access: crate::resource::AccessExpr<ParserPlaceholder, B>,
+        base: ParserStageValue<B>,
+    ) -> Result<ParserStageValue<B>, ParseError> {
+        // Parameters retain their neutral head until the caller supplies a
+        // typed argument. Select while that argument still carries its For
+        // handle, before generic access can lower it to a resource attribute.
+        if let Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::FnParam { name } | ParserPlaceholder::FnLocal { name },
+        )) = access.base()
+            && let Some(handle) = self
+                .substitutions
+                .get(name)
+                .and_then(|argument| argument.handle())
+            && let Some(group) = handle.loop_group()
+            && let crate::resource::PathSegment::Field { name } = access.step()
+        {
+            let mut selected = match crate::eval_value::select_dot(group, name) {
+                Ok(child) => child.into_lookup().reference(),
+                Err(rejected) => {
+                    rejected.preserve(handle.canonical_binding(), access.source_line())
+                }
+            };
+            if let Some(locations) = access.access_locations()
+                && let Value::Deferred(DeferredValue::Access(rejected)) = &mut selected
+            {
+                rejected.set_access_locations(locations.clone());
+            }
+            return Ok(selected);
+        }
+        access
+            .rebuild_with_base(base, crate::resource::AccessMissPolicy::Error)
+            .map_err(|error| ParseError::InvalidExpression {
+                line: access.source_line(),
+                message: error.to_string(),
+            })
+    }
+
     fn leaf(
         &mut self,
         input: &LeafInput<'_, Transform, ParserPlaceholder, B>,
@@ -185,7 +147,8 @@ impl<B: BindingAddress> ParserRewrite<B> for FunctionParameterRewrite<'_, B> {
             LeafInput::BindingRef(_)
             | LeafInput::Unknown(_)
             | LeafInput::Placeholder(
-                ParserPlaceholder::ModuleArgument {
+                ParserPlaceholder::FunctionHead(_)
+                | ParserPlaceholder::ModuleArgument {
                     name: _,
                     diagnostic: _,
                 }
@@ -218,49 +181,6 @@ impl<B: BindingAddress> ParserRewrite<B> for FunctionParameterRewrite<'_, B> {
 mod tests {
     use super::*;
     use crate::resource::{AuthoredValue, RelativeBindingName};
-
-    #[test]
-    fn loop_dot_rewrite_preserves_a_dormant_fallback_call() {
-        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let parsed = crate::parser::parse(
-            "let children = for k, v in ({ a = 'x' }) { mock.test.Source { name = v } }",
-            &context,
-        )
-        .unwrap();
-        let heads = parsed
-            .parser_binding_metadata
-            .structural_handles()
-            .iter()
-            .map(|(name, handle)| (name.as_str(), handle))
-            .collect();
-        let provisional = AuthoredValue::resource_ref("children", "a", vec!["name".to_owned()]);
-        // upper(Int) fails if evaluated. A structural rewrite must preserve it
-        // while normalizing the selected reference on the coalesce's left.
-        let fallback = AuthoredValue::Deferred(DeferredValue::FunctionCall {
-            name: crate::builtins::BuiltinFunction::upper,
-            args: vec![FunctionArgument::from_value(AuthoredValue::Concrete(
-                ConcreteValue::Int(1),
-            ))],
-            source_line: 2.into(),
-        });
-        let value = AuthoredValue::Deferred(DeferredValue::Coalesce {
-            value: Box::new(provisional),
-            default: Box::new(fallback.clone()),
-        });
-        let normalized = resolve_loop_dot_references(&value, &heads, 2).unwrap();
-        if let AuthoredValue::Deferred(DeferredValue::Coalesce { value, default }) = normalized {
-            assert_eq!(*default, fallback);
-            let path = match *value {
-                AuthoredValue::Deferred(DeferredValue::ResourceRef { path }) => path,
-                _ => panic!("selected child reference"),
-            };
-            assert_eq!(path.binding(), "children.a");
-            assert_eq!(path.attribute(), "name");
-            assert!(path.segments().is_empty());
-        } else {
-            panic!("structural rewriting preserves the coalesce");
-        }
-    }
 
     #[test]
     fn substitution_without_placeholders_keeps_arcs_and_reports_unchanged()

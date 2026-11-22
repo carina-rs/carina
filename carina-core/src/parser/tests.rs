@@ -22577,6 +22577,260 @@ fn for_value_keys_bare_handle_hint() {
 }
 
 #[test]
+fn loop_dot_review_round2_stored_function_values_select_children() {
+    for (pattern, iterable) in [("k, item", "({ a = 'x' })"), ("item", "['a']")] {
+        for default in [false, true] {
+            for forward in [false, true] {
+                for reader in [
+                    "children.a.name",
+                    "children['a'].name",
+                    "(children).a.name",
+                    "(children)['a'].name",
+                ] {
+                    let function = if default {
+                        format!(
+                            "fn selected(x: String, value: String = {reader}): String {{ value }}"
+                        )
+                    } else {
+                        format!("fn selected(x: String): String {{ {reader} }}")
+                    };
+                    let group = format!(
+                        "let children = for {pattern} in {iterable} {{ mock.test.Source {{ name = item }} }}"
+                    );
+                    let source = if forward {
+                        format!("{function}\n{group}")
+                    } else {
+                        format!("{group}\n{function}")
+                    };
+                    let parsed = parse(
+                        &source,
+                        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                    )
+                    .unwrap();
+                    let function = &parsed.user_functions["selected"];
+                    assert!(!function.has_provisional_reference_heads());
+                    let value = if default {
+                        function.params[1].default.as_ref().unwrap()
+                    } else {
+                        &function.body.value
+                    };
+                    let Value::Deferred(DeferredValue::ResourceRef { path }) = value else {
+                        panic!(
+                            "{reader}, default={default}, forward={forward}: selected child reference"
+                        );
+                    };
+                    assert_eq!(
+                        path.binding(),
+                        "children.a",
+                        "{reader}, default={default}, forward={forward}"
+                    );
+                    assert_eq!(
+                        path.attribute(),
+                        "name",
+                        "{reader}, default={default}, forward={forward}"
+                    );
+                    assert!(path.segments().is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn loop_dot_review_round2_prepass_keeps_typed_heads_until_classification() {
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for reader in [
+        "children.a.name",
+        "children['a'].name",
+        "(children).a.name",
+        "(children)['a'].name",
+    ] {
+        let source = format!(
+            "fn selected(): String {{ {reader} }}\nlet children = for k, item in ({{ a = 'x' }}) {{ mock.test.Source {{ name = item }} }}"
+        );
+        let functions = super::entry::top_level_user_functions(&source, &config).unwrap();
+        let function = &functions["selected"];
+        assert!(function.has_provisional_reference_heads(), "{reader}");
+        let mut references = 0;
+        function
+            .body
+            .value
+            .visit_resource_refs(&mut |_, _| references += 1);
+        assert_eq!(references, 0, "{reader}");
+        assert!(
+            function.body.value.clone().into_expanded().is_err(),
+            "{reader}: unclassified heads cannot escape as values"
+        );
+    }
+}
+
+#[test]
+fn loop_dot_review_round2_non_loop_function_prepass_keeps_main_values() {
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let functions = super::entry::top_level_user_functions(
+        "fn selected(): String { r.name }\nlet r = mock.test.Source { name = 'r' }",
+        &config,
+    )
+    .unwrap();
+    assert!(!functions["selected"].has_provisional_reference_heads());
+    let Value::Deferred(DeferredValue::ResourceRef { path }) = &functions["selected"].body.value
+    else {
+        panic!("ordinary reference retains main's representation");
+    };
+    assert_eq!(path.binding(), "r");
+    assert_eq!(path.attribute(), "name");
+    let functions = super::entry::top_level_user_functions(
+        "fn selected(): String { r }\nlet r = mock.test.Source { name = 'r' }",
+        &config,
+    )
+    .unwrap();
+    assert!(matches!(
+        &functions["selected"].body.value,
+        Value::Concrete(ConcreteValue::EnumIdentifier(_))
+    ));
+}
+
+#[test]
+fn loop_dot_review_round2_seeded_function_values_keep_classified_heads() {
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for (declaration, reader) in [
+        ("let r = mock.test.Source { name = 'r' }", "r.name"),
+        (
+            "let children = for k, v in ({ a = 'x' }) { mock.test.Source { name = v } }",
+            "children.a.name",
+        ),
+        (
+            "let children = for v in ['a'] { mock.test.Source { name = v } }",
+            "children.a.name",
+        ),
+    ] {
+        for same_file in [false, true] {
+            let function =
+                format!("fn selected(x: String): String {{ \"${{x}}-${{{reader}}}\" }}\n");
+            let call = "let value = selected(g())\n";
+            let files = vec![
+                (std::path::PathBuf::from("main.crn"), declaration.to_owned()),
+                (
+                    std::path::PathBuf::from("functions.crn"),
+                    if same_file {
+                        format!("{function}{call}")
+                    } else {
+                        function
+                    },
+                ),
+                (
+                    std::path::PathBuf::from("g.crn"),
+                    "fn g(): String { 'gee' }".to_owned(),
+                ),
+                (
+                    std::path::PathBuf::from("value.crn"),
+                    if same_file {
+                        String::new()
+                    } else {
+                        call.to_owned()
+                    },
+                ),
+                (
+                    std::path::PathBuf::from("sink.crn"),
+                    "let other = mock.test.Source { name = 'other' comment = value }".to_owned(),
+                ),
+            ];
+            let parsed = crate::config_loader::parse_directory_files(&files, &config).unwrap();
+            let other = parsed
+                .iter()
+                .flat_map(|(_, file)| file.parsed().resources.iter())
+                .find(|resource| {
+                    resource
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.as_str() == "other")
+                })
+                .unwrap();
+            let value = &other.attributes["comment"];
+            assert!(
+                !super::functions::contains_provisional_function_head(value),
+                "{reader}, same_file={same_file}"
+            );
+            if let Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                function,
+                functions,
+                ..
+            }) = value
+            {
+                assert!(
+                    !function.has_provisional_reference_heads(),
+                    "{reader}, same_file={same_file}"
+                );
+                assert!(
+                    functions
+                        .values()
+                        .all(|function| !function.has_provisional_reference_heads()),
+                    "{reader}, same_file={same_file}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn loop_dot_review_round2_typed_function_arguments_preserve_selection() {
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for (pattern, iterable) in [("k, v", "({ a = 'x' })"), ("v", "['a']")] {
+        for reader in ["xs.a.name", "xs['a'].name"] {
+            let source = format!(
+                "let children = for {pattern} in {iterable} {{ mock.test.Source {{ name = v }} }}\nfn selected(xs): String {{ {reader} }}\nlet other = mock.test.Source {{ name = selected(children) }}"
+            );
+            let parsed = parse(&source, &config).unwrap();
+            let other = parsed
+                .resources
+                .iter()
+                .find(|resource| {
+                    resource
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.as_str() == "other")
+                })
+                .unwrap();
+            let Value::Deferred(DeferredValue::ResourceRef { path }) = &other.attributes["name"]
+            else {
+                panic!("{reader}: selected argument reference");
+            };
+            assert_eq!(path.binding(), "children.a", "{reader}");
+            assert_eq!(path.attribute(), "name", "{reader}");
+            assert!(path.segments().is_empty());
+        }
+    }
+}
+
+#[test]
+fn loop_dot_review_round2_storage_preserves_local_and_dormant_values() {
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let source = "let children = for k, item in ({ a = 'x' }) { mock.test.Source { name = item } }\nfn selected(): String { let local = children.a.name children.a.name ?? fallback() }\nfn fallback(): String { 'fallback' }";
+    let parsed = parse(source, &config).unwrap();
+    let function = &parsed.user_functions["selected"];
+    let Value::Deferred(DeferredValue::ResourceRef { path }) = &function.local_lets[0].1 else {
+        panic!("selected local")
+    };
+    assert_eq!(path.binding(), "children.a");
+    assert_eq!(path.attribute(), "name");
+    let Value::Deferred(DeferredValue::Coalesce { value, default }) = &function.body.value else {
+        panic!("stored coalesce")
+    };
+    let Value::Deferred(DeferredValue::ResourceRef { path }) = value.as_ref() else {
+        panic!("selected left")
+    };
+    assert_eq!(path.binding(), "children.a");
+    assert_eq!(path.attribute(), "name");
+    assert!(
+        matches!(
+            default.as_ref(),
+            Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+        ),
+        "dormant call is not evaluated while storing the selection"
+    );
+}
+
+#[test]
 fn loop_dot_isolated_function_reads_resolve_to_selected_children() {
     for (pattern, iterable) in [("k, item", "({ a = 'x' })"), ("item", "['a']")] {
         for default in [false, true] {

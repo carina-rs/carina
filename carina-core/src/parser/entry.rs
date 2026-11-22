@@ -283,9 +283,7 @@ pub fn parse_file(
     path: &std::path::Path,
     config: &ProviderContext,
 ) -> Result<ParsedFile, ParseError> {
-    let user_functions = resolve_top_level_user_functions(&[(path, input)], config)?;
-    let parsed = parse_with_seeded_bindings_inner(input, config, &[], &user_functions, true, path)
-        .map_err(super::resolve::RootInputFailure::into_parse_error)?;
+    let parsed = parse_with_function_heads(input, path, config, &[])?;
     super::resolve::reject_cyclic_let_bindings(&parsed)?;
     Ok(parsed)
 }
@@ -750,16 +748,47 @@ pub(crate) fn parse_with_seeded_bindings(
     config: &ProviderContext,
     seeds: &[BindingSeed<'_>],
 ) -> Result<ParsedFile, ParseError> {
-    let user_functions = top_level_user_functions(input, config)?;
-    parse_with_seeded_bindings_inner(
-        input,
-        config,
-        seeds,
-        &user_functions,
-        true,
-        std::path::Path::new("test.crn"),
-    )
-    .map_err(super::resolve::RootInputFailure::into_parse_error)
+    parse_with_function_heads(input, Path::new("test.crn"), config, seeds)
+}
+
+/// A file-only parse needs the same classified function heads as a directory
+/// parse. Bootstrap only when a declaration actually contains free dot heads;
+/// typed seeds then let functions be stored canonically before any final call
+/// captures their lexical definition, including forward-declared loops.
+fn parse_with_function_heads(
+    input: &str,
+    path: &Path,
+    config: &ProviderContext,
+    seeds: &[BindingSeed<'_>],
+) -> Result<ParsedFile, ParseError> {
+    let sources = [(path, input)];
+    let functions = resolve_top_level_user_functions(&sources, config, seeds, false)?;
+    if !functions
+        .values()
+        .any(UserFunction::has_provisional_reference_heads)
+    {
+        return parse_with_seeded_bindings_inner(input, config, seeds, &functions, true, path)
+            .map_err(super::resolve::RootInputFailure::into_parse_error);
+    }
+    let bootstrap = parse_with_seeded_bindings_inner(input, config, seeds, &functions, false, path)
+        .map_err(super::resolve::RootInputFailure::into_parse_error)?;
+    let mut classified = seeds.to_vec();
+    // Only For authority is needed here. Do not seed ordinary values into a
+    // file-only parse or change its existing forward-value behavior.
+    classified.extend(
+        bootstrap
+            .parser_binding_metadata
+            .structural_handles()
+            .iter()
+            .filter(|(_, handle)| handle.is_for_binding())
+            .map(|(name, handle)| BindingSeed {
+                name: name.as_str(),
+                kind: SeedKind::TypedStructural(handle),
+            }),
+    );
+    let functions = resolve_top_level_user_functions(&sources, config, &classified, true)?;
+    parse_with_seeded_bindings_inner(input, config, &classified, &functions, true, path)
+        .map_err(super::resolve::RootInputFailure::into_parse_error)
 }
 
 /// Parse only the top-level function declarations from one source file.
@@ -771,7 +800,7 @@ pub(crate) fn top_level_user_functions(
     input: &str,
     config: &ProviderContext,
 ) -> Result<IndexMap<String, UserFunction>, ParseError> {
-    resolve_top_level_user_functions(&[(Path::new("test.crn"), input)], config)
+    resolve_top_level_user_functions(&[(Path::new("test.crn"), input)], config, &[], false)
 }
 
 /// Parse the directory's function declarations as one lexical scope.
@@ -787,22 +816,43 @@ pub(crate) fn top_level_user_functions_in_files(
         .iter()
         .map(|(path, input)| (path.as_path(), input.as_str()))
         .collect::<Vec<_>>();
-    resolve_top_level_user_functions(&sources, config)
+    resolve_top_level_user_functions(&sources, config, &[], false)
+}
+
+pub(crate) fn top_level_user_functions_with_bindings(
+    files: &[(PathBuf, String)],
+    config: &ProviderContext,
+    seeds: &[BindingSeed<'_>],
+) -> Result<IndexMap<String, UserFunction>, ParseError> {
+    let sources = files
+        .iter()
+        .map(|(path, input)| (path.as_path(), input.as_str()))
+        .collect::<Vec<_>>();
+    resolve_top_level_user_functions(&sources, config, seeds, true)
 }
 
 fn resolve_top_level_user_functions(
     sources: &[(&Path, &str)],
     config: &ProviderContext,
+    seeds: &[BindingSeed<'_>],
+    classified: bool,
 ) -> Result<IndexMap<String, UserFunction>, ParseError> {
     // Preserve the old directory behavior for duplicate names: a later file
     // owns the seed, while two declarations in the same file are an error.
     let mut owners = IndexMap::<String, usize>::new();
+    let mut may_have_loop_heads = seeds
+        .iter()
+        .any(|seed| matches!(seed.kind, SeedKind::Provisional));
     for (source_index, (path, input)) in sources.iter().enumerate() {
         let preprocessed_file =
             super::preprocess_file(input).map_err(|error| locate_function_error(error, path))?;
         let pairs = preprocessed_file
             .parse()
             .map_err(|error| locate_function_error(error, path))?;
+        may_have_loop_heads |= pairs
+            .clone()
+            .flatten()
+            .any(|pair| pair.as_rule() == Rule::for_expr);
         let mut local_names = HashSet::new();
         for pair in pairs {
             if pair.as_rule() != Rule::file {
@@ -844,6 +894,12 @@ fn resolve_top_level_user_functions(
             .map_err(|error| locate_function_error(error, initial_path))?,
     );
     let mut ctx = ParseContext::new(config, initial_path, initial_file);
+    seed_bindings(&mut ctx, seeds);
+    ctx.provisional_function_heads = !classified && may_have_loop_heads;
+    for (_, input) in sources {
+        ctx.function_head_names
+            .extend(top_level_let_binding_names(input)?);
+    }
     let mut functions = HashMap::new();
 
     while !pending.is_empty() {
@@ -1004,6 +1060,16 @@ fn parse_with_seeded_bindings_inner(
     let mut ctx = ParseContext::new(config, source_file, Arc::clone(&preprocessed_file));
     ctx.set_authored_nodes(syntax.expressions().captured_nodes());
     ctx.defer_provisional_static_conditions = !bindings_fully_classified;
+    if !bindings_fully_classified
+        && seeded_user_functions
+            .values()
+            .any(UserFunction::has_provisional_reference_heads)
+    {
+        ctx.function_head_names
+            .extend(top_level_let_binding_names(input)?);
+        ctx.function_head_names
+            .extend(seeds.iter().map(|seed| seed.name.to_owned()));
+    }
     ctx.extend_warnings(single_quote_warnings);
     seed_bindings(&mut ctx, seeds);
     ctx.extend_user_functions(seeded_user_functions.clone());

@@ -5490,10 +5490,21 @@ pub enum ReReadReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NoPlaceholder {}
 
+/// An unresolved free head in a function declaration prepass. It is not a
+/// resource attribute: classified function parsing must select a For child
+/// through the loop selector before producing a reference.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProvisionalFunctionHead {
+    pub(crate) name: String,
+}
+
 /// Parser-stage slots consumed by function evaluation, module expansion, or
 /// deferred-loop template construction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ParserPlaceholder {
+    /// Only the declaration prepass can emit this head. It cannot cross the
+    /// parser-to-expanded boundary or be consumed as an ordinary ResourceRef.
+    FunctionHead(ProvisionalFunctionHead),
     FnParam {
         name: String,
     },
@@ -5527,7 +5538,9 @@ impl ParserPlaceholder {
         match self {
             Self::ModuleArgument { diagnostic, .. } => diagnostic.declaration_location(),
             Self::EmptyInterpolation { source } => source.declaration_location(),
-            Self::FnParam { .. } | Self::FnLocal { .. } | Self::Loop(_) => None,
+            Self::FunctionHead(_) | Self::FnParam { .. } | Self::FnLocal { .. } | Self::Loop(_) => {
+                None
+            }
         }
     }
 
@@ -5536,7 +5549,9 @@ impl ParserPlaceholder {
         match self {
             Self::ModuleArgument { diagnostic, .. } => diagnostic.authored_location(),
             Self::EmptyInterpolation { source } => source.authored_location(),
-            Self::FnParam { .. } | Self::FnLocal { .. } | Self::Loop(_) => None,
+            Self::FunctionHead(_) | Self::FnParam { .. } | Self::FnLocal { .. } | Self::Loop(_) => {
+                None
+            }
         }
     }
 }
@@ -5906,6 +5921,11 @@ struct LoopPlaceholderWireTag {
 impl std::fmt::Display for ParserPlaceholder {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::FunctionHead(head) => write!(
+                formatter,
+                "unresolved function reference head: {}",
+                head.name
+            ),
             Self::FnParam { name } => write!(formatter, "unresolved function parameter: {name}"),
             Self::FnLocal { name } => write!(formatter, "unresolved function local: {name}"),
             Self::ModuleArgument { name, .. } => {
@@ -6232,7 +6252,8 @@ impl ValueKind for ParserPlaceholder {
     fn module_argument_name(&self) -> Option<&str> {
         match self {
             Self::ModuleArgument { name, .. } => Some(name),
-            Self::FnParam { .. }
+            Self::FunctionHead(_)
+            | Self::FnParam { .. }
             | Self::FnLocal { .. }
             | Self::Loop(_)
             | Self::EmptyInterpolation { .. } => None,
@@ -6242,7 +6263,8 @@ impl ValueKind for ParserPlaceholder {
     fn loop_slot(&self) -> Option<LoopSlot> {
         match self {
             Self::Loop(slot) => Some(*slot),
-            Self::FnParam { .. }
+            Self::FunctionHead(_)
+            | Self::FnParam { .. }
             | Self::ModuleArgument { .. }
             | Self::FnLocal { .. }
             | Self::EmptyInterpolation { .. } => None,
@@ -6255,6 +6277,9 @@ impl ValueKind for ParserPlaceholder {
 
     fn render(&self) -> String {
         match self {
+            Self::FunctionHead(head) => {
+                format!("(unresolved function reference head: {})", head.name)
+            }
             Self::FnParam { name } => format!("(unresolved function parameter: {name})"),
             Self::FnLocal { name } => format!("(unresolved function local: {name})"),
             Self::ModuleArgument { name, .. } => {
@@ -6626,7 +6651,8 @@ impl<B: BindingAddress> Value<ParserPlaceholder, B> {
                 ParserPlaceholder::ModuleArgument { .. } => {
                     policy.module_arguments == ModuleArgumentPolicy::AllowUntilModuleExpansion
                 }
-                ParserPlaceholder::FnParam { .. }
+                ParserPlaceholder::FunctionHead(_)
+                | ParserPlaceholder::FnParam { .. }
                 | ParserPlaceholder::FnLocal { .. }
                 | ParserPlaceholder::EmptyInterpolation { .. } => false,
             };

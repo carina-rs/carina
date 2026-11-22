@@ -376,6 +376,9 @@ fn same_span(a: &DiagnosticSourceSpan, b: &DiagnosticSourceSpan) -> bool {
 }
 fn same_placeholder(a: &ParserPlaceholder, b: &ParserPlaceholder) -> bool {
     match a {
+        ParserPlaceholder::FunctionHead(a) => {
+            matches!(b, ParserPlaceholder::FunctionHead(b) if a == b)
+        }
         ParserPlaceholder::FnParam { name: a } => {
             matches!(b,ParserPlaceholder::FnParam {name:b} if a==b)
         }

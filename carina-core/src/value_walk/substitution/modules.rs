@@ -343,7 +343,8 @@ impl<B: BindingAddress> ParserRewrite<B> for ModuleArgumentRewrite<'_, B> {
                 }
             }
             LeafInput::Placeholder(
-                ParserPlaceholder::FnParam { name: _ }
+                ParserPlaceholder::FunctionHead(_)
+                | ParserPlaceholder::FnParam { name: _ }
                 | ParserPlaceholder::FnLocal { name: _ }
                 | ParserPlaceholder::Loop(LoopSlot::Key)
                 | ParserPlaceholder::Loop(LoopSlot::Index)

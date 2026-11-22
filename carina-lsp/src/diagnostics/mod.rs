@@ -2896,7 +2896,7 @@ impl DiagnosticRun<'_> {
                     };
                     let (values, _prefixes_reported_by_file) = report.values.as_parts();
                     for error in values.errors() {
-                        if Self::loop_child_owns_module_lookup(preferred_tree, call, error) {
+                        if preferred_tree.loop_child_owns_module_lookup(call, error) {
                             continue;
                         }
                         let finding = carina_core::parser::Located::new(

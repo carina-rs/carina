@@ -61,7 +61,7 @@ pub(super) fn parse_fn_def(
                         }
                         _ => {
                             // This is the default expression
-                            let mut default_ctx = ctx.isolated();
+                            let mut default_ctx = ctx.function_scope();
                             default_ctx
                                 .replace_shared_user_functions(Arc::clone(&ctx.user_functions));
                             default_ctx
@@ -112,7 +112,7 @@ pub(super) fn parse_fn_def(
 
     // Create a context where parameters are registered as variables
     // so that param references in the body are resolved as variable refs
-    let mut body_ctx = ctx.isolated();
+    let mut body_ctx = ctx.function_scope();
     body_ctx.replace_shared_user_functions(Arc::clone(&ctx.user_functions));
     body_ctx
         .seeded_user_functions
@@ -473,7 +473,8 @@ pub(crate) fn contains_module_argument_matching<B: BindingAddress>(
             },
         )) => predicate(name),
         GenericValue::Deferred(DeferredValue::Placeholder(
-            ParserPlaceholder::FnParam { name: _ }
+            ParserPlaceholder::FunctionHead(_)
+            | ParserPlaceholder::FnParam { name: _ }
             | ParserPlaceholder::FnLocal { name: _ }
             | ParserPlaceholder::Loop(crate::resource::LoopSlot::Key)
             | ParserPlaceholder::Loop(crate::resource::LoopSlot::Index)
@@ -1104,6 +1105,16 @@ pub(crate) fn lower_function_arguments(
         .collect()
 }
 
+pub(super) fn contains_provisional_function_head<B: BindingAddress>(
+    value: &GenericValue<ParserPlaceholder, B>,
+) -> bool {
+    let mut provisional = false;
+    value.visit_placeholders(&mut |placeholder, _| {
+        provisional |= matches!(placeholder, ParserPlaceholder::FunctionHead(_));
+    });
+    provisional
+}
+
 pub(crate) fn construct_builtin_call(
     builtin: crate::builtins::Builtin,
     args: Vec<EvalValue>,
@@ -1124,7 +1135,11 @@ pub(crate) fn construct_builtin_call(
                 // Normalize successful authored inputs here. A failed static
                 // evaluation stays deferred so the normal strict/permissive
                 // resolver policy still owns unavailable values.
-                Ok(try_evaluate_fn_value(value.clone(), ctx, line).unwrap_or(value))
+                match try_evaluate_fn_value(value.clone(), ctx, line) {
+                    Ok(evaluated) => Ok(evaluated),
+                    Err(error) if contains_provisional_function_head(&value) => Err(error),
+                    Err(_) => Ok(value),
+                }
             } else {
                 Ok(value)
             }
@@ -1552,29 +1567,16 @@ pub(super) fn try_evaluate_fn_value<Source: super::context::EvaluationSource>(
     ctx: &ParseContext<'_, Source>,
     containing_line: usize,
 ) -> Result<Value, ParseError> {
-    // Isolated bodies/defaults retain provisional heads. Resolve them with
-    // the caller's For handles before materialization reaches the binding index.
-    let value = ctx.resolve_loop_dot_references(value, containing_line)?;
-    evaluate_fn_value_with_resolved_heads(value, ctx, containing_line)
-}
-
-fn evaluate_fn_value_with_resolved_heads<Source: super::context::EvaluationSource>(
-    value: Value,
-    ctx: &ParseContext<'_, Source>,
-    containing_line: usize,
-) -> Result<Value, ParseError> {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             let mut deferred = *deferred;
-            deferred.condition.value = evaluate_fn_value_with_resolved_heads(
+            deferred.condition.value = try_evaluate_fn_value(
                 deferred.condition.value,
                 ctx,
                 deferred.condition.source_line,
             )?;
-            deferred.then_value =
-                evaluate_fn_value_with_resolved_heads(deferred.then_value, ctx, containing_line)?;
-            deferred.else_value =
-                evaluate_fn_value_with_resolved_heads(deferred.else_value, ctx, containing_line)?;
+            deferred.then_value = try_evaluate_fn_value(deferred.then_value, ctx, containing_line)?;
+            deferred.else_value = try_evaluate_fn_value(deferred.else_value, ctx, containing_line)?;
             Ok(Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred))))
         }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
@@ -1588,7 +1590,7 @@ fn evaluate_fn_value_with_resolved_heads<Source: super::context::EvaluationSourc
                 .iter()
                 .map(|argument| {
                     argument.try_map_value(|value| {
-                        evaluate_fn_value_with_resolved_heads(value.clone(), ctx, source_line)
+                        try_evaluate_fn_value(value.clone(), ctx, source_line)
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1612,7 +1614,7 @@ fn evaluate_fn_value_with_resolved_heads<Source: super::context::EvaluationSourc
                 .iter()
                 .map(|argument| {
                     argument.try_map_value(|value| {
-                        evaluate_fn_value_with_resolved_heads(value.clone(), ctx, source_line)
+                        try_evaluate_fn_value(value.clone(), ctx, source_line)
                     })
                 })
                 .collect();
@@ -1651,11 +1653,7 @@ fn evaluate_fn_value_with_resolved_heads<Source: super::context::EvaluationSourc
             .map_err(|error| ParseError::from_resolution(error, source_line))
         }
         Value::Deferred(DeferredValue::Access(access)) => {
-            let base = evaluate_fn_value_with_resolved_heads(
-                access.base().clone(),
-                ctx,
-                access.source_line(),
-            )?;
+            let base = try_evaluate_fn_value(access.base().clone(), ctx, access.source_line())?;
             access
                 .rebuild_with_base(base, crate::resource::AccessMissPolicy::Error)
                 .map_err(|error| ParseError::InvalidExpression {
@@ -1665,12 +1663,12 @@ fn evaluate_fn_value_with_resolved_heads<Source: super::context::EvaluationSourc
         }
         Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
             let span = expression.operator_span();
-            let lhs = evaluate_fn_value_with_resolved_heads(
+            let lhs = try_evaluate_fn_value(
                 expression.lhs().clone(),
                 ctx,
                 span.line().unwrap_or(containing_line),
             )?;
-            let rhs = evaluate_fn_value_with_resolved_heads(
+            let rhs = try_evaluate_fn_value(
                 expression.rhs().clone(),
                 ctx,
                 span.line().unwrap_or(containing_line),
@@ -1682,7 +1680,7 @@ fn evaluate_fn_value_with_resolved_heads<Source: super::context::EvaluationSourc
         Value::Concrete(ConcreteValue::List(items)) => {
             let evaluated: Result<Vec<Value>, ParseError> = items
                 .into_iter()
-                .map(|v| evaluate_fn_value_with_resolved_heads(v, ctx, containing_line))
+                .map(|v| try_evaluate_fn_value(v, ctx, containing_line))
                 .collect();
             Ok(Value::Concrete(ConcreteValue::List(evaluated?)))
         }
@@ -1690,8 +1688,7 @@ fn evaluate_fn_value_with_resolved_heads<Source: super::context::EvaluationSourc
             let evaluated: Result<IndexMap<String, Value>, ParseError> = map
                 .into_iter()
                 .map(|(k, v)| {
-                    evaluate_fn_value_with_resolved_heads(v, ctx, containing_line)
-                        .map(|value| (k, value))
+                    try_evaluate_fn_value(v, ctx, containing_line).map(|value| (k, value))
                 })
                 .collect();
             Ok(Value::Concrete(ConcreteValue::Map(evaluated?)))
@@ -1701,8 +1698,7 @@ fn evaluate_fn_value_with_resolved_heads<Source: super::context::EvaluationSourc
             for part in parts {
                 match part {
                     crate::resource::InterpolationPart::Expr(value) => {
-                        let value =
-                            evaluate_fn_value_with_resolved_heads(value, ctx, containing_line)?;
+                        let value = try_evaluate_fn_value(value, ctx, containing_line)?;
                         evaluated.push(crate::resource::InterpolationPart::Expr(value));
                     }
                     other => evaluated.push(other),
@@ -1720,9 +1716,7 @@ fn evaluate_fn_value_with_resolved_heads<Source: super::context::EvaluationSourc
             message: format!("{name}(): {reason}"),
         }),
         Value::Deferred(DeferredValue::Secret(inner)) => inner
-            .try_map(|value| {
-                evaluate_fn_value_with_resolved_heads(value.clone(), ctx, containing_line)
-            })
+            .try_map(|value| try_evaluate_fn_value(value.clone(), ctx, containing_line))
             .map(|inner| Value::Deferred(DeferredValue::Secret(inner))),
         value @ Value::Concrete(
             ConcreteValue::String(_)

@@ -152,6 +152,7 @@ pub use entry::{
 pub(crate) use entry::{
     BindingSeed, parse_with_directory_context, top_level_argument_names,
     top_level_let_binding_names, top_level_user_functions_in_files,
+    top_level_user_functions_with_bindings,
 };
 #[cfg(test)]
 pub(crate) use entry::{parse, parse_and_resolve, parse_with_seeded_bindings};

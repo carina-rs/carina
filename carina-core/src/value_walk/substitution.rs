@@ -10,9 +10,7 @@ use crate::{
     parser::ParseError,
     resource::{DiagnosticSourceLine, InsideSecret, ParserPlaceholder},
 };
-pub(crate) use functions::{
-    resolve_loop_dot_references, substitute_function_call_argument, substitute_function_parameters,
-};
+pub(crate) use functions::{substitute_function_call_argument, substitute_function_parameters};
 #[cfg(test)]
 pub(crate) use modules::select_authored_module_ifs;
 pub(crate) use modules::{

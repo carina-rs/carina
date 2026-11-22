@@ -13,7 +13,8 @@ pub(super) trait ModuleIfAuditPlaceholder: PlaceholderKind {
 impl ModuleIfAuditPlaceholder for ParserPlaceholder {
     fn contains_module_if(&self) -> bool {
         match self {
-            Self::FnParam { name: _ }
+            Self::FunctionHead(_)
+            | Self::FnParam { name: _ }
             | Self::ModuleArgument {
                 name: _,
                 diagnostic: _,

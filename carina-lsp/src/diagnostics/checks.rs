@@ -1864,43 +1864,6 @@ impl DiagnosticRun<'_> {
             .collect()
     }
 
-    /// A caller's missing-child diagnostic owns the same lookup failure after
-    /// argument substitution. Other findings from the module remain independent.
-    pub(super) fn loop_child_owns_module_lookup(
-        tree: &carina_core::parser::AnalysisTree<'_>,
-        call: &carina_core::parser::ModuleCallId,
-        error: &carina_core::schema::TypeError,
-    ) -> bool {
-        use carina_core::resource::SecretDiagnosticError;
-        use carina_core::validation::admission::AdmissionReferenceError;
-        let carina_core::schema::TypeError::Reference { error, .. } = error else {
-            return false;
-        };
-        let SecretDiagnosticError::Public(AdmissionReferenceError::UnknownBinding {
-            binding, ..
-        }) = error.as_ref()
-        else {
-            return false;
-        };
-        let Some(authored_call) = tree.module_calls().find(|authored| authored.id() == call) else {
-            return false;
-        };
-        tree.value_references().iter().any(|value| {
-            let reference = value.reference();
-            reference.binding_matches(|key| key.matches_name(binding))
-                && authored_call.arguments().any(|(name, _)| {
-                    let Some(argument) = call.argument_value_location(name) else {
-                        return false;
-                    };
-                    let location = reference.location();
-                    location.file() == argument.file()
-                        && argument.span().start_byte() <= location.span().start_byte()
-                        && location.span().end_byte() <= argument.span().end_byte()
-                })
-                && tree.undefined_loop_child_reference(reference).is_some()
-        })
-    }
-
     /// Check for unknown attributes on resource references (typo detection).
     ///
     /// When a ResourceRef like `igw.internet_gateway_idd` references an attribute

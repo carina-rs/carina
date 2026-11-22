@@ -166,6 +166,10 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     /// control-flow expressions defer only that provisional case; the final
     /// parse runs with this disabled and reports the classified error.
     pub(super) defer_provisional_static_conditions: bool,
+    /// Function prepasses have no classified binding scope yet. Dotted free
+    /// heads remain parser slots until declarations are compiled with seeds.
+    pub(super) provisional_function_heads: bool,
+    pub(super) function_head_names: HashSet<String>,
     /// Shared parser-side provenance recorder. Real lexical child contexts
     /// share it; expression parsing never clones the context merely to change
     /// sink behavior.
@@ -250,6 +254,53 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         context.authored_nodes = self.authored_nodes.clone();
         context.evaluation_scopes = self.evaluation_scopes.clone();
         context
+    }
+
+    /// Keep function evaluation isolated while retaining For-handle authority
+    /// for selection at the point bodies and defaults are stored.
+    pub(super) fn function_scope(&self) -> Self {
+        let mut context = self.isolated();
+        context.provisional_function_heads = self.provisional_function_heads
+            || (self.defer_provisional_static_conditions && !self.function_head_names.is_empty());
+        context
+            .function_head_names
+            .extend(self.function_head_names.iter().cloned());
+        for (name, binding) in &self.bindings {
+            match binding {
+                ParseBinding::Structural { handle, .. } if handle.is_for_binding() => {
+                    context.function_head_names.remove(name);
+                    context.bindings.insert(name.clone(), binding.clone());
+                }
+                ParseBinding::Value { value, .. }
+                    if matches!(value.as_ref(), EvalValue::ProvisionalReference { .. }) =>
+                {
+                    context.function_head_names.insert(name.clone());
+                }
+                ParseBinding::Structural { .. } | ParseBinding::Value { .. } => {
+                    // A typed ordinary binding needs no provisional loop head.
+                    // Preserve the isolated function's existing value semantics.
+                    context.function_head_names.remove(name);
+                }
+            }
+        }
+        context
+    }
+
+    pub(super) fn provisional_function_head(&self, name: &str) -> Option<EvalValue> {
+        (self.provisional_function_heads
+            && self.function_head_names.contains(name)
+            && matches!(self.lookup_binding(name), ParseBindingRef::Unbound))
+        .then(|| {
+            EvalValue::from_value(Value::Deferred(
+                crate::resource::DeferredValue::Placeholder(
+                    crate::resource::ParserPlaceholder::FunctionHead(
+                        crate::resource::ProvisionalFunctionHead {
+                            name: name.to_owned(),
+                        },
+                    ),
+                ),
+            ))
+        })
     }
 
     pub(super) fn set_preprocessed_file(&mut self, file: &super::PreprocessedFile) {
@@ -513,6 +564,8 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
             seeded_bindings: HashSet::new(),
             pending_function_type_checks: Rc::new(RefCell::new(Vec::new())),
             defer_provisional_static_conditions: false,
+            provisional_function_heads: false,
+            function_head_names: HashSet::new(),
             parsed_binding_uses: Rc::new(RefCell::new(ParsedBindingUses::default())),
             binding_scope: BindingScopeId::root(&source_file),
             binding_scope_source_file: source_file,
@@ -738,27 +791,6 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
             Some(ParseBinding::Structural { handle, .. }) => ParseBindingRef::Structural(handle),
             None => ParseBindingRef::Unbound,
         }
-    }
-
-    pub(super) fn resolve_loop_dot_references(
-        &self,
-        value: Value,
-        source_line: usize,
-    ) -> Result<Value, ParseError> {
-        let heads: HashMap<_, _> = self
-            .bindings
-            .iter()
-            .filter_map(|(name, binding)| match binding {
-                ParseBinding::Structural { handle, .. } if handle.is_for_binding() => {
-                    Some((name.as_str(), handle))
-                }
-                _ => None,
-            })
-            .collect();
-        if heads.is_empty() {
-            return Ok(value);
-        }
-        crate::value_walk::resolve_loop_dot_references(&value, &heads, source_line)
     }
 
     fn binding_scope(&self, name: &str) -> Option<&BindingScopeId> {
