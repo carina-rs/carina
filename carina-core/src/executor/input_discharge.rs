@@ -405,7 +405,7 @@ impl<R> PreparedWrite<R> {
     pub fn request(&self) -> &R {
         &self.request
     }
-    pub(super) fn writeback(&self) -> &SecretPreservingAttributes {
+    pub(crate) fn writeback(&self) -> &SecretPreservingAttributes {
         &self.writeback
     }
     pub(super) fn resource_id(&self) -> &ResourceId {

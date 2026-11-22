@@ -3459,14 +3459,12 @@ async fn resume_dispatch_validates_resent_sent_against_checked_request() {
                 .await
                 .expect("fixture request passes provider preparation");
             let permit = crate::replacement::create_permit_for_test(request);
-            let writeback = permit.prepared_write().writeback().clone();
             let request = crate::provider::ResumeCreateRequest::new(pending, permit)
                 .expect("fixture continuation and request share a route");
 
             let failure = crate::executor::dispatch_resume_create(
                 &crate::provider::ProviderBoundary::fixture(&provider),
                 request,
-                writeback,
             )
             .await
             .expect_err("resent pending fixture returns a classified failure");

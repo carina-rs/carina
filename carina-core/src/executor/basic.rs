@@ -1266,8 +1266,7 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
             let PreparedBasicRequest::Resume(write) = prepared else {
                 unreachable!("prepared resume variant")
             };
-            let (request, resolved_attrs, accepted_request) = match resume.prepare(&resource, write)
-            {
+            let (request, accepted_request) = match resume.prepare(&resource, write) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
                     return StartedBasicEffectResult::new(
@@ -1280,12 +1279,13 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
                     );
                 }
             };
+            let resolved_attrs = accepted_request.resolved_desired_attributes().clone();
             let outcome = match request {
                 PreparedResume::Resend(request) => {
-                    super::dispatch_resume_create(provider, request, resolved_attrs.clone()).await
+                    super::dispatch_resume_create(provider, request).await
                 }
                 PreparedResume::Poll(request) => {
-                    super::dispatch_poll_create(provider, request, resolved_attrs.clone()).await
+                    super::dispatch_poll_create(provider, request).await
                 }
             };
             match outcome.map(crate::provider::HostResumeOutcome::into_kind) {

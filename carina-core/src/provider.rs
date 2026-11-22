@@ -5070,6 +5070,7 @@ pub struct ResumeRoutingMismatch {
 pub struct ResumeCreateRequest {
     pending: InFlightCreate<ProviderCreateRecord>,
     request: CreateRequest,
+    writeback: SecretPreservingAttributes,
     authorization: ResumeAuthorization,
 }
 
@@ -5093,11 +5094,15 @@ enum ResumeAuthorization {
 pub struct PollCreateRequest {
     resumed: ResumedCreate,
     request: CreateRequest,
+    writeback: SecretPreservingAttributes,
 }
 
 impl PollCreateRequest {
-    pub(crate) fn new(pending: InFlightCreate, request: CreateRequest) -> Result<Self, HostError> {
-        if pending.id() != &request.resource().id {
+    pub(crate) fn new(
+        pending: InFlightCreate,
+        write: crate::executor::PreparedWrite<CreateRequest>,
+    ) -> Result<Self, HostError> {
+        if pending.id() != &write.request().resource().id {
             return Err(
                 HostError::internal("poll request belongs to another resource")
                     .for_resource(pending.id().clone()),
@@ -5114,7 +5119,8 @@ impl PollCreateRequest {
                 pending: pending.into_provider_record(),
                 identifier,
             },
-            request,
+            request: write.request().clone(),
+            writeback: write.writeback().clone(),
         })
     }
 
@@ -5126,6 +5132,7 @@ impl PollCreateRequest {
         ResumeCreateRequest {
             pending: self.resumed.pending,
             request: self.request,
+            writeback: self.writeback,
             authorization: ResumeAuthorization::Poll(self.resumed.identifier),
         }
     }
@@ -5407,6 +5414,7 @@ impl ResumeCreateRequest {
         Ok(Self {
             pending: pending.into_provider_record(),
             request,
+            writeback: permit.prepared_write().writeback().clone(),
             authorization: ResumeAuthorization::Resend(permit),
         })
     }
@@ -5428,6 +5436,10 @@ impl ResumeCreateRequest {
 
     pub(crate) fn request(&self) -> &CreateRequest {
         &self.request
+    }
+
+    pub(crate) fn writeback(&self) -> &SecretPreservingAttributes {
+        &self.writeback
     }
 
     pub(crate) fn pending_for_dispatch(&self) -> InFlightCreate<ProviderCreateRecord> {

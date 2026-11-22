@@ -41,7 +41,7 @@ impl CreatePermit {
     pub fn request(&self) -> &crate::provider::CreateRequest {
         self.request.request()
     }
-    pub(super) fn prepared_write(&self) -> &super::PreparedWrite<crate::provider::CreateRequest> {
+    pub(crate) fn prepared_write(&self) -> &super::PreparedWrite<crate::provider::CreateRequest> {
         &self.request
     }
     pub(super) fn into_write(self) -> super::PreparedWrite<crate::provider::CreateRequest> {
@@ -254,15 +254,7 @@ impl<S: Clone> ScheduledResume<S> {
         self,
         resource: &crate::resource::ResolvedResource<S>,
         write: super::PreparedWrite<crate::provider::CreateRequest>,
-    ) -> Result<
-        (
-            PreparedResume,
-            crate::binding_index::SecretPreservingAttributes,
-            super::AcceptedRequest,
-        ),
-        super::EffectFailureKind,
-    > {
-        let attributes = write.writeback().clone();
+    ) -> Result<(PreparedResume, super::AcceptedRequest), super::EffectFailureKind> {
         let accepted = super::AcceptedRequest::from_prepared_create(&write);
         let request = match self {
             Self::Resend { pending, create } => PreparedResume::Resend(
@@ -270,7 +262,7 @@ impl<S: Clone> ScheduledResume<S> {
                     .map_err(super::EffectFailureKind::execution)?,
             ),
             Self::Poll(pending) => PreparedResume::Poll(
-                crate::provider::PollCreateRequest::new(*pending, write.into_parts().0)
+                crate::provider::PollCreateRequest::new(*pending, write)
                     .map_err(super::EffectFailureKind::execution)?,
             ),
             Self::Missing => {
@@ -280,7 +272,7 @@ impl<S: Clone> ScheduledResume<S> {
                 )));
             }
         };
-        Ok((request, attributes, accepted))
+        Ok((request, accepted))
     }
 }
 

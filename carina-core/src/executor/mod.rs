@@ -157,6 +157,7 @@ pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 mod create_dispatch {
     use super::{HostCreateFailure, HostCreateOutcome, HostProvider, dispatch_create_with_attempt};
 
+    /// Dispatch a permitted create with its cancellation receiver and raw host outcome.
     pub fn dispatch_create<'a, P: HostProvider + ?Sized>(
         provider: &'a P,
         permit: crate::replacement::CreatePermit,
@@ -190,9 +191,8 @@ pub struct CreateWriteback {
 
 /// Dispatch a prepared create and retain its desired values for every writeback result.
 ///
-/// Prepare dispatch of an already checked create request while minting the
-/// unforgeable initial-attempt witness and its cancellation receiver inside
-/// core. The supervising caller must retain the receiver until the returned
+/// Core mints the initial-attempt witness and cancellation receiver during
+/// dispatch. The supervising caller must retain the receiver until the returned
 /// future settles. Executor-owned abandonment paths drain it before saving
 /// the cancellation classification.
 /// A caller cannot replace the admitted request, even at the same identity:
@@ -358,23 +358,22 @@ async fn dispatch_create_with_attempt<P: HostProvider + ?Sized>(
 }
 
 /// Dispatch a checked resume request through the same sent-attribute
-/// validation seam as an initial create. The prepared desired values are
-/// required to produce host records for state writeback.
+/// validation seam as an initial create, using its prepared desired values
+/// to produce host records for state writeback.
 pub async fn dispatch_resume_create<P: HostProvider + ?Sized>(
     provider: &P,
     request: ResumeCreateRequest,
-    writeback: SecretPreservingAttributes,
 ) -> Result<HostResumeOutcome, HostResumeFailure> {
     // Resume validation retains both the starting witness and the provider result.
     // Bound that frame before embedding it in every scheduled basic operation.
-    Box::pin(dispatch_resume_create_raw(provider, request, writeback)).await
+    Box::pin(dispatch_resume_create_raw(provider, request)).await
 }
 
 async fn dispatch_resume_create_raw<P: HostProvider + ?Sized>(
     provider: &P,
     request: ResumeCreateRequest,
-    writeback: SecretPreservingAttributes,
 ) -> Result<HostResumeOutcome, HostResumeFailure> {
+    let writeback = request.writeback().clone();
     let id = request.id().clone();
     let starting = request.pending_for_dispatch();
     let request_attributes: BTreeSet<_> = request
@@ -450,9 +449,8 @@ async fn dispatch_resume_create_raw<P: HostProvider + ?Sized>(
 pub async fn dispatch_poll_create<P: HostProvider + ?Sized>(
     provider: &P,
     request: crate::provider::PollCreateRequest,
-    writeback: SecretPreservingAttributes,
 ) -> Result<HostResumeOutcome, HostResumeFailure> {
-    dispatch_resume_create(provider, request.into_resume_request(), writeback).await
+    dispatch_resume_create(provider, request.into_resume_request()).await
 }
 
 /// The accepted provider request whose result produced a complete state.

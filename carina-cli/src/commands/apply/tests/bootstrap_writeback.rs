@@ -8,7 +8,7 @@ async fn assert_bootstrap_transport_writeback(behavior: BootstrapCreateBehavior)
         BootstrapCreateBehavior::IdentifierReported => "observed",
         _ => "tags_secret",
     };
-    let resource = Resource::with_provider("aws", "s3.Bucket", "state_bucket", None)
+    let mut resource = Resource::with_provider("aws", "s3.Bucket", "state_bucket", None)
         .with_attribute("bucket", string_value("state-bucket"))
         .with_attribute(
             attribute,
@@ -16,6 +16,20 @@ async fn assert_bootstrap_transport_writeback(behavior: BootstrapCreateBehavior)
                 Box::new(string_value(&plaintext)).into(),
             )),
         );
+    if matches!(behavior, BootstrapCreateBehavior::Success) {
+        resource = resource.with_attribute(
+            "tags",
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "k".to_string(),
+                    Value::Deferred(DeferredValue::Secret(
+                        Box::new(string_value(&plaintext)).into(),
+                    )),
+                ),
+                ("public".to_string(), string_value("p")),
+            ]))),
+        );
+    }
     let (schemas, comparison_provider) = carina_core::provider::comparison_fixture_for_test(
         &bootstrap_bucket_schemas(),
         std::iter::once(&resource.id),
@@ -69,6 +83,16 @@ async fn assert_bootstrap_transport_writeback(behavior: BootstrapCreateBehavior)
                             if value.expose_plaintext() == plaintext),
                     "transport must retain the stripped fixture value"
                 );
+                if matches!(behavior, BootstrapCreateBehavior::Success) {
+                    assert!(
+                        matches!(transport.get_attr("tags"),
+                            Some(Value::Concrete(ConcreteValue::Map(tags)))
+                                if matches!(tags.get("k"),
+                                    Some(Value::Concrete(ConcreteValue::String(value)))
+                                        if value.expose_plaintext() == plaintext)),
+                        "transport must retain the stripped nested fixture value"
+                    );
+                }
                 let comparison = comparison_provider
                     .comparison_for(&schemas, &transport.id)
                     .unwrap_or_else(|_| panic!("fixture comparison must be available"));
@@ -168,6 +192,23 @@ async fn assert_bootstrap_transport_writeback(behavior: BootstrapCreateBehavior)
         hash.verify(serde_json::to_vec(&plaintext).expect("fixture must serialize")),
         "transport row digest must verify the fixture value"
     );
+    if matches!(behavior, BootstrapCreateBehavior::Success) {
+        let marker = &attributes["tags"]["k"];
+        assert_eq!(marker.as_object().map(serde_json::Map::len), Some(1));
+        let digest = marker["$secret"]
+            .as_str()
+            .expect("transport row must retain a nested secret digest");
+        let hash = carina_core::resource::RedactedSecretHash::from_encoded_digest(digest)
+            .expect("transport row must retain a valid nested digest");
+        assert!(
+            hash.verify(serde_json::to_vec(&plaintext).expect("fixture must serialize")),
+            "transport row nested digest must verify the fixture value"
+        );
+        assert!(
+            attributes["tags"]["public"].as_str() == Some("p"),
+            "transport row public map leaf must stay plain"
+        );
+    }
 }
 
 #[tokio::test]

@@ -7071,6 +7071,9 @@ impl Provider for BootstrapRecordingProvider {
                 if let Some(secret) = request.resource().as_resource().get_attr("tags_secret") {
                     attributes.insert("tags_secret".to_string(), secret.clone());
                 }
+                if let Some(tags) = request.resource().as_resource().get_attr("tags") {
+                    attributes.insert("tags".to_string(), tags.clone());
+                }
                 Box::pin(async move {
                     Ok(attempt
                         .issued(
@@ -7294,6 +7297,13 @@ fn bootstrap_bucket_schemas() -> SchemaRegistry {
                     .build(),
             )
             .attribute(
+                PatternAttributeSchema::optional(
+                    "tags",
+                    PatternAttributeType::map(PatternAttributeType::string()),
+                )
+                .build(),
+            )
+            .attribute(
                 PatternAttributeSchema::optional("observed", PatternAttributeType::string())
                     .build(),
             ))
@@ -7387,7 +7397,7 @@ async fn assert_bootstrap_secret_seed(behavior: BootstrapCreateBehavior) {
         behavior,
     };
     let (_temp, backend) = bootstrap_test_backend();
-    let resource = Resource::with_provider("aws", "s3.Bucket", "state_bucket", None)
+    let mut resource = Resource::with_provider("aws", "s3.Bucket", "state_bucket", None)
         .with_attribute("bucket", string_value("state-bucket"))
         .with_attribute(
             attribute,
@@ -7395,6 +7405,20 @@ async fn assert_bootstrap_secret_seed(behavior: BootstrapCreateBehavior) {
                 Box::new(string_value(plaintext)).into(),
             )),
         );
+    if matches!(behavior, BootstrapCreateBehavior::Success) {
+        resource = resource.with_attribute(
+            "tags",
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "k".to_string(),
+                    Value::Deferred(DeferredValue::Secret(
+                        Box::new(string_value(plaintext)).into(),
+                    )),
+                ),
+                ("public".to_string(), string_value("p")),
+            ]))),
+        );
+    }
     let outcome = bootstrap_declared_state_bucket_with_resource(
         crate::output_style::ColorMode::Plain,
         &provider,
@@ -7466,6 +7490,23 @@ async fn assert_bootstrap_secret_seed(behavior: BootstrapCreateBehavior) {
         hash.verify(serde_json::to_vec(plaintext).expect("fixture string must serialize")),
         "bootstrap secret hash must match the authored value"
     );
+    if matches!(behavior, BootstrapCreateBehavior::Success) {
+        let marker = &attributes["tags"]["k"];
+        assert_eq!(marker.as_object().map(serde_json::Map::len), Some(1));
+        let digest = marker["$secret"]
+            .as_str()
+            .expect("bootstrap nested secret must be stored as a hash");
+        let hash = carina_core::resource::RedactedSecretHash::from_encoded_digest(digest)
+            .expect("bootstrap nested secret must have a valid digest");
+        assert!(
+            hash.verify(serde_json::to_vec(plaintext).expect("fixture string must serialize")),
+            "bootstrap nested secret hash must match the authored value"
+        );
+        assert!(
+            attributes["tags"]["public"].as_str() == Some("p"),
+            "bootstrap public map leaf must stay plain"
+        );
+    }
 }
 
 #[tokio::test]
