@@ -138,7 +138,7 @@ use crate::parser::ResolvedProviderConfigs;
 use crate::provider::{
     AppliedIdentifier, CreateRequest, HostCreateFailure, HostCreateFailureKind, HostCreateOutcome,
     HostError, HostIdentifiedCreate, HostNormalizer, HostPartialReadDiagnostic, HostProvider,
-    HostResumeFailure, HostResumeFailureKind, HostResumeOutcome, InFlightCreate, PatchOp,
+    HostResumeFailure, HostResumeFailureKind, HostResumeOutcome, InFlightCreate, PlannedPatchOp,
     ProviderReadyDataSource, ResumeCreateRequest, SentAttributes, SentDesiredAttributes,
     UnknownCreateOutcome, UpdateRequest,
 };
@@ -449,26 +449,27 @@ impl AcceptedRequest {
         request: &UpdateRequest,
         resolved_desired_attributes: SecretPreservingAttributes,
     ) -> Self {
-        let sent_attributes = request.patch().sent_attributes();
         let mut sent = BTreeMap::new();
         let mut removed = BTreeSet::new();
-        for op in &request.patch().ops {
+        for op in request.planned_ops() {
             match op {
-                PatchOp::Add { key, .. }
-                | PatchOp::Replace { key, .. }
-                | PatchOp::Reassert { key, .. } => {
+                PlannedPatchOp::Add(sent_op)
+                | PlannedPatchOp::Replace(sent_op)
+                | PlannedPatchOp::Reassert(sent_op) => {
+                    let (key, grafted_leaves) = sent_op.sent_parts();
                     sent.insert(
-                        key.clone(),
+                        key.to_string(),
                         SentKey {
-                            grafted_leaves: request.grafted_leaves(key).to_vec(),
+                            grafted_leaves: grafted_leaves.to_vec(),
                         },
                     );
                 }
-                PatchOp::Remove { key } => {
+                PlannedPatchOp::Remove { key } => {
                     removed.insert(key.clone());
                 }
             }
         }
+        let sent_attributes = SentAttributes::only(sent.keys().cloned().collect());
         Self {
             kind: AcceptedRequestKind::Update { sent, removed },
             sent_attributes,
