@@ -980,8 +980,6 @@ pub type HostResult<T> = ProviderResult<T, Bound>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentAttributes {
     attributes: BTreeSet<String>,
-    #[cfg(any(test, feature = "test-utils"))]
-    all_for_test: bool,
 }
 
 impl SentAttributes {
@@ -997,19 +995,7 @@ impl SentAttributes {
     }
 
     pub(crate) fn only(attributes: BTreeSet<String>) -> Self {
-        Self {
-            attributes,
-            #[cfg(any(test, feature = "test-utils"))]
-            all_for_test: false,
-        }
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    pub(crate) fn all_for_test() -> Self {
-        Self {
-            attributes: BTreeSet::new(),
-            all_for_test: true,
-        }
+        Self { attributes }
     }
 
     fn from_update_patch(patch: &UpdatePatch) -> Self {
@@ -1036,10 +1022,6 @@ impl SentAttributes {
 
     /// Whether this operation sent `attribute` with a desired value.
     pub fn contains(&self, attribute: &str) -> bool {
-        #[cfg(any(test, feature = "test-utils"))]
-        if self.all_for_test {
-            return true;
-        }
         self.attributes.contains(attribute)
     }
 }
@@ -3170,29 +3152,6 @@ pub enum SentRecord {
     Persisted(PendingEnvelope),
 }
 
-impl SentRecord {
-    /// Recover attribute send evidence while it is still retained in request
-    /// form. Persisted continuations intentionally omit ordinary observable
-    /// attribute names, so they cannot claim a sent desired basis.
-    fn sent_attributes_for<S, D>(
-        &self,
-        resource: &Resource<
-            S,
-            crate::resource::NoPlaceholder,
-            crate::resource::AbsoluteBindingAddress,
-            D,
-        >,
-    ) -> Option<SentAttributes> {
-        match self {
-            Self::Request(sent) => Some(SentAttributes::from_create_sent(
-                sent,
-                resource.attributes.keys(),
-            )),
-            Self::Persisted(_envelope) => None,
-        }
-    }
-}
-
 /// What carina-core knows about a create for which the provider reported an
 /// identifier.
 #[derive(Debug)]
@@ -3293,20 +3252,16 @@ impl<S: TextState> IdentifiedCreate<S> {
 
 impl<S: TextState> IdentifiedCreate<S, SecretPreservingAttributes> {
     /// Resolved desired values and send evidence retained by the accepted
-    /// create observation.
-    pub fn sent_desired_attributes_for<'a, M, D>(
-        &'a self,
-        resource: &'a Resource<
-            M,
-            crate::resource::NoPlaceholder,
-            crate::resource::AbsoluteBindingAddress,
-            D,
-        >,
-    ) -> Option<SentDesiredAttributes<'a>> {
-        let sent = self.sent.sent_attributes_for(resource)?;
+    /// create observation. Membership is expanded from this record's retained
+    /// writeback keys. Persisted continuations omit ordinary observable keys
+    /// and therefore cannot claim a sent desired basis.
+    pub fn sent_desired_attributes(&self) -> Option<SentDesiredAttributes<'_>> {
+        let SentRecord::Request(sent) = &self.sent else {
+            return None;
+        };
         Some(SentDesiredAttributes::new(
             self.writeback.values().iter(),
-            sent,
+            SentAttributes::from_create_sent(sent, self.writeback.values().keys()),
         ))
     }
 
@@ -11898,7 +11853,7 @@ mod tests {
             Timestamp::try_from("2026-10-23T08:00:00Z").expect("fixture timestamp is valid");
         let identifier = AppliedIdentifier::new("persisted-id").expect("valid identifier");
         let pending = PendingCreate::new(
-            id,
+            id.clone(),
             PendingToken::new("persisted-token"),
             CreateProgress::ReadingBack {
                 identifier: identifier.clone(),
@@ -11933,10 +11888,14 @@ mod tests {
         );
         let diagnostic = diagnostic.into_host_for_test();
         let outcome = outcome.into_host_for_test().into_writeback(
-            crate::executor::AcceptedRequest::create_for_test(&HashMap::from([(
-                "arn".to_string(),
-                Value::Concrete(ConcreteValue::String("known-arn".into())),
-            )]))
+            crate::executor::AcceptedRequest::from_create_permit_for_test(
+                &crate::test_utils::prepared_write::create_permit(
+                    &Resource::from_id(id).with_value_attributes(HashMap::from([(
+                        "arn".to_string(),
+                        Value::Concrete(ConcreteValue::String("known-arn".into())),
+                    )])),
+                ),
+            )
             .resolved_desired_attributes()
             .clone(),
         );

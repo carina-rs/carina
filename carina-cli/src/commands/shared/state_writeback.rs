@@ -2768,22 +2768,39 @@ mod apply_state_save_tests {
         assert_eq!(comparison.owner_schema().owner(), "aws");
     }
 
-    fn complete_create(state: State, desired: &indexmap::IndexMap<String, Value>) -> Applied {
-        Applied::Complete {
-            state: state.to_snapshot(),
-            request: AcceptedRequest::create_for_test(desired),
-        }
-    }
-
-    fn complete_update(
+    fn complete_create<S, D>(
         state: State,
-        sent: &[&str],
-        removed: &[&str],
-        desired: &indexmap::IndexMap<String, Value>,
+        desired: &carina_core::resource::Resource<
+            S,
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+            D,
+        >,
     ) -> Applied {
         Applied::Complete {
             state: state.to_snapshot(),
-            request: AcceptedRequest::update_for_test(sent, removed, desired),
+            request: AcceptedRequest::from_create_permit_for_test(
+                &carina_core::test_utils::prepared_write::create_permit(desired),
+            ),
+        }
+    }
+
+    fn complete_update<S, D>(
+        from: carina_core::resource::SnapshotState,
+        state: State,
+        changed: &[&str],
+        desired: &carina_core::resource::Resource<
+            S,
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+            D,
+        >,
+    ) -> Applied {
+        Applied::Complete {
+            state: state.to_snapshot(),
+            request: AcceptedRequest::from_update_permit_for_test(
+                &carina_core::test_utils::prepared_write::update_permit(desired, from, changed),
+            ),
         }
     }
 
@@ -2994,7 +3011,7 @@ mod apply_state_save_tests {
                     )]),
                 )
                 .with_identifier("complete-id"),
-                &resolved_resource.attributes,
+                &resolved_resource,
             ),
             ReplacementAppliedKind::Observed => Applied::Observed(
                 identified_create(
@@ -3352,7 +3369,7 @@ mod apply_state_save_tests {
                             provider_attributes,
                         )
                         .with_identifier("provider-id"),
-                        &resource.attributes,
+                        resource,
                     ),
                 )]),
                 plan: &Plan::new(),
@@ -3726,10 +3743,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &managed_current,
-                applied_states: &HashMap::from([(
-                    id.clone(),
-                    complete_create(applied, &desired.attributes),
-                )]),
+                applied_states: &HashMap::from([(id.clone(), complete_create(applied, &desired))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -3839,7 +3853,15 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     id.clone(),
-                    complete_update(applied, &["comment"], &[], &desired.attributes),
+                    complete_update(
+                        carina_core::resource::SnapshotState::existing(
+                            desired.id.clone(),
+                            std::collections::BTreeMap::new(),
+                        ),
+                        applied,
+                        &["comment"],
+                        &desired,
+                    ),
                 )]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
@@ -3875,7 +3897,15 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     id.clone(),
-                    complete_update(applied, &["password"], &[], &desired.attributes),
+                    complete_update(
+                        carina_core::resource::SnapshotState::existing(
+                            desired.id.clone(),
+                            std::collections::BTreeMap::new(),
+                        ),
+                        applied,
+                        &["password"],
+                        &desired,
+                    ),
                 )]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
@@ -3954,7 +3984,7 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     id.clone(),
-                    complete_update(applied, &[], &["password"], &desired.attributes),
+                    complete_update(applied.to_snapshot(), applied, &["password"], &desired),
                 )]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
@@ -4028,7 +4058,13 @@ mod apply_state_save_tests {
                 managed_current: &managed_current,
                 applied_states: &HashMap::from([(
                     id.clone(),
-                    complete_update(applied, &["comment"], &["password"], &desired.attributes),
+                    complete_update(
+                        State::existing(before.id.clone(), before.resolved_attributes())
+                            .to_snapshot(),
+                        applied,
+                        &["comment", "password"],
+                        &desired,
+                    ),
                 )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -4645,7 +4681,15 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     destination.clone(),
-                    complete_update(applied, &["name"], &[], &destination_resource.attributes),
+                    complete_update(
+                        carina_core::resource::SnapshotState::existing(
+                            destination_resource.id.clone(),
+                            std::collections::BTreeMap::new(),
+                        ),
+                        applied,
+                        &["name"],
+                        &destination_resource,
+                    ),
                 )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -5101,13 +5145,10 @@ mod apply_state_save_tests {
         .with_identifier("sibling-id");
         let resources = vec![resolved(resource.clone()), resolved(sibling.clone())];
         let applied_states = HashMap::from([
-            (
-                id.clone(),
-                complete_create(applied_state, &resources[0].attributes),
-            ),
+            (id.clone(), complete_create(applied_state, &resources[0])),
             (
                 sibling_id.clone(),
-                complete_create(sibling_state, &resources[1].attributes),
+                complete_create(sibling_state, &resources[1]),
             ),
         ]);
         let state = build_state_after_apply(
@@ -5185,7 +5226,15 @@ mod apply_state_save_tests {
         let managed_current = HashMap::from([(id.clone(), listener_current)]);
         let applied_states = HashMap::from([(
             sibling_id,
-            complete_update(sibling_state, &["name"], &[], &resources[1].attributes),
+            complete_update(
+                carina_core::resource::SnapshotState::existing(
+                    resources[1].id.clone(),
+                    std::collections::BTreeMap::new(),
+                ),
+                sibling_state,
+                &["name"],
+                &resources[1],
+            ),
         )]);
         let carried = build_state_after_apply(
             ApplyStateSave {
@@ -5246,10 +5295,7 @@ mod apply_state_save_tests {
             .expect("test state setup must be valid");
         let applied_states = HashMap::from([(
             id.clone(),
-            complete_create(
-                applied_name_state(&id, "new-temp"),
-                &sorted_resources[0].attributes,
-            ),
+            complete_create(applied_name_state(&id, "new-temp"), &sorted_resources[0]),
         )]);
         let plan = plan_with_name_override(&id, "new-temp", "dsl-new");
 
@@ -5305,10 +5351,7 @@ mod apply_state_save_tests {
             .expect("test state setup must be valid");
         let applied_states = HashMap::from([(
             id.clone(),
-            complete_create(
-                applied_name_state(&id, "legacy-temp"),
-                &sorted_resources[0].attributes,
-            ),
+            complete_create(applied_name_state(&id, "legacy-temp"), &sorted_resources[0]),
         )]);
         let plan = plan_with_name_override(&id, "legacy-temp", "dsl-value");
 
@@ -5365,7 +5408,7 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     child_id.clone(),
-                    complete_create(child_state, &runtime_child.attributes),
+                    complete_create(child_state, &runtime_child),
                 )]),
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(
                     runtime_child.clone(),
@@ -5601,10 +5644,8 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::new();
-        let applied_states = HashMap::from([(
-            id.clone(),
-            complete_create(applied_state, &runtime_child.attributes),
-        )]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &runtime_child))]);
         let successfully_deleted =
             HashSet::from([DeletedInstanceKey::current(id.clone(), "old-record-id")]);
         let failed_refreshes = HashSet::new();
@@ -5687,10 +5728,8 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(
-            id.clone(),
-            complete_create(applied_state, &runtime_child.attributes),
-        )]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &runtime_child))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -5750,10 +5789,8 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(
-            id.clone(),
-            complete_create(applied_state, &runtime_child.attributes),
-        )]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &runtime_child))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -5834,7 +5871,15 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     id,
-                    complete_update(applied_state, &["cidr_block"], &[], &desired.attributes),
+                    complete_update(
+                        carina_core::resource::SnapshotState::existing(
+                            desired.id.clone(),
+                            std::collections::BTreeMap::new(),
+                        ),
+                        applied_state,
+                        &["cidr_block"],
+                        &desired,
+                    ),
                 )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -5900,10 +5945,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(
-                    id,
-                    complete_create(applied_state, &desired.attributes),
-                )]),
+                applied_states: &HashMap::from([(id, complete_create(applied_state, &desired))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -5976,10 +6018,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::from([(id.clone(), Current::from_state(current_state))]),
-                applied_states: &HashMap::from([(
-                    id,
-                    complete_create(applied_state, &desired.attributes),
-                )]),
+                applied_states: &HashMap::from([(id, complete_create(applied_state, &desired))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -6039,10 +6078,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(
-                    id,
-                    complete_create(applied_state, &desired.attributes),
-                )]),
+                applied_states: &HashMap::from([(id, complete_create(applied_state, &desired))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -6157,7 +6193,7 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     create_id,
-                    complete_create(applied_state, &saved_desired.attributes),
+                    complete_create(applied_state, &saved_desired),
                 )]),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
@@ -6222,7 +6258,7 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     create_id,
-                    complete_create(applied_state, &desired.attributes),
+                    complete_create(applied_state, &desired),
                 )]),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
@@ -6346,7 +6382,7 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     id,
-                    complete_create(applied_state, &saved_desired.attributes),
+                    complete_create(applied_state, &saved_desired),
                 )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -6485,7 +6521,7 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     id,
-                    complete_create(applied_state, &saved_desired.attributes),
+                    complete_create(applied_state, &saved_desired),
                 )]),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
@@ -6624,7 +6660,15 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     id.clone(),
-                    complete_update(applied_state, &["password"], &[], &desired.attributes),
+                    complete_update(
+                        carina_core::resource::SnapshotState::existing(
+                            desired.id.clone(),
+                            std::collections::BTreeMap::new(),
+                        ),
+                        applied_state,
+                        &["password"],
+                        &desired,
+                    ),
                 )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -6717,7 +6761,7 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     id.clone(),
-                    complete_create(applied_state, &desired.attributes),
+                    complete_create(applied_state, &desired),
                 )]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
@@ -6788,7 +6832,15 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     id.clone(),
-                    complete_update(applied_state, &["password"], &[], &desired.attributes),
+                    complete_update(
+                        carina_core::resource::SnapshotState::existing(
+                            desired.id.clone(),
+                            std::collections::BTreeMap::new(),
+                        ),
+                        applied_state,
+                        &["password"],
+                        &desired,
+                    ),
                 )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -6999,7 +7051,7 @@ mod apply_state_save_tests {
                 )])),
                 applied_states: &HashMap::from([(
                     id.clone(),
-                    complete_create(applied_state, &runtime_child.attributes),
+                    complete_create(applied_state, &runtime_child),
                 )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -7109,7 +7161,7 @@ mod apply_state_save_tests {
                 managed_current: &crate::managed_current_from_states(current_states),
                 applied_states: &HashMap::from([(
                     id.clone(),
-                    complete_create(applied_state, &sorted_resources[0].attributes),
+                    complete_create(applied_state, &sorted_resources[0]),
                 )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -7180,10 +7232,8 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(
-            id.clone(),
-            complete_create(applied_state, &runtime_child.attributes),
-        )]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &runtime_child))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -7271,10 +7321,8 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(
-            id.clone(),
-            complete_create(applied_state, &runtime_child.attributes),
-        )]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &runtime_child))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -7345,10 +7393,8 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(
-            id.clone(),
-            complete_create(applied_state, &runtime_child.attributes),
-        )]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &runtime_child))]);
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
@@ -7599,10 +7645,8 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(
-            id.clone(),
-            complete_create(applied_state, &runtime_child.attributes),
-        )]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &runtime_child))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -7977,7 +8021,7 @@ mod apply_state_save_tests {
         .with_identifier("bucket-new-id");
         let applied_states = HashMap::from([(
             id.clone(),
-            complete_create(applied_state, &sorted_resources[0].attributes),
+            complete_create(applied_state, &sorted_resources[0]),
         )]);
 
         let state = build_state_after_apply(
@@ -8046,10 +8090,8 @@ mod apply_state_save_tests {
             origin: None,
         });
         let current_states = HashMap::new();
-        let applied_states = HashMap::from([(
-            id.clone(),
-            complete_create(applied_state, &desired.attributes),
-        )]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &desired))]);
         let successfully_deleted = HashSet::new();
         let failed_refreshes = HashSet::new();
         let schemas = SchemaRegistry::new();
@@ -8118,7 +8160,7 @@ mod apply_state_save_tests {
             id.clone(),
             complete_create(
                 applied_name_state(&id, "new-temp"),
-                &result.runtime_synthesized_resources[0].attributes,
+                &result.runtime_synthesized_resources[0],
             ),
         );
         result.permanent_name_overrides.insert(

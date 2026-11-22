@@ -2214,14 +2214,6 @@ impl SecretPreservingAttributes {
         Self { attributes }
     }
 
-    #[cfg(any(test, feature = "test-utils"))]
-    pub(crate) fn from_attributes_for_test<'a, P: crate::resource::StateValueLeaf + 'a>(
-        attributes: impl IntoIterator<Item = (&'a String, &'a Value<P>)>,
-    ) -> Self {
-        let attributes = attributes.into_iter().collect::<Vec<_>>();
-        Self::from_provider_values(attributes.iter().copied(), attributes.iter().copied())
-    }
-
     /// Read-only access for state writeback. Construction remains confined to
     /// the secret-preserving resolution paths above.
     pub fn values(&self) -> &BTreeMap<String, crate::resource::SnapshotValue> {

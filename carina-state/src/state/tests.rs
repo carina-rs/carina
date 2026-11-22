@@ -1,11 +1,21 @@
 use super::*;
 use crate::provider_text_fixtures::*;
+use carina_core::test_utils::prepared_write;
 mod create_writeback_fixtures;
 mod provider_text_secret_redaction;
 use create_writeback_fixtures::{
     create_attempt_for_test, create_fixture_provider, create_request_for_test,
     dispatched_create_failure_for_test, ready_for_test, resumed_create_observation_for_test,
 };
+
+fn accepted_attributes_for_test(request: &AcceptedRequest) -> IndexMap<String, Value> {
+    request
+        .resolved_desired_attributes()
+        .values()
+        .iter()
+        .map(|(key, value)| (key.clone(), value.to_value_at(key).unwrap()))
+        .collect()
+}
 
 fn desired_value_comparison_for_test(
     schema: Option<&ResourceSchema>,
@@ -2314,7 +2324,8 @@ fn from_provider_state_aligns_reordered_nested_and_provider_added_list_elements(
     )
     .with_identifier("listener-id");
 
-    let accepted = AcceptedRequest::create_for_test(&resource.attributes);
+    let accepted =
+        AcceptedRequest::from_create_permit_for_test(&prepared_write::create_permit(&resource));
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
         &provider_state,
@@ -2400,7 +2411,9 @@ fn state_writeback_uses_explicit_basis_per_sent_top_level_attribute() {
         &prior_provider,
         None,
         None,
-        RowBasis::Applied(&AcceptedRequest::create_for_test(&resource.attributes)),
+        RowBasis::Applied(&AcceptedRequest::from_create_permit_for_test(
+            &prepared_write::create_permit(&resource),
+        )),
         None,
     )
     .expect("create writeback records the server default");
@@ -2432,7 +2445,14 @@ fn state_writeback_uses_explicit_basis_per_sent_top_level_attribute() {
         ]),
     )
     .with_identifier("listener-id");
-    let update = AcceptedRequest::update_for_test(&["description"], &[], &updated.attributes);
+    let update = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &updated,
+        carina_core::resource::SnapshotState::existing(
+            updated.id.clone(),
+            std::collections::BTreeMap::new(),
+        ),
+        &["description"],
+    ));
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&updated),
         &updated_provider,
@@ -3365,7 +3385,8 @@ fn carried_whole_value_clears_when_readded_field_has_a_unique_pair() {
         Diff::NoChange(_)
     ));
 
-    let accepted = AcceptedRequest::create_for_test(&applied.attributes);
+    let accepted =
+        AcceptedRequest::from_create_permit_for_test(&prepared_write::create_permit(&applied));
     let applied_row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&applied),
         &provider,
@@ -6216,7 +6237,8 @@ fn accepted_create_records_write_only_attributes() {
                 .write_only()
                 .build(),
         );
-    let request = AcceptedRequest::create_for_test(&resource.attributes);
+    let request =
+        AcceptedRequest::from_create_permit_for_test(&prepared_write::create_permit(&resource));
     let rs = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
         &provider_state,
@@ -6348,7 +6370,9 @@ fn accepted_create_does_not_record_write_only_attribute_absent_from_desired() {
         &provider_state,
         None,
         Some(&schema),
-        RowBasis::Applied(&AcceptedRequest::create_for_test(&resource.attributes)),
+        RowBasis::Applied(&AcceptedRequest::from_create_permit_for_test(
+            &prepared_write::create_permit(&resource),
+        )),
         None,
     )
     .unwrap();
@@ -6404,7 +6428,9 @@ fn accepted_write_only_does_not_overwrite_protected_provider_value() {
         &provider_state,
         None,
         Some(&schema),
-        RowBasis::Applied(&AcceptedRequest::create_for_test(&resource.attributes)),
+        RowBasis::Applied(&AcceptedRequest::from_create_permit_for_test(
+            &prepared_write::create_permit(&resource),
+        )),
         None,
     )
     .unwrap();
@@ -6640,23 +6666,52 @@ fn applied_previous_secret_hash_authority_requires_known_public_desired() {
             expected_desired_key,
             "{label}: classify the entire desired value tree"
         );
-        let request = AcceptedRequest::update_for_test(&["computed"], &[], &resource.attributes);
-        for (authority, protected) in [
+        let preparation = prepared_write::try_update_permit(
+            &resource,
+            SnapshotState::existing(resource.id.clone(), BTreeMap::new()),
+            &["computed"],
+        );
+        let unresolved = matches!(
+            label,
+            "reference"
+                | "binding"
+                | "unknown"
+                | "call"
+                | "nested reference"
+                | "literal interpolation remains deferred"
+                | "literal coalesce remains deferred"
+        );
+        let request = if unresolved {
+            assert!(
+                preparation.is_err(),
+                "{label}: unresolved desired inputs cannot be accepted"
+            );
+            None
+        } else {
+            Some(AcceptedRequest::from_update_permit_for_test(
+                &preparation.unwrap(),
+            ))
+        };
+        let request_attributes = request.as_ref().map(accepted_attributes_for_test);
+        let mut authorities = vec![
             (PreviousSecretHashAuthority::None, false),
             (
                 PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&previous),
                 true,
             ),
-            (
+        ];
+        if let Some(request) = &request {
+            authorities.push((
                 PreviousSecretHashAuthority::AcceptedWrite {
                     previous: &previous,
-                    request: &request,
-                    request_attributes: Cow::Borrowed(&resource.attributes),
+                    request,
+                    request_attributes: Cow::Borrowed(request_attributes.as_ref().unwrap()),
                     final_desired: None,
                 },
-                protected,
-            ),
-        ] {
+                label == "absent",
+            ));
+        }
+        for (authority, protected) in authorities {
             let selected = SelectedStateAttributes {
                 encoded: BTreeMap::from([("computed".to_owned(), provider_value.clone())]),
                 write_only_keys: HashSet::new(),
@@ -6708,7 +6763,15 @@ fn previous_secret_hash_unsent_update_requires_provider_equality() {
         PersistedValue::encode_desired_value(&old, None).unwrap(),
     )]))
     .unwrap();
-    let request = AcceptedRequest::update_for_test(&["other"], &[], &attributes);
+    let mut request_resource = Resource::with_provider("mock", "test.resource", "sink", None);
+    request_resource.attributes = attributes.clone();
+    request_resource.set_attr("other", Value::Concrete(ConcreteValue::Bool(true)));
+    let request = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &request_resource,
+        SnapshotState::existing(request_resource.id.clone(), BTreeMap::new()),
+        &["other"],
+    ));
+    let request_attributes = accepted_attributes_for_test(&request);
     for (provider, expected) in [
         ("different", PreviousSecretHashDecision::Protect),
         ("public", PreviousSecretHashDecision::Release),
@@ -6723,7 +6786,7 @@ fn previous_secret_hash_unsent_update_requires_provider_equality() {
                 &PreviousSecretHashAuthority::AcceptedWrite {
                     previous: &previous,
                     request: &request,
-                    request_attributes: Cow::Borrowed(&attributes),
+                    request_attributes: Cow::Borrowed(&request_attributes),
                     final_desired: Some(&FinalDesiredAttributes::for_test(attributes.clone())),
                 },
                 "computed",
@@ -6899,14 +6962,45 @@ fn previous_secret_hash_decision_matrix() {
                     DesiredKey::NotKnownPublic
                 );
             }
-            let request = AcceptedRequest::update_for_test(&["computed"], &[], &attributes);
+            let mut request_resource =
+                Resource::with_provider("mock", "test.resource", "sink", None);
+            request_resource.attributes = attributes.clone();
+            let preparation = prepared_write::try_update_permit(
+                &request_resource,
+                SnapshotState::existing(request_resource.id.clone(), BTreeMap::new()),
+                &["computed"],
+            );
+            let unresolved = matches!(
+                *label,
+                "reference"
+                    | "retained call"
+                    | "map with reference leaf"
+                    | "list with deferred interpolation"
+                    | "omitted reference"
+                    | "omitted call"
+            );
+            let request = if unresolved {
+                assert!(
+                    preparation.is_err(),
+                    "{label}: unresolved desired inputs cannot be accepted"
+                );
+                None
+            } else {
+                Some(AcceptedRequest::from_update_permit_for_test(
+                    &preparation.unwrap(),
+                ))
+            };
+            let request_attributes = request.as_ref().map(accepted_attributes_for_test);
             let final_desired = FinalDesiredAttributes::for_test(attributes.clone());
             for (basis, applied) in [("applied", true), ("carried", false), ("imported", false)] {
                 let authority = if applied {
+                    let Some(request) = request.as_ref() else {
+                        continue;
+                    };
                     PreviousSecretHashAuthority::AcceptedWrite {
                         previous,
-                        request: &request,
-                        request_attributes: Cow::Borrowed(&attributes),
+                        request,
+                        request_attributes: Cow::Borrowed(request_attributes.as_ref().unwrap()),
                         final_desired: Some(&final_desired),
                     }
                 } else {
@@ -7024,7 +7118,15 @@ fn previous_secret_hash_unsent_update_uses_final_plan_desired() {
         resource.id.clone(),
         IndexMap::from([("computed".into(), public)]),
     )]);
-    let request = AcceptedRequest::update_for_test(&["other"], &[], &resource.attributes);
+    let request_resource = resource
+        .as_resource()
+        .clone()
+        .with_attribute("other", Value::Concrete(ConcreteValue::Bool(true)));
+    let request = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &request_resource,
+        SnapshotState::existing(resource.id.clone(), BTreeMap::new()),
+        &["other"],
+    ));
     let row = ResourceState::from_provider_state_with_final_desired(
         &resource,
         &state,
@@ -7186,14 +7288,14 @@ fn in_flight_create_explicit_matches_applied_after_request_canonicalization() {
         .with_attribute("name_prefix", string("generated-"))
         .with_attribute(
             "password",
-            Value::Deferred(DeferredValue::Secret(Box::new(password.clone()).into())),
+            Value::Deferred(DeferredValue::Secret(Box::new(password).into())),
         );
     // Canonicalization consumes the authored companion, and provider defaults
-    // introduce a request-only key. The request also strips the secret wrapper.
+    // introduce a request-only key. Preparation strips the secret wrapper from
+    // the transport while retaining it in the prepared writeback.
     let mut request_resource = resource.clone();
     request_resource.attributes.shift_remove("name_prefix");
     request_resource.set_attr("name", string("generated-name"));
-    request_resource.set_attr("password", password);
     request_resource.set_attr(
         "tags",
         Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -7218,10 +7320,27 @@ fn in_flight_create_explicit_matches_applied_after_request_canonicalization() {
         )
         .validate()
         .unwrap();
-    let accepted = AcceptedRequest::create_for_test(&request_resource.attributes);
-    let observed: State = State::existing(resource.id.clone(), request_resource.attributes.clone())
-        .with_identifier("canonicalized-id");
-    let prepared = create_request_for_test(request_resource, schema.clone());
+    let prepared = carina_core::replacement::create_permit_for_test(create_request_for_test(
+        request_resource,
+        schema.clone(),
+    ));
+    let accepted = AcceptedRequest::from_create_permit_for_test(&prepared);
+    assert!(matches!(
+        accepted
+            .resolved_desired_attributes()
+            .values()
+            .get("password"),
+        Some(Value::Deferred(DeferredValue::Secret(_)))
+    ));
+    assert!(!matches!(
+        prepared.request().resource().attributes.get("password"),
+        Some(Value::Deferred(DeferredValue::Secret(_)))
+    ));
+    let observed: State = State::existing(
+        resource.id.clone(),
+        prepared.request().resource().attributes.clone(),
+    )
+    .with_identifier("canonicalized-id");
     let provider = create_fixture_provider("mock", |attempt| {
         Box::pin(std::future::ready(Err(attempt
             .pending(
@@ -7232,10 +7351,7 @@ fn in_flight_create_explicit_matches_applied_after_request_canonicalization() {
             .preserve(ProviderError::internal("create remains in flight")))))
     });
     let boundary = crate::provider_text_fixtures::boundary(Box::new(provider));
-    let (create, _cancellation) = carina_core::executor::dispatch_create(
-        &boundary,
-        carina_core::replacement::create_permit_for_test(prepared),
-    );
+    let (create, _cancellation) = carina_core::executor::dispatch_create(&boundary, prepared);
     let Err(failure) = ready_for_test(create) else {
         panic!("fixture create must remain in flight")
     };
@@ -7274,6 +7390,14 @@ fn in_flight_create_explicit_matches_applied_after_request_canonicalization() {
         "applied authoring includes the sent provider default"
     );
     assert_eq!(in_flight.explicit, applied.explicit);
+    assert!(
+        applied
+            .persisted_attributes()
+            .unwrap()
+            .redacted_secret_hash("password")
+            .is_some(),
+        "applied writeback retains the prepared secret shape"
+    );
 
     let CurrentInstance::CreateInFlight { pending } = in_flight.current() else {
         panic!("in-flight row must retain its continuation")
@@ -7605,7 +7729,9 @@ fn accepted_write_only_keeps_raw_legacy_shaped_text_plain() {
         .with_identifier("plain-id"),
         None,
         Some(&schema),
-        RowBasis::Applied(&AcceptedRequest::create_for_test(&resource.attributes)),
+        RowBasis::Applied(&AcceptedRequest::from_create_permit_for_test(
+            &prepared_write::create_permit(&resource),
+        )),
         None,
     )
     .expect("marker-shaped desired plaintext is ordinary text");
@@ -7681,7 +7807,14 @@ fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove()
 
     // Add: a sent attribute without prior leaf provenance establishes it.
     let (added_resource, schema) = nested_write_only_state_fixture("add-secret");
-    let add = AcceptedRequest::update_for_test(&["config"], &[], &added_resource.attributes);
+    let add = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &added_resource,
+        carina_core::resource::SnapshotState::existing(
+            added_resource.id.clone(),
+            std::collections::BTreeMap::new(),
+        ),
+        &["config"],
+    ));
     let added = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&added_resource),
         &provider_state(&added_resource),
@@ -7710,10 +7843,17 @@ fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove()
             .contains("add-secret")
     );
 
-    // Replace and Reassert both arrive at state writeback as a sent key. A
-    // replacement rotates the recorded hash; a reassert preserves it.
+    // Prepared replacements arrive at state writeback as a sent key. A new
+    // value rotates the recorded hash; repeating that value preserves it.
     let (replaced_resource, _) = nested_write_only_state_fixture("replace-secret");
-    let replace = AcceptedRequest::update_for_test(&["config"], &[], &replaced_resource.attributes);
+    let replace = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &replaced_resource,
+        carina_core::resource::SnapshotState::existing(
+            replaced_resource.id.clone(),
+            std::collections::BTreeMap::new(),
+        ),
+        &["config"],
+    ));
     let replaced = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&replaced_resource),
         &provider_state(&replaced_resource),
@@ -7728,8 +7868,14 @@ fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove()
         replaced.nested_write_only().get("config")
     );
 
-    let reassert =
-        AcceptedRequest::update_for_test(&["config"], &[], &replaced_resource.attributes);
+    let reassert = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &replaced_resource,
+        carina_core::resource::SnapshotState::existing(
+            replaced_resource.id.clone(),
+            std::collections::BTreeMap::new(),
+        ),
+        &["config"],
+    ));
     let reasserted = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&replaced_resource),
         &provider_state(&replaced_resource),
@@ -7746,7 +7892,11 @@ fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove()
 
     let removed_resource =
         carina_core::resource::Resource::with_provider("mock", "test.Resource", "nested", None);
-    let remove = AcceptedRequest::update_for_test(&[], &["config"], &removed_resource.attributes);
+    let remove = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &removed_resource,
+        provider_state(&replaced_resource).to_snapshot(),
+        &["config"],
+    ));
     let removed = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&removed_resource),
         &ProviderState::<carina_core::resource::NoPlaceholder>::existing(
@@ -7812,7 +7962,14 @@ fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
         )]),
     )
     .with_identifier("resource-id");
-    let accepted = AcceptedRequest::update_for_test(&["config"], &[], &resource.attributes);
+    let accepted = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &resource,
+        carina_core::resource::SnapshotState::existing(
+            resource.id.clone(),
+            std::collections::BTreeMap::new(),
+        ),
+        &["config"],
+    ));
 
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
@@ -8473,7 +8630,14 @@ fn from_provider_state_imported_demotion_releases_only_equal_public_value() {
                     .unwrap()
             );
         }
-        let request = AcceptedRequest::update_for_test(&["computed"], &[], &resource.attributes);
+        let request = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+            &resource,
+            carina_core::resource::SnapshotState::existing(
+                resource.id.clone(),
+                std::collections::BTreeMap::new(),
+            ),
+            &["computed"],
+        ));
         let applied = resource_state_from_provider_state_for_resource_and_schema_for_test(
             &resolved(&resource),
             &provider,
@@ -8525,7 +8689,14 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
             .write_only()
             .build(),
     );
-    let request = AcceptedRequest::update_for_test(&["password"], &[], &resource.attributes);
+    let request = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &resource,
+        carina_core::resource::SnapshotState::existing(
+            resource.id.clone(),
+            std::collections::BTreeMap::new(),
+        ),
+        &["password"],
+    ));
     let rs = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
         &provider_state,
@@ -8548,7 +8719,7 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
 }
 
 #[test]
-fn accepted_update_ignores_sent_non_write_only_key_absent_from_writeback_resource() {
+fn accepted_update_keeps_unsent_write_only_value_with_request_only_key() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
     use carina_core::schema::{
         CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
@@ -8567,8 +8738,15 @@ fn accepted_update_ignores_sent_non_write_only_key_absent_from_writeback_resourc
             .write_only()
             .build(),
     );
-    let request =
-        AcceptedRequest::update_for_test(&["apply_time_normalized_key"], &[], &resource.attributes);
+    let request_resource = resource.clone().with_attribute(
+        "apply_time_normalized_key",
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+    let request = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &request_resource,
+        SnapshotState::existing(resource.id.clone(), BTreeMap::new()),
+        &["apply_time_normalized_key"],
+    ));
 
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
@@ -9587,7 +9765,14 @@ fn conservative_list_authoring_round_trips_and_recovers_on_writeback() {
         Diff::NoChange(_)
     ));
 
-    let accepted = AcceptedRequest::update_for_test(&["rules"], &[], &desired.attributes);
+    let accepted = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &desired,
+        carina_core::resource::SnapshotState::existing(
+            desired.id.clone(),
+            std::collections::BTreeMap::new(),
+        ),
+        &["rules"],
+    ));
     let rewritten = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&desired),
         &current,
@@ -10178,7 +10363,15 @@ fn previous_secret_hash_omitted_public_value_keeps_root_and_nested_hashes() {
     );
     let provider: State =
         State::existing(resource.id.clone(), BTreeMap::new()).with_identifier("sink-id");
-    let request = AcceptedRequest::update_for_test(&["other"], &[], &resource.attributes);
+    let request_resource = resource
+        .as_resource()
+        .clone()
+        .with_attribute("other", Value::Concrete(ConcreteValue::Bool(true)));
+    let request = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &request_resource,
+        SnapshotState::existing(resource.id.clone(), BTreeMap::new()),
+        &["other"],
+    ));
     for previous in [
         secret.clone(),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([

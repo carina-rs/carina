@@ -135,13 +135,20 @@ fn validate_with_test_factories(
     )
 }
 
-fn complete_create(
+fn complete_create<S, D>(
     state: carina_core::resource::State,
-    desired: &indexmap::IndexMap<String, Value>,
+    desired: &carina_core::resource::Resource<
+        S,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+        D,
+    >,
 ) -> carina_core::executor::Applied {
     carina_core::executor::Applied::Complete {
         state: state.to_snapshot(),
-        request: carina_core::executor::AcceptedRequest::create_for_test(desired),
+        request: carina_core::executor::AcceptedRequest::from_create_permit_for_test(
+            &carina_core::test_utils::prepared_write::create_permit(desired),
+        ),
     }
 }
 
@@ -191,15 +198,22 @@ where
         .expect("test fixture must contain no parser placeholders")
 }
 
-fn complete_update(
+fn complete_update<S, D>(
+    from: carina_core::resource::SnapshotState,
     state: carina_core::resource::State,
-    sent: &[&str],
-    removed: &[&str],
-    desired: &indexmap::IndexMap<String, Value>,
+    changed: &[&str],
+    desired: &carina_core::resource::Resource<
+        S,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+        D,
+    >,
 ) -> carina_core::executor::Applied {
     carina_core::executor::Applied::Complete {
         state: state.to_snapshot(),
-        request: carina_core::executor::AcceptedRequest::update_for_test(sent, removed, desired),
+        request: carina_core::executor::AcceptedRequest::from_update_permit_for_test(
+            &carina_core::test_utils::prepared_write::update_permit(desired, from, changed),
+        ),
     }
 }
 
@@ -5206,7 +5220,7 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
     .with_identifier("legacy-id");
     let applied_states = HashMap::from([(
         id.clone(),
-        complete_create(applied_state, &sorted_resources[0].attributes),
+        complete_create(applied_state, &sorted_resources[0]),
     )]);
     let plan = plan_with_name_override(&id, "legacy-temp", "legacy");
 
@@ -8485,7 +8499,7 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     let mut applied_states = HashMap::new();
     applied_states.insert(
         sorted_resources[0].id.clone(),
-        complete_create(applied_state, &sorted_resources[0].attributes),
+        complete_create(applied_state, &sorted_resources[0]),
     );
 
     let current_states = HashMap::new();
@@ -8625,7 +8639,7 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
     let mut applied_states = HashMap::new();
     applied_states.insert(
         sorted_resources[0].id.clone(),
-        complete_create(applied_state, &sorted_resources[0].attributes),
+        complete_create(applied_state, &sorted_resources[0]),
     );
 
     let current_states = HashMap::new();
@@ -8899,7 +8913,7 @@ fn block_unique_name_attribute_state_roundtrip() {
     let mut applied_states = HashMap::new();
     applied_states.insert(
         sorted_resources[0].id.clone(),
-        complete_create(applied_state, &sorted_resources[0].attributes),
+        complete_create(applied_state, &sorted_resources[0]),
     );
 
     let state = build_state_after_apply(
@@ -9024,7 +9038,15 @@ fn move_plus_update_keeps_post_update_attributes() {
     let mut applied_states = HashMap::new();
     applied_states.insert(
         new_id.clone(),
-        complete_update(applied, &["value"], &[], &sorted_resources[0].attributes),
+        complete_update(
+            carina_core::resource::SnapshotState::existing(
+                sorted_resources[0].id.clone(),
+                std::collections::BTreeMap::new(),
+            ),
+            applied,
+            &["value"],
+            &sorted_resources[0],
+        ),
     );
 
     // Old state row carries the pre-Update value.
@@ -9334,7 +9356,7 @@ fn move_from_overlapping_desired_resource_errors() {
         complete_create(
             State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
                 .with_identifier("x"),
-            &sorted_resources[0].attributes,
+            &sorted_resources[0],
         ),
     );
 
@@ -9404,7 +9426,7 @@ fn remove_overlapping_desired_resource_errors() {
         complete_create(
             State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
                 .with_identifier("x"),
-            &sorted_resources[0].attributes,
+            &sorted_resources[0],
         ),
     );
 
@@ -9469,7 +9491,7 @@ fn self_move_overlapping_desired_resource_errors() {
         complete_create(
             State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
                 .with_identifier("x"),
-            &sorted_resources[0].attributes,
+            &sorted_resources[0],
         ),
     );
 

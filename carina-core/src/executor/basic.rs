@@ -1498,6 +1498,9 @@ mod process_basic_result_tests {
     #[test]
     fn partial_success_records_state_and_diagnostic() {
         let resource: Resource = Resource::with_provider("mock", "test.resource", "r1", None);
+        let request = AcceptedRequest::from_create_permit_for_test(
+            &crate::test_utils::prepared_write::create_permit(&resource),
+        );
         let id = resource.id.clone();
         let state = State::existing(id.clone(), HashMap::new()).with_identifier("mock-id");
         let diagnostic = PartialReadDiagnostic::new(
@@ -1529,7 +1532,7 @@ mod process_basic_result_tests {
                 Instant::now(),
                 BasicEffectResult::PartialSuccess {
                     completed: CompletedEffect {
-                        request: AcceptedRequest::create_for_test(&writeback_state.attributes),
+                        request,
                         state: Box::new(writeback_state),
                     },
                     resource_id: id.clone(),
@@ -1597,6 +1600,9 @@ mod process_basic_result_tests {
     #[test]
     fn partial_success_marks_only_reported_missing_attributes_unknown() {
         let resource: Resource = Resource::with_provider("mock", "test.resource", "r1", None);
+        let request = AcceptedRequest::from_create_permit_for_test(
+            &crate::test_utils::prepared_write::create_permit(&resource),
+        );
         let id = resource.id.clone();
         let state = State::existing(
             id.clone(),
@@ -1627,7 +1633,7 @@ mod process_basic_result_tests {
             resource,
             BasicEffectResult::PartialSuccess {
                 completed: CompletedEffect {
-                    request: AcceptedRequest::create_for_test(&writeback_state.attributes),
+                    request,
                     state: Box::new(writeback_state),
                 },
                 resource_id: id,
@@ -1652,6 +1658,9 @@ mod process_basic_result_tests {
     #[test]
     fn partial_success_treats_unlisted_absent_attribute_as_definitive() {
         let resource: Resource = Resource::with_provider("mock", "test.resource", "r1", None);
+        let request = AcceptedRequest::from_create_permit_for_test(
+            &crate::test_utils::prepared_write::create_permit(&resource),
+        );
         let id = resource.id.clone();
         let state = State::existing(
             id.clone(),
@@ -1682,7 +1691,7 @@ mod process_basic_result_tests {
             resource,
             BasicEffectResult::PartialSuccess {
                 completed: CompletedEffect {
-                    request: AcceptedRequest::create_for_test(&writeback_state.attributes),
+                    request,
                     state: Box::new(writeback_state),
                 },
                 resource_id: id,
@@ -1717,6 +1726,9 @@ mod process_basic_result_tests {
     #[test]
     fn partial_success_completeness_does_not_extract_state_marker() {
         let resource: Resource = Resource::with_provider("mock", "test.resource", "r1", None);
+        let request = AcceptedRequest::from_create_permit_for_test(
+            &crate::test_utils::prepared_write::create_permit(&resource),
+        );
         let id = resource.id.clone();
         let state = State::existing(id.clone(), HashMap::new()).with_identifier("mock-id");
         let diagnostic = PartialReadDiagnostic::new(
@@ -1739,7 +1751,7 @@ mod process_basic_result_tests {
             resource,
             BasicEffectResult::PartialSuccess {
                 completed: CompletedEffect {
-                    request: AcceptedRequest::create_for_test(&state.attributes),
+                    request,
                     state: Box::new(state),
                 },
                 resource_id: id,

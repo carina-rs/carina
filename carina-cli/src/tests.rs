@@ -264,22 +264,39 @@ fn final_state_save_inputs(sorted_resources: &[ResolvedResource]) -> Arc<ApplySt
     ))
 }
 
-fn complete_create(state: State, desired: &indexmap::IndexMap<String, Value>) -> Applied {
-    Applied::Complete {
-        state: state.to_snapshot(),
-        request: AcceptedRequest::create_for_test(desired),
-    }
-}
-
-fn complete_update(
+fn complete_create<S, D>(
     state: State,
-    sent: &[&str],
-    removed: &[&str],
-    desired: &indexmap::IndexMap<String, Value>,
+    desired: &carina_core::resource::Resource<
+        S,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+        D,
+    >,
 ) -> Applied {
     Applied::Complete {
         state: state.to_snapshot(),
-        request: AcceptedRequest::update_for_test(sent, removed, desired),
+        request: AcceptedRequest::from_create_permit_for_test(
+            &carina_core::test_utils::prepared_write::create_permit(desired),
+        ),
+    }
+}
+
+fn complete_update<S, D>(
+    from: carina_core::resource::SnapshotState,
+    state: State,
+    changed: &[&str],
+    desired: &carina_core::resource::Resource<
+        S,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+        D,
+    >,
+) -> Applied {
+    Applied::Complete {
+        state: state.to_snapshot(),
+        request: AcceptedRequest::from_update_permit_for_test(
+            &carina_core::test_utils::prepared_write::update_permit(desired, from, changed),
+        ),
     }
 }
 
@@ -514,7 +531,9 @@ async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps
         .schema()
         .as_schema();
 
-    let create_request = AcceptedRequest::create_for_test(&created.attributes);
+    let create_request = AcceptedRequest::from_create_permit_for_test(
+        &carina_core::test_utils::prepared_write::create_permit(&created),
+    );
     let create_state = State::<carina_core::resource::NoPlaceholder>::existing(
         id.clone(),
         HashMap::from([(
@@ -1749,8 +1768,8 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
         &applied_state,
         None,
         None,
-        RowBasis::Applied(&AcceptedRequest::create_for_test(
-            &resources_run1[0].attributes,
+        RowBasis::Applied(&AcceptedRequest::from_create_permit_for_test(
+            &carina_core::test_utils::prepared_write::create_permit(&resources_run1[0]),
         )),
         None,
         &carina_core::differ::exact_comparison_context_for_tests(),
@@ -1883,8 +1902,8 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
         &applied_state,
         None,
         None,
-        RowBasis::Applied(&AcceptedRequest::create_for_test(
-            &resources_run1[0].attributes,
+        RowBasis::Applied(&AcceptedRequest::from_create_permit_for_test(
+            &carina_core::test_utils::prepared_write::create_permit(&resources_run1[0]),
         )),
         None,
         &carina_core::differ::exact_comparison_context_for_tests(),
@@ -3675,7 +3694,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
                 dependency_bindings: Default::default(),
                 partial_read: None,
             },
-            &resource.attributes,
+            &resource,
         ),
     )]);
 
@@ -3784,7 +3803,7 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
                     Value::Concrete(ConcreteValue::String("eipalloc-123".into())),
                 )]),
             ),
-            &resource.attributes,
+            &resource,
         ),
     )]);
     let mut schemas = SchemaRegistry::new();
@@ -3871,6 +3890,10 @@ fn build_state_after_apply_write_only_detects_value_change() {
     let applied_states = HashMap::from([(
         id.clone(),
         complete_update(
+            carina_core::resource::SnapshotState::existing(
+                resource.id.clone(),
+                std::collections::BTreeMap::new(),
+            ),
             State {
                 id: id.clone(),
                 identifier: Some("vpc-123".to_string()),
@@ -3883,8 +3906,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
                 partial_read: None,
             },
             &["cidr_block", "ipv4_netmask_length"],
-            &[],
-            &resource.attributes,
+            &resource,
         ),
     )]);
 
@@ -5567,10 +5589,8 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     let result = {
         let mut result = ApplyResult::empty();
         result.success_count = 1;
-        result.applied_states = HashMap::from([(
-            a_id.clone(),
-            complete_create(a_state.clone(), &resource_a.attributes),
-        )]);
+        result.applied_states =
+            HashMap::from([(a_id.clone(), complete_create(a_state.clone(), &resource_a))]);
         result.managed_current = HashMap::from([(a_id, Current::from_state(a_state))]);
         result.failure_sink().record(
             &carina_core::executor::NoopExecutionObserver,
@@ -5704,7 +5724,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
         result.success_count = 1;
         result.applied_states = HashMap::from([(
             resource_id.clone(),
-            complete_create(state.clone(), &resource.attributes),
+            complete_create(state.clone(), &resource),
         )]);
         result.managed_current = HashMap::from([(resource_id, Current::from_state(state))]);
         result

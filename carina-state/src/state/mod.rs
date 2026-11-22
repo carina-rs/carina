@@ -3079,7 +3079,7 @@ impl ResourceState {
         let applied_desired =
             resource_with_secret_shape_union(resource, identified.resolved_desired_attributes())?;
         let writeback_resource = &applied_desired;
-        let sent_desired = identified.sent_desired_attributes_for(writeback_resource);
+        let sent_desired = identified.sent_desired_attributes();
         let previous = existing.and_then(ResourceState::persisted_attributes);
         let no_observed_values = BTreeMap::new();
         let (observed_values, pending_reread) = match identified.observation() {

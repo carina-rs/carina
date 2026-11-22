@@ -511,41 +511,18 @@ impl AcceptedRequest {
         }
     }
 
-    /// Construct create provenance for fixtures and state-boundary tests.
+    /// Retain the exact prepared create's values and send membership in fixtures.
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
-    pub fn create_for_test<'a, P: crate::resource::StateValueLeaf + 'a>(
-        attributes: impl IntoIterator<Item = (&'a String, &'a crate::resource::Value<P>)>,
-    ) -> Self {
-        Self {
-            kind: AcceptedRequestKind::Create,
-            sent_attributes: SentAttributes::all_for_test(),
-            resolved_desired_attributes: SecretPreservingAttributes::from_attributes_for_test(
-                attributes,
-            ),
-        }
+    pub fn from_create_permit_for_test(permit: &crate::replacement::CreatePermit) -> Self {
+        Self::from_prepared_create(permit.prepared_write())
     }
 
-    /// Construct update provenance for fixtures and state-boundary tests.
+    /// Retain the exact prepared update's values and checked patch in fixtures.
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
-    pub fn update_for_test<'a, P: crate::resource::StateValueLeaf + 'a>(
-        sent: &[&str],
-        removed: &[&str],
-        attributes: impl IntoIterator<Item = (&'a String, &'a crate::resource::Value<P>)>,
-    ) -> Self {
-        Self {
-            kind: AcceptedRequestKind::Update {
-                sent: sent.iter().map(|key| (*key).to_string()).collect(),
-                removed: removed.iter().map(|key| (*key).to_string()).collect(),
-            },
-            sent_attributes: SentAttributes::only(
-                sent.iter().map(|key| (*key).to_string()).collect(),
-            ),
-            resolved_desired_attributes: SecretPreservingAttributes::from_attributes_for_test(
-                attributes,
-            ),
-        }
+    pub fn from_update_permit_for_test(permit: &crate::replacement::UpdatePermit) -> Self {
+        Self::from_update_request(&permit.write)
     }
 
     pub fn kind(&self) -> &AcceptedRequestKind {

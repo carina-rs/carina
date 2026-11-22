@@ -67,7 +67,7 @@ pub fn create_permit_with_schemas_for_test(
     );
     let attributes = request.resource().as_resource().resolved_attributes();
     let writeback = crate::binding_index::SecretPreservingAttributes::from_provider_values(
-        &attributes,
+        request.resource().protected_desired_tree().attributes(),
         &attributes,
     );
     let write = check
@@ -117,7 +117,7 @@ pub fn update_permit_with_schemas_for_test(
         .into_iter()
         .collect();
     let writeback = crate::binding_index::SecretPreservingAttributes::from_provider_values(
-        &attributes,
+        desired.protected_desired_tree().attributes(),
         &attributes,
     );
     let write = check
