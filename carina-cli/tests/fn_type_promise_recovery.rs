@@ -158,6 +158,35 @@ fn tp14_validate_plan_apply_keep_exact_promise_rejection() {
 }
 
 #[test]
+fn tp17_validate_plan_apply_keep_the_same_finding_order() {
+    let scenario = Scenario::applied();
+    scenario.write_call("src.identifier", "fn bad(x: Int): String { x }\n");
+    let validation = scenario.run(&["validate", ".", "--json"]);
+    assert_rejected(&validation, PROMISE);
+    assert_rejected(&validation, MISMATCH);
+    let report: Value = serde_json::from_slice(&validation.stdout).unwrap();
+    assert_eq!(
+        report["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|finding| finding["message"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [PROMISE, MISMATCH]
+    );
+    for args in [vec!["plan", "."], vec!["apply", ".", "--auto-approve"]] {
+        let output = scenario.run(&args);
+        assert_rejected(&output, PROMISE);
+        assert_rejected(&output, MISMATCH);
+        let rendered = text(&output);
+        assert!(
+            rendered.find(PROMISE).unwrap() < rendered.find(MISMATCH).unwrap(),
+            "{args:?}: {rendered}"
+        );
+    }
+}
+
+#[test]
 fn tp14_recovery_keeps_main_definite_mismatch_rejection() {
     let scenario = Scenario::applied();
     scenario.write_call("src.identifier", "fn bad(a: Int): String { a }\n");

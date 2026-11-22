@@ -183,37 +183,7 @@ pub fn validate(dir: &Path, snapshot: &LoadedProviderSnapshot) -> Result<(), Str
             .collect::<Vec<_>>()
             .join("\n")
     })?;
-    let configuration =
-        carina_core::config_loader::load_buffer_configuration(parsed, schemas, context);
-    let mut findings: Vec<_> = configuration
-        .judged()
-        .report()
-        .findings()
-        .iter()
-        .map(|finding| {
-            carina_core::parser::Located::new(
-                finding.location().clone(),
-                finding.detail().to_string(),
-            )
-        })
-        .collect();
-    for finding in configuration
-        .judged()
-        .function_type_promise_findings(&bindings)
-    {
-        let (location, message) = finding.into_parts();
-        let finding = carina_core::parser::Located::new(location, message.to_string());
-        if !findings.contains(&finding) {
-            findings.push(finding);
-        }
-    }
-    if !findings.is_empty() {
-        return Err(findings
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n"));
-    }
+    carina_core::validation::validate_user_function_ref_types_with_bindings(parsed, &bindings)?;
     carina_core::test_utils::ordinary_sink_findings_for_test(
         carina_core::validation::deferred_types::with_session_for_test(
             snapshot.provider_context(),

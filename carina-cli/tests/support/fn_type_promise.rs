@@ -172,6 +172,15 @@ impl ProviderFactory for PromiseFactory {
                         .build(),
                 )
                 .with_def(
+                    "OtherName",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::from_dotted("test.OtherName")),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .with_def(
                     "Name",
                     AttributeType::refined_string(
                         Some(TypeIdentity::from_dotted("test.Name")),
@@ -241,7 +250,13 @@ impl ProviderFactory for PromiseFactory {
             self.schemas(),
             Default::default(),
             Default::default(),
-            Vec::new(),
+            vec![
+                carina_core::schema::AssignabilityEdge::new(
+                    TypeIdentity::from_dotted("test.Name"),
+                    TypeIdentity::from_dotted("test.OtherName"),
+                )
+                .unwrap(),
+            ],
         )
         .unwrap()
     }

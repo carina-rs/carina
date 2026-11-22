@@ -6,6 +6,18 @@ fn project(source: &str) -> Directory {
     directory
 }
 
+#[test]
+fn tp17_different_reference_identity_needs_value_evidence_in_cli_and_lsp() {
+    parity(
+        &project(
+            "fn promise(value: test.OtherName): String { 'accepted' }\ntest.Sink { name = 'sink' value = promise(src.typed_name) }\n",
+        ),
+        &[
+            "function 'promise': parameter 'value' is declared as test.OtherName, but its argument has type test.Name, so validate cannot prove it fits. Pass a value known at validate, or declare the parameter as test.Name and let the resource attribute that receives it check the value.",
+        ],
+    );
+}
+
 fn parity(directory: &Directory, expected: &[&str]) {
     parity_with_lsp(directory, expected, expected);
 }

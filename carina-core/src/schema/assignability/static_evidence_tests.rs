@@ -2,6 +2,69 @@ use super::*;
 use crate::schema::{AttributeType, PatternMatch, PatternSpec};
 
 #[test]
+fn tp17_reference_proof_requires_identity_length_pattern_and_member_evidence() {
+    use crate::schema::{StringIdentityLayer, StringMemberConstraints};
+    let id = TypeIdentity::from_dotted("test.Name");
+    let reference = |identity, pattern, length| AttributeType::reference(identity, pattern, length);
+    let target =
+        |pattern, length| AttributeType::refined_string(Some(id.clone()), pattern, length, None);
+    let catalog = crate::parser::ProviderCustomTypes::default();
+    let owner = crate::parser::SchemaTypeOwner::Provider("test".into());
+    let defs = std::collections::BTreeMap::new();
+    let source = reference(id.clone(), None, None);
+    let same = target(None, None);
+    assert!(
+        source
+            .in_schema(&defs)
+            .reference_relation_to(
+                same.in_schema(&defs)
+                    .with_authority(&catalog, SinkAuthority::Owner(&owner))
+            )
+            .type_proven()
+    );
+    for (case, source, target) in [
+        (
+            "different identity",
+            reference(TypeIdentity::from_dotted("test.Other"), None, None),
+            target(None, None),
+        ),
+        (
+            "length not contained",
+            reference(id.clone(), None, Some((Some(1), Some(128)))),
+            target(None, Some((Some(1), Some(64)))),
+        ),
+        (
+            "pattern does not imply",
+            reference(
+                id.clone(),
+                Some(PatternSpec::new("a+", PatternMatch::Full)),
+                None,
+            ),
+            target(Some(PatternSpec::new("b+", PatternMatch::Full)), None),
+        ),
+        (
+            "target member constraints",
+            reference(id.clone(), None, None),
+            AttributeType::string_member(
+                StringIdentityLayer::new(Some(id.clone()), None, None, None),
+                StringMemberConstraints::new(None, Some((Some(1), Some(64)))),
+            ),
+        ),
+    ] {
+        let sink = target
+            .in_schema(&defs)
+            .with_authority(&catalog, SinkAuthority::Owner(&owner));
+        assert!(
+            !source
+                .in_schema(&defs)
+                .reference_relation_to(sink)
+                .type_proven(),
+            "{case}"
+        );
+    }
+}
+
+#[test]
 fn static_evidence_keeps_nested_literal_sets_proven() {
     let source = AttributeType::union(vec![
         AttributeType::string_literal_set(vec!["dev".into()]),

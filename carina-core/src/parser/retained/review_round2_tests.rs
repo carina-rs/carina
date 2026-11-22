@@ -2,11 +2,8 @@ use super::*;
 
 fn function_validation(source: &str) -> Vec<String> {
     let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    let parsed = match super::super::parse_file(source, Path::new("function-default.crn"), &catalog)
-    {
-        Ok(parsed) => parsed,
-        Err(error) => return vec![error.to_string()],
-    };
+    let parsed =
+        super::super::parse_file(source, Path::new("function-default.crn"), &catalog).unwrap();
     let schemas = crate::schema::SchemaRegistry::new();
     let configuration =
         crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);

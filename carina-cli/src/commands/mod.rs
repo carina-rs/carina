@@ -275,7 +275,7 @@ pub(crate) fn collapse_errors(errors: Vec<AppError>) -> AppError {
 
 pub(crate) fn collapse_presented_errors(errors: Vec<crate::error::PresentedAppError>) -> AppError {
     collapse_errors(
-        errors
+        validate::merge_function_promise_errors(errors)
             .into_iter()
             .map(|error| match error {
                 crate::error::PresentedAppError::Ordinary(error) => error,

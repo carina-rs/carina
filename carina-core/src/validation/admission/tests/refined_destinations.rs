@@ -92,10 +92,9 @@ pub fn check(
     })
     .map_err(|e| e.to_string())?;
     let root_bindings = BindingIndex::from_parsed(loaded.parsed.parsed(), schemas, context);
-    crate::validation::tests::validate_function_promises_for_test(
+    crate::validation::validate_user_function_ref_types_with_bindings(
         loaded.parsed.parsed(),
         &root_bindings,
-        schemas,
     )?;
     let parsed = with_session_for_test(snapshot.provider_context(), |session| {
         crate::module_resolver::resolve_modules_with_config(loaded.parsed, &root, session, schemas)

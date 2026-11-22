@@ -944,6 +944,19 @@ impl std::ops::Deref for DiagnosticRun<'_> {
 }
 
 impl DiagnosticRun<'_> {
+    fn publication_key(&self, doc: &Document, file: &carina_core::parser::SourceFileId) -> PathBuf {
+        let identity = PathIdentity::new(file.path());
+        if identity == PathIdentity::new(doc.source_file()) {
+            doc.source_file().to_path_buf()
+        } else {
+            self.open_sources
+                .iter()
+                .find(|(path, _)| PathIdentity::new(path) == identity)
+                .map(|(path, _)| path.clone())
+                .unwrap_or_else(|| file.diagnostic_path())
+        }
+    }
+
     /// One publication seam for deferred prefixes: use the authored key only,
     /// never a module-call projection. Non-prefix findings retain their routes.
     fn publish_deferred_prefixes(
@@ -959,17 +972,8 @@ impl DiagnosticRun<'_> {
                 continue;
             };
             let path = location.file().path();
-            let identity = PathIdentity::new(path);
-            let is_current = identity == PathIdentity::new(doc.source_file());
-            let publication = if is_current {
-                doc.source_file().to_path_buf()
-            } else {
-                self.open_sources
-                    .iter()
-                    .find(|(path, _)| PathIdentity::new(path) == identity)
-                    .map(|(path, _)| path.clone())
-                    .unwrap_or_else(|| location.file().diagnostic_path())
-            };
+            let is_current = PathIdentity::new(path) == PathIdentity::new(doc.source_file());
+            let publication = self.publication_key(doc, location.file());
             let diagnostic = if path == doc.source_file() {
                 render_merged(
                     doc,
@@ -1760,7 +1764,9 @@ impl DiagnosticRun<'_> {
                     let Some(diagnostic) = diagnostic else {
                         continue;
                     };
-                    let destination = promises.entry(path.to_path_buf()).or_default();
+                    let destination = promises
+                        .entry(self.publication_key(doc, finding.location().file()))
+                        .or_default();
                     if !destination.contains(&diagnostic) {
                         destination.push(diagnostic);
                     }

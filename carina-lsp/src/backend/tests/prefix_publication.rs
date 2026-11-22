@@ -28,6 +28,80 @@ async fn states(root: &Path) -> (ProviderStates, tempfile::TempDir) {
     (states.into_inner(), home)
 }
 
+#[tokio::test]
+async fn tp17_parent_relative_promise_and_main_finding_share_publication() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    let shared = directory.path().join("shared");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    let root_source = "provider mock {}\nlet shared = use { source = '../shared' }\nshared {}\n";
+    let shared_source = "let src = mock.test.resource { name = 'source' }\nfn pick(x: 'dev' | 'prod'): String { 'accepted' }\nmock.test.resource { name = pick(src.identifier) }\n\nmock.test.resource { name_prefix = src.identifier }\n";
+    let root_path = root.join("main.crn");
+    let shared_path = shared.join("main.crn");
+    std::fs::write(&root_path, root_source).unwrap();
+    std::fs::write(&shared_path, shared_source).unwrap();
+    std::fs::write(
+        shared.join("arguments.crn"),
+        "arguments { unused: Bool = true }\n",
+    )
+    .unwrap();
+    let (states, _home) = states(&root).await;
+    let engine = &states.state_for_path(&root).diagnostic_engine;
+    let document = |source: &str, path| {
+        Document::new_with_path(
+            source.into(),
+            path,
+            Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
+        )
+    };
+    let root_document = document(root_source, root_path.clone());
+    let shared_document = document(shared_source, shared_path.clone());
+    let shared_uri = tower_lsp::lsp_types::Url::from_file_path(&shared_path).unwrap();
+    for opened in [false, true] {
+        let open_documents = if opened {
+            vec![&shared_document]
+        } else {
+            vec![]
+        };
+        let report = engine.analyze_document_set(&root_document, Some(&root_path), &open_documents);
+        let publications: Vec<_> = report
+            .iter()
+            .filter(|(path, _)| {
+                tower_lsp::lsp_types::Url::from_file_path(path).unwrap() == shared_uri
+            })
+            .collect();
+        assert_eq!(publications.len(), 1, "opened={opened}: {report:#?}");
+        assert_eq!(publications[0].0, &shared_path);
+        let findings: Vec<_> = publications[0]
+            .1
+            .iter()
+            .filter(|finding| {
+                finding.message.contains("cannot prove it fits")
+                    || finding.message.starts_with("'name_prefix' must be known")
+            })
+            .collect();
+        assert_eq!(findings.len(), 2, "opened={opened}: {report:#?}");
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.range.start.line)
+                .collect::<Vec<_>>(),
+            [2, 4]
+        );
+        assert!(
+            findings[0]
+                .message
+                .starts_with("function 'pick': parameter 'x'")
+        );
+        assert!(
+            findings[1]
+                .message
+                .starts_with("'name_prefix' must be known")
+        );
+    }
+}
+
 async fn assert_publications(module_documents: bool) {
     let inputs: Value = serde_json::from_str(INPUTS).unwrap();
     let directories: Value = serde_json::from_str(DIRECTORIES).unwrap();

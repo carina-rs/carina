@@ -509,6 +509,19 @@ impl Warning {
     }
 }
 
+pub(in crate::commands) fn merge_function_promise_errors(
+    errors: Vec<crate::error::PresentedAppError>,
+) -> Vec<crate::error::PresentedAppError> {
+    let (promises, ordinary) = errors
+        .into_iter()
+        .partition(|error| matches!(error, crate::error::PresentedAppError::FunctionPromise(_)));
+    merge_function_promise_diagnostics(ordinary, promises, |error| {
+        presented_error_diagnostics(error)
+            .first()
+            .and_then(diagnostic_position)
+    })
+}
+
 impl ValidateReport {
     #[cfg(any(test, feature = "test-utils"))]
     pub(super) fn into_result(self, exit_code: i32) -> Result<(), AppError> {
@@ -531,14 +544,7 @@ impl ValidateReport {
         warnings: Vec<Warning>,
         events: Vec<HumanEvent>,
     ) -> Self {
-        let (promises, ordinary) = errors.into_iter().partition(|error| {
-            matches!(error, crate::error::PresentedAppError::FunctionPromise(_))
-        });
-        let errors = merge_function_promise_diagnostics(ordinary, promises, |error| {
-            presented_error_diagnostics(error)
-                .first()
-                .and_then(diagnostic_position)
-        });
+        let errors = merge_function_promise_errors(errors);
         let outcome = match NonEmptyValidationErrors::from_presented(errors) {
             Ok(errors) => Outcome::Failure(errors),
             Err(_) => Outcome::Success(resources),

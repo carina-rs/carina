@@ -4501,6 +4501,23 @@ pub(crate) fn module_argument_reference_error(
     })
 }
 
+/// Validate resource/binding references at user-function parameter and return
+/// boundaries using the same BindingIndex + TypeInSchema relation as module,
+/// export, attribute, and provider-attribute references.
+///
+/// The shared value checker deliberately defers references. This pass supplies
+/// the missing binding authority: function-call arguments use their declared
+/// parameter type, and function bodies use the declared return type.
+pub fn validate_user_function_ref_types_with_bindings<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
+    bindings: &BindingIndex<'_>,
+) -> Result<(), String> {
+    validate_user_function_ref_types_inner(parsed, bindings, UnknownReferencePolicy::Report)
+}
+
 mod user_function_refs {
     use super::*;
     pub(super) enum FunctionRefFinding {

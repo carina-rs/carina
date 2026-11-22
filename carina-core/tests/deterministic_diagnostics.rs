@@ -175,26 +175,33 @@ fn function_reference_and_call_findings_keep_sibling_declaration_order() {
     let schemas = schemas();
     let loaded = load_buffer_configuration(&parsed, &schemas, &config);
     let bindings = loaded.parsed().binding_index(&config);
-    let findings = loaded.report().findings().to_vec();
-    assert!(
-        loaded.function_type_promise_findings(&bindings).is_empty(),
-        "definite mismatches belong entirely to the authored judgement"
-    );
-    assert_eq!(findings.len(), 4, "{findings:#?}");
-    for (finding, function) in findings.iter().zip(["zebra", "sink", "alpha", "sink"]) {
-        let error = finding.detail().to_string();
+    let errors =
+        carina_core::validation::validate_user_function_ref_types_with_bindings(&parsed, &bindings)
+            .unwrap_err();
+    let errors = errors.lines().collect::<Vec<_>>();
+    assert_eq!(errors.len(), 4, "{errors:#?}");
+    for (error, function) in errors.iter().zip(["zebra", "sink", "alpha", "sink"]) {
         assert!(error.contains(&format!("function '{function}'")), "{error}");
         assert!(
             error.contains("expected Int") && error.contains("got String"),
             "{error}"
         );
     }
+    let tree = loaded.parsed().analysis_tree().unwrap();
+    let findings = carina_core::validation::user_function_reference_diagnostics(&tree, &bindings);
     assert_eq!(
         findings
             .iter()
             .map(|finding| finding_location(finding.location()))
             .collect::<Vec<_>>(),
         FUNCTION_LOCATIONS.map(|(file, line)| (file.to_owned(), line))
+    );
+    assert_eq!(
+        findings
+            .iter()
+            .map(|finding| finding.detail().as_str())
+            .collect::<Vec<_>>(),
+        errors
     );
 }
 
@@ -564,4 +571,34 @@ fn unknown_module_argument_findings_keep_authored_order() {
             [3, 4, 5, 6, 7, 8]
         );
     });
+}
+
+#[test]
+fn tp18_authored_function_mismatches_keep_sibling_declaration_order() {
+    let parsed = directory("functions/references");
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let schemas = schemas();
+    let loaded = load_buffer_configuration(&parsed, &schemas, &config);
+    let bindings = loaded.parsed().binding_index(&config);
+    let findings = loaded.report().findings().to_vec();
+    assert!(
+        loaded.function_type_promise_findings(&bindings).is_empty(),
+        "definite mismatches belong entirely to the authored judgement"
+    );
+    assert_eq!(findings.len(), 4, "{findings:#?}");
+    for (finding, function) in findings.iter().zip(["zebra", "sink", "alpha", "sink"]) {
+        let error = finding.detail().to_string();
+        assert!(error.contains(&format!("function '{function}'")), "{error}");
+        assert!(
+            error.contains("expected Int") && error.contains("got String"),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        findings
+            .iter()
+            .map(|finding| finding_location(finding.location()))
+            .collect::<Vec<_>>(),
+        FUNCTION_LOCATIONS.map(|(file, line)| (file.to_owned(), line))
+    );
 }
