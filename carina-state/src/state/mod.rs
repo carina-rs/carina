@@ -3291,7 +3291,7 @@ impl ResourceState {
             .map(DesiredAuthoringBasis::Sent)
             .unwrap_or(DesiredAuthoringBasis::CarriedRead);
         row.populate_desired_metadata(
-            writeback_resource,
+            resource,
             existing,
             &BTreeMap::new(),
             schema,

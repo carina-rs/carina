@@ -3313,21 +3313,6 @@ impl<S: TextState> IdentifiedCreate<S, SecretPreservingAttributes> {
     pub fn resolved_desired_attributes(&self) -> &SecretPreservingAttributes {
         &self.writeback
     }
-
-    /// Construct the observation produced by a resumed in-flight create in
-    /// cross-crate tests.
-    #[cfg(feature = "test-utils")]
-    #[doc(hidden)]
-    pub fn from_in_flight_for_test<'a, P: crate::resource::StateValueLeaf + 'a>(
-        pending: InFlightCreate,
-        identifier: AppliedIdentifier,
-        observation: CreateObservation<S>,
-        attributes: impl IntoIterator<Item = (&'a String, &'a Value<P>)>,
-    ) -> Self {
-        identified_from_resume(pending, identifier, observation).into_writeback(
-            SecretPreservingAttributes::from_attributes_for_test(attributes),
-        )
-    }
 }
 
 impl<S: TextState, W> IdentifiedCreate<S, W> {
@@ -3360,15 +3345,6 @@ impl<S: TextState, W> IdentifiedCreate<S, W> {
 
     pub fn partial_read_diagnostic(&self) -> Option<&PartialReadDiagnostic<S>> {
         self.partial_read.as_deref()
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    #[doc(hidden)]
-    pub fn with_desired_for_test<'a, P: crate::resource::StateValueLeaf + 'a>(
-        self,
-        attributes: impl IntoIterator<Item = (&'a String, &'a Value<P>)>,
-    ) -> IdentifiedCreate<S, SecretPreservingAttributes> {
-        self.map_writeback(|_| SecretPreservingAttributes::from_attributes_for_test(attributes))
     }
 
     fn with_partial_read(mut self, diagnostic: PartialReadDiagnostic<S>) -> Self {
@@ -5379,8 +5355,8 @@ impl FinishingResume {
     }
 }
 
-fn identified_from_resume<S: TextState, W>(
-    pending: InFlightCreate<W>,
+fn identified_from_resume<S: TextState>(
+    pending: InFlightCreate<ProviderCreateRecord>,
     identifier: AppliedIdentifier,
     observation: CreateObservation<S>,
 ) -> IdentifiedCreate<S> {

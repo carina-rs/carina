@@ -1,6 +1,11 @@
 use super::*;
 use crate::provider_text_fixtures::*;
+mod create_writeback_fixtures;
 mod provider_text_secret_redaction;
+use create_writeback_fixtures::{
+    create_attempt_for_test, create_fixture_provider, create_request_for_test,
+    dispatched_create_failure_for_test, ready_for_test, resumed_create_observation_for_test,
+};
 
 fn desired_value_comparison_for_test(
     schema: Option<&ResourceSchema>,
@@ -300,125 +305,6 @@ fn destroy_refresh_projection_preserves_persisted_deposed_error_context() {
     }] if identifier.as_str() == "persisted-id"),
         "refresh must preserve main's persisted-generation diagnostic context"
     );
-}
-
-// Capture an attempt only after a real provider-ready request has passed
-// admission and discharge. This helper is private to state writeback tests.
-fn create_attempt_for_test(id: ResourceId) -> carina_core::provider::CreateAttempt {
-    use carina_core::provider::*;
-    use std::future::Future;
-    use std::task::{Context, Poll, Waker};
-
-    struct CaptureAttempt(std::sync::Mutex<Option<CreateAttempt>>);
-
-    impl Provider for CaptureAttempt {
-        fn name(&self) -> &str {
-            "capture-attempt"
-        }
-        fn read(
-            &self,
-            _: &ResourceId,
-            _: &AppliedIdentifier,
-            _: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
-            panic!("unexpected fixture read")
-        }
-        fn read_data_source(
-            &self,
-            _: &ProviderReadyDataSource,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
-            panic!("unexpected fixture data-source read")
-        }
-        fn create(
-            &self,
-            _: &ResourceId,
-            _: CreateRequest,
-            attempt: CreateAttempt,
-        ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
-            *self.0.lock().unwrap() = Some(attempt);
-            Box::pin(std::future::pending())
-        }
-        fn resume_create(
-            &self,
-            _: ResumeCreateRequest,
-        ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
-            panic!("unexpected fixture resume")
-        }
-        fn update(
-            &self,
-            _: &ResourceId,
-            _: &AppliedIdentifier,
-            _: UpdateRequest,
-            _: UpdateAttempt,
-        ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
-            panic!("unexpected fixture update")
-        }
-        fn delete(
-            &self,
-            _attempt: carina_core::provider::DeleteAttempt,
-        ) -> BoxFuture<'_, ProviderResult<()>> {
-            panic!("unexpected fixture delete")
-        }
-        fn required_permissions(
-            &self,
-            _: &ResourceId,
-            _: carina_core::effect::PlanOp,
-        ) -> ProviderResult<Vec<String>> {
-            panic!("unexpected fixture permissions")
-        }
-    }
-
-    fn ready<F: Future>(future: F) -> F::Output {
-        let mut future = std::pin::pin!(future);
-        let mut context = Context::from_waker(Waker::noop());
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => output,
-            Poll::Pending => panic!("fixture preparation must complete synchronously"),
-        }
-    }
-
-    let provider = std::sync::Arc::new(CaptureAttempt(std::sync::Mutex::new(None)));
-    let bindings = carina_core::binding_index::ResolvedBindings::default();
-    let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let mut schemas = carina_core::schema::SchemaRegistry::new();
-    schemas.insert(
-        &id.provider,
-        carina_core::schema::PatternResourceSchema::new(&id.resource_type)
-            .validate()
-            .unwrap(),
-    );
-    carina_core::validation::deferred_types::with_session_for_test(
-        &carina_core::parser::LoadedProviderContext::empty_for_test(),
-        |type_checks| {
-            let preparation = carina_core::executor::ProviderPreparationContext::for_test(
-                &bindings,
-                &gate,
-                &[],
-                &NoopNormalizer,
-                &schemas,
-                type_checks,
-            );
-            let request = ready(carina_core::executor::prepare_create_request(
-                Resource::from_id(id),
-                &preparation,
-            ))
-            .expect("fixture passes provider preparation");
-            // This fixture only captures dispatch provenance; its schema has no input rules.
-            let prepared = carina_core::replacement::create_permit_for_test(request);
-            let boundary =
-                crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
-            let (create, _cancellation) =
-                carina_core::executor::dispatch_create(&boundary, prepared);
-            let mut create = std::pin::pin!(create);
-            assert!(
-                create
-                    .as_mut()
-                    .poll(&mut Context::from_waker(Waker::noop()))
-                    .is_pending()
-            );
-        },
-    );
-    provider.0.lock().unwrap().take().unwrap()
 }
 
 fn published_exports_from_state(state: &StateFile) -> PublishedExports {
@@ -7291,10 +7177,127 @@ fn retained_write_only_previous_hash_cannot_prove_plaintext_equality() {
 }
 
 #[test]
+fn in_flight_create_explicit_matches_applied_after_request_canonicalization() {
+    use carina_core::provider::{HostCreateFailureKind, PendingToken, ProviderError};
+
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+    let password = string(&"metadata-fixture".repeat(2));
+    let resource = Resource::with_provider("mock", "test.resource", "canonicalized", None)
+        .with_attribute("name_prefix", string("generated-"))
+        .with_attribute(
+            "password",
+            Value::Deferred(DeferredValue::Secret(Box::new(password.clone()).into())),
+        );
+    // Canonicalization consumes the authored companion, and provider defaults
+    // introduce a request-only key. The request also strips the secret wrapper.
+    let mut request_resource = resource.clone();
+    request_resource.attributes.shift_remove("name_prefix");
+    request_resource.set_attr("name", string("generated-name"));
+    request_resource.set_attr("password", password);
+    request_resource.set_attr(
+        "tags",
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "provider_default".into(),
+            string("enabled"),
+        )]))),
+    );
+    let schema = PatternResourceSchema::new("test.resource")
+        .attribute(
+            PatternAttributeSchema::optional("name_prefix", PatternAttributeType::string()).build(),
+        )
+        .attribute(PatternAttributeSchema::required("name", PatternAttributeType::string()).build())
+        .attribute(
+            PatternAttributeSchema::optional("password", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let accepted = AcceptedRequest::create_for_test(&request_resource.attributes);
+    let observed: State = State::existing(resource.id.clone(), request_resource.attributes.clone())
+        .with_identifier("canonicalized-id");
+    let prepared = create_request_for_test(request_resource, schema.clone());
+    let provider = create_fixture_provider("mock", |attempt| {
+        Box::pin(std::future::ready(Err(attempt
+            .pending(
+                PendingToken::new("canonicalized-token"),
+                Sent::AllRequestAttributes,
+                1,
+            )
+            .preserve(ProviderError::internal("create remains in flight")))))
+    });
+    let boundary = crate::provider_text_fixtures::boundary(Box::new(provider));
+    let (create, _cancellation) = carina_core::executor::dispatch_create(
+        &boundary,
+        carina_core::replacement::create_permit_for_test(prepared),
+    );
+    let Err(failure) = ready_for_test(create) else {
+        panic!("fixture create must remain in flight")
+    };
+    let HostCreateFailureKind::InFlight { pending, .. } = failure.into_kind() else {
+        panic!("fixture must retain a fresh create continuation")
+    };
+    let resource = resolved(&resource);
+    let in_flight = ResourceState::from_in_flight(
+        &resource,
+        &pending,
+        None,
+        Some(schema.as_schema()),
+        None,
+        &exact_comparison_context(),
+    )
+    .unwrap();
+    let applied = resource_state_from_provider_state_for_resource_and_schema_for_test(
+        &resource,
+        &observed,
+        None,
+        Some(schema.as_schema()),
+        RowBasis::Applied(&accepted),
+        None,
+    )
+    .unwrap();
+
+    let ExplicitFields::Struct { children } = &applied.explicit else {
+        panic!("applied create must record resource authoring")
+    };
+    assert!(
+        children.contains_key("name_prefix"),
+        "applied authoring retains the consumed key"
+    );
+    assert!(
+        children.contains_key("tags"),
+        "applied authoring includes the sent provider default"
+    );
+    assert_eq!(in_flight.explicit, applied.explicit);
+
+    let CurrentInstance::CreateInFlight { pending } = in_flight.current() else {
+        panic!("in-flight row must retain its continuation")
+    };
+    let InFlightPersistence::Persisted = pending.persistence() else {
+        panic!("in-flight row must persist its sent envelope")
+    };
+    let SentRecord::Persisted(envelope) = pending.sent() else {
+        panic!("persisted continuation must retain its sent envelope")
+    };
+    assert!(
+        envelope
+            .secrets()
+            .get("password")
+            .is_some_and(|value| value.secret_hash().is_some()),
+        "authored secrecy must survive request canonicalization"
+    );
+}
+
+#[test]
 fn observation_previous_secret_hashes_release_only_equal_public_values() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, CreateFailureKind, HostCreateObservation,
-        HostIdentifiedCreate, Observation, PendingToken, ProviderError, ReadOutcome,
+        AppliedIdentifier, AppliedState, CreateFailureKind, Observation, PendingToken,
+        ProviderError, ReadOutcome,
     };
 
     // Observations cannot accept an accepted-write authority.
@@ -7344,12 +7347,7 @@ fn observation_previous_secret_hashes_release_only_equal_public_values() {
                     PersistedAttributes::default(),
                     PersistedAttributes::default(),
                 );
-            HostIdentifiedCreate::from_in_flight_for_test(
-                pending,
-                identifier.clone(),
-                HostCreateObservation::Observed(observed()),
-                &resource.attributes,
-            )
+            resumed_create_observation_for_test(&resource, pending, observed(), None)
         } else {
             let failure = create_attempt_for_test(resource.id.clone())
                 .issued(identifier.clone(), Sent::AllRequestAttributes)
@@ -7357,10 +7355,8 @@ fn observation_previous_secret_hashes_release_only_equal_public_values() {
                     Observation::Read(ReadOutcome::found(observed())),
                     ProviderError::internal("synthetic post-create finishing failure"),
                 );
-            match failure.into_host_for_test().into_kind() {
-                CreateFailureKind::IdentifierReported { identified, .. } => {
-                    identified.with_desired_for_test(&resource.attributes)
-                }
+            match dispatched_create_failure_for_test(&resource, failure, None).into_kind() {
+                CreateFailureKind::IdentifierReported { identified, .. } => identified,
                 _ => panic!("fixture must produce an identifier-reported create"),
             }
         };
@@ -7851,8 +7847,7 @@ fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
 #[test]
 fn resumed_persisted_create_records_nested_write_only_sent_values() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, HostCreateObservation as CreateObservation,
-        HostIdentifiedCreate as IdentifiedCreate, PendingToken, PersistedAttributes, Sent,
+        AppliedIdentifier, AppliedState, PendingToken, PersistedAttributes, Sent,
     };
 
     let (resource, schema) = nested_write_only_state_fixture("resumed-secret");
@@ -7886,11 +7881,21 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
         )]),
     )
     .unwrap();
-    let created = IdentifiedCreate::from_in_flight_for_test(
+    let request_schema = PatternResourceSchema::new("test.Resource")
+        .attribute(
+            PatternAttributeSchema::optional(
+                "config",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let created = resumed_create_observation_for_test(
+        &resource,
         pending,
-        identifier,
-        CreateObservation::Observed(observed_state),
-        &resource.attributes,
+        observed_state,
+        Some(request_schema),
     );
 
     let row = resource_state_from_observation_for_test(
@@ -7920,10 +7925,8 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
 #[test]
 fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, HostCreateObservation as CreateObservation,
-        HostIdentifiedCreate as IdentifiedCreate,
-        HostPartialReadDiagnostic as PartialReadDiagnostic, PendingToken, PersistedAttributes,
-        Sent,
+        AppliedIdentifier, AppliedState, HostPartialReadDiagnostic as PartialReadDiagnostic,
+        PendingToken, PersistedAttributes, Sent,
     };
 
     for key in ["computed\x1b[2J".to_string(), "x".repeat(9000)] {
@@ -7950,13 +7953,11 @@ fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys()
         assert!(!label.contains('\x1b'));
         assert!(label.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
         assert_ne!(label, key);
-        let created = IdentifiedCreate::from_in_flight_for_test(
+        let created = resumed_create_observation_for_test(
+            &resource,
             pending,
-            identifier,
-            CreateObservation::Observed(
-                AppliedState::new(resource.id.clone(), "persisted-id", HashMap::new()).unwrap(),
-            ),
-            &resource.attributes,
+            AppliedState::new(resource.id.clone(), "persisted-id", HashMap::new()).unwrap(),
+            None,
         )
         .with_partial_read_for_test(diagnostic);
         let row = resource_state_from_observation_for_test(
@@ -7983,10 +7984,8 @@ fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys()
 #[test]
 fn resumed_partial_create_records_exact_missing_attributes() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, HostCreateObservation as CreateObservation,
-        HostIdentifiedCreate as IdentifiedCreate,
-        HostPartialReadDiagnostic as PartialReadDiagnostic, PendingToken, PersistedAttributes,
-        Sent, SentRecord,
+        AppliedIdentifier, AppliedState, HostPartialReadDiagnostic as PartialReadDiagnostic,
+        PendingToken, PersistedAttributes, Sent, SentRecord,
     };
 
     let resource = Resource::with_provider("mock", "test.Widget", "example", None).with_attribute(
@@ -8016,13 +8015,8 @@ fn resumed_partial_create_records_exact_missing_attributes() {
             .try_into()
             .expect("nonempty partial attributes"),
     );
-    let created = IdentifiedCreate::from_in_flight_for_test(
-        pending,
-        identifier.clone(),
-        CreateObservation::Observed(observed_state),
-        &resource.attributes,
-    )
-    .with_partial_read_for_test(diagnostic);
+    let created = resumed_create_observation_for_test(&resource, pending, observed_state, None)
+        .with_partial_read_for_test(diagnostic);
 
     let SentRecord::Persisted(envelope) = created.sent() else {
         panic!("resumed partial create must retain its persisted sent envelope")
@@ -8075,11 +8069,12 @@ fn unobserved_not_found_create_records_identifier_and_partial_read() {
             Observation::Read(ReadOutcome::not_found(resource.id.clone())),
             ProviderError::api_error("create access denied"),
         );
-    let identified = match failure.into_host_for_test().into_kind() {
+    let identified = match dispatched_create_failure_for_test(&resource, failure, None).into_kind()
+    {
         CreateFailureKind::IdentifierReported {
             identified,
             error: _,
-        } => identified.with_desired_for_test(&resource.attributes),
+        } => identified,
         CreateFailureKind::NoResource(error) => {
             panic!("identifier-bearing failure became not_created: {error}")
         }
@@ -8147,11 +8142,12 @@ fn unobserved_read_failed_observation_records_identifier_and_provider_error_deta
             Observation::ReadFailed(read_error),
             ProviderError::api_error("create finishing failed"),
         );
-    let identified = match failure.into_host_for_test().into_kind() {
+    let identified = match dispatched_create_failure_for_test(&resource, failure, None).into_kind()
+    {
         CreateFailureKind::IdentifierReported {
             identified,
             error: _,
-        } => identified.with_desired_for_test(&resource.attributes),
+        } => identified,
         CreateFailureKind::NoResource(error) => {
             panic!("identifier-bearing failure became not_created: {error}")
         }
@@ -8189,9 +8185,8 @@ fn unobserved_read_failed_observation_records_identifier_and_provider_error_deta
 fn identified_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappers() {
     use carina_core::differ::Diff;
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, HostCreateFailureKind as CreateFailureKind,
-        HostCreateObservation as CreateObservation, HostIdentifiedCreate as IdentifiedCreate,
-        Observation, PendingToken, PersistedAttributes, ProviderError, ReadOutcome, Sent,
+        AppliedIdentifier, AppliedState, HostCreateFailureKind as CreateFailureKind, Observation,
+        PendingToken, PersistedAttributes, ProviderError, ReadOutcome, Sent,
     };
     use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
     use carina_core::schema::SchemaRegistry;
@@ -8302,11 +8297,11 @@ fn identified_create_records_nested_leaf_from_desired_under_ancestor_secret_wrap
                 .issued(identifier.clone(), Sent::AllRequestAttributes)
                 .pending(PendingToken::new(format!("resume-{wrapper}")), 1)
                 .persist(PersistedAttributes::default(), sent_secrets);
-            IdentifiedCreate::from_in_flight_for_test(
+            resumed_create_observation_for_test(
+                &resource,
                 pending,
-                identifier.clone(),
-                CreateObservation::Observed(observed_state()),
-                &resource.attributes,
+                observed_state(),
+                Some(schema.clone()),
             )
         } else {
             let failed = create_attempt_for_test(resource.id.clone())
@@ -8315,11 +8310,13 @@ fn identified_create_records_nested_leaf_from_desired_under_ancestor_secret_wrap
                     Observation::Read(ReadOutcome::found(observed_state())),
                     ProviderError::internal("synthetic post-create finishing failure"),
                 );
-            match failed.into_host_for_test().into_kind() {
+            match dispatched_create_failure_for_test(&resource, failed, Some(schema.clone()))
+                .into_kind()
+            {
                 CreateFailureKind::IdentifierReported {
                     identified,
                     error: _error,
-                } => identified.with_desired_for_test(&resource.attributes),
+                } => identified,
                 CreateFailureKind::NoResource(error) => {
                     panic!("expected an observed create, got not_created failure: {error}")
                 }
