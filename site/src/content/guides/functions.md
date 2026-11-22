@@ -152,6 +152,10 @@ Unavailable provider schemas or failed upstream loads leave the promise check pe
 Definite type mismatches and invalid annotations remain declaration errors,
 including in unused functions.
 
+`destroy` and `state refresh` skip checks for unproven function type promises, so
+a configuration rejected for that reason can still be destroyed or refreshed.
+Definite type mismatches still fail there.
+
 For an unknown return value, Carina types the body once with each parameter's
 declared type. For example, `fn pick(x: String): 'dev' | 'prod' { x }` accepts
 `pick('dev')`, but rejects `pick(src.identifier)` when `src.identifier` is an

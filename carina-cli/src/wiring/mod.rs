@@ -691,6 +691,32 @@ pub(crate) struct ValidationPipelineAccess {
     provider_configuration: ProviderConfigurationPurpose,
 }
 
+/// The same mode gates desired-resource and upstream-derived checks. Recovery
+/// commands retain ordinary judgement but cannot obtain the full-check capability.
+#[derive(Clone, Copy)]
+pub(crate) enum ValidationMode {
+    Full(FullValidation),
+    Recovery,
+}
+
+/// Only the wiring transitions can mint permission to check function promises.
+#[derive(Clone, Copy)]
+pub(crate) struct FullValidation(());
+
+impl ValidationMode {
+    fn from_skip_resource_validation(skip: bool) -> Self {
+        if skip {
+            Self::Recovery
+        } else {
+            Self::Full(FullValidation(()))
+        }
+    }
+
+    pub(crate) fn checks_resources(self) -> bool {
+        matches!(self, Self::Full(_))
+    }
+}
+
 enum ProviderConfigurationPurpose {
     SourceExecution,
     SavedPlanSecretCandidates,
@@ -1472,7 +1498,7 @@ fn validation_report_from<'a>(
         load_errors,
         parsed,
         base_dir,
-        skip_resource_validation,
+        ValidationMode::from_skip_resource_validation(skip_resource_validation),
         duplicate_declarations,
         crate::commands::ConfigNameResolution::EvaluatedOnly,
         |parsed, _catalog| Ok(parsed),
@@ -1485,7 +1511,7 @@ fn validation_report_with<'a, T>(
     load_errors: &HashMap<String, String>,
     parsed: &carina_core::config_loader::InferredRootDirectory,
     base_dir: &ResolvedPath,
-    skip_resource_validation: bool,
+    mode: ValidationMode,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     name_resolution: crate::commands::ConfigNameResolution,
     finish: impl FnOnce(
@@ -1497,12 +1523,7 @@ fn validation_report_with<'a, T>(
     ) -> Result<T, AppError>,
 ) -> ValidationReport<'a, T> {
     let catalog = context.validation_catalog(&parsed.providers, load_errors);
-    let load_findings = provider_load_findings(
-        context,
-        load_errors,
-        &parsed.providers,
-        skip_resource_validation,
-    );
+    let load_findings = provider_load_findings(context, load_errors, &parsed.providers, mode);
     let checks =
         carina_core::validation::deferred_types::TypeCheckSession::run(&catalog, |catalog| {
             let crate::commands::ConfigurationValidation {
@@ -1516,7 +1537,7 @@ fn validation_report_with<'a, T>(
                 context,
                 catalog,
                 load_errors,
-                skip_resource_validation,
+                mode,
                 duplicate_declarations,
                 name_resolution,
             );
@@ -1563,10 +1584,10 @@ fn provider_load_findings<P: PlaceholderKind, B: BindingAddress>(
     context: &WiringContext,
     load_errors: &HashMap<String, String>,
     providers: &[ProviderConfig<P, B>],
-    skip_resource_validation: bool,
+    mode: ValidationMode,
 ) -> Vec<AppError> {
     let mut findings = sorted_provider_load_errors(load_errors);
-    if !skip_resource_validation {
+    if mode.checks_resources() {
         let missing = providers
             .iter()
             .filter(|provider| {
@@ -1608,16 +1629,11 @@ fn resolve_config_pair_errors_with_context(
     parsed: carina_core::config_loader::InferredRootDirectory,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
     base_dir: &ResolvedPath,
-    skip_resource_validation: bool,
+    mode: ValidationMode,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> Result<ReadyConfigPair, NonEmptyValidationErrors> {
     let catalog = context.validation_catalog(&parsed.providers, load_errors);
-    let load_findings = provider_load_findings(
-        context,
-        load_errors,
-        &parsed.providers,
-        skip_resource_validation,
-    );
+    let load_findings = provider_load_findings(context, load_errors, &parsed.providers, mode);
     resolve_config_pair_errors_with_catalog(
         access,
         ProviderValidationInputs {
@@ -1628,7 +1644,7 @@ fn resolve_config_pair_errors_with_context(
         parsed,
         unresolved,
         base_dir,
-        skip_resource_validation,
+        mode,
         duplicate_declarations,
     )
 }
@@ -1650,7 +1666,7 @@ fn resolve_config_pair_errors_with_catalog(
     parsed: carina_core::config_loader::InferredRootDirectory,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
     base_dir: &ResolvedPath,
-    skip_resource_validation: bool,
+    mode: ValidationMode,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> Result<ReadyConfigPair, NonEmptyValidationErrors> {
     let ProviderValidationInputs {
@@ -1667,7 +1683,7 @@ fn resolve_config_pair_errors_with_catalog(
                 context,
                 catalog,
                 &HashMap::new(),
-                skip_resource_validation,
+                mode,
                 duplicate_declarations,
                 crate::commands::ConfigNameResolution::Paired(Box::new(unresolved)),
             )
@@ -1713,7 +1729,7 @@ fn resolve_config_pair_with_context(
         parsed,
         unresolved,
         base_dir,
-        skip_resource_validation,
+        ValidationMode::from_skip_resource_validation(skip_resource_validation),
         duplicate_declarations,
     )
     .map_err(|errors| crate::commands::collapse_presented_errors(errors.into_vec()))
@@ -1921,7 +1937,7 @@ impl ProviderLoad {
         self.validate_evaluated_config_for(
             parsed,
             base_dir,
-            true,
+            ValidationMode::Recovery,
             duplicate_declarations,
             crate::commands::ConfigNameResolution::ReadOnly,
         )
@@ -1939,7 +1955,7 @@ impl ProviderLoad {
         self.validate_evaluated_config_for(
             parsed,
             base_dir,
-            skip_resource_validation,
+            ValidationMode::from_skip_resource_validation(skip_resource_validation),
             duplicate_declarations,
             crate::commands::ConfigNameResolution::EvaluatedOnly,
         )
@@ -1949,7 +1965,7 @@ impl ProviderLoad {
         self,
         parsed: carina_core::config_loader::InferredRootDirectory,
         base_dir: &ResolvedPath,
-        skip_resource_validation: bool,
+        mode: ValidationMode,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
         name_resolution: crate::commands::ConfigNameResolution,
     ) -> Result<ValidatedConfig<ExpandedInferredFile>, AppError> {
@@ -1958,7 +1974,7 @@ impl ProviderLoad {
             &self.load_errors,
             &parsed,
             base_dir,
-            skip_resource_validation,
+            mode,
             duplicate_declarations,
             name_resolution,
             |parsed, catalog| {
@@ -2005,7 +2021,7 @@ impl ProviderLoad {
             parsed,
             unresolved,
             base_dir,
-            skip_resource_validation,
+            ValidationMode::from_skip_resource_validation(skip_resource_validation),
             duplicate_declarations,
         ) {
             Ok(canonical_resources) => canonical_resources,
@@ -2119,7 +2135,7 @@ impl MigrationCheckProviderLoad {
             &load_errors,
             &parsed,
             base_dir,
-            true,
+            ValidationMode::Recovery,
             duplicate_declarations,
             crate::commands::ConfigNameResolution::ReadOnly,
             |parsed, session| resolve_file_binding_uses(parsed, base_dir, &context, session),
@@ -2156,7 +2172,7 @@ impl CompleteProviderLoad {
             parsed,
             unresolved,
             base_dir,
-            skip_resource_validation,
+            ValidationMode::from_skip_resource_validation(skip_resource_validation),
             duplicate_declarations,
         )
         .map_err(|errors| crate::commands::collapse_presented_errors(errors.into_vec()))?;
@@ -2261,7 +2277,7 @@ impl ReportingProviderLoad {
             &self.context,
             &self.load_errors,
             providers,
-            skip_resource_validation,
+            ValidationMode::from_skip_resource_validation(skip_resource_validation),
         )
     }
 }
