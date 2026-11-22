@@ -11,7 +11,7 @@
 //! known-accept / unknown-reject behaviour where observed. The node-judge PR
 //! of #4400 changes those outcomes ON PURPOSE. An unexplained accept/reject
 //! change is a regression, not a refresh. Only the temporary directory prefix
-//! is normalized; panics always fail. The two excluded probes remain documented.
+//! is normalized; panics always fail. The remaining excluded probe is documented.
 use carina_core::provider::{BoxFuture, ProviderFactory, ProviderInitialization, ProviderResult};
 use carina_core::schema::{
     AttributeSchema, AttributeType as T, ResourceSchema, StringIdentityLayer,
@@ -625,18 +625,43 @@ fn all_rows() -> Vec<Row> {
 // 6-reevaluation: CLI admission uses ValidationEvaluation::None. upper('same')
 // folds before admission; whole-map reevaluation is only on LSP expanded /
 // relative_static paths, outside this collector.
-// 28-dot: sibling-file built.first.name fails name resolution (unknown binding
-// 'built') before source-type admission. Row 28 uses built['first'].name.
-const SKIPPED_PROBES: [(&str, &str); 2] = [
-    (
-        "6-reevaluation",
-        "CLI admission uses ValidationEvaluation::None; upper('same') folds before admission. Whole-map reevaluation is only on LSP expanded/relative_static paths.",
-    ),
-    (
-        "28-dot",
-        "Sibling-file built.first.name fails name resolution (unknown binding 'built') before source-type admission. Row 28 uses built['first'].name.",
-    ),
-];
+const SKIPPED_PROBES: [(&str, &str); 1] = [(
+    "6-reevaluation",
+    "CLI admission uses ValidationEvaluation::None; upper('same') folds before admission. Whole-map reevaluation is only on LSP expanded/relative_static paths.",
+)];
+
+#[test]
+fn authored_reference_dot_probe_matches_subscript_admission() {
+    for schema in ["Source", "CompatibleSource"] {
+        for known in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
+            let mut observations = Vec::new();
+            for reader in ["built['first'].name", "built.first.name"] {
+                let mut row =
+                    Row::new("28-dot", "keyed child dot spelling", schema, "Sink", reader);
+                row.source_override =
+                    Some([for_map_source(schema, true), for_map_source(schema, false)]);
+                for (name, body) in row.files(known) {
+                    std::fs::write(directory.path().join(name), body).unwrap();
+                }
+                let observed = observe(&path);
+                let messages: Vec<_> = observed["json"]["errors"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|error| error["message"].clone())
+                    .collect();
+                observations.push((
+                    observed["status"].clone(),
+                    messages,
+                    observed["diagnostics"].clone(),
+                ));
+            }
+            assert_eq!(observations[0], observations[1], "{schema}, known={known}");
+        }
+    }
+}
 
 fn cells() -> Json {
     let mut records = Vec::new();

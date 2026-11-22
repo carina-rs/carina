@@ -2879,6 +2879,18 @@ where
                 .binding_names()
                 .iter()
                 .map(ToString::to_string)
+                // Generated loop children have admitted bindings without a
+                // separate authored declaration. Scope checks need those too.
+                .chain(
+                    file.iter_top_level_resources()
+                        .filter_map(|resource| resource.binding().map(str::to_owned)),
+                )
+                .chain(
+                    file.parser_binding_metadata
+                        .structural_handles()
+                        .keys()
+                        .map(ToString::to_string),
+                )
                 .chain(file.variables.keys().cloned())
                 .chain(file.structural_bindings.iter().map(ToString::to_string))
                 .collect(),

@@ -89,6 +89,8 @@ let vpcs = for name, cidr in cidrs {
 
 A bound loop is a structural group. Select an instance attribute with a String subscript for simple list and map loops (`vpcs['dev'].vpc_id`), or an integer subscript for indexed loops (`vpcs[0].vpc_id`). `vpcs[0]` on a simple list loop is an error that points to the indexed form. Bare `length(vpcs)` and bare-value exports of the group remain errors; author an ordinary collection of selected attributes when you need a value.
 
+For keyed loops, `vpcs.dev.vpc_id` is equivalent to `vpcs['dev'].vpc_id`. Dot keys must start with a letter and contain only letters, digits, or underscores. A key named `vpc_id` is selected first in `vpcs.vpc_id.vpc_id`; the second `.vpc_id` reads its attribute. Use String subscripts for keys such as `'3rd'`, `'my-key'`, or `'a.b'`. Indexed loops reject dot selection, including `.0`.
+
 Keyed child lookup on a deferred loop remains unsupported. Managed resource loops whose pending members are only module arguments expand after argument substitution, so their String-keyed children can be referenced inside the module and appear within its plan group. Changing a previously eager partial simple list to deferred syntax also removes its parse-time child lookup; use indexed iteration when that lookup is required.
 
 ```crn

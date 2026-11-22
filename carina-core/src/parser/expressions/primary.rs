@@ -177,28 +177,9 @@ pub(crate) fn apply_postfix_path_segment(
     let base = match value {
         EvalValue::User(base) => base,
         EvalValue::UnexpandedStructuralHandle(handle) => {
-            if let PathSegment::Subscript { index } = &step {
-                if matches!(
-                    handle.kind(),
-                    crate::eval_value::UnexpandedStructuralHandleKind::For(
-                        crate::parser::ForBinding::Simple(_)
-                    )
-                ) && matches!(index, Subscript::Int { .. })
-                {
-                    return Err(ParseError::ValueKeyedSubscript {
-                        span: location.span(),
-                    }
-                    .at(location));
-                }
-                return Ok(EvalValue::from_value(
-                    crate::resource::binding_address::BindingLookup::new(
-                        handle.canonical_binding(),
-                    )
-                    .select(index)
-                    .reference(),
-                ));
-            }
-            handle.access_base_value()
+            return handle
+                .select_access(step, location)
+                .map(EvalValue::from_value);
         }
         EvalValue::PendingValue(slot) => return Ok(EvalValue::pending_value(slot)),
         EvalValue::ProvisionalReference { binding } => {
@@ -437,6 +418,29 @@ fn parse_namespaced_id_value(
     };
 
     let head_binding = ctx.lookup_binding(parts[0]);
+
+    if let ParseBindingRef::Structural(handle) = &head_binding
+        && let Some(group) = handle.loop_group()
+    {
+        let location = ctx.declaration_location(&pair);
+        let base = match crate::eval_value::select_dot(group, parts[1]) {
+            Ok(child) => child.into_lookup().reference(),
+            Err(rejected) => {
+                rejected.preserve(handle.canonical_binding(), location.span().start_line())
+            }
+        };
+        let mut value = EvalValue::from_value(base);
+        for segment in parts[2..]
+            .iter()
+            .map(|field| PathSegment::Field {
+                name: (*field).to_owned(),
+            })
+            .chain(trailing_segments)
+        {
+            value = apply_postfix_path_segment(value, segment, &location)?;
+        }
+        return Ok(value);
+    }
 
     match head_binding {
         ParseBindingRef::Structural(handle) if handle.addressable_binding().is_some() => {

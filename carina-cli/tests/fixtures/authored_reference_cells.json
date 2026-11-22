@@ -17628,10 +17628,6 @@
     [
       "6-reevaluation",
       "CLI admission uses ValidationEvaluation::None; upper('same') folds before admission. Whole-map reevaluation is only on LSP expanded/relative_static paths."
-    ],
-    [
-      "28-dot",
-      "Sibling-file built.first.name fails name resolution (unknown binding 'built') before source-type admission. Row 28 uses built['first'].name."
     ]
   ]
 }

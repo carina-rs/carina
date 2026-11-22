@@ -985,6 +985,10 @@ impl<B: BindingAddress> BindingLookup<B> {
         self.binding.as_str()
     }
 
+    pub(crate) fn binding(&self) -> &B {
+        &self.binding
+    }
+
     pub(crate) fn reference<P: super::ValueKind>(self) -> super::Value<P, B> {
         super::Value::Deferred(super::DeferredValue::BindingRef {
             binding: self.binding,

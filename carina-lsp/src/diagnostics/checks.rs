@@ -4,7 +4,7 @@ use carina_core::parser::ExportParamLike;
 use carina_core::validation::admission::configuration::backend::{
     BackendAttributeError, LocatedBackendError,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
@@ -1777,6 +1777,14 @@ impl DiagnosticRun<'_> {
         let export_bindings =
             inference_input.binding_index_in_session(None, &signatures, self.provider_context);
         let mut boundary_export_params = inferred_export_params.parameters().to_vec();
+        // A failed expression already owns its diagnostic, as in CLI validation.
+        // Do not add a reference mismatch at the enclosing export boundary.
+        boundary_export_params.retain(|parameter| {
+            !parameter.judgement().is_ok_and(|expression| {
+                expression.check_owner()
+                    == carina_core::parser::retained::ExpressionCheckOwner::Reported
+            })
+        });
         for parameter in &mut boundary_export_params {
             let Some(type_expr) = parameter.type_expr_opt_mut() else {
                 continue;
@@ -1814,6 +1822,7 @@ impl DiagnosticRun<'_> {
         tree: &carina_core::parser::AnalysisTree<'_>,
         defined_bindings: &HashSet<String>,
         declared_providers: &HashSet<String>,
+        scope_errors: &HashMap<String, String>,
     ) -> Vec<carina_core::parser::Located<carina_core::resource::SecretDiagnosticError<String>>>
     {
         let mut enum_namespaces = HashSet::new();
@@ -1843,16 +1852,19 @@ impl DiagnosticRun<'_> {
                 {
                     return None;
                 }
-                let finding = carina_core::parser::Located::new(
-                    reference.prefix_location().clone(),
-                    reference.render(|path| {
-                        format!(
-                            "Undefined resource: '{}'. Define it with 'let {} = aws...'",
-                            path.binding(),
-                            path.binding()
-                        )
-                    }),
-                );
+                let finding =
+                    carina_core::parser::Located::new(
+                        reference.prefix_location().clone(),
+                        reference.render(|path| {
+                            scope_errors.get(path.binding()).cloned().unwrap_or_else(|| {
+                            format!(
+                                "Undefined resource: '{}'. Define it with 'let {} = aws...'",
+                                path.binding(),
+                                path.binding()
+                            )
+                        })
+                        }),
+                    );
                 Some(finding)
             })
             .collect()

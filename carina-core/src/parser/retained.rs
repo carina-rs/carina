@@ -5843,6 +5843,25 @@ mod judgement {
             authored,
             expressions,
             bindings: &bindings,
+            structural_handles: file.parser_binding_metadata.structural_handles(),
+            structural_definitions: expressions
+                .definitions
+                .iter()
+                .filter_map(|(name, definition)| {
+                    file.parser_binding_metadata
+                        .structural_handles()
+                        .get(name)
+                        .map(|handle| {
+                            (
+                                (
+                                    definition.authored.location.instance.clone(),
+                                    definition.node_id(),
+                                ),
+                                handle,
+                            )
+                        })
+                })
+                .collect(),
             functions,
             schemas,
             config,
@@ -6026,6 +6045,11 @@ mod judgement {
         authored: IndexMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
         expressions: &'a Expressions<B>,
         bindings: &'a InferenceBindings,
+        structural_handles: &'a IndexMap<B, crate::eval_value::UnexpandedStructuralHandle<B>>,
+        structural_definitions: HashMap<
+            (ExpressionInstance, NodeId),
+            &'a crate::eval_value::UnexpandedStructuralHandle<B>,
+        >,
         functions: HashMap<(ExpressionInstance, String), Arc<FunctionSignature>>,
         schemas: &'a crate::schema::SchemaRegistry,
         config: &'a super::super::ProviderContext,
@@ -6510,18 +6534,28 @@ mod judgement {
             result.data_mut().origin = Some(root.location.clone());
             result.data_mut().authority = Some(self.authority.clone());
             if matches!(root.kind, ExprKind::Reference { .. }) {
-                if matches!(
-                    result.judgement,
-                    ExprJudgement::Typed {
-                        kind: InferredKind::Ordinary(_),
-                        ..
-                    }
-                ) {
+                let loop_reference = match &root.kind {
+                    ExprKind::Reference { binding, .. } => self
+                        .structural_handles
+                        .get(binding)
+                        .and_then(crate::eval_value::UnexpandedStructuralHandle::loop_group)
+                        .is_some(),
+                    _ => false,
+                };
+                if !loop_reference
+                    && matches!(
+                        result.judgement,
+                        ExprJudgement::Typed {
+                            kind: InferredKind::Ordinary(_),
+                            ..
+                        }
+                    )
+                {
                     result.set_kind(InferredKind::Reference);
                 }
                 // The binding pass owns reference existence and field errors.
                 // A containing operation preserves that ownership.
-                if !result.is_enum_identifier() {
+                if !result.is_enum_identifier() && !loop_reference {
                     result.report_at(FailureOwner::BindingIndex);
                 }
             }
@@ -6870,6 +6904,80 @@ mod judgement {
             result
         }
 
+        /// Resolve structural prefixes from the handle registry, including
+        /// lexical definition uses. A value's collection shape grants no loop authority.
+        fn structural_lookup(
+            &self,
+            expression: &ExprValue<ParserPlaceholder, B>,
+        ) -> Option<crate::resource::binding_address::BindingLookup<B>> {
+            use crate::resource::binding_address::BindingLookup;
+            let root = &expression.authored;
+            if let Some(handle) = self
+                .structural_definitions
+                .get(&(root.location.instance.clone(), root.id))
+            {
+                return Some(BindingLookup::new(handle.canonical_binding()));
+            }
+            match &root.kind {
+                ExprKind::Binding { binding, .. } => self
+                    .structural_handles
+                    .get(binding)
+                    .map(|handle| BindingLookup::new(handle.canonical_binding())),
+                ExprKind::Definition | ExprKind::Alias | ExprKind::Parens => {
+                    self.structural_lookup(root.children.first()?)
+                }
+                ExprKind::Access(step) => {
+                    let lookup = self.structural_lookup(root.children.first()?)?;
+                    match step {
+                        PathSegment::Subscript { index } => Some(lookup.select(index)),
+                        PathSegment::Field { name } => {
+                            let group = self
+                                .structural_handles
+                                .get(lookup.binding())?
+                                .loop_group()?;
+                            crate::eval_value::select_dot(group, name)
+                                .ok()
+                                .map(|child| child.into_lookup())
+                        }
+                    }
+                }
+                ExprKind::Reference {
+                    binding,
+                    attribute,
+                    segments,
+                    ..
+                } if segments.is_empty() => {
+                    let group = self.structural_handles.get(binding)?.loop_group()?;
+                    crate::eval_value::select_dot(group, attribute)
+                        .ok()
+                        .map(|child| child.into_lookup())
+                }
+                _ => None,
+            }
+        }
+
+        fn loop_dot(
+            &self,
+            group: crate::eval_value::LoopGroupRef<'_, B>,
+            field: &str,
+            base: &JudgedExprData,
+        ) -> Result<crate::eval_value::SelectedLoopChild<B>, InferredExpr> {
+            crate::eval_value::select_dot(group, field)
+                .map_err(|rejected| Self::loop_dot_failure(rejected, base))
+        }
+
+        fn loop_dot_failure(
+            rejected: crate::eval_value::InvalidLoopDot,
+            base: &JudgedExprData,
+        ) -> InferredExpr {
+            let member_type = base
+                .member
+                .as_deref()
+                .map(|member| member.type_description())
+                .unwrap_or_else(|| "value-dependent expression".into());
+            declared(Err(rejected.error(&member_type).into()), false)
+        }
+
         fn access_path(
             &self,
             base: InferredExpr,
@@ -6879,6 +6987,128 @@ mod judgement {
             steps
                 .iter()
                 .fold(base, |base, step| self.access(&base, Some(step), binding))
+        }
+
+        fn reference(
+            &mut self,
+            binding: &B,
+            attribute: &str,
+            segments: &[PathSegment],
+        ) -> InferredExpr {
+            if let Some(group) = self
+                .structural_handles
+                .get(binding)
+                .and_then(crate::eval_value::UnexpandedStructuralHandle::loop_group)
+            {
+                // Select the child before looking up a module output or a resource attribute.
+                let selection = crate::eval_value::select_dot(group, attribute);
+                let base = self
+                    .expressions
+                    .definitions
+                    .get(binding)
+                    .map(|definition| self.judge(definition));
+                let Some(base) = base else {
+                    return incomplete("authored loop group");
+                };
+                let child = match selection {
+                    Ok(child) => child,
+                    Err(rejected) => return Self::loop_dot_failure(rejected, &base),
+                };
+                let selected = self.access(&base, Some(&child.step()), binding.as_str());
+                if let Some((PathSegment::Field { name }, rest)) = segments.split_first()
+                    && (self.module_attributes.is_some_and(|outputs| {
+                        outputs.contains_key(&(child.binding().clone(), name.clone()))
+                    }) || matches!(
+                        self.bindings.get(child.binding().as_str()),
+                        Some(InferenceBinding::ModuleCall)
+                    ) || (!self.bindings.contains_key(child.binding().as_str())
+                        && !self.structural_handles.contains_key(child.binding())))
+                {
+                    return self.reference(child.binding(), name, rest);
+                }
+                return self.access_path(selected, segments, child.binding().as_str());
+            }
+            let steps = std::iter::once(PathSegment::Field {
+                name: attribute.to_owned(),
+            })
+            .chain(segments.iter().cloned())
+            .collect::<Vec<_>>();
+            if let Some(ty) = self.parameter_type(binding) {
+                return self.access_path(
+                    declared(Ok(ty.clone()), false).owned_by_bindings(),
+                    &steps,
+                    binding.as_str(),
+                );
+            }
+            if let Some(attribute) = self
+                .module_attributes
+                .and_then(|attributes| attributes.get(&(binding.clone(), attribute.to_owned())))
+            {
+                let attribute = self.refresh_module_output(attribute);
+                return self.access_path(
+                    InferredExpr::from(&attribute),
+                    segments,
+                    binding.as_str(),
+                );
+            }
+            if let Some(ty) = self
+                .upstream
+                .and_then(|exports| exports.get(binding))
+                .and_then(|fields| fields.get(attribute))
+                .and_then(|entry| entry.static_type.declared_known())
+            {
+                return self.access_path(
+                    declared(Ok(ty.clone()), false).owned_by_bindings(),
+                    segments,
+                    binding.as_str(),
+                );
+            }
+            if matches!(
+                self.bindings.get(binding.as_str()),
+                Some(InferenceBinding::UpstreamState | InferenceBinding::ModuleCall)
+            ) {
+                let mut result = value_dependent(
+                    "external value is checked at its declared or resolved boundary",
+                );
+                result.data_mut().judgement = ExprJudgement::ValueDependent {
+                    reason: NotInferableReason::NonInferableBinding {
+                        binding: binding.to_string(),
+                    },
+                    shape: None,
+                    owner: FailureOwner::Expression,
+                };
+                return result;
+            }
+            if let Some(InferenceBinding::Virtual { attributes }) =
+                self.bindings.get(binding.as_str())
+                && !attributes.contains(attribute)
+            {
+                return declared(
+                    Err(InferenceError::UnknownAttribute {
+                        binding: binding.to_string(),
+                        attribute: attribute.to_owned(),
+                    }
+                    .into()),
+                    false,
+                );
+            }
+            if self.bindings.contains_key(binding.as_str()) {
+                declared(
+                    inference::infer_declared_reference_type(
+                        binding.as_str(),
+                        attribute,
+                        segments,
+                        self.bindings,
+                        self.schemas,
+                    ),
+                    false,
+                )
+            } else if let Some(definition) = self.expressions.definitions.get(binding) {
+                let base = self.judge(definition);
+                self.access_path(InferredExpr::from(&base), &steps, binding.as_str())
+            } else {
+                declared(Ok(TypeExpr::String), true).with_kind(|_| InferredKind::EnumIdentifier)
+            }
         }
 
         fn infer(
@@ -6920,90 +7150,8 @@ mod judgement {
                     binding,
                     attribute,
                     segments,
-                    authored_binding: _,
-                } => {
-                    let steps = std::iter::once(PathSegment::Field {
-                        name: attribute.clone(),
-                    })
-                    .chain(segments.iter().cloned())
-                    .collect::<Vec<_>>();
-                    if let Some(ty) = self.parameter_type(binding) {
-                        return self.access_path(
-                            ordinary(Ok(ty.clone()), false).owned_by_bindings(),
-                            &steps,
-                            binding.as_str(),
-                        );
-                    }
-                    if let Some(attribute) = self.module_attributes.and_then(|attributes| {
-                        attributes.get(&(binding.clone(), attribute.clone()))
-                    }) {
-                        let attribute = self.refresh_module_output(attribute);
-                        return self.access_path(
-                            InferredExpr::from(&attribute),
-                            segments,
-                            binding.as_str(),
-                        );
-                    }
-                    if let Some(ty) = self
-                        .upstream
-                        .and_then(|exports| exports.get(binding))
-                        .and_then(|fields| fields.get(attribute))
-                        .and_then(|entry| entry.static_type.declared_known())
-                    {
-                        return self.access_path(
-                            ordinary(Ok(ty.clone()), false).owned_by_bindings(),
-                            segments,
-                            binding.as_str(),
-                        );
-                    }
-                    if matches!(
-                        self.bindings.get(binding.as_str()),
-                        Some(InferenceBinding::UpstreamState | InferenceBinding::ModuleCall)
-                    ) {
-                        let mut result = value_dependent(
-                            "external value is checked at its declared or resolved boundary",
-                        );
-                        result.data_mut().judgement = ExprJudgement::ValueDependent {
-                            reason: NotInferableReason::NonInferableBinding {
-                                binding: binding.to_string(),
-                            },
-                            shape: None,
-                            owner: FailureOwner::Expression,
-                        };
-                        return result;
-                    }
-                    if let Some(InferenceBinding::Virtual { attributes }) =
-                        self.bindings.get(binding.as_str())
-                        && !attributes.contains(attribute)
-                    {
-                        return ordinary(
-                            Err(InferenceError::UnknownAttribute {
-                                binding: binding.to_string(),
-                                attribute: attribute.clone(),
-                            }
-                            .into()),
-                            false,
-                        );
-                    }
-                    if self.bindings.contains_key(binding.as_str()) {
-                        ordinary(
-                            inference::infer_declared_reference_type(
-                                binding.as_str(),
-                                attribute,
-                                segments,
-                                self.bindings,
-                                self.schemas,
-                            ),
-                            false,
-                        )
-                    } else if let Some(definition) = self.expressions.definitions.get(binding) {
-                        let base = self.judge(definition);
-                        self.access_path(InferredExpr::from(&base), &steps, binding.as_str())
-                    } else {
-                        ordinary(Ok(TypeExpr::String), true)
-                            .with_kind(|_| InferredKind::EnumIdentifier)
-                    }
-                }
+                    ..
+                } => self.reference(binding, attribute, segments),
                 ExprKind::EmptyInterpolation => ordinary(Ok(TypeExpr::String), false),
                 ExprKind::Interpolation {
                     single_reference: true,
@@ -7228,7 +7376,41 @@ mod judgement {
                         None => incomplete("function declaration or builtin signature"),
                     }
                 }
-                ExprKind::Access(step) => self.access(&children[0], Some(step), "access base"),
+                ExprKind::Access(step) => {
+                    if let Some(lookup) = self.structural_lookup(&root.children[0])
+                        && let PathSegment::Field { name } = step
+                    {
+                        if let Some(group) = self
+                            .structural_handles
+                            .get(lookup.binding())
+                            .and_then(crate::eval_value::UnexpandedStructuralHandle::loop_group)
+                        {
+                            return match self.loop_dot(group, name, &children[0]) {
+                                Ok(child) => {
+                                    self.access(&children[0], Some(&child.step()), lookup.as_str())
+                                }
+                                Err(failure) => failure,
+                            };
+                        }
+                        if let Some(output) = self.module_attributes.and_then(|outputs| {
+                            outputs.get(&(lookup.binding().clone(), name.clone()))
+                        }) {
+                            return InferredExpr::from(&self.refresh_module_output(output));
+                        }
+                        if !children[0].failed()
+                            && (matches!(
+                                self.bindings.get(lookup.as_str()),
+                                Some(InferenceBinding::ModuleCall)
+                            ) || (!self.bindings.contains_key(lookup.as_str())
+                                && !self.structural_handles.contains_key(lookup.binding())))
+                        {
+                            // Missing children retain ordinary reference-scope
+                            // ownership; module children retain their output authority.
+                            return self.reference(lookup.binding(), name, &[]);
+                        }
+                    }
+                    self.access(&children[0], Some(step), "access base")
+                }
                 ExprKind::Integer { op, location } => {
                     let operands = [children[0].clone(), children[1].clone()];
                     if self.demand == JudgementDemand::Value {

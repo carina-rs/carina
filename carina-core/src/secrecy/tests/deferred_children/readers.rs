@@ -1,7 +1,6 @@
 use super::*;
 
 use crate::module_resolver::ModuleError;
-use crate::resource::knowledge::{Classification, KnowledgeContext};
 use crate::validation::ParameterValueFinding;
 
 #[derive(Debug)]
@@ -465,21 +464,8 @@ fn for_value_keys_reader_pending_keeps_runtime_redaction() {
             )
         })
         .unwrap();
-        if selector == "children.comment.name" {
-            assert!(
-                matches!(
-                    value
-                        .knowledge(&KnowledgeContext::plan(&bindings))
-                        .unwrap()
-                        .into_classification(),
-                    Classification::Pending(_)
-                ),
-                "{selector}"
-            );
-        } else {
-            assert!(crate::value::contains_secret(&value), "{selector}");
-            assert!(!crate::value::format_value(&value).contains("canary"));
-        }
+        assert!(crate::value::contains_secret(&value), "{selector}");
+        assert!(!crate::value::format_value(&value).contains("canary"));
         let child = resolved
             .as_file()
             .resources
@@ -523,21 +509,10 @@ fn for_value_keys_reader_pending_keeps_runtime_redaction() {
             )
         })
         .unwrap();
-        if selector == "children.comment.name" {
-            assert!(matches!(
-                value
-                    .knowledge(&KnowledgeContext::apply(&applied))
-                    .unwrap()
-                    .into_classification(),
-                Classification::Pending(_)
-            ));
-            assert!(!crate::value::format_value(&value).contains("canary"));
-        } else {
-            assert!(crate::value::contains_secret(&value));
-            assert!(!crate::value::format_value(&value).contains("canary"));
-            let snapshot = crate::value::redact_secrets_in_value(&value).unwrap();
-            assert!(!serde_json::to_string(&snapshot).unwrap().contains("canary"));
-        }
+        assert!(crate::value::contains_secret(&value));
+        assert!(!crate::value::format_value(&value).contains("canary"));
+        let snapshot = crate::value::redact_secrets_in_value(&value).unwrap();
+        assert!(!serde_json::to_string(&snapshot).unwrap().contains("canary"));
     }
 }
 
@@ -561,17 +536,21 @@ fn for_value_keys_reader_pending_mixed_alternatives_characterization() {
             .is_err()
     );
 
-    // String subscripts select keyed children; field access remains invalid.
-    let (_directory, file, _schemas, _context) = reader_fixture(
+    // Dot and String-subscript spelling select the same keyed child.
+    let (_directory, file, schemas, context) = reader_fixture(
         "let children = for item in ['comment'] { mock.test.Resource { name = secret('name canary') } }\nlet other = mock.test.Resource { comment = children.comment.name ?? 'public' }\n",
         None,
     );
-    let error = file.unwrap_err().to_string();
+    let file = file.unwrap();
+    let pending = report(&file, &schemas, &context);
+    assert!(pending.is_pending(), "{pending:?}");
+    assert!(pending.findings().is_empty(), "{pending:?}");
+    assert!(!format!("{pending:?}").contains("canary"));
     assert!(
-        error.contains("cannot apply access .comment to keyed loop group"),
-        "{error}"
+        resolve_owner(file, &schemas, &context)
+            .validated_secrecy()
+            .is_err()
     );
-    assert!(!error.contains("canary"));
 
     let loop_source = "let children = for item in ['comment'] { mock.test.Resource { comment = secret('canary') name = secret('name canary') } }\nlet other = mock.test.Resource { comment = children.comment.name }\n";
     let (_directory, file, schemas, context) = reader_fixture(loop_source, None);

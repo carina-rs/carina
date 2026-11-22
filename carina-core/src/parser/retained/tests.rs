@@ -347,6 +347,29 @@ fn keyed_loop_addressing_agrees_across_judgement_validation_and_expansion() {
 }
 
 #[test]
+fn loop_dot_judgement_selects_a_key_and_owns_indexed_rejection() {
+    for (pattern, iterable) in [("k, v", "({ a = 'x' })"), ("v", "['a']")] {
+        let (_, report) = source_schema_report(&format!(
+            "let children = for {pattern} in {iterable} {{ mock.test.Source {{ name = v }} }}\nlet selected = children.a.name"
+        ));
+        let selected = report
+            .binding(&RelativeBindingName::new("selected"))
+            .unwrap();
+        assert_eq!(selected.static_type().unwrap(), &TypeExpr::String);
+        assert!(report.findings().is_empty(), "{:?}", report.findings());
+    }
+    let (_, report) = source_schema_report(
+        "let children = for (i, v) in ['a'] { mock.test.Source { name = v } }\nlet selected = children.a.name",
+    );
+    let errors: Vec<_> = report
+        .findings()
+        .iter()
+        .map(|finding| finding.detail().to_string())
+        .collect();
+    assert_eq!(errors, ["cannot apply access .a to list(mock.test.Source)"]);
+}
+
+#[test]
 fn single_reference_interpolation_preserves_child_judgement_and_literal_folding() {
     for definition in [
         "let x = src.name",

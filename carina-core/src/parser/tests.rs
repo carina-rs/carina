@@ -22577,6 +22577,83 @@ fn for_value_keys_bare_handle_hint() {
 }
 
 #[test]
+fn loop_dot_selects_the_key_before_the_resource_attribute() {
+    for (pattern, iterable) in [("k, item", "({ name = 'x' })"), ("item", "['name']")] {
+        for reader in ["children.name.name", "children['name'].name"] {
+            let source = format!(
+                "let children = for {pattern} in {iterable} {{ mock.test.Source {{ name = item }} }}\nlet other = mock.test.Source {{ name = {reader} }}"
+            );
+            let parsed = parse(
+                &source,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap();
+            let other = parsed
+                .resources
+                .iter()
+                .find(|resource| {
+                    resource
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.as_str() == "other")
+                })
+                .unwrap();
+            let Value::Deferred(DeferredValue::ResourceRef { path }) = &other.attributes["name"]
+            else {
+                panic!("{reader}: expected a selected child reference");
+            };
+            assert_eq!(path.binding(), "children.name", "{reader}");
+            assert_eq!(path.attribute(), "name", "{reader}");
+            assert!(path.segments().is_empty(), "{reader}");
+            assert!(
+                path.reference_locations().is_some(),
+                "{reader}: retain authored reference location"
+            );
+            let origins = other.dependencies.depends_on.reference_origins();
+            assert_eq!(origins.len(), 1, "{reader}: dependency origin");
+            let identity = origins[0].as_ref().identity();
+            assert!(
+                identity.binding_key().matches_name("children.name"),
+                "{reader}"
+            );
+            assert_eq!(
+                identity.source(),
+                path.diagnostic_source_owned(),
+                "{reader}: dependency location"
+            );
+        }
+        for reader in ["children.name", "children['name']"] {
+            let source = format!(
+                "let children = for {pattern} in {iterable} {{ mock.test.Source {{ name = item }} }}\nlet other = mock.test.Source {{ name = {reader} }}"
+            );
+            let parsed = parse(
+                &source,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap();
+            let other = parsed
+                .resources
+                .iter()
+                .find(|resource| {
+                    resource
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.as_str() == "other")
+                })
+                .unwrap();
+            let origins = other.dependencies.depends_on.binding_reference_origins();
+            assert_eq!(origins.len(), 1, "{reader}: bare child dependency origin");
+            assert_eq!(origins[0].detail().as_str(), "children.name", "{reader}");
+            assert_eq!(
+                origins[0].location().span().start_line(),
+                2,
+                "{reader}: bare child dependency location"
+            );
+        }
+    }
+}
+
+#[test]
 fn resource_slot_inventory_keeps_ready_pending_and_grouped_attributes() {
     use std::collections::BTreeSet;
 

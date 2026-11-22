@@ -1,6 +1,95 @@
 //! Directory acceptance tests for parser-owned diagnostic locations (#4220).
 use super::*;
 
+#[path = "../../../../carina-cli/tests/common/loop_dot_cases.rs"]
+mod loop_dot_cases;
+
+#[test]
+fn loop_dot_case_table_diagnostics_match_validate() {
+    let directory = Directory::new(&[]);
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let root = directory.root.path();
+    let observe = |owner: &str| {
+        let path = root.join(owner);
+        let source = std::fs::read_to_string(&path).unwrap();
+        engine
+            .analyze(&create_document_at(&source, path.clone()), Some(&path))
+            .into_iter()
+            .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>()
+    };
+    let mut failures = Vec::new();
+    for row in loop_dot_cases::rows() {
+        loop_dot_cases::fixture(root, &row);
+        for &position in row.positions {
+            let owner = loop_dot_cases::reader(root, position, row.reader);
+            let dot = observe(owner);
+            let expected = match row.expected {
+                loop_dot_cases::Outcome::Validates => Vec::new(),
+                loop_dot_cases::Outcome::Error(errors) => {
+                    errors.iter().map(|error| (*error).to_owned()).collect()
+                }
+                loop_dot_cases::Outcome::SameAsSubscript(subscript) => {
+                    loop_dot_cases::reader(root, position, subscript);
+                    let bracket = observe(owner);
+                    // These are the CLI table's bare-child outcomes. All other
+                    // subscript controls validate without errors.
+                    let expected: Vec<String> = if row.id == "2-4" {
+                        match position {
+                            "plain" | "if" => vec![
+                                "expected String, got mock.test.resource",
+                                "expected String, got mock.test.resource",
+                            ],
+                            "single interpolation" | "multipart interpolation" => vec![
+                                "mock.test.resource.other: 'children.a' is a resource handle, not a value",
+                            ],
+                            "coalesce" | "export" => vec![
+                                "coalesce default type `String` does not match left type `mock.test.resource`",
+                            ],
+                            "export plain" => vec![
+                                "export 'out': inferred resource handle mock.test.resource cannot cross a state boundary; export an identity value such as mock.test.resource.Id instead",
+                            ],
+                            "module argument" => vec![
+                                "module call 'consume (anonymous call)': argument 'value': cannot assign mock.test.resource to 'value': expected String, got mock.test.resource (from children.a)",
+                            ],
+                            "function argument" | "arithmetic" => Vec::new(),
+                            _ => unreachable!("bare-child position {position}"),
+                        }
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    if bracket != expected {
+                        failures.push(format!(
+                            "{}, {:?}, {position}, {subscript}: LSP {bracket:?}, validate {expected:?}",
+                            row.id, row.kind
+                        ));
+                    }
+                    expected
+                }
+            };
+            if dot != expected {
+                failures.push(format!(
+                    "{}, {:?}, {position}, {}: {dot:?}, expected {expected:?}",
+                    row.id, row.kind, row.reader
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 struct Directory {
     root: tempfile::TempDir,
 }
