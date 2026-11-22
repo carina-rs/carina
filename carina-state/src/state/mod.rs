@@ -3276,7 +3276,7 @@ impl ResourceState {
                 });
                 (
                     fresh.persist(write_only, secrets),
-                    Some(fresh.sent_desired_attributes(writeback_resource.attributes.keys())),
+                    Some(fresh.sent_desired_attributes()),
                 )
             }
         };

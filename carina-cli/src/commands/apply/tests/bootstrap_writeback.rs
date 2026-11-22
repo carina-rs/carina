@@ -2,7 +2,10 @@ use super::*;
 use carina_core::executor::dispatch_create_for_writeback;
 use carina_core::provider::HostCreateFailureKind;
 
-async fn assert_bootstrap_transport_writeback(behavior: BootstrapCreateBehavior) {
+async fn assert_bootstrap_transport_writeback(
+    behavior: BootstrapCreateBehavior,
+    position: BootstrapSecretPosition,
+) {
     let plaintext = ["bootstrap", "condition", "fixture"].join("-");
     let attribute = match behavior {
         BootstrapCreateBehavior::IdentifierReported => "observed",
@@ -17,18 +20,8 @@ async fn assert_bootstrap_transport_writeback(behavior: BootstrapCreateBehavior)
             )),
         );
     if matches!(behavior, BootstrapCreateBehavior::Success) {
-        resource = resource.with_attribute(
-            "tags",
-            Value::Concrete(ConcreteValue::Map(IndexMap::from([
-                (
-                    "k".to_string(),
-                    Value::Deferred(DeferredValue::Secret(
-                        Box::new(string_value(&plaintext)).into(),
-                    )),
-                ),
-                ("public".to_string(), string_value("p")),
-            ]))),
-        );
+        resource =
+            resource.with_attribute(position.attribute(), position.desired_value(&plaintext));
     }
     let (schemas, comparison_provider) = carina_core::provider::comparison_fixture_for_test(
         &bootstrap_bucket_schemas(),
@@ -84,10 +77,20 @@ async fn assert_bootstrap_transport_writeback(behavior: BootstrapCreateBehavior)
                     "transport must retain the stripped fixture value"
                 );
                 if matches!(behavior, BootstrapCreateBehavior::Success) {
+                    let nested = transport
+                        .get_attr(position.attribute())
+                        .expect("transport must retain the nested attribute");
+                    let fields = match (position, nested) {
+                        (
+                            BootstrapSecretPosition::ListStructField,
+                            Value::Concrete(ConcreteValue::List(elements)),
+                        ) => elements.first(),
+                        _ => Some(nested),
+                    };
                     assert!(
-                        matches!(transport.get_attr("tags"),
-                            Some(Value::Concrete(ConcreteValue::Map(tags)))
-                                if matches!(tags.get("k"),
+                        matches!(fields,
+                            Some(Value::Concrete(ConcreteValue::Map(fields)))
+                                if matches!(fields.get("k"),
                                     Some(Value::Concrete(ConcreteValue::String(value)))
                                         if value.expose_plaintext() == plaintext)),
                         "transport must retain the stripped nested fixture value"
@@ -193,7 +196,8 @@ async fn assert_bootstrap_transport_writeback(behavior: BootstrapCreateBehavior)
         "transport row digest must verify the fixture value"
     );
     if matches!(behavior, BootstrapCreateBehavior::Success) {
-        let marker = &attributes["tags"]["k"];
+        let fields = position.encoded_fields(&attributes[position.attribute()]);
+        let marker = &fields["k"];
         assert_eq!(marker.as_object().map(serde_json::Map::len), Some(1));
         let digest = marker["$secret"]
             .as_str()
@@ -205,28 +209,62 @@ async fn assert_bootstrap_transport_writeback(behavior: BootstrapCreateBehavior)
             "transport row nested digest must verify the fixture value"
         );
         assert!(
-            attributes["tags"]["public"].as_str() == Some("p"),
-            "transport row public map leaf must stay plain"
+            fields["public"].as_str() == Some("p"),
+            "transport row public sibling must stay plain"
         );
     }
 }
 
 #[tokio::test]
 async fn bootstrap_transport_applied_writeback_retains_secret_hash() {
-    assert_bootstrap_transport_writeback(BootstrapCreateBehavior::Success).await;
+    assert_bootstrap_transport_writeback(
+        BootstrapCreateBehavior::Success,
+        BootstrapSecretPosition::MapEntry,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn bootstrap_transport_partial_writeback_retains_secret_hash() {
-    assert_bootstrap_transport_writeback(BootstrapCreateBehavior::PartialSuccess).await;
+    assert_bootstrap_transport_writeback(
+        BootstrapCreateBehavior::PartialSuccess,
+        BootstrapSecretPosition::MapEntry,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn bootstrap_transport_observation_writeback_retains_secret_hash() {
-    assert_bootstrap_transport_writeback(BootstrapCreateBehavior::IdentifierReported).await;
+    assert_bootstrap_transport_writeback(
+        BootstrapCreateBehavior::IdentifierReported,
+        BootstrapSecretPosition::MapEntry,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn bootstrap_transport_in_flight_writeback_retains_secret_hash() {
-    assert_bootstrap_transport_writeback(BootstrapCreateBehavior::InFlight).await;
+    assert_bootstrap_transport_writeback(
+        BootstrapCreateBehavior::InFlight,
+        BootstrapSecretPosition::MapEntry,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn bootstrap_transport_struct_field_writeback_retains_secret_hash() {
+    assert_bootstrap_transport_writeback(
+        BootstrapCreateBehavior::Success,
+        BootstrapSecretPosition::StructField,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn bootstrap_transport_list_struct_field_writeback_retains_secret_hash() {
+    assert_bootstrap_transport_writeback(
+        BootstrapCreateBehavior::Success,
+        BootstrapSecretPosition::ListStructField,
+    )
+    .await;
 }

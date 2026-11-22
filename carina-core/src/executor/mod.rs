@@ -487,10 +487,8 @@ impl AcceptedRequest {
         }
     }
 
-    fn from_update_request(
-        request: &UpdateRequest,
-        resolved_desired_attributes: SecretPreservingAttributes,
-    ) -> Self {
+    fn from_update_request(write: &PreparedWrite<UpdateRequest>) -> Self {
+        let request = write.request();
         let sent_attributes = request.patch().sent_attributes();
         let mut sent = BTreeSet::new();
         let mut removed = BTreeSet::new();
@@ -509,7 +507,7 @@ impl AcceptedRequest {
         Self {
             kind: AcceptedRequestKind::Update { sent, removed },
             sent_attributes,
-            resolved_desired_attributes,
+            resolved_desired_attributes: write.writeback().clone(),
         }
     }
 

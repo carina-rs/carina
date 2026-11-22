@@ -7071,8 +7071,10 @@ impl Provider for BootstrapRecordingProvider {
                 if let Some(secret) = request.resource().as_resource().get_attr("tags_secret") {
                     attributes.insert("tags_secret".to_string(), secret.clone());
                 }
-                if let Some(tags) = request.resource().as_resource().get_attr("tags") {
-                    attributes.insert("tags".to_string(), tags.clone());
+                for name in ["tags", "settings", "rules"] {
+                    if let Some(value) = request.resource().as_resource().get_attr(name) {
+                        attributes.insert(name.to_string(), value.clone());
+                    }
                 }
                 Box::pin(async move {
                     Ok(attempt
@@ -7280,8 +7282,55 @@ async fn bootstrap_declared_state_bucket(
     bootstrap_declared_state_bucket_with_resource(color_mode, provider, backend, resource).await
 }
 
+#[derive(Clone, Copy)]
+enum BootstrapSecretPosition {
+    MapEntry,
+    StructField,
+    ListStructField,
+}
+
+impl BootstrapSecretPosition {
+    fn attribute(self) -> &'static str {
+        match self {
+            Self::MapEntry => "tags",
+            Self::StructField => "settings",
+            Self::ListStructField => "rules",
+        }
+    }
+
+    fn desired_value(self, plaintext: &str) -> Value {
+        let fields = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "k".to_string(),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(string_value(plaintext)).into(),
+                )),
+            ),
+            ("public".to_string(), string_value("p")),
+        ])));
+        match self {
+            Self::ListStructField => Value::Concrete(ConcreteValue::List(vec![fields])),
+            Self::MapEntry | Self::StructField => fields,
+        }
+    }
+
+    fn encoded_fields(self, value: &serde_json::Value) -> &serde_json::Value {
+        match self {
+            Self::ListStructField => &value[0],
+            Self::MapEntry | Self::StructField => value,
+        }
+    }
+}
+
 fn bootstrap_bucket_schemas() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
+    let settings = PatternAttributeType::struct_(
+        "BootstrapSettings",
+        vec![
+            PatternStructField::optional("k", PatternAttributeType::string()).build(),
+            PatternStructField::optional("public", PatternAttributeType::string()).build(),
+        ],
+    );
     schemas.insert(
         "aws",
         (PatternResourceSchema::new("s3.Bucket")
@@ -7302,6 +7351,11 @@ fn bootstrap_bucket_schemas() -> SchemaRegistry {
                     PatternAttributeType::map(PatternAttributeType::string()),
                 )
                 .build(),
+            )
+            .attribute(PatternAttributeSchema::optional("settings", settings.clone()).build())
+            .attribute(
+                PatternAttributeSchema::optional("rules", PatternAttributeType::list(settings))
+                    .build(),
             )
             .attribute(
                 PatternAttributeSchema::optional("observed", PatternAttributeType::string())
@@ -7380,7 +7434,10 @@ async fn declared_state_bucket_bootstrap_success_seeds_protected_provider_state(
     );
 }
 
-async fn assert_bootstrap_secret_seed(behavior: BootstrapCreateBehavior) {
+async fn assert_bootstrap_secret_seed(
+    behavior: BootstrapCreateBehavior,
+    position: BootstrapSecretPosition,
+) {
     let plaintext = "bootstrap-authored-secret-4473-c8b47d2e";
     let attribute = match behavior {
         BootstrapCreateBehavior::IdentifierReported => "observed",
@@ -7406,18 +7463,7 @@ async fn assert_bootstrap_secret_seed(behavior: BootstrapCreateBehavior) {
             )),
         );
     if matches!(behavior, BootstrapCreateBehavior::Success) {
-        resource = resource.with_attribute(
-            "tags",
-            Value::Concrete(ConcreteValue::Map(IndexMap::from([
-                (
-                    "k".to_string(),
-                    Value::Deferred(DeferredValue::Secret(
-                        Box::new(string_value(plaintext)).into(),
-                    )),
-                ),
-                ("public".to_string(), string_value("p")),
-            ]))),
-        );
+        resource = resource.with_attribute(position.attribute(), position.desired_value(plaintext));
     }
     let outcome = bootstrap_declared_state_bucket_with_resource(
         crate::output_style::ColorMode::Plain,
@@ -7491,7 +7537,8 @@ async fn assert_bootstrap_secret_seed(behavior: BootstrapCreateBehavior) {
         "bootstrap secret hash must match the authored value"
     );
     if matches!(behavior, BootstrapCreateBehavior::Success) {
-        let marker = &attributes["tags"]["k"];
+        let fields = position.encoded_fields(&attributes[position.attribute()]);
+        let marker = &fields["k"];
         assert_eq!(marker.as_object().map(serde_json::Map::len), Some(1));
         let digest = marker["$secret"]
             .as_str()
@@ -7503,30 +7550,64 @@ async fn assert_bootstrap_secret_seed(behavior: BootstrapCreateBehavior) {
             "bootstrap nested secret hash must match the authored value"
         );
         assert!(
-            attributes["tags"]["public"].as_str() == Some("p"),
-            "bootstrap public map leaf must stay plain"
+            fields["public"].as_str() == Some("p"),
+            "bootstrap public sibling must stay plain"
         );
     }
 }
 
 #[tokio::test]
 async fn declared_state_bucket_bootstrap_does_not_write_authored_secret_plaintext() {
-    assert_bootstrap_secret_seed(BootstrapCreateBehavior::Success).await;
+    assert_bootstrap_secret_seed(
+        BootstrapCreateBehavior::Success,
+        BootstrapSecretPosition::MapEntry,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn bootstrap_struct_field_seed_retains_secret_hash() {
+    assert_bootstrap_secret_seed(
+        BootstrapCreateBehavior::Success,
+        BootstrapSecretPosition::StructField,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn bootstrap_list_struct_field_seed_retains_secret_hash() {
+    assert_bootstrap_secret_seed(
+        BootstrapCreateBehavior::Success,
+        BootstrapSecretPosition::ListStructField,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn bootstrap_partial_success_does_not_write_authored_secret_plaintext() {
-    assert_bootstrap_secret_seed(BootstrapCreateBehavior::PartialSuccess).await;
+    assert_bootstrap_secret_seed(
+        BootstrapCreateBehavior::PartialSuccess,
+        BootstrapSecretPosition::MapEntry,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn bootstrap_identified_failure_does_not_write_authored_secret_plaintext() {
-    assert_bootstrap_secret_seed(BootstrapCreateBehavior::IdentifierReported).await;
+    assert_bootstrap_secret_seed(
+        BootstrapCreateBehavior::IdentifierReported,
+        BootstrapSecretPosition::MapEntry,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn bootstrap_in_flight_seed_does_not_write_authored_secret_plaintext() {
-    assert_bootstrap_secret_seed(BootstrapCreateBehavior::InFlight).await;
+    assert_bootstrap_secret_seed(
+        BootstrapCreateBehavior::InFlight,
+        BootstrapSecretPosition::MapEntry,
+    )
+    .await;
 }
 
 #[tokio::test]

@@ -2823,8 +2823,9 @@ mod apply_state_save_tests {
         sent: carina_core::provider::Sent,
         attributes: &indexmap::IndexMap<String, Value>,
     ) -> carina_core::provider::InFlightCreate {
-        crate::fixture_in_flight_create(id, token, identifier, sent)
-            .with_desired_for_test(attributes)
+        let mut resource = Resource::from_id(id.clone());
+        resource.attributes = attributes.clone();
+        crate::fixture_in_flight_create_for_resource(resource, token, identifier, sent)
     }
 
     fn secret_string(value: &str) -> Value {
@@ -2842,7 +2843,9 @@ mod apply_state_save_tests {
         sent: carina_core::provider::Sent,
         desired: &indexmap::IndexMap<String, Value>,
     ) -> carina_core::provider::HostIdentifiedCreate {
-        crate::fixture_identified_create(id, attributes, sent).with_desired_for_test(desired)
+        let mut resource = Resource::from_id(id.clone());
+        resource.attributes = desired.clone();
+        crate::fixture_identified_create(resource, attributes, sent)
     }
 
     #[test]
@@ -4189,7 +4192,7 @@ mod apply_state_save_tests {
             value
                 .verify_secret(&material)
                 .expect("fixture secret material serializes"),
-            "secret hash did not match {plaintext:?}"
+            "secret hash did not match the fixture value"
         );
     }
 

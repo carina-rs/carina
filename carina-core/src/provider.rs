@@ -2836,14 +2836,11 @@ impl From<PendingCreate> for FreshPendingCreate<ProviderCreateRecord> {
 
 impl FreshPendingCreate {
     /// Desired values retained by this continuation, with send membership
-    /// expanded from the request's attribute names.
-    pub fn sent_desired_attributes<'a>(
-        &self,
-        request_attribute_names: impl IntoIterator<Item = &'a String>,
-    ) -> SentDesiredAttributes<'_> {
+    /// expanded from its retained writeback's attribute names.
+    pub fn sent_desired_attributes(&self) -> SentDesiredAttributes<'_> {
         SentDesiredAttributes::new(
             self.writeback.values().iter(),
-            SentAttributes::from_create_sent(&self.sent, request_attribute_names),
+            SentAttributes::from_create_sent(&self.sent, self.writeback.values().keys()),
         )
     }
 
@@ -3227,6 +3224,20 @@ impl std::fmt::Display for UnobservedReason<Bound> {
 /// A provider-reported identifier, its observation, and the accepted create's sent values.
 /// Provider records acquire the required [`SecretPreservingAttributes`] when
 /// dispatch converts them into [`HostIdentifiedCreate`] records.
+///
+/// Callers outside core cannot attach writeback to a provider-stage record.
+///
+/// ```compile_fail,E0624
+/// use carina_core::{
+///     binding_index::SecretPreservingAttributes,
+///     provider::{IdentifiedCreate, ProviderCreateRecord},
+///     provider_text::Unbound,
+/// };
+///
+/// fn forge(record: IdentifiedCreate<Unbound, ProviderCreateRecord>, writeback: SecretPreservingAttributes) {
+///     let _ = record.into_writeback(writeback);
+/// }
+/// ```
 #[derive(Debug)]
 pub struct IdentifiedCreate<S: TextState = Unbound, W = ProviderCreateRecord> {
     id: ResourceId,
@@ -3696,15 +3707,6 @@ impl<W> InFlightCreate<W> {
 
     fn into_provider_record(self) -> InFlightCreate<ProviderCreateRecord> {
         self.map_writeback(|_| ProviderCreateRecord)
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    #[doc(hidden)]
-    pub fn with_desired_for_test<'a, P: crate::resource::StateValueLeaf + 'a>(
-        self,
-        attributes: impl IntoIterator<Item = (&'a String, &'a Value<P>)>,
-    ) -> InFlightCreate {
-        self.map_writeback(|_| SecretPreservingAttributes::from_attributes_for_test(attributes))
     }
 
     /// Convert a continuation produced by a native provider or host adapter

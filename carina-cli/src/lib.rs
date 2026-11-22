@@ -372,12 +372,24 @@ impl carina_core::provider::Provider for FixtureCreateProvider {
         '_,
         Result<carina_core::provider::ResumeOutcome, carina_core::provider::ResumeFailure>,
     > {
+        let result = self
+            .result
+            .lock()
+            .expect("fixture create result lock is not poisoned")
+            .take()
+            .expect("fixture resume is dispatched once");
         Box::pin(async move {
-            let (resume, create_request) = request.into_parts();
-            drop(create_request);
+            let FixtureCreateResult::Pending { token, .. } = result else {
+                panic!("resume fixture must select a pending result");
+            };
+            let (resume, _request) = request.into_parts();
+            let repended = match resume {
+                carina_core::provider::Resume::Unissued(attempt) => attempt.repend(token),
+                carina_core::provider::Resume::Issued(resumed) => resumed.repend(token),
+            };
             Err(
-                resume.preserve(carina_core::provider::ProviderError::internal(
-                    "resume is not used by create fixtures",
+                repended.preserve(carina_core::provider::ProviderError::timeout(
+                    "fixture create remains in progress",
                 )),
             )
         })
@@ -438,7 +450,6 @@ fn dispatch_fixture_create(
     id: &carina_core::resource::ResourceId,
     result: FixtureCreateResult,
 ) -> carina_core::provider::HostCreateFailure {
-    let mut resource = carina_core::resource::Resource::from_id(id.clone());
     let sent = match &result {
         FixtureCreateResult::NotCreated { .. } | FixtureCreateResult::Unknown { .. } => {
             &carina_core::provider::Sent::AllRequestAttributes
@@ -447,6 +458,15 @@ fn dispatch_fixture_create(
             sent
         }
     };
+    dispatch_fixture_create_for_resource(fixture_create_resource(id, sent), result)
+}
+
+#[cfg(test)]
+fn fixture_create_resource(
+    id: &carina_core::resource::ResourceId,
+    sent: &carina_core::provider::Sent,
+) -> carina_core::resource::Resource {
+    let mut resource = carina_core::resource::Resource::from_id(id.clone());
     if let carina_core::provider::Sent::Only(names) = sent {
         for name in names {
             resource.set_attr(
@@ -457,6 +477,14 @@ fn dispatch_fixture_create(
             );
         }
     }
+    resource
+}
+
+#[cfg(test)]
+fn prepare_fixture_create(
+    resource: carina_core::resource::Resource,
+) -> carina_core::replacement::CreatePermit {
+    let id = resource.id.clone();
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let mut schemas = carina_core::schema::SchemaRegistry::new();
@@ -471,6 +499,18 @@ fn dispatch_fixture_create(
         );
     }
     schemas.insert(&id.provider, schema.validate().unwrap());
+    let graph = carina_core::resolved_graph::ExpandedBindingIndex::for_test_resources(
+        std::slice::from_ref(&resource),
+    )
+    .expect("fixture resource graph resolves");
+    let checked = graph
+        .initial_create_plan_for_test(resource, &schemas)
+        .expect("fixture initial create resolves")
+        .check_inputs_with_types(
+            &schemas,
+            &carina_core::input_rules::InputTypeContext::empty(),
+        )
+        .expect("fixture initial create inputs pass");
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
         |type_checks| {
@@ -482,23 +522,29 @@ fn dispatch_fixture_create(
                 &schemas,
                 type_checks,
             );
-            let request = block_on_ready(carina_core::executor::prepare_create_request(
-                resource,
+            block_on_ready(carina_core::executor::prepare_initial_create(
+                &checked,
                 &preparation,
             ))
-            .expect("fixture resource passes provider preparation");
-            let provider = FixtureCreateProvider {
-                result: std::sync::Mutex::new(Some(result)),
-            };
-            let provider = std::sync::Arc::new(provider);
-            let provider_boundary =
-                crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
-            let prepared = carina_core::replacement::create_permit_for_test(request);
-            let (create, _cancellation) =
-                carina_core::executor::dispatch_create(&provider_boundary, prepared);
-            block_on_ready(create).expect_err("fixture create returns a classified failure")
+            .expect("fixture resource passes provider preparation")
+            .expect("fixture create is ready")
         },
     )
+}
+
+#[cfg(test)]
+fn dispatch_fixture_create_for_resource(
+    resource: carina_core::resource::Resource,
+    result: FixtureCreateResult,
+) -> carina_core::provider::HostCreateFailure {
+    let prepared = prepare_fixture_create(resource);
+    let provider = FixtureCreateProvider {
+        result: std::sync::Mutex::new(Some(result)),
+    };
+    let provider_boundary = crate::provider_text_fixtures::boundary(Box::new(provider));
+    let (create, _cancellation) =
+        carina_core::executor::dispatch_create(&provider_boundary, prepared);
+    block_on_ready(create).expect_err("fixture create returns a classified failure")
 }
 
 #[cfg(test)]
@@ -522,8 +568,23 @@ pub(crate) fn fixture_in_flight_create(
     identifier: Option<&str>,
     sent: carina_core::provider::Sent,
 ) -> carina_core::provider::InFlightCreate {
-    let failure = dispatch_fixture_create(
-        id,
+    fixture_in_flight_create_for_resource(
+        fixture_create_resource(id, &sent),
+        token,
+        identifier,
+        sent,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_in_flight_create_for_resource(
+    resource: carina_core::resource::Resource,
+    token: impl Into<String>,
+    identifier: Option<&str>,
+    sent: carina_core::provider::Sent,
+) -> carina_core::provider::InFlightCreate {
+    let failure = dispatch_fixture_create_for_resource(
+        resource,
         FixtureCreateResult::Pending {
             token: carina_core::provider::PendingToken::new(token),
             identifier: identifier.map(fixture_applied_identifier),
@@ -549,73 +610,46 @@ pub(crate) fn fixture_in_flight_create(
 }
 
 #[cfg(test)]
-pub(crate) fn fixture_repend_in_flight_create<'a, P: carina_core::resource::StateValueLeaf + 'a>(
+pub(crate) fn fixture_repend_in_flight_create<'a>(
     pending: carina_core::provider::InFlightCreate,
     token: impl Into<String>,
-    desired_attributes: impl IntoIterator<Item = (&'a String, &'a carina_core::resource::Value<P>)>,
+    desired_attributes: impl IntoIterator<Item = (&'a String, &'a carina_core::resource::Value)>,
 ) -> carina_core::provider::InFlightCreate {
-    let id = pending.id().clone();
-    let bindings = carina_core::binding_index::ResolvedBindings::default();
-    let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let mut schemas = carina_core::schema::SchemaRegistry::new();
-    schemas.insert(
-        &id.provider,
-        carina_core::schema::PatternResourceSchema::new(&id.resource_type)
-            .validate()
-            .unwrap(),
-    );
-    carina_core::validation::deferred_types::with_session_for_test(
-        &carina_core::parser::LoadedProviderContext::empty_for_test(),
-        |type_checks| {
-            let preparation = carina_core::executor::ProviderPreparationContext::for_test(
-                &bindings,
-                &module_gate,
-                &[],
-                &carina_core::provider::NoopNormalizer,
-                &schemas,
-                type_checks,
-            );
-            let request = block_on_ready(carina_core::executor::prepare_create_request(
-                carina_core::resource::Resource::from_id(id),
-                &preparation,
-            ))
-            .expect("resume fixture resource passes provider preparation");
-            let request = carina_core::provider::ResumeCreateRequest::for_test(pending, request)
-                .expect("resume fixture route agrees with its checked request");
-            let (resume, _request) = request.into_parts();
-            let token = carina_core::provider::PendingToken::new(token);
-            let repended = match resume {
-                carina_core::provider::Resume::Unissued(attempt) => attempt.repend(token),
-                carina_core::provider::Resume::Issued(resumed) => resumed.repend(token),
-            };
-            let failure = repended.preserve(carina_core::provider::ProviderError::timeout(
-                "fixture create remains in progress",
-            ));
-            match failure.into_kind() {
-                carina_core::provider::ResumeFailureKind::InFlight {
-                    pending,
-                    error: _error,
-                } => pending.with_desired_for_test(desired_attributes),
-                carina_core::provider::ResumeFailureKind::IdentifierReported {
-                    identified: _identified,
-                    error,
-                } => panic!("re-pend fixture was classified identifier-reported: {error:?}"),
-                carina_core::provider::ResumeFailureKind::NoResource(error) => {
-                    panic!("re-pend fixture was classified no-resource: {error:?}")
-                }
-            }
-        },
-    )
+    let mut resource = carina_core::resource::Resource::from_id(pending.id().clone());
+    resource.attributes = desired_attributes
+        .into_iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let permit = prepare_fixture_create(resource);
+    let request = carina_core::provider::ResumeCreateRequest::new(pending, permit)
+        .expect("resume fixture route agrees with its checked request");
+    let provider = FixtureCreateProvider {
+        result: std::sync::Mutex::new(Some(FixtureCreateResult::Pending {
+            token: carina_core::provider::PendingToken::new(token),
+            identifier: None,
+            sent: carina_core::provider::Sent::AllRequestAttributes,
+        })),
+    };
+    let provider_boundary = crate::provider_text_fixtures::boundary(Box::new(provider));
+    let failure = block_on_ready(carina_core::executor::dispatch_resume_create(
+        &provider_boundary,
+        request,
+    ))
+    .expect_err("fixture resume returns a classified failure");
+    match failure.into_kind() {
+        carina_core::provider::ResumeFailureKind::InFlight { pending, .. } => pending,
+        _ => panic!("re-pend fixture must retain its continuation"),
+    }
 }
 
 #[cfg(test)]
 pub(crate) fn fixture_identified_create(
-    id: &carina_core::resource::ResourceId,
+    resource: carina_core::resource::Resource,
     attributes: std::collections::HashMap<String, carina_core::resource::Value>,
     sent: carina_core::provider::Sent,
 ) -> carina_core::provider::HostIdentifiedCreate {
-    let failure = dispatch_fixture_create(
-        id,
+    let failure = dispatch_fixture_create_for_resource(
+        resource,
         FixtureCreateResult::Observed {
             identifier: fixture_applied_identifier("created-id"),
             attributes,

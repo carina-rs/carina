@@ -53,7 +53,6 @@ pub(super) enum BasicEffectResult {
     Success {
         completed: CompletedEffect,
         resource_id: ResourceId,
-        resolved_attrs: Option<SecretPreservingAttributes>,
         binding: Option<AbsoluteBindingAddress>,
     },
     PartialSuccess {
@@ -61,7 +60,6 @@ pub(super) enum BasicEffectResult {
         resource_id: ResourceId,
         diagnostic: HostPartialReadDiagnostic,
         read_back_end: ReadBackEnd,
-        resolved_attrs: Option<SecretPreservingAttributes>,
         binding: Option<AbsoluteBindingAddress>,
     },
     Failure {
@@ -71,13 +69,11 @@ pub(super) enum BasicEffectResult {
     ResumeSuccess {
         completed: HostCompletedResume,
         resource_id: ResourceId,
-        resolved_attrs: SecretPreservingAttributes,
         binding: Option<AbsoluteBindingAddress>,
     },
     ResumePartialSuccess {
         partial: HostPartialResume,
         resource_id: ResourceId,
-        resolved_attrs: SecretPreservingAttributes,
         binding: Option<AbsoluteBindingAddress>,
     },
     ClassifiedFailure {
@@ -788,21 +784,18 @@ pub(super) fn process_basic_result<S: Clone>(
         BasicEffectResult::Success {
             completed,
             resource_id,
-            resolved_attrs,
             binding,
         } => {
             started.succeeded(Some(&completed.state), duration);
             let CompletedEffect { state, request } = completed;
             exec.accumulator.mutate(|accumulated| {
                 accumulated.success_count += 1;
-                if let Some(attrs) = &resolved_attrs {
-                    accumulated.bindings.record_applied(
-                        binding.as_ref().map(|binding| binding.as_str()),
-                        attrs,
-                        &state,
-                        BindingCompleteness::Complete,
-                    );
-                }
+                accumulated.bindings.record_applied(
+                    binding.as_ref().map(|binding| binding.as_str()),
+                    request.resolved_desired_attributes(),
+                    &state,
+                    BindingCompleteness::Complete,
+                );
             });
             let state = *state;
             exec.accumulator.insert_published(
@@ -826,23 +819,23 @@ pub(super) fn process_basic_result<S: Clone>(
         BasicEffectResult::ResumeSuccess {
             completed,
             resource_id,
-            resolved_attrs,
             binding,
         } => {
-            let state = completed.observed_state();
+            let created = completed.into_identified_create();
+            let state = created.observed_state();
             started.succeeded(Some(&state), duration);
             exec.accumulator.mutate(|accumulated| {
                 accumulated.success_count += 1;
                 accumulated.bindings.record_applied(
                     binding.as_ref().map(|binding| binding.as_str()),
-                    &resolved_attrs,
+                    created.resolved_desired_attributes(),
                     &state,
                     BindingCompleteness::Complete,
                 );
             });
             exec.accumulator.insert_published(
                 resource_id,
-                Applied::Observed(std::sync::Arc::new(completed.into_identified_create())),
+                Applied::Observed(std::sync::Arc::new(created)),
                 &state,
             );
             BasicEffectCompletion::Succeeded
@@ -850,7 +843,6 @@ pub(super) fn process_basic_result<S: Clone>(
         BasicEffectResult::ResumePartialSuccess {
             partial,
             resource_id,
-            resolved_attrs,
             binding,
         } => {
             let (created, state, diagnostic, read_back_end) = partial.into_parts();
@@ -865,7 +857,7 @@ pub(super) fn process_basic_result<S: Clone>(
                 accumulated.partial_count += 1;
                 accumulated.bindings.record_applied(
                     binding.as_ref().map(|binding| binding.as_str()),
-                    &resolved_attrs,
+                    created.resolved_desired_attributes(),
                     &state,
                     completeness,
                 );
@@ -896,7 +888,6 @@ pub(super) fn process_basic_result<S: Clone>(
             resource_id,
             diagnostic,
             read_back_end,
-            resolved_attrs,
             binding,
         } => {
             started.partially_succeeded(&state, &diagnostic, duration);
@@ -909,14 +900,12 @@ pub(super) fn process_basic_result<S: Clone>(
             );
             exec.accumulator.mutate(|accumulated| {
                 accumulated.partial_count += 1;
-                if let Some(attrs) = &resolved_attrs {
-                    accumulated.bindings.record_applied(
-                        binding.as_ref().map(|binding| binding.as_str()),
-                        attrs,
-                        &state,
-                        completeness,
-                    );
-                }
+                accumulated.bindings.record_applied(
+                    binding.as_ref().map(|binding| binding.as_str()),
+                    request.resolved_desired_attributes(),
+                    &state,
+                    completeness,
+                );
                 accumulated
                     .partial_diagnostics
                     .push((resource_id.clone(), diagnostic));
@@ -1197,7 +1186,6 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
                     read_back_end,
                     ..
                 }) => {
-                    let resolved_attrs = request.resolved_desired_attributes().clone();
                     if let Some(diagnostic) = diagnostic {
                         BasicEffectResult::PartialSuccess {
                             completed: CompletedEffect {
@@ -1207,7 +1195,6 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
                             resource_id: resource.id.clone(),
                             diagnostic,
                             read_back_end,
-                            resolved_attrs: Some(resolved_attrs),
                             binding: resource.binding.clone(),
                         }
                     } else {
@@ -1217,7 +1204,6 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
                                 request,
                             },
                             resource_id: resource.id.clone(),
-                            resolved_attrs: Some(resolved_attrs),
                             binding: resource.binding.clone(),
                         }
                     }
@@ -1279,7 +1265,6 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
                     );
                 }
             };
-            let resolved_attrs = accepted_request.resolved_desired_attributes().clone();
             let outcome = match request {
                 PreparedResume::Resend(request) => {
                     super::dispatch_resume_create(provider, request).await
@@ -1292,7 +1277,6 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
                 Ok(HostResumeOutcomeKind::Resumed(completed)) => BasicEffectResult::ResumeSuccess {
                     completed: *completed,
                     resource_id: resource.id.clone(),
-                    resolved_attrs,
                     binding: resource.binding.clone(),
                 },
                 Ok(HostResumeOutcomeKind::PartialSuccess(partial)) => {
@@ -1300,7 +1284,6 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
                     BasicEffectResult::ResumePartialSuccess {
                         partial,
                         resource_id: resource.id.clone(),
-                        resolved_attrs,
                         binding: resource.binding.clone(),
                     }
                 }
@@ -1316,7 +1299,6 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
                             resource_id: resource.id.clone(),
                             diagnostic,
                             read_back_end,
-                            resolved_attrs: Some(resolved_attrs),
                             binding: resource.binding.clone(),
                         }
                     } else {
@@ -1326,7 +1308,6 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
                                 request,
                             },
                             resource_id: resource.id.clone(),
-                            resolved_attrs: Some(resolved_attrs),
                             binding: resource.binding.clone(),
                         }
                     }
@@ -1373,11 +1354,7 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
             let PreparedBasicRequest::Update(write) = prepared else {
                 unreachable!("prepared update variant")
             };
-            let resolved_desired_attributes = write.writeback().clone();
-            let accepted_request = AcceptedRequest::from_update_request(
-                write.request(),
-                resolved_desired_attributes.clone(),
-            );
+            let accepted_request = AcceptedRequest::from_update_request(&write);
             match super::dispatch_update(provider, update.authorize(write)).await {
                 Ok(outcome) => {
                     let diagnostic = outcome.diagnostic().cloned();
@@ -1392,7 +1369,6 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
                             resource_id: id.clone(),
                             diagnostic,
                             read_back_end,
-                            resolved_attrs: Some(resolved_desired_attributes),
                             binding: to.binding.clone(),
                         }
                     } else {
@@ -1402,7 +1378,6 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
                                 request: accepted_request,
                             },
                             resource_id: id.clone(),
-                            resolved_attrs: Some(resolved_desired_attributes),
                             binding: to.binding.clone(),
                         }
                     }
@@ -1542,10 +1517,6 @@ mod process_basic_result_tests {
             pending_refreshes: &mut pending_refreshes,
         };
 
-        let resolved_attrs = SecretPreservingAttributes::from_provider_values::<
-            crate::resource::NoPlaceholder,
-            crate::resource::NoPlaceholder,
-        >(&HashMap::new(), &HashMap::new());
         let effect = Effect::Create(crate::resource::ResolvedResource::new(
             resource.into_value_snapshot(),
         ));
@@ -1564,7 +1535,6 @@ mod process_basic_result_tests {
                     resource_id: id.clone(),
                     diagnostic: diagnostic.clone(),
                     read_back_end: ReadBackEnd::ProviderReported,
-                    resolved_attrs: Some(resolved_attrs),
                     binding: Some(crate::resource::absolute_binding_address_for_test(
                         "upstream",
                     )),
@@ -1663,10 +1633,6 @@ mod process_basic_result_tests {
                 resource_id: id,
                 diagnostic: diagnostic.clone(),
                 read_back_end: ReadBackEnd::ProviderReported,
-                resolved_attrs: Some(SecretPreservingAttributes::from_provider_values::<
-                    crate::resource::NoPlaceholder,
-                    crate::resource::NoPlaceholder,
-                >(&HashMap::new(), &HashMap::new())),
                 binding: Some(crate::resource::absolute_binding_address_for_test("source")),
             },
             &mut exec,
@@ -1722,10 +1688,6 @@ mod process_basic_result_tests {
                 resource_id: id,
                 diagnostic,
                 read_back_end: ReadBackEnd::ProviderReported,
-                resolved_attrs: Some(SecretPreservingAttributes::from_provider_values::<
-                    crate::resource::NoPlaceholder,
-                    crate::resource::NoPlaceholder,
-                >(&HashMap::new(), &HashMap::new())),
                 binding: Some(crate::resource::absolute_binding_address_for_test("source")),
             },
             &mut exec,
@@ -1783,7 +1745,6 @@ mod process_basic_result_tests {
                 resource_id: id,
                 diagnostic,
                 read_back_end: ReadBackEnd::ProviderReported,
-                resolved_attrs: None,
                 binding: None,
             },
             &mut exec,
