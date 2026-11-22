@@ -1306,6 +1306,12 @@ impl<'a, E, D, B: BindingAddress> JudgedFile<'a, E, D, B> {
     pub fn schemas(&self) -> &'a crate::schema::SchemaRegistry {
         self.schemas
     }
+    pub fn has_user_functions(&self) -> bool {
+        self.report()
+            .syntax_nodes
+            .values()
+            .any(|node| matches!(node.kind, ExprKind::Function { .. }))
+    }
     /// Check unknown function-boundary values using the completed source index.
     /// The authored judge has already typed each body with declared parameters.
     pub fn function_type_promise_findings(
@@ -1315,24 +1321,20 @@ impl<'a, E, D, B: BindingAddress> JudgedFile<'a, E, D, B> {
     where
         D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
+        if !self.has_user_functions() {
+            return Vec::new();
+        }
         let values = crate::binding_index::ResolvedBindings::<ParserPlaceholder>::build_validation(
             &self.file,
             Clone::clone,
             Clone::clone,
         );
-        let mut findings = self.report().function_findings().to_vec();
-        for finding in function_promises::check(
+        function_promises::check(
             self.file.parser_binding_metadata.syntax().expressions(),
             self.report(),
             bindings,
             &values,
-            true,
-        ) {
-            if !findings.contains(&finding.diagnostic) {
-                findings.push(finding.diagnostic);
-            }
-        }
-        findings
+        )
     }
     pub(crate) fn into_file(self) -> super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
         self.file
@@ -1362,16 +1364,8 @@ where
         schemas: &'a crate::schema::SchemaRegistry,
         config: &super::ProviderContext,
     ) -> Self {
-        Self::new_with_function_bindings(file, schemas, config, None)
-    }
-
-    pub(crate) fn new_with_function_bindings(
-        mut file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-        schemas: &'a crate::schema::SchemaRegistry,
-        config: &super::ProviderContext,
-        bindings: Option<&crate::binding_index::BindingIndex<'_, B>>,
-    ) -> Self {
-        judge_configuration_in(&mut file, schemas, config, bindings);
+        let mut file = file;
+        judge_configuration(&mut file, schemas, config);
         Self {
             file,
             schemas,
@@ -1401,35 +1395,8 @@ pub(crate) fn judge_configuration<
 ) where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    judge_configuration_in(file, schemas, config, None);
-}
-
-fn judge_configuration_in<E: super::ExportParamLike<ParserPlaceholder, B>, D, B: BindingAddress>(
-    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-    schemas: &crate::schema::SchemaRegistry,
-    config: &super::ProviderContext,
-    function_bindings: Option<&crate::binding_index::BindingIndex<'_, B>>,
-) where
-    D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-{
     prepare_slots(file, schemas);
-    let inferred = function_bindings
-        .is_none()
-        .then(|| crate::binding_index::BindingIndex::from_parsed(file, schemas, config));
-    let bindings = function_bindings
-        .or(inferred.as_ref())
-        .expect("function source index");
-    let values = crate::binding_index::ResolvedBindings::<ParserPlaceholder>::build_validation(
-        file,
-        Clone::clone,
-        Clone::clone,
-    );
-    let mut report = judgement::judge_expressions_with_bindings(
-        file,
-        schemas,
-        config,
-        Some((bindings, &values, function_bindings.is_some())),
-    );
+    let mut report = judgement::judge_expressions(file, schemas, config);
     for parameter in &file.export_params {
         if let (Some(sink), Some(location)) =
             (parameter.type_expr_opt(), parameter.value_location())
@@ -3859,6 +3826,14 @@ mod judgement {
                     }
                 )
         }
+        pub(crate) fn known_empty_collection(&self) -> bool {
+            self.concrete()
+                && matches!(self.value_shape(), Some(ValueShape::List | ValueShape::Map))
+                && self.elements.is_empty()
+                && self.fields.is_empty()
+                && self.member.is_none()
+                && self.alternatives.is_empty()
+        }
         fn failed(&self) -> bool {
             self.failure().is_some()
         }
@@ -5461,92 +5436,6 @@ mod judgement {
         pub fn findings(&self) -> &[Located<InferenceError>] {
             &self.findings
         }
-        pub(super) fn function_findings(&self) -> &[Located<InferenceError>] {
-            &self.function_errors
-        }
-        /// Keep a rejected call invalid in aliases and containing expressions,
-        /// just as a rejection discovered during the authored walk would be.
-        pub(super) fn record_function_promises(
-            &mut self,
-            findings: Vec<super::function_promises::Finding>,
-            bindings: &crate::binding_index::BindingIndex<'_, B>,
-        ) {
-            if findings.is_empty() {
-                return;
-            }
-            let mut failures = HashMap::new();
-            for finding in findings {
-                failures
-                    .entry(finding.node)
-                    .or_insert_with(|| finding.diagnostic.clone());
-                if !self.findings.contains(&finding.diagnostic) {
-                    Arc::make_mut(&mut self.findings).push(finding.diagnostic.clone());
-                }
-                if !self.function_errors.contains(&finding.diagnostic) {
-                    Arc::make_mut(&mut self.function_errors).push(finding.diagnostic);
-                }
-            }
-            // The authored judge records nodes after their syntax/binding
-            // dependencies. Reuse that order; no body is judged a second time.
-            for (key, node) in self.syntax_nodes.iter() {
-                let inherited = node
-                    .children
-                    .iter()
-                    .find_map(|child| {
-                        failures
-                            .get(&(child.authored.location.instance.clone(), child.node_id()))
-                            .cloned()
-                    })
-                    .or_else(|| {
-                        let binding = match &node.kind {
-                            ExprKind::Binding(binding) => binding,
-                            ExprKind::Reference { binding, .. }
-                                if !bindings.is_declared(binding.as_str()) =>
-                            {
-                                binding
-                            }
-                            _ => return None,
-                        };
-                        let definition = self.definitions.get(binding)?;
-                        failures
-                            .get(&(
-                                definition.authored.location.instance.clone(),
-                                definition.node_id(),
-                            ))
-                            .cloned()
-                    });
-                if let Some(finding) = inherited {
-                    failures.entry(key.clone()).or_insert(finding);
-                }
-            }
-            let reject = |expression: &mut JudgedExpr, finding: &Located<InferenceError>| {
-                expression.mark_failed(finding.detail().clone(), FailureOwner::Reported);
-                expression.data_mut().boundary_owner = Some(Arc::new(finding.location().clone()));
-            };
-            #[allow(clippy::iter_over_hash_type)]
-            // commutative: copy failures to independent entries without emitting diagnostics.
-            for (key, finding) in &failures {
-                if let Some(expression) = Arc::make_mut(&mut self.nodes).get_mut(key) {
-                    reject(expression, finding);
-                }
-                if let Some(node) = self.syntax_nodes.get(key)
-                    && let Some(expression) =
-                        Arc::make_mut(&mut self.expressions).get_mut(&node.location)
-                {
-                    reject(expression, finding);
-                }
-            }
-            for (name, expression) in Arc::make_mut(&mut self.bindings) {
-                if let Some(definition) = self.definitions.get(name)
-                    && let Some(finding) = failures.get(&(
-                        definition.authored.location.instance.clone(),
-                        definition.node_id(),
-                    ))
-                {
-                    reject(expression, finding);
-                }
-            }
-        }
         pub(crate) fn first_function_error(&self) -> Option<super::super::ParseError> {
             first_error(&self.function_errors)
         }
@@ -5556,16 +5445,13 @@ mod judgement {
     }
 
     fn first_error(findings: &[Located<InferenceError>]) -> Option<super::super::ParseError> {
-        findings
-            .iter()
-            .find(|finding| !finding.detail().is_function_type_promise())
-            .map(|finding| {
-                super::super::ParseError::InvalidExpression {
-                    line: finding.location().span().start_line(),
-                    message: finding.detail().to_string(),
-                }
-                .at(finding.location())
-            })
+        findings.first().map(|finding| {
+            super::super::ParseError::InvalidExpression {
+                line: finding.location().span().start_line(),
+                message: finding.detail().to_string(),
+            }
+            .at(finding.location())
+        })
     }
 
     pub fn judge_expressions<
@@ -5578,28 +5464,6 @@ mod judgement {
         file: &super::super::File<E, P, T, D, B>,
         schemas: &crate::schema::SchemaRegistry,
         config: &super::super::ProviderContext,
-    ) -> ExpressionReport<B>
-    where
-        D: super::super::DeferredForPhaseTraversal<P, T, B>,
-    {
-        judge_expressions_with_bindings(file, schemas, config, None)
-    }
-
-    pub(super) fn judge_expressions_with_bindings<
-        E,
-        P: crate::resource::PlaceholderKind,
-        T: crate::resource::PlaceholderKind,
-        D,
-        B: BindingAddress,
-    >(
-        file: &super::super::File<E, P, T, D, B>,
-        schemas: &crate::schema::SchemaRegistry,
-        config: &super::super::ProviderContext,
-        function_bindings: Option<(
-            &crate::binding_index::BindingIndex<'_, B>,
-            &crate::binding_index::ResolvedBindings<ParserPlaceholder, B>,
-            bool,
-        )>,
     ) -> ExpressionReport<B>
     where
         D: super::super::DeferredForPhaseTraversal<P, T, B>,
@@ -5798,17 +5662,6 @@ mod judgement {
                 root.environment = environment.clone();
                 root
             }));
-        }
-        // Record failures once before resource snapshots share this evidence.
-        if let Some((bindings, values, complete_sources)) = function_bindings {
-            let promises = super::function_promises::check(
-                expressions,
-                &report,
-                bindings,
-                values,
-                complete_sources,
-            );
-            report.record_function_promises(promises, bindings);
         }
         let mut snapshots = HashMap::new();
         for (id, previous) in expressions.report.resource_reports.iter() {

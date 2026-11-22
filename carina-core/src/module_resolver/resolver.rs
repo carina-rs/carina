@@ -367,7 +367,10 @@ impl ResidualModuleResolutionError {
                 .any(|error| match error {
                     crate::validation::ExpansionBoundaryReferenceError::ModuleCall(_error) => true,
                     crate::validation::ExpansionBoundaryReferenceError::Attribute(_message)
-                    | crate::validation::ExpansionBoundaryReferenceError::Export(_message) => false,
+                    | crate::validation::ExpansionBoundaryReferenceError::Export(_message)
+                    | crate::validation::ExpansionBoundaryReferenceError::Function(_message) => {
+                        false
+                    }
                 })
                 .then_some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::UnknownArgument {

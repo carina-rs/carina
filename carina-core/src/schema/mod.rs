@@ -4338,6 +4338,18 @@ impl KnownAssignment<'_, '_> {
 }
 
 impl<'source, R: PatternForm> TypeInSchema<'source, R> {
+    pub(crate) fn iterable_element(self) -> Option<Self> {
+        let attr = match self.attr.shape_with_defs(self.defs) {
+            Shape::List { element_type, .. } => element_type,
+            Shape::Map { value, .. } => value,
+            _ => return None,
+        };
+        Some(Self {
+            attr,
+            defs: self.defs,
+        })
+    }
+
     /// Borrow the source declaration after resolving its own definition scope.
     pub(crate) fn resolve(self) -> Result<ResolvedAttrType<'source, R>, TypeError> {
         resolve_refs_on_path(self.attr, self.defs, &mut Vec::new())

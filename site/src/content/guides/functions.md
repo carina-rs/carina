@@ -160,7 +160,7 @@ or typed parameters in nested calls.
 Calls inside a function body use the enclosing function's declared parameter
 types, once per declaration. A non-proving nested call is reported at each outer
 call whose relevant argument is unknown. An unused outer function does not
-trigger that rule-3 finding.
+trigger that validation error.
 
 Inside a module, unknown arguments use the types declared in that module's
 `arguments` block. For example, `env: 'dev' | 'prod'` proves `pick(env)` fits the

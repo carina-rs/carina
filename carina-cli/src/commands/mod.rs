@@ -774,6 +774,54 @@ impl ValidationStopped {
     }
 }
 
+fn complete_function_promises<E, D, B: BindingAddress>(
+    file: &carina_core::parser::File<
+        E,
+        carina_core::resource::ParserPlaceholder,
+        carina_core::resource::ParserPlaceholder,
+        D,
+        B,
+    >,
+    base_dir: &ResolvedPath,
+    ctx: &WiringContext,
+    context: &ValidationProviderCatalog,
+    signatures: &module_resolver::ResolvedModuleSignatures,
+) -> Result<
+    Vec<carina_core::parser::Located<carina_core::static_type::InferenceError>>,
+    carina_core::parser::AnalysisTreeError,
+>
+where
+    E: Clone + carina_core::parser::ExportParamLike<carina_core::resource::ParserPlaceholder, B>,
+    D: Clone
+        + carina_core::parser::DeferredForPhaseTraversal<
+            carina_core::resource::ParserPlaceholder,
+            carina_core::resource::ParserPlaceholder,
+            B,
+        >,
+{
+    let configuration = carina_core::config_loader::load_buffer_configuration(
+        file,
+        ctx.schemas(),
+        context.catalog(),
+    );
+    if !configuration.judged().has_user_functions() {
+        return Ok(Vec::new());
+    }
+    let tree = carina_core::parser::AnalysisTree::try_from_file(file)?;
+    let (upstream, _) = carina_core::upstream_exports::resolve_upstream_exports_report(
+        base_dir,
+        &tree,
+        context,
+        Some(ctx.schemas()),
+    )?;
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+        file, ctx.schemas(), Some(&upstream), signatures, context,
+    );
+    Ok(configuration
+        .judged()
+        .function_type_promise_findings(&bindings))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_and_resolve_configuration<'s>(
     access: &crate::wiring::ValidationPipelineAccess,
@@ -1040,10 +1088,9 @@ fn validate_and_resolve_configuration<'s>(
 
     // Independent root failures still collect expanded secrecy findings. The
     // resolver and its conversion channel are consumed once on either path.
-    // A function promise is already reported, but must not hide independent
-    // resource schema findings by stopping successful expansion here.
-    let blocks_expansion = |error: &AppError| !matches!(error, AppError::ExpressionType(finding) if finding.detail().is_function_type_promise());
-    let had_ordinary_failure = errors.ordinary_failure_where(blocks_expansion).is_some();
+    // Promise findings must not stop later independent validation checks.
+    let stops_validation = |error: &AppError| !matches!(error, AppError::ExpressionType(finding) if finding.detail().is_function_type_promise());
+    let had_ordinary_failure = errors.ordinary_failure_where(stops_validation).is_some();
     if had_ordinary_failure {
         // Dependency diagnostics are independent of unrelated argument-type
         // failures. The per-argument report preserves every sound result even
@@ -1092,6 +1139,35 @@ fn validate_and_resolve_configuration<'s>(
         extend_secrecy_errors(secrecy_errors, configuration.judged().secrecy());
         errors.include_file(graph);
     }
+    // The completed module graph (or the complete root index on failure) owns
+    // promise diagnostics. They are collected before ordinary errors can stop
+    // validation, and never enter the authored expression report.
+    let promises = match &module_resolution {
+        module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
+            complete_function_promises(
+                graph,
+                base_dir,
+                ctx,
+                enriched_context,
+                &imported_module_signatures,
+            )
+        }
+        _ => complete_function_promises(
+            parsed.parsed(),
+            base_dir,
+            ctx,
+            enriched_context,
+            &imported_module_signatures,
+        ),
+    };
+    match promises {
+        Ok(findings) => errors.extend(
+            findings
+                .into_iter()
+                .map(|finding| AppError::ExpressionType(Box::new(finding))),
+        ),
+        Err(error) => errors.push(AppError::AnalysisInvariant(error)),
+    }
     if had_ordinary_failure {
         extend_module_call_errors(errors, authored_module_call_findings);
         return Err(ValidationStopped::existing(errors));
@@ -1107,7 +1183,7 @@ fn validate_and_resolve_configuration<'s>(
                 })?
                 .clone();
             extend_module_call_errors(errors, authored_module_call_findings);
-            if errors.ordinary_failure_where(blocks_expansion).is_some() {
+            if errors.ordinary_failure_where(stops_validation).is_some() {
                 return Err(ValidationStopped::existing(errors));
             }
             *graph
@@ -1322,20 +1398,7 @@ fn validate_and_resolve_configuration<'s>(
     );
     let configuration = resolved_config
         .canonicalized()
-        .judge_with_function_bindings(enriched_context.catalog(), &bindings);
-    let promise_findings = configuration
-        .judged()
-        .function_type_promise_findings(&bindings);
-    for finding in promise_findings {
-        if !errors.client_findings().any(|error| {
-            matches!(error, AppError::ExpressionType(existing)
-                if existing.detail() == finding.detail()
-                    && existing.location().file().path() == finding.location().file().path()
-                    && existing.location().span() == finding.location().span())
-        }) {
-            errors.push(AppError::ExpressionType(Box::new(finding)));
-        }
-    }
+        .judge(enriched_context.catalog());
     if let Err(ref_errors) = carina_core::validation::validate_export_param_ref_types_with_bindings(
         parsed.export_params,
         &bindings,
@@ -1430,7 +1493,7 @@ fn validate_and_resolve_configuration<'s>(
                     }),
             );
         }
-        if errors.ordinary_failure().is_some() {
+        if errors.ordinary_failure_where(stops_validation).is_some() {
             return Err(ValidationStopped::existing(errors));
         }
     }
@@ -1459,7 +1522,7 @@ fn validate_and_resolve_configuration<'s>(
     );
     // Downstream plan code assumes every resource has a stable id, so any
     // identity or move-target error must stop the pipeline here.
-    if errors.ordinary_failure().is_some() {
+    if errors.ordinary_failure_where(stops_validation).is_some() {
         return Err(ValidationStopped::existing(errors));
     }
 

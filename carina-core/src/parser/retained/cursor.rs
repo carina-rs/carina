@@ -1002,21 +1002,6 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
         }
     }
 
-    /// The call already owns this ordinary failure. Carried conversions still
-    /// require their value walk, independently of the function finding.
-    pub(crate) fn reported_function_promise(&self) -> bool {
-        let source = match &self.kind {
-            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => usage.node().judgement(),
-            CursorKind::Projected(ProjectionAuthority::Validation(ValidationProjection {
-                source: ValidationSource::Judged(source),
-            })) => source,
-            CursorKind::Projected(_) => return false,
-        };
-        source.no_conversion().is_some()
-            && source.check_owner() == super::ExpressionCheckOwner::Reported
-            && matches!(source.static_type(),
-                Err(crate::static_type::InferenceIssue::Failed(error)) if error.is_function_type_promise())
-    }
     pub(crate) fn covered_by(usage: AuthoredUse<'s, B>) -> Self {
         Self {
             kind: CursorKind::CoveredBy(usage),

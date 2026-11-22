@@ -296,31 +296,8 @@ where
         &self,
         context: &ProviderContext,
     ) -> PrefixCanonicalized<'s, JudgedFile<'s, X, D, B>> {
-        self.judge_in(context, None)
-    }
-
-    /// Record completed function findings before resource evidence is shared,
-    /// so admission retains the authored call's diagnostic ownership.
-    pub fn judge_with_function_bindings(
-        &self,
-        context: &ProviderContext,
-        bindings: &crate::binding_index::BindingIndex<'_, B>,
-    ) -> PrefixCanonicalized<'s, JudgedFile<'s, X, D, B>> {
-        self.judge_in(context, Some(bindings))
-    }
-
-    fn judge_in(
-        &self,
-        context: &ProviderContext,
-        bindings: Option<&crate::binding_index::BindingIndex<'_, B>>,
-    ) -> PrefixCanonicalized<'s, JudgedFile<'s, X, D, B>> {
         PrefixCanonicalized {
-            file: JudgedFile::new_with_function_bindings(
-                self.file.clone(),
-                self.schemas,
-                context,
-                bindings,
-            ),
+            file: JudgedFile::new(self.file.clone(), self.schemas, context),
             schemas: self.schemas,
             errors: self.errors.clone(),
             visits: self.visits.clone(),

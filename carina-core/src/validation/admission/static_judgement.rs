@@ -5,18 +5,18 @@ use crate::binding_index::{BindingIndex, ResolvedRefType};
 use crate::parser::{ProviderContext, TypeExpr};
 use crate::resource::BindingAddress;
 use crate::schema::{
-    MismatchTypeNames, TypeInSchema,
+    TypeInSchema,
     assignability::{AssignmentRelation, ReferenceAssignment},
 };
-use crate::static_type::StaticTypeResolutionError;
 
 pub(crate) enum StaticAssignmentSource<'a> {
     Reference(&'a ResolvedRefType),
+    Element(&'a ResolvedRefType),
     Expression(&'a TypeExpr),
+    Judged(&'a crate::parser::retained::JudgedExpr),
     /// Authored interpolation or a string-producing builtin, without identity evidence.
     ComputedString,
     Unknown,
-    SchemaUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,8 +28,8 @@ pub(crate) enum StaticAssignmentVerdict {
 
 #[derive(Debug)]
 pub(crate) enum StaticAssignmentError {
-    Mismatch(MismatchTypeNames),
-    Resolution(StaticTypeResolutionError),
+    Mismatch,
+    Resolution,
 }
 
 pub(crate) fn type_needs_schema(ty: &TypeExpr, config: &ProviderContext) -> bool {
@@ -58,31 +58,84 @@ pub(crate) fn judge_static_assignment<B: BindingAddress>(
     use StaticAssignmentError::{Mismatch, Resolution};
     use StaticAssignmentVerdict::{NeedsLocal, NeedsSchema};
     let config = bindings.provider_context();
-    if matches!(source, StaticAssignmentSource::SchemaUnavailable)
-        || type_needs_schema(expected, config)
-    {
+    if type_needs_schema(expected, config) {
         return Ok(NeedsSchema);
     }
-    let expected = super::super::resolve_type_expr(expected, config).map_err(Resolution)?;
+    let expected = super::super::resolve_type_expr(expected, config).map_err(|_| Resolution)?;
+    if let StaticAssignmentSource::Judged(expression) = source {
+        let children: Vec<_> = match &expected {
+            TypeExpr::Struct { fields } if expression.fields().next().is_some() => {
+                let mut children = Vec::new();
+                for (name, ty) in fields {
+                    let Ok(field) = expression.field(name) else {
+                        return Ok(NeedsLocal);
+                    };
+                    children.push((field, ty));
+                }
+                children
+            }
+            TypeExpr::List(ty) if expression.elements().next().is_some() => expression
+                .elements()
+                .map(|field| (field, ty.as_ref()))
+                .collect(),
+            TypeExpr::Map(ty) if expression.fields().next().is_some() => expression
+                .fields()
+                .map(|(_, field)| (field, ty.as_ref()))
+                .collect(),
+            _ => {
+                return judge_static_assignment(
+                    match expression.static_type() {
+                        Ok(TypeExpr::String)
+                            if expression
+                                .for_sink(&TypeExpr::String, config)
+                                .is_single_string_construction() =>
+                        {
+                            StaticAssignmentSource::ComputedString
+                        }
+                        Ok(ty) => StaticAssignmentSource::Expression(ty),
+                        Err(_) => StaticAssignmentSource::Unknown,
+                    },
+                    &expected,
+                    bindings,
+                );
+            }
+        };
+        let mut verdict = StaticAssignmentVerdict::Proven;
+        for (field, ty) in children {
+            match judge_static_assignment(StaticAssignmentSource::Judged(field), ty, bindings)? {
+                NeedsSchema => return Ok(NeedsSchema),
+                NeedsLocal => verdict = NeedsLocal,
+                StaticAssignmentVerdict::Proven => {}
+            }
+        }
+        return Ok(verdict);
+    }
     let constructed_string_sink = expected.is_string_shaped() && expected != TypeExpr::String;
     let Some(expected) = super::super::lift_type_expr(&expected) else {
         return Ok(NeedsLocal);
     };
     let sink = expected.assignment_sink(&config.custom_types);
-    let (relation, types) = match source {
-        StaticAssignmentSource::Reference(source) => {
+    let relation = match source {
+        kind @ (StaticAssignmentSource::Reference(source)
+        | StaticAssignmentSource::Element(source)) => {
             let mut relations = Vec::new();
+            let elements = matches!(kind, StaticAssignmentSource::Element(_));
             for ty in source.constraints() {
+                let ty = if elements {
+                    let Some(ty) = ty.iterable_element() else {
+                        return Ok(NeedsLocal);
+                    };
+                    ty
+                } else {
+                    ty
+                };
                 let relation = ty.reference_relation_to(sink);
                 if relation.is_mismatch() {
-                    return Err(Mismatch(MismatchTypeNames::for_types(*sink, ty)));
+                    return Err(Mismatch);
                 }
                 relations.push(relation);
             }
-            (
-                ReferenceAssignment::all(relations),
-                source.mismatch_type_names(*sink),
-            )
+            ReferenceAssignment::all(relations)
         }
         source @ (StaticAssignmentSource::Expression(_)
         | StaticAssignmentSource::ComputedString) => {
@@ -98,25 +151,21 @@ pub(crate) fn judge_static_assignment<B: BindingAddress>(
             if type_needs_schema(source, config) {
                 return Ok(NeedsSchema);
             }
-            let source = super::super::resolve_type_expr(source, config).map_err(Resolution)?;
+            let source = super::super::resolve_type_expr(source, config).map_err(|_| Resolution)?;
             let Some(source) = super::super::lift_type_expr(&source) else {
                 return Ok(NeedsLocal);
             };
             let source = TypeInSchema::schemaless(&source);
-            return classify(
-                source.reference_relation_to(sink),
-                MismatchTypeNames::for_types(*sink, source),
-            );
+            return classify(source.reference_relation_to(sink));
         }
+        StaticAssignmentSource::Judged(_) => unreachable!("authored children were consumed"),
         StaticAssignmentSource::Unknown => return Ok(NeedsLocal),
-        StaticAssignmentSource::SchemaUnavailable => return Ok(NeedsSchema),
     };
-    classify(relation, types)
+    classify(relation)
 }
 
 fn classify(
     relation: ReferenceAssignment<'_>,
-    types: MismatchTypeNames,
 ) -> Result<StaticAssignmentVerdict, StaticAssignmentError> {
     use StaticAssignmentVerdict::{NeedsLocal, NeedsSchema, Proven};
     let proven = relation.type_proven();
@@ -127,6 +176,6 @@ fn classify(
         AssignmentRelation::NeedsLocal(Some(_)) | AssignmentRelation::Unchecked(_) => {
             Ok(NeedsSchema)
         }
-        AssignmentRelation::Mismatch => Err(StaticAssignmentError::Mismatch(types)),
+        AssignmentRelation::Mismatch => Err(StaticAssignmentError::Mismatch),
     }
 }

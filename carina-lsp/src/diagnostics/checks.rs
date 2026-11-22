@@ -1230,6 +1230,33 @@ impl DiagnosticRun<'_> {
             .collect()
     }
 
+    pub(super) fn check_user_function_ref_types(
+        &self,
+        doc: &Document,
+        tree: &carina_core::parser::AnalysisTree<'_>,
+        binding_index: &BindingIndex<'_>,
+        report: &carina_core::parser::retained::ExpressionReport,
+    ) -> Vec<Diagnostic> {
+        carina_core::validation::user_function_reference_diagnostics(tree, binding_index)
+            .iter()
+            .filter(|finding| match report.expression(finding.location()) {
+                Ok(expression) => {
+                    expression.check_owner()
+                        != carina_core::parser::retained::ExpressionCheckOwner::Reported
+                }
+                Err(_) => true,
+            })
+            .filter_map(|finding| {
+                render_merged(
+                    doc,
+                    finding,
+                    DiagnosticSeverity::WARNING,
+                    finding.detail().clone(),
+                )
+            })
+            .collect()
+    }
+
     pub(super) fn unused_binding_diagnostics(
         &self,
         doc: &Document,

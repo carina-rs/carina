@@ -20,58 +20,77 @@ use crate::validation::typecheck::{
 };
 use std::collections::BTreeSet;
 
-struct Source<'a> {
-    reference: Option<ResolvedRefType>,
-    ty: Option<TypeExpr>,
-    constructed_string: bool,
-    untyped_export: Option<String>,
-    untyped_parameter: Option<(&'a str, &'a str)>,
-    unavailable: bool,
-    pending_substitution: bool,
-    incomplete_context: bool,
-    resolution_error: Option<crate::static_type::StaticTypeResolutionError>,
+// Only ready evidence can be submitted to the shared admission relation.
+// Missing schemas, substitutions, and incomplete references have no judgement.
+enum Source<'a> {
+    Deferred,
+    Ready(ReadySource<'a>),
 }
 
-pub(super) struct Finding {
-    pub node: (ExpressionInstance, NodeId),
-    pub diagnostic: Located<InferenceError>,
+enum ReadySource<'a> {
+    Reference(ResolvedRefType),
+    Element(ResolvedRefType),
+    Expression(&'a TypeExpr),
+    Authored(&'a JudgedExpr),
+    UntypedExport(String),
+    UntypedParameter {
+        function: &'a str,
+        parameter: &'a str,
+    },
+    Unknown,
 }
 
-impl Source<'_> {
-    fn evidence(&self) -> StaticAssignmentSource<'_> {
-        if self.unavailable {
-            StaticAssignmentSource::SchemaUnavailable
-        } else if let Some(reference) = &self.reference {
-            StaticAssignmentSource::Reference(reference)
-        } else if self.constructed_string {
-            StaticAssignmentSource::ComputedString
-        } else if let Some(ty) = &self.ty {
-            StaticAssignmentSource::Expression(ty)
-        } else {
-            StaticAssignmentSource::Unknown
+struct Finding {
+    node: (ExpressionInstance, NodeId),
+    diagnostic: Located<InferenceError>,
+}
+
+impl ReadySource<'_> {
+    fn assignment(&self) -> StaticAssignmentSource<'_> {
+        match self {
+            Self::Reference(reference) => StaticAssignmentSource::Reference(reference),
+            Self::Element(reference) => StaticAssignmentSource::Element(reference),
+            Self::Expression(ty) => StaticAssignmentSource::Expression(ty),
+            Self::Authored(expression) => StaticAssignmentSource::Judged(expression),
+            Self::UntypedExport(_) | Self::UntypedParameter { .. } | Self::Unknown => {
+                StaticAssignmentSource::Unknown
+            }
         }
     }
 
     fn diagnostic_source(&self) -> FunctionTypeSource<'_> {
-        if let Some(export) = self.untyped_export.as_deref() {
-            FunctionTypeSource::UntypedExport(export)
-        } else if let Some((function, parameter)) = self.untyped_parameter {
-            FunctionTypeSource::UntypedParameter {
+        match self {
+            Self::UntypedExport(export) => FunctionTypeSource::UntypedExport(export),
+            Self::UntypedParameter {
                 function,
                 parameter,
-            }
-        } else if let Some(reference) = &self.reference {
-            FunctionTypeSource::Typed {
+            } => FunctionTypeSource::UntypedParameter {
+                function,
+                parameter,
+            },
+            Self::Reference(reference) => FunctionTypeSource::Typed {
                 display: reference.display_type_name(),
                 writable: WritableType::reference(reference),
-            }
-        } else if let Some(ty) = &self.ty {
-            FunctionTypeSource::Typed {
+            },
+            Self::Element(reference) => match reference.iterable_constraints().next() {
+                Some(ty) => FunctionTypeSource::Typed {
+                    display: ty.resolved_type_name(),
+                    writable: WritableType::schema(ty),
+                },
+                None => FunctionTypeSource::Unknown,
+            },
+            Self::Expression(ty) => FunctionTypeSource::Typed {
                 display: ty.to_string(),
                 writable: Some(WritableType::expression(ty)),
-            }
-        } else {
-            FunctionTypeSource::Unknown
+            },
+            Self::Authored(expression) => match expression.static_type() {
+                Ok(ty) => FunctionTypeSource::Typed {
+                    display: ty.to_string(),
+                    writable: Some(WritableType::expression(ty)),
+                },
+                Err(_) => FunctionTypeSource::Unknown,
+            },
+            Self::Unknown => FunctionTypeSource::Unknown,
         }
     }
 }
@@ -102,7 +121,6 @@ struct Evidence<'a, 'index, B: BindingAddress> {
     report: &'a ExpressionReport<B>,
     bindings: &'a BindingIndex<'index, B>,
     values: &'a ResolvedBindings<ParserPlaceholder, B>,
-    complete_sources: bool,
     projections: HashMap<(ExpressionInstance, NodeId), &'a Value<ParserPlaceholder, B>>,
     definitions: HashSet<&'a str>,
     untyped_parameters: HashMap<(ExpressionInstance, NodeId), (&'a str, &'a str)>,
@@ -114,7 +132,6 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
         report: &'a ExpressionReport<B>,
         bindings: &'a BindingIndex<'index, B>,
         values: &'a ResolvedBindings<ParserPlaceholder, B>,
-        complete_sources: bool,
     ) -> Self {
         let mut projections = HashMap::new();
         for definition in expressions.definitions.values() {
@@ -155,7 +172,6 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
             report,
             bindings,
             values,
-            complete_sources,
             projections,
             untyped_parameters,
             definitions: expressions
@@ -181,9 +197,22 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
             .or_else(|| self.projections.get(&key).copied())
     }
 
-    fn known(&self, expression: &ExprValue<ParserPlaceholder, B>) -> bool {
+    fn known_value(
+        &self,
+        expression: &ExprValue<ParserPlaceholder, B>,
+    ) -> Option<Value<ParserPlaceholder, RelativeBindingName>> {
         let Some(value) = self.projection(expression) else {
-            return false;
+            let node = &expression.authored;
+            let child = match node.kind {
+                ExprKind::Alias | ExprKind::Parens | ExprKind::Definition | ExprKind::Iterable => {
+                    node.children.first()
+                }
+                ExprKind::Sequence => node
+                    .result_index()
+                    .and_then(|index| node.children.get(index)),
+                _ => None,
+            }?;
+            return self.known_value(child);
         };
         // Use the resolver's validation view, just like ordinary value checks.
         // A configured literal remains known when reached through another resource.
@@ -196,25 +225,31 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
                 crate::resolver::ValueResolution::Present(value)
                 | crate::resolver::ValueResolution::Unknown(value),
             ) => value,
-            _ => return false,
+            _ => return None,
         };
         let value = value.map_bindings(&mut |binding| RelativeBindingName::new(binding.as_str()));
         let Ok(knowledge) =
             value.knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
         else {
-            return false;
+            return None;
         };
         let knowledge = knowledge.into_classification();
-        knowledge.permits_static_evaluation()
-            && super::super::evaluate_static_value_for_validation(
-                &knowledge,
-                self.bindings.provider_context(),
-            )
-            .is_some_and(|value| {
-                value
-                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-                    .is_ok_and(|proof| proof.into_classification().into_known().is_ok())
-            })
+        if !knowledge.permits_static_evaluation() {
+            return None;
+        }
+        super::super::evaluate_static_value_for_validation(
+            &knowledge,
+            self.bindings.provider_context(),
+        )
+        .filter(|value| {
+            value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .is_ok_and(|proof| proof.into_classification().into_known().is_ok())
+        })
+    }
+
+    fn known(&self, expression: &ExprValue<ParserPlaceholder, B>) -> bool {
+        self.known_value(expression).is_some()
     }
 
     fn known_in_body(&self, expression: &ExprValue<ParserPlaceholder, B>) -> bool {
@@ -238,37 +273,10 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
         if judged.failed() {
             return None;
         }
-        let source = self.source(expression);
-        if source.pending_substitution || (!self.complete_sources && source.incomplete_context) {
+        let Source::Ready(source) = self.evidence(expression) else {
             return None;
-        }
-        if let Some(error) = source.resolution_error {
-            return Some(InferenceError::TypeResolution { error });
-        }
-        match judge_static_assignment(source.evidence(), ty, self.bindings) {
-            Ok(StaticAssignmentVerdict::Proven | StaticAssignmentVerdict::NeedsSchema) => None,
-            Err(StaticAssignmentError::Resolution(error)) => {
-                Some(InferenceError::TypeResolution { error })
-            }
-            Err(StaticAssignmentError::Mismatch(types)) => {
-                // Structural arguments and bare handle returns are owned by
-                // the existing handle/value boundary, not a value promise.
-                let structural_argument = source
-                    .reference
-                    .as_ref()
-                    .is_some_and(|reference| reference.resource_handle_type().is_some());
-                let structural_type = source.ty.as_ref().is_some_and(|ty| {
-                    crate::validation::resolve_parameter_type(ty, self.bindings.provider_context())
-                        .is_ok_and(|ty| ty.is_handle())
-                });
-                if structural_argument || structural_type {
-                    None
-                } else {
-                    Some(InferenceError::UnknownType {
-                        reason: format!("function '{name}': {position}: {types}"),
-                    })
-                }
-            }
+        };
+        match judge_static_assignment(source.assignment(), ty, self.bindings) {
             Ok(StaticAssignmentVerdict::NeedsLocal) => Some(InferenceError::FunctionTypePromise {
                 reason: format_function_type_promise_error(
                     name,
@@ -277,6 +285,9 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
                     source.diagnostic_source(),
                 ),
             }),
+            // Existing judgement owns definite mismatches and annotation errors.
+            Ok(StaticAssignmentVerdict::Proven | StaticAssignmentVerdict::NeedsSchema)
+            | Err(StaticAssignmentError::Mismatch | StaticAssignmentError::Resolution) => None,
         }
     }
 
@@ -295,7 +306,33 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
             {
                 continue;
             }
-            if matches!(node.kind, ExprKind::If) {
+            if matches!(node.kind, ExprKind::For) {
+                pending.extend(node.children.first());
+                let empty = node
+                    .children
+                    .first()
+                    .and_then(|iterable| self.known_value(iterable))
+                    .is_some_and(|value| match value {
+                        Value::Concrete(crate::resource::ConcreteValue::List(values)) => {
+                            values.is_empty()
+                        }
+                        Value::Concrete(crate::resource::ConcreteValue::Map(values)) => {
+                            values.is_empty()
+                        }
+                        _ => false,
+                    })
+                    || node
+                        .children
+                        .first()
+                        .and_then(|iterable| {
+                            self.report
+                                .node(&iterable.authored.location.instance, iterable.node_id())
+                        })
+                        .is_some_and(|judged| judged.known_empty_collection());
+                if !empty {
+                    pending.extend(node.children.iter().skip(1).rev());
+                }
+            } else if matches!(node.kind, ExprKind::If) {
                 pending.extend(node.children.first());
                 match self.report.secrecy_condition_value(expression) {
                     Some(selected) => {
@@ -415,60 +452,73 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
         false
     }
 
-    fn source(&self, expression: &ExprValue<ParserPlaceholder, B>) -> Source<'_> {
-        let expressions = self.expressions;
-        let report = self.report;
-        let bindings = self.bindings;
+    fn evidence(&self, expression: &ExprValue<ParserPlaceholder, B>) -> Source<'_> {
         let node = &expression.authored;
-        // Sequences and aliases select an existing judgement, never a new body.
         let selected = match node.kind {
             ExprKind::Sequence => node
                 .result_index()
                 .and_then(|index| node.children.get(index)),
-            ExprKind::Alias | ExprKind::Parens | ExprKind::Definition => node.children.first(),
+            ExprKind::Alias | ExprKind::Parens | ExprKind::Definition | ExprKind::Iterable => {
+                node.children.first()
+            }
             _ => None,
         };
         if let Some(selected) = selected {
-            return self.source(selected);
+            return self.evidence(selected);
         }
-        let judged = report.node(&node.location.instance, node.id);
-        let mut source = Source {
-            reference: None,
-            ty: judged.and_then(|judged| judged.static_type().ok()).cloned(),
-            constructed_string: judged.is_some_and(|judged| {
-                judged.static_type() == Ok(&TypeExpr::String)
-                    && judged
-                        .for_sink(&TypeExpr::String, bindings.provider_context())
-                        .is_single_string_construction()
-            }),
-            untyped_export: None,
-            untyped_parameter: self
+        let bindings = self.bindings;
+        let judged = self.report.node(&node.location.instance, node.id);
+        let ty = judged.and_then(|judged| judged.static_type().ok());
+        if self.schema_unavailable(expression)
+            || ty.is_some_and(|ty| type_needs_schema(ty, bindings.provider_context()))
+            || self
+                .projection(expression)
+                .is_some_and(super::super::functions::contains_module_argument)
+        {
+            return Source::Deferred;
+        }
+        if matches!(node.kind, ExprKind::Element)
+            && ty.is_none()
+            && let Some(collection) = node.children.first()
+        {
+            return match self.evidence(collection) {
+                Source::Ready(ReadySource::Reference(reference)) => {
+                    Source::Ready(ReadySource::Element(reference))
+                }
+                Source::Ready(ReadySource::Expression(
+                    TypeExpr::List(inner) | TypeExpr::Map(inner),
+                )) => Source::Ready(ReadySource::Expression(inner)),
+                Source::Ready(ReadySource::Authored(collection)) => {
+                    match collection.static_type() {
+                        Ok(TypeExpr::List(inner) | TypeExpr::Map(inner)) => {
+                            Source::Ready(ReadySource::Expression(inner))
+                        }
+                        _ => Source::Ready(ReadySource::Authored(collection)),
+                    }
+                }
+                other => other,
+            };
+        }
+        let authored = || {
+            if let Some(&(function, parameter)) = self
                 .untyped_parameters
                 .get(&(node.location.instance.clone(), node.id))
-                .copied(),
-            unavailable: self.schema_unavailable(expression),
-            pending_substitution: self
-                .projection(expression)
-                .is_some_and(super::super::functions::contains_module_argument),
-            incomplete_context: matches!(
-                judged.map(|judged| judged.static_type()),
-                Some(Err(InferenceIssue::NotInferable(
-                    NotInferableReason::NonInferableBinding { .. }
-                )))
-            ),
-            resolution_error: None,
+            {
+                ReadySource::UntypedParameter {
+                    function,
+                    parameter,
+                }
+            } else {
+                judged.map_or(ReadySource::Unknown, ReadySource::Authored)
+            }
         };
-        source.unavailable |= source
-            .ty
-            .as_ref()
-            .is_some_and(|ty| type_needs_schema(ty, bindings.provider_context()));
-        // The authored judge already uses the child's declared argument type,
-        // including through aliases and accesses. A substituted projection is
-        // value evidence, not the caller's type or upstream-export provenance.
+        // The child's declared argument type is authoritative. Its projection
+        // contributes known values, never the caller's type or export name.
         if self.uses_module_argument(expression) {
+            let mut unavailable = false;
             if let Some(value) = self.projection(expression) {
                 value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
-                    source.unavailable |= reference
+                    unavailable |= reference
                         .check(|path| {
                             Ok::<_, InferenceError>(
                                 bindings.upstream_is_unavailable(path.binding())
@@ -482,7 +532,11 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
                         .unwrap_or(false);
                 });
             }
-            return source;
+            return if unavailable {
+                Source::Deferred
+            } else {
+                Source::Ready(authored())
+            };
         }
         let authored_path = match &node.kind {
             ExprKind::Reference {
@@ -501,72 +555,60 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
             _ => authored_path.as_ref(),
         };
         if let Some(path) = path {
-            source.pending_substitution |= pending_argument(expressions, bindings, path.binding());
-            source.unavailable |= bindings.upstream_is_unavailable(path.binding());
+            if pending_argument(self.expressions, bindings, path.binding())
+                || bindings.upstream_is_unavailable(path.binding())
+            {
+                return Source::Deferred;
+            }
             if let Some(entry) = bindings.get(path.binding())
                 && let BindingTarget::UpstreamState(exports) = entry.target
                 && let Some(export) = exports.get(path.attribute())
             {
                 match &export.static_type {
                     UpstreamExportType::Static(ConsumerExportStaticType::Inferred(_)) => {
-                        source.ty = None;
-                        source.incomplete_context = false;
-                        source.untyped_export =
-                            Some(format!("{}.{}", path.binding(), path.attribute()));
+                        return Source::Ready(ReadySource::UntypedExport(format!(
+                            "{}.{}",
+                            path.binding(),
+                            path.attribute()
+                        )));
                     }
                     UpstreamExportType::Static(ConsumerExportStaticType::Declared(
-                        StaticType::Unchecked(reason),
-                    )) => {
-                        source.ty = None;
-                        source.unavailable |=
-                            type_needs_schema(reason.original(), bindings.provider_context());
-                        if !source.unavailable {
-                            source.resolution_error = Some(reason.resolution_error().clone());
-                        }
-                    }
+                        StaticType::Unchecked(_),
+                    )) => return Source::Deferred,
                     _ => {}
                 }
             }
-            if source.untyped_export.is_none() {
-                match bindings.ref_type(ReferencePathRef::Access(path)) {
-                    RefType::Typed(reference) => {
-                        source.reference = Some(reference);
-                        source.incomplete_context = false;
-                    }
-                    RefType::Unchecked | RefType::UnknownBinding { .. } => {
-                        // An instance's declaration cannot strengthen a caller's
-                        // still-unindexed reference. The completed index owns it.
-                        if !self.definitions.contains(path.binding()) {
-                            source.ty = None;
-                            source.incomplete_context = true;
-                            source.unavailable |=
-                                bindings.references_resource_attribute(path.into());
-                        }
-                    }
-                    RefType::UnknownAttribute(_) => {}
+            return match bindings.ref_type(ReferencePathRef::Access(path)) {
+                RefType::Typed(reference) => Source::Ready(ReadySource::Reference(reference)),
+                RefType::UnknownAttribute(_) => Source::Deferred,
+                RefType::Unchecked | RefType::UnknownBinding { .. }
+                    if !self.definitions.contains(path.binding()) =>
+                {
+                    Source::Deferred
                 }
-            }
-        } else if let Some(Value::Deferred(DeferredValue::BindingRef { binding })) =
+                _ => Source::Ready(authored()),
+            };
+        }
+        if let Some(Value::Deferred(DeferredValue::BindingRef { binding })) =
             self.projection(expression)
         {
-            source.pending_substitution |=
-                pending_argument(expressions, bindings, binding.as_str());
-            source.unavailable |= bindings.upstream_is_unavailable(binding.as_str());
-            match bindings.ref_type(ReferencePathRef::Binding(binding)) {
-                RefType::Typed(reference) => {
-                    source.reference = Some(reference);
-                    source.incomplete_context = false;
-                }
-                RefType::Unchecked | RefType::UnknownBinding { .. } => {
-                    if !expressions.definitions.contains_key(binding) {
-                        source.ty = None;
-                        source.incomplete_context = true;
-                    }
-                }
-                RefType::UnknownAttribute(_) => {}
+            if pending_argument(self.expressions, bindings, binding.as_str())
+                || bindings.upstream_is_unavailable(binding.as_str())
+            {
+                return Source::Deferred;
             }
+            return match bindings.ref_type(ReferencePathRef::Binding(binding)) {
+                RefType::Typed(reference) => Source::Ready(ReadySource::Reference(reference)),
+                RefType::UnknownAttribute(_) => Source::Deferred,
+                RefType::Unchecked | RefType::UnknownBinding { .. }
+                    if !self.expressions.definitions.contains_key(binding) =>
+                {
+                    Source::Deferred
+                }
+                _ => Source::Ready(authored()),
+            };
         }
-        source
+        Source::Ready(authored())
     }
 
     fn relevance(
@@ -642,7 +684,6 @@ fn body_verdict<B: BindingAddress>(
     declarations: &IndexMap<DeclarationKey, &AuthoredExpr<ParserPlaceholder, B>>,
     verdicts: &mut HashMap<DeclarationKey, Arc<BodyVerdict>>,
     visiting: &mut HashSet<DeclarationKey>,
-    findings: &mut Vec<Finding>,
 ) -> Arc<BodyVerdict> {
     if let Some(verdict) = verdicts.get(key) {
         return verdict.clone();
@@ -677,14 +718,10 @@ fn body_verdict<B: BindingAddress>(
         && !evidence.known_in_body(body)
         && let Some(failure) = evidence.promise_error(body, ty, name, FunctionTypePosition::Return)
     {
-        if failure.is_function_type_promise() {
-            verdict.result = Some(BodyFinding {
-                error: failure,
-                relevance: Relevance::default(),
-            });
-        } else {
-            push_finding(findings, &body.authored, failure, evidence.report);
-        }
+        verdict.result = Some(BodyFinding {
+            error: failure,
+            relevance: Relevance::default(),
+        });
     }
     let calls: Vec<_> = evidence
         .calls([body], true)
@@ -700,7 +737,7 @@ fn body_verdict<B: BindingAddress>(
         .collect();
     // Dependency summaries, like the body types, are cached per declaration.
     for (_, callee) in &calls {
-        body_verdict(callee, evidence, declarations, verdicts, visiting, findings);
+        body_verdict(callee, evidence, declarations, verdicts, visiting);
     }
     for (call, callee) in calls {
         if evidence
@@ -712,16 +749,12 @@ fn body_verdict<B: BindingAddress>(
         }
         let target = declarations[&callee];
         for (argument, failure) in evidence.parameter_failures(target, call, true) {
-            if failure.is_function_type_promise() {
-                let relevance = evidence.relevance(argument, &signature.parameter_nodes, verdicts);
-                if relevance.independent || !relevance.parameters.is_empty() {
-                    verdict.nested.push(BodyFinding {
-                        error: failure,
-                        relevance,
-                    });
-                }
-            } else {
-                push_finding(findings, call, failure, evidence.report);
+            let relevance = evidence.relevance(argument, &signature.parameter_nodes, verdicts);
+            if relevance.independent || !relevance.parameters.is_empty() {
+                verdict.nested.push(BodyFinding {
+                    error: failure,
+                    relevance,
+                });
             }
         }
         let Some(target_verdict) = verdicts.get(&callee) else {
@@ -767,9 +800,8 @@ pub(super) fn check<B: BindingAddress>(
     report: &ExpressionReport<B>,
     bindings: &BindingIndex<'_, B>,
     values: &ResolvedBindings<ParserPlaceholder, B>,
-    complete_sources: bool,
-) -> Vec<Finding> {
-    let evidence = Evidence::new(expressions, report, bindings, values, complete_sources);
+) -> Vec<Located<InferenceError>> {
+    let evidence = Evidence::new(expressions, report, bindings, values);
     let mut declarations = IndexMap::new();
     for node in report.syntax_nodes.values() {
         if let ExprKind::Function { name, .. } = &node.kind {
@@ -787,7 +819,6 @@ pub(super) fn check<B: BindingAddress>(
             &declarations,
             &mut verdicts,
             &mut HashSet::new(),
-            &mut findings,
         );
     }
     for expression in evidence.calls(
@@ -805,22 +836,16 @@ pub(super) fn check<B: BindingAddress>(
         let Some(declaration) = declarations.get(&key).copied() else {
             continue;
         };
-        // No projection means main has not evaluated this occurrence (empty loops).
-        if evidence.projection(expression).is_none()
-            || report
-                .node(&node.location.instance, node.id)
-                .is_some_and(|judged| judged.failed())
+        if report
+            .node(&node.location.instance, node.id)
+            .is_some_and(|judged| judged.failed())
         {
             continue;
         }
-        if evidence
-            .projection(expression)
-            .is_some_and(super::super::functions::contains_module_argument)
-            || node.children.iter().any(|argument| {
-                let source = evidence.source(argument);
-                source.pending_substitution
-                    || (!complete_sources && (source.unavailable || source.incomplete_context))
-            })
+        if node
+            .children
+            .iter()
+            .any(|argument| matches!(evidence.evidence(argument), Source::Deferred))
         {
             continue;
         }
@@ -832,7 +857,8 @@ pub(super) fn check<B: BindingAddress>(
             if finding.relevance.independent
                 || finding.relevance.parameters.iter().any(|index| {
                     argument(declaration, node, *index).is_some_and(|argument| {
-                        !evidence.known(argument) && !evidence.source(argument).unavailable
+                        !evidence.known(argument)
+                            && matches!(evidence.evidence(argument), Source::Ready(_))
                     })
                 })
             {
@@ -840,7 +866,11 @@ pub(super) fn check<B: BindingAddress>(
             }
         }
     }
+    findings.sort_by(|a, b| a.diagnostic.location().cmp(b.diagnostic.location()));
     findings
+        .into_iter()
+        .map(|finding| finding.diagnostic)
+        .collect()
 }
 
 fn push_finding<B: BindingAddress>(

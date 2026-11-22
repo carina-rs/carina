@@ -330,6 +330,12 @@ impl RefTypeMismatch {
 }
 
 impl ResolvedRefType {
+    pub(crate) fn iterable_constraints(
+        &self,
+    ) -> impl Iterator<Item = TypeInSchema<'_, crate::schema::Compiled>> {
+        self.constraints().filter_map(|ty| ty.iterable_element())
+    }
+
     pub(crate) fn reference_assignment<'a>(
         &'a self,
         sink: crate::schema::AssignmentSink<'a, crate::schema::Compiled>,
@@ -708,6 +714,7 @@ pub struct BindingIndex<'a, B: BindingAddress = RelativeBindingName> {
     /// keep this index-only view keyed by the visible composition binding.
     pending_composition_handles: HashMap<B, HashMap<String, crate::parser::ResourceTypePath>>,
     registry: &'a SchemaRegistry,
+    user_functions: &'a indexmap::IndexMap<String, crate::parser::UserFunction<B>>,
 }
 
 impl<'a, B: BindingAddress> BindingIndex<'a, B> {
@@ -1071,6 +1078,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
             resource_handles,
             pending_composition_handles,
             registry,
+            user_functions: &parsed.user_functions,
         }
     }
 
@@ -1132,6 +1140,10 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         ty: &crate::parser::TypeExpr,
     ) -> Result<crate::parser::TypeExpr, crate::static_type::StaticTypeResolutionError> {
         crate::parser::resolve_type_expr_from_schemas(ty, self.schemas, &self.provider_context)
+    }
+
+    pub(crate) fn user_function(&self, name: &str) -> Option<&'a crate::parser::UserFunction<B>> {
+        self.user_functions.get(name)
     }
 
     /// Resolve the static type of one complete reference path.

@@ -77,6 +77,12 @@ const UNKNOWN_FUNCTION_TYPE_ADVICE: &str =
 pub(crate) struct WritableType(String);
 
 impl WritableType {
+    pub(crate) fn schema(
+        ty: crate::schema::TypeInSchema<'_, crate::schema::Compiled>,
+    ) -> Option<Self> {
+        ty.writable_type_name().map(Self)
+    }
+
     pub(crate) fn expression(ty: &TypeExpr) -> Self {
         Self(ty.to_string())
     }

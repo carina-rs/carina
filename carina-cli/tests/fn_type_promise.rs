@@ -15,6 +15,9 @@ mod review_round2;
 #[path = "fn_type_promise/untyped_parameter.rs"]
 mod untyped_parameter;
 
+#[path = "fn_type_promise/review_round3.rs"]
+mod review_round3;
+
 use carina_cli::commands::validate::{ValidateDiagnostics, validate_diagnostics_with_factories};
 use carina_cli::wiring::LoadedProviderFactory;
 use carina_core::paths::ResolvedPath;
@@ -1075,12 +1078,25 @@ fn tp2_lsp_return_parity_module() {
 }
 
 #[test]
-fn tp2_untyped_body_primitive_return_owns_error() {
+fn tp2_untyped_body_primitive_return_keeps_attribute_mismatch() {
     let directory = Directory::new(Scope::Module);
     directory.write_source(&format!(
         "{SOURCE}fn promise(value): Int {{ value }}\ntest.Sink {{ name = 'sink' number = promise(src.identifier) }}\n"
     ));
-    assert_untyped_return(&directory, "Int");
+    // Main's attribute check also rejects the forwarded String. A promise
+    // diagnostic must not poison its expression evidence and hide that error.
+    let diagnostics = validate(&directory);
+    let errors = messages(&diagnostics);
+    assert_eq!(errors.len(), 2, "{}", diagnostics.json);
+    assert_eq!(
+        errors[0],
+        "function 'promise': return value is declared as Int, but it comes from parameter 'value', which has no declared type, so validate cannot prove it fits. Pass a value known at validate, or declare the type of parameter 'value'."
+    );
+    assert!(
+        errors[1].starts_with("Type mismatch: expected Int, got String (from "),
+        "{errors:?}"
+    );
+    assert!(errors[1].ends_with(".src.identifier)"), "{errors:?}");
 }
 
 #[test]
