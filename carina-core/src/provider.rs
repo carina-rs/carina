@@ -32,6 +32,7 @@ pub use carina_provider_protocol::types::{
 
 use crate::binding_index::SecretPreservingAttributes;
 use crate::effect::PlanOp;
+use crate::executor::PreparedCreateWriteback;
 use crate::parser::{ProviderConfig, StateBlockAddress};
 #[cfg(test)]
 use crate::provider_text::OpaqueFixtureDisplay as _;
@@ -95,15 +96,15 @@ pub type HostUpdateOutcomeKind = UpdateOutcomeKind<Bound>;
 pub type HostPartialReadDiagnostic = PartialReadDiagnostic<Bound>;
 pub type HostCreateObservation = CreateObservation<Bound>;
 pub type HostUnobservedReason = UnobservedReason<Bound>;
-pub type HostIdentifiedCreate = IdentifiedCreate<Bound, SecretPreservingAttributes>;
-pub type HostCreateFailure = CreateFailure<Bound, SecretPreservingAttributes>;
-pub type HostCreateFailureKind = CreateFailureKind<Bound, SecretPreservingAttributes>;
-pub type HostResumeOutcome<W = SecretPreservingAttributes> = ResumeOutcome<Bound, W>;
-pub type HostResumeOutcomeKind<W = SecretPreservingAttributes> = ResumeOutcomeKind<Bound, W>;
-pub type HostCompletedResume = CompletedResume<Bound, SecretPreservingAttributes>;
-pub type HostPartialResume = PartialResume<Bound, SecretPreservingAttributes>;
-pub type HostResumeFailure<W = SecretPreservingAttributes> = ResumeFailure<Bound, W>;
-pub type HostResumeFailureKind<W = SecretPreservingAttributes> = ResumeFailureKind<Bound, W>;
+pub type HostIdentifiedCreate = IdentifiedCreate<Bound, PreparedCreateWriteback>;
+pub type HostCreateFailure = CreateFailure<Bound, PreparedCreateWriteback>;
+pub type HostCreateFailureKind = CreateFailureKind<Bound, PreparedCreateWriteback>;
+pub type HostResumeOutcome<W = PreparedCreateWriteback> = ResumeOutcome<Bound, W>;
+pub type HostResumeOutcomeKind<W = PreparedCreateWriteback> = ResumeOutcomeKind<Bound, W>;
+pub type HostCompletedResume = CompletedResume<Bound, PreparedCreateWriteback>;
+pub type HostPartialResume = PartialResume<Bound, PreparedCreateWriteback>;
+pub type HostResumeFailure<W = PreparedCreateWriteback> = ResumeFailure<Bound, W>;
+pub type HostResumeFailureKind<W = PreparedCreateWriteback> = ResumeFailureKind<Bound, W>;
 
 /// Provider-produced records have no desired values. Only dispatch can turn
 /// this stage into a host writeback record, supplying secret-preserving values.
@@ -1008,14 +1009,9 @@ impl SentAttributes {
         )
     }
 
-    fn from_create_sent<'a>(
-        sent: &Sent,
-        request_attribute_names: impl IntoIterator<Item = &'a String>,
-    ) -> Self {
+    fn from_create_sent(sent: &Sent, request_attributes: &Self) -> Self {
         match sent {
-            Sent::AllRequestAttributes => {
-                Self::only(request_attribute_names.into_iter().cloned().collect())
-            }
+            Sent::AllRequestAttributes => request_attributes.clone(),
             Sent::Only(attributes) => Self::only(attributes.clone()),
         }
     }
@@ -2790,9 +2786,9 @@ pub struct PendingCreate {
 /// Read-only record retained after a provider returns a fresh pending create.
 /// Unlike [`PendingCreate`], this is storage, not transition authority.
 /// The provider stage carries [`ProviderCreateRecord`]; only the host stage
-/// carries [`SecretPreservingAttributes`] and can reach state writers.
+/// carries [`PreparedCreateWriteback`] and can reach state writers.
 #[derive(Debug, Clone, PartialEq)]
-pub struct FreshPendingCreate<W = SecretPreservingAttributes> {
+pub struct FreshPendingCreate<W = PreparedCreateWriteback> {
     id: ResourceId,
     writeback: Box<W>,
     token: PendingToken,
@@ -2818,16 +2814,16 @@ impl From<PendingCreate> for FreshPendingCreate<ProviderCreateRecord> {
 
 impl FreshPendingCreate {
     /// Desired values retained by this continuation, with send membership
-    /// expanded from its retained writeback's attribute names.
+    /// expanded from the same prepared create's request attributes.
     pub fn sent_desired_attributes(&self) -> SentDesiredAttributes<'_> {
         SentDesiredAttributes::new(
-            self.writeback.values().iter(),
-            SentAttributes::from_create_sent(&self.sent, self.writeback.values().keys()),
+            self.writeback.attributes().values().iter(),
+            SentAttributes::from_create_sent(&self.sent, self.writeback.sent_attributes()),
         )
     }
 
     pub fn resolved_desired_attributes(&self) -> &SecretPreservingAttributes {
-        &self.writeback
+        self.writeback.attributes()
     }
 }
 
@@ -3181,19 +3177,19 @@ impl std::fmt::Display for UnobservedReason<Bound> {
 }
 
 /// A provider-reported identifier, its observation, and the accepted create's sent values.
-/// Provider records acquire the required [`SecretPreservingAttributes`] when
+/// Provider records acquire the required [`PreparedCreateWriteback`] when
 /// dispatch converts them into [`HostIdentifiedCreate`] records.
 ///
 /// Callers outside core cannot attach writeback to a provider-stage record.
 ///
 /// ```compile_fail,E0624
 /// use carina_core::{
-///     binding_index::SecretPreservingAttributes,
+///     executor::PreparedCreateWriteback,
 ///     provider::{IdentifiedCreate, ProviderCreateRecord},
 ///     provider_text::Unbound,
 /// };
 ///
-/// fn forge(record: IdentifiedCreate<Unbound, ProviderCreateRecord>, writeback: SecretPreservingAttributes) {
+/// fn forge(record: IdentifiedCreate<Unbound, ProviderCreateRecord>, writeback: PreparedCreateWriteback) {
 ///     let _ = record.into_writeback(writeback);
 /// }
 /// ```
@@ -3210,8 +3206,8 @@ pub struct IdentifiedCreate<S: TextState = Unbound, W = ProviderCreateRecord> {
 impl<S: TextState> IdentifiedCreate<S> {
     pub(crate) fn into_writeback(
         self,
-        attributes: SecretPreservingAttributes,
-    ) -> IdentifiedCreate<S, SecretPreservingAttributes> {
+        attributes: PreparedCreateWriteback,
+    ) -> IdentifiedCreate<S, PreparedCreateWriteback> {
         self.map_writeback(|ProviderCreateRecord| attributes)
     }
 
@@ -3250,23 +3246,23 @@ impl<S: TextState> IdentifiedCreate<S> {
     }
 }
 
-impl<S: TextState> IdentifiedCreate<S, SecretPreservingAttributes> {
+impl<S: TextState> IdentifiedCreate<S, PreparedCreateWriteback> {
     /// Resolved desired values and send evidence retained by the accepted
-    /// create observation. Membership is expanded from this record's retained
-    /// writeback keys. Persisted continuations omit ordinary observable keys
+    /// create observation. Membership is expanded from the same prepared
+    /// create's request attributes. Persisted continuations omit observable keys
     /// and therefore cannot claim a sent desired basis.
     pub fn sent_desired_attributes(&self) -> Option<SentDesiredAttributes<'_>> {
         let SentRecord::Request(sent) = &self.sent else {
             return None;
         };
         Some(SentDesiredAttributes::new(
-            self.writeback.values().iter(),
-            SentAttributes::from_create_sent(sent, self.writeback.values().keys()),
+            self.writeback.attributes().values().iter(),
+            SentAttributes::from_create_sent(sent, self.writeback.sent_attributes()),
         ))
     }
 
     pub fn resolved_desired_attributes(&self) -> &SecretPreservingAttributes {
-        &self.writeback
+        self.writeback.attributes()
     }
 }
 
@@ -3384,7 +3380,7 @@ enum PendingRecord<W> {
 }
 
 /// Exhaustive borrowed view of how an in-flight create entered this process.
-pub enum InFlightPersistence<'a, W = SecretPreservingAttributes> {
+pub enum InFlightPersistence<'a, W = PreparedCreateWriteback> {
     /// Produced by a provider call in this process and not encoded yet.
     Fresh(&'a FreshPendingCreate<W>),
     /// Loaded from a validated persisted-state row.
@@ -3420,7 +3416,7 @@ pub enum InFlightPersistence<'a, W = SecretPreservingAttributes> {
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq)]
-pub struct InFlightCreate<W = SecretPreservingAttributes> {
+pub struct InFlightCreate<W = PreparedCreateWriteback> {
     id: ResourceId,
     pending: PendingRecord<W>,
     started_at: Timestamp,
@@ -3609,7 +3605,7 @@ impl InFlightCreate<ProviderCreateRecord> {
         }
     }
 
-    pub(crate) fn into_writeback(self, attributes: SecretPreservingAttributes) -> InFlightCreate {
+    pub(crate) fn into_writeback(self, attributes: PreparedCreateWriteback) -> InFlightCreate {
         self.map_writeback(|ProviderCreateRecord| attributes)
     }
 }
@@ -4442,7 +4438,7 @@ impl<S: TextState, W> PartialResume<S, W> {
     }
 }
 
-impl PartialResume<Bound, SecretPreservingAttributes> {
+impl PartialResume<Bound, PreparedCreateWriteback> {
     pub fn observed_state(&self) -> SnapshotState {
         self.diagnostic
             .clone()
@@ -4533,10 +4529,7 @@ impl<S: TextState, W> ResumeOutcome<S, W> {
 }
 
 impl ResumeOutcome<Bound> {
-    pub(crate) fn into_writeback(
-        self,
-        attributes: SecretPreservingAttributes,
-    ) -> HostResumeOutcome {
+    pub(crate) fn into_writeback(self, attributes: PreparedCreateWriteback) -> HostResumeOutcome {
         ResumeOutcome {
             kind: match self.kind {
                 ResumeOutcomeKind::Resumed(completed) => ResumeOutcomeKind::Resumed(Box::new(
@@ -5003,7 +4996,7 @@ pub struct ResumeRoutingMismatch {
 pub struct ResumeCreateRequest {
     pending: InFlightCreate<ProviderCreateRecord>,
     request: CreateRequest,
-    writeback: SecretPreservingAttributes,
+    writeback: PreparedCreateWriteback,
     authorization: ResumeAuthorization,
 }
 
@@ -5027,7 +5020,7 @@ enum ResumeAuthorization {
 pub struct PollCreateRequest {
     resumed: ResumedCreate,
     request: CreateRequest,
-    writeback: SecretPreservingAttributes,
+    writeback: PreparedCreateWriteback,
 }
 
 impl PollCreateRequest {
@@ -5053,7 +5046,7 @@ impl PollCreateRequest {
                 identifier,
             },
             request: write.request().clone(),
-            writeback: write.writeback().clone(),
+            writeback: write.create_writeback(),
         })
     }
 
@@ -5347,7 +5340,7 @@ impl ResumeCreateRequest {
         Ok(Self {
             pending: pending.into_provider_record(),
             request,
-            writeback: permit.prepared_write().writeback().clone(),
+            writeback: permit.prepared_write().create_writeback(),
             authorization: ResumeAuthorization::Resend(permit),
         })
     }
@@ -5371,7 +5364,7 @@ impl ResumeCreateRequest {
         &self.request
     }
 
-    pub(crate) fn writeback(&self) -> &SecretPreservingAttributes {
+    pub(crate) fn writeback(&self) -> &PreparedCreateWriteback {
         &self.writeback
     }
 
@@ -11887,18 +11880,15 @@ mod tests {
             diagnostic.clone(),
         );
         let diagnostic = diagnostic.into_host_for_test();
-        let outcome = outcome.into_host_for_test().into_writeback(
-            crate::executor::AcceptedRequest::from_create_permit_for_test(
-                &crate::test_utils::prepared_write::create_permit(
-                    &Resource::from_id(id).with_value_attributes(HashMap::from([(
-                        "arn".to_string(),
-                        Value::Concrete(ConcreteValue::String("known-arn".into())),
-                    )])),
-                ),
-            )
-            .resolved_desired_attributes()
-            .clone(),
+        let permit = crate::test_utils::prepared_write::create_permit(
+            &Resource::from_id(id).with_value_attributes(HashMap::from([(
+                "arn".to_string(),
+                Value::Concrete(ConcreteValue::String("known-arn".into())),
+            )])),
         );
+        let outcome = outcome
+            .into_host_for_test()
+            .into_writeback(permit.prepared_write().create_writeback());
         let ResumeOutcomeKind::PartialSuccess(partial) = outcome.into_kind() else {
             panic!("resumed partial read-back must remain distinct from a resent create")
         };

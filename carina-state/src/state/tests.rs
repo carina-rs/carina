@@ -6623,6 +6623,16 @@ fn applied_previous_secret_hash_authority_requires_known_public_desired() {
     )])));
     let cases = [
         ("absent", None, true),
+        (
+            "resolved secret",
+            Some(Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    ["resolved", "fixture"].join("-").into(),
+                )))
+                .into(),
+            ))),
+            true,
+        ),
         ("known public tree", Some(public), false),
         (
             "plain literal",
@@ -6708,17 +6718,38 @@ fn applied_previous_secret_hash_authority_requires_known_public_desired() {
                     request_attributes: Cow::Borrowed(request_attributes.as_ref().unwrap()),
                     final_desired: None,
                 },
-                label == "absent",
+                protected,
             ));
         }
+        let writeback_resource = if label == "resolved secret" {
+            // Exercise previous-hash protection through the accepted request,
+            // without the row's desired shape masking the provider value first.
+            resolved(&Resource::from_id(resource.id.clone()))
+        } else {
+            resource.clone()
+        };
         for (authority, protected) in authorities {
+            assert_eq!(
+                SelectedStateAttributes::decide_previous_secret_hash(
+                    &authority,
+                    "computed",
+                    Some(&provider_value),
+                    Some(desired_value_comparison_for_test(None)),
+                ),
+                if protected {
+                    PreviousSecretHashDecision::Protect
+                } else {
+                    PreviousSecretHashDecision::Release
+                },
+                "{label}: previous-hash authority must match the desired classification"
+            );
             let selected = SelectedStateAttributes {
                 encoded: BTreeMap::from([("computed".to_owned(), provider_value.clone())]),
                 write_only_keys: HashSet::new(),
                 retained_write_only: HashSet::new(),
             }
             .protect_for_resource(
-                &resource,
+                &writeback_resource,
                 authority,
                 None,
                 true,
@@ -7276,6 +7307,187 @@ fn retained_write_only_previous_hash_cannot_prove_plaintext_equality() {
     )
     .unwrap();
     assert!(selected.encoded.get("computed") == Some(&previous_value));
+}
+
+#[test]
+fn create_rows_agree_on_sent_membership_after_normalizer_drops_attribute() {
+    use carina_core::executor::{
+        ModuleConstraintGate, ProviderPreparationContext, prepare_initial_create,
+    };
+    use carina_core::provider::{
+        AppliedIdentifier, BoxFuture, HostCreateFailureKind, Observation, PendingToken,
+        ProviderError, ProviderNormalizer, ProviderResult, ReadOutcome, SavedAttrs,
+        StateTransformMap, ready_noop,
+    };
+    use carina_core::resource::ProviderResource;
+
+    struct DroppingNormalizer;
+    impl ProviderNormalizer for DroppingNormalizer {
+        fn normalize_desired<'a>(
+            &'a self,
+            resources: &'a mut [ProviderResource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            for resource in resources {
+                resource.attributes.shift_remove("dropped");
+            }
+            ready_noop()
+        }
+
+        fn normalize_state<'a>(
+            &'a self,
+            _: &'a mut StateTransformMap,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            ready_noop()
+        }
+
+        fn hydrate_read_state<'a>(
+            &'a self,
+            _: &'a mut StateTransformMap,
+            _: &'a SavedAttrs,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            ready_noop()
+        }
+    }
+
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+    let resource = Resource::with_provider("mock", "test.resource", "dropped-key", None)
+        .with_attribute("name", string("retained"))
+        .with_attribute("dropped", string("consumed"));
+    let schema = PatternResourceSchema::new("test.resource")
+        .attribute(PatternAttributeSchema::optional("name", PatternAttributeType::string()).build())
+        .attribute(
+            PatternAttributeSchema::optional("dropped", PatternAttributeType::string()).build(),
+        )
+        .validate()
+        .unwrap();
+    let mut schemas = carina_core::schema::SchemaRegistry::new();
+    schemas.insert("mock", schema.clone());
+    let mut configuration = carina_core::parser::ExpandedInferredFile::default();
+    configuration.resources.push(resource.clone()); // allow: direct — fixture test inspection
+    let checked = carina_core::resolved_graph::ResolvedInitialCreatePlan::from_configuration(
+        configuration,
+        &resource.id,
+        &schemas,
+    )
+    .unwrap()
+    .check_inputs_with_types(
+        &schemas,
+        &carina_core::input_rules::InputTypeContext::empty(),
+    )
+    .unwrap();
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let gate = ModuleConstraintGate::from_live_compositions(&[]);
+    let normalizer =
+        crate::provider_text_fixtures::normalizer("mock", Box::new(DroppingNormalizer));
+    let prepare = || {
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let context = ProviderPreparationContext::for_test(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &normalizer,
+                    &schemas,
+                    type_checks,
+                );
+                ready_for_test(prepare_initial_create(&checked, &context))
+                    .expect("normalized create passes preparation")
+                    .expect("create is ready")
+            },
+        )
+    };
+
+    let prepared = prepare();
+    let accepted = AcceptedRequest::from_create_permit_for_test(&prepared);
+    assert!(
+        accepted
+            .resolved_desired_attributes()
+            .values()
+            .contains_key("dropped")
+    );
+    assert!(
+        !prepared
+            .request()
+            .resource()
+            .attributes
+            .contains_key("dropped")
+    );
+    assert!(accepted.sent_attributes().contains("name"));
+    assert!(!accepted.sent_attributes().contains("dropped"));
+    // Row builders receive the normalized request, so only retained send
+    // evidence could incorrectly add the dropped writeback key to explicit.
+    let transport = prepared.request().resource().as_inner().clone();
+    let observed = State::existing(transport.id.clone(), transport.attributes.clone())
+        .with_identifier("normalized-id");
+    let pending_provider = create_fixture_provider("mock", |attempt| {
+        Box::pin(std::future::ready(Err(attempt
+            .pending(
+                PendingToken::new("normalized-token"),
+                Sent::AllRequestAttributes,
+                1,
+            )
+            .preserve(ProviderError::internal("create remains in flight")))))
+    });
+    let boundary = crate::provider_text_fixtures::boundary(Box::new(pending_provider));
+    let (create, _cancellation) = carina_core::executor::dispatch_create(&boundary, prepared);
+    let Err(failure) = ready_for_test(create) else {
+        panic!("fixture must return an in-flight create");
+    };
+    let HostCreateFailureKind::InFlight { pending, .. } = failure.into_kind() else {
+        panic!("fixture must retain its continuation");
+    };
+    let observed_id = transport.id.clone();
+    let identified_provider = create_fixture_provider("mock", move |attempt| {
+        Box::pin(std::future::ready(Err(attempt
+            .issued(
+                AppliedIdentifier::new("normalized-id").unwrap(),
+                Sent::AllRequestAttributes,
+            )
+            .identifier_reported(
+                Observation::Read(ReadOutcome::not_found(observed_id.clone())),
+                ProviderError::internal("create observation failed"),
+            ))))
+    });
+    let boundary = crate::provider_text_fixtures::boundary(Box::new(identified_provider));
+    let (create, _cancellation) = carina_core::executor::dispatch_create(&boundary, prepare());
+    let Err(failure) = ready_for_test(create) else {
+        panic!("fixture must return an identified failure");
+    };
+    let HostCreateFailureKind::IdentifierReported { identified, .. } = failure.into_kind() else {
+        panic!("fixture must retain its identifier");
+    };
+    let resource = transport;
+    let in_flight = ResourceState::from_in_flight(
+        &resource,
+        &pending,
+        None,
+        Some(schema.as_schema()),
+        None,
+        &exact_comparison_context(),
+    )
+    .unwrap();
+    let identified = ResourceState::from_observation(
+        &resource,
+        &identified,
+        None,
+        Some(schema.as_schema()),
+        None,
+        &exact_comparison_context(),
+    )
+    .unwrap();
+    let applied = resource_state_from_provider_state_for_resource_and_schema_for_test(
+        &resource,
+        &observed,
+        None,
+        Some(schema.as_schema()),
+        RowBasis::Applied(&accepted),
+        None,
+    )
+    .unwrap();
+    assert_explicit_struct_keys(&applied.explicit, &["name"]);
+    assert_eq!(in_flight.explicit, applied.explicit);
+    assert_eq!(identified.explicit, applied.explicit);
 }
 
 #[test]

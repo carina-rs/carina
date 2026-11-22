@@ -34,7 +34,7 @@ pub use delete::{
     DeleteCompletion, DeleteRelease, DeleteScheduleError, DeleteScheduler, ScheduledDelete,
     dispatch_delete, prepare_initial_delete,
 };
-pub use input_discharge::{DeletePermit, PreparedWrite};
+pub use input_discharge::{DeletePermit, PreparedCreateWriteback, PreparedWrite};
 pub use parallel::classify_stalled_effects;
 pub use scheduler::prepare_initial_create;
 pub use wait::StartMarker;
