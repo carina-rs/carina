@@ -16,7 +16,7 @@ use carina_core::provider::{
     InFlightCreate, InFlightPersistence, NestedWriteOnlyRecord, PersistedAttributes,
     PersistedAttributesError, RawSavedAttrs, Sent, SentDesiredAttributes, SentRecord,
     StateTransformMap, UnknownCreateOutcome, merge_previous_secret_hashes_into_provider_value,
-    previous_hash,
+    previous_hash, restrict_previous_secret_hashes_to_leaves,
 };
 pub use carina_core::resource::DeposedKey;
 #[cfg(test)]
@@ -29,7 +29,7 @@ use carina_core::resource::{
     UnavailableSecretError, Value,
 };
 use carina_core::schema::{
-    CompiledResourceSchema as ResourceSchema, FieldName, SchemaKind, SchemaRegistry,
+    CompiledResourceSchema as ResourceSchema, FieldName, LeafPath, SchemaKind, SchemaRegistry,
     schema_write_only_keys,
 };
 use carina_core::validation::admission::final_input::{FinalDesiredAttributes, FinalDesiredValues};
@@ -117,10 +117,18 @@ impl DesiredKey {
     }
 }
 
+/// Whether desired-secret masking has already protected the provider value.
+#[derive(Clone, Copy)]
+enum PreviousSecretHashInput<'a> {
+    ProviderValue(Option<&'a PersistedValue>),
+    DesiredSecretsMasked,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreviousSecretHashDecision {
+enum PreviousSecretHashDecision<'a> {
     Release,
     Protect,
+    ProtectLeaves(&'a [LeafPath]),
 }
 
 /// Provider values selected for a state row before secret protection.
@@ -274,36 +282,55 @@ impl SelectedStateAttributes {
         }
     }
 
-    fn decide_previous_secret_hash(
-        authority: &PreviousSecretHashAuthority<'_>,
+    fn decide_previous_secret_hash<'a>(
+        authority: &'a PreviousSecretHashAuthority<'_>,
         key: &str,
-        provider_value: Option<&PersistedValue>,
+        input: PreviousSecretHashInput<'_>,
         comparison: Option<DesiredValueComparison<'_>>,
-    ) -> PreviousSecretHashDecision {
+    ) -> PreviousSecretHashDecision<'a> {
+        if let PreviousSecretHashAuthority::AcceptedWrite {
+            request,
+            request_attributes,
+            ..
+        } = authority
+            && (matches!(input, PreviousSecretHashInput::DesiredSecretsMasked)
+                || DesiredKey::from_attributes(request_attributes, key) == DesiredKey::KnownPublic)
+        {
+            match request.kind() {
+                AcceptedRequestKind::Create => return PreviousSecretHashDecision::Release,
+                AcceptedRequestKind::Update { sent, removed: _ } => {
+                    if let Some(sent) = sent.get(key) {
+                        return if sent.grafted_leaves().is_empty() {
+                            PreviousSecretHashDecision::Release
+                        } else {
+                            PreviousSecretHashDecision::ProtectLeaves(sent.grafted_leaves())
+                        };
+                    }
+                }
+            }
+        }
+        let provider_value = match input {
+            PreviousSecretHashInput::ProviderValue(value) => value,
+            // Only accepted public writes above can release previous leaf
+            // hashes. Otherwise merge them into the already-masked value.
+            PreviousSecretHashInput::DesiredSecretsMasked => {
+                return if matches!(authority, PreviousSecretHashAuthority::None) {
+                    PreviousSecretHashDecision::Release
+                } else {
+                    PreviousSecretHashDecision::Protect
+                };
+            }
+        };
         let final_desired = match authority {
             PreviousSecretHashAuthority::None => return PreviousSecretHashDecision::Release,
             PreviousSecretHashAuthority::AllPreviouslyHashedKeys(_) => {
                 return PreviousSecretHashDecision::Protect;
             }
-            PreviousSecretHashAuthority::AcceptedWrite {
-                request,
-                request_attributes,
-                final_desired,
-                ..
-            } => {
-                if DesiredKey::from_attributes(request_attributes, key) == DesiredKey::KnownPublic
-                    && match request.kind() {
-                        AcceptedRequestKind::Create => true,
-                        AcceptedRequestKind::Update { sent, .. } => sent.contains(key),
-                    }
-                {
-                    return PreviousSecretHashDecision::Release;
-                }
-                match final_desired {
-                    Some(desired) => *desired,
-                    None => return PreviousSecretHashDecision::Protect,
-                }
-            }
+            PreviousSecretHashAuthority::AcceptedWrite { final_desired, .. } => match final_desired
+            {
+                Some(desired) => *desired,
+                None => return PreviousSecretHashDecision::Protect,
+            },
             PreviousSecretHashAuthority::MatchingFinalDesiredValue { desired, .. } => *desired,
         };
         let desired_attributes = final_desired.attributes();
@@ -346,22 +373,27 @@ impl SelectedStateAttributes {
         };
         let keys = previous.keys().cloned().collect::<Vec<_>>();
         for key in keys {
-            if protected_secret_keys.contains(&key)
-                || Self::decide_previous_secret_hash(
-                    authority,
-                    &key,
-                    self.encoded.get(&key),
-                    comparison,
-                ) == PreviousSecretHashDecision::Release
-                || (self.write_only_keys.contains(&key) && !self.retained_write_only.contains(&key))
-            {
+            if self.write_only_keys.contains(&key) && !self.retained_write_only.contains(&key) {
                 continue;
             }
             let Some(previous_value) = previous.encoded_value(&key) else {
                 continue;
             };
+            let input = if protected_secret_keys.contains(&key) {
+                PreviousSecretHashInput::DesiredSecretsMasked
+            } else {
+                PreviousSecretHashInput::ProviderValue(self.encoded.get(&key))
+            };
+            let previous_value =
+                match Self::decide_previous_secret_hash(authority, &key, input, comparison) {
+                    PreviousSecretHashDecision::Release => continue,
+                    PreviousSecretHashDecision::Protect => Cow::Borrowed(previous_value),
+                    PreviousSecretHashDecision::ProtectLeaves(leaves) => Cow::Owned(
+                        restrict_previous_secret_hashes_to_leaves(previous_value, leaves)?,
+                    ),
+                };
             let Some(masked) = merge_previous_secret_hashes_into_provider_value(
-                previous_value,
+                &previous_value,
                 self.encoded.get(&key),
             )?
             else {
@@ -3424,7 +3456,7 @@ impl ResourceState {
                 }
                 AcceptedRequestKind::Update { sent, .. } => {
                     accepted.extend(
-                        sent.iter()
+                        sent.keys()
                             .filter(|key| {
                                 desired_keys.contains(*key) && schema_write_only.contains(*key)
                             })
@@ -3547,7 +3579,7 @@ impl ResourceState {
                     for key in removed {
                         record.remove_attribute(key);
                     }
-                    (record, sent.iter().map(String::as_str).collect::<Vec<_>>())
+                    (record, sent.keys().map(String::as_str).collect::<Vec<_>>())
                 }
             },
             RowBasis::Imported => (NestedWriteOnlyRecord::default(), Vec::new()),

@@ -28,8 +28,8 @@ use crate::module_resolver::{
 };
 use crate::parser::ProviderConfig;
 use crate::provider::{
-    CreateRequest, HostNormalizer, ProviderDirectives, ProviderWireError, ProviderWireTarget,
-    ResourceWirePayload, UpdateRequest, WireAttributes, WireReady,
+    AdmittedUpdatePatch, CreateRequest, HostNormalizer, ProviderDirectives, ProviderWireError,
+    ProviderWireTarget, ResourceWirePayload, UpdateRequest, WireAttributes, WireReady,
 };
 use crate::resource::{
     AbsoluteBindingAddress, DataSource, LiveComposition, NoPlaceholder, ProviderDataSource,
@@ -428,26 +428,20 @@ impl<'a> ProviderPreparationContext<'a> {
         changed: &[String],
         resource: &ProviderReadyResource,
         from: &crate::resource::SnapshotState,
-    ) -> Result<FinalInput<WireReady<crate::provider::UpdatePatch>>, ProviderPreparationError> {
+    ) -> Result<AdmittedUpdatePatch, ProviderPreparationError> {
         let schema = self
             .schemas
             .get_for(resource.as_resource())
             .ok_or_else(|| ProviderPreparationError::MissingManagedSchema {
                 resource: resource.id.clone(),
             })?;
-        let patch = crate::provider::build_update_patch(
+        let planned = crate::provider::build_update_patch(
             changed,
             resource,
             from,
             schema.schema().as_schema(),
         )?;
-        let admitted = crate::validation::admission::final_input::admit_update_patch(
-            patch,
-            resource,
-            schema,
-            self.bindings,
-            self.type_checks,
-        )?;
+        let admitted = planned.admit(resource, schema, self.bindings, self.type_checks)?;
         settle_preparation(self.type_checks.pending(admitted))
     }
 }

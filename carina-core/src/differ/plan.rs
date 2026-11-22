@@ -1283,6 +1283,7 @@ fn create_plan_parts(
                                 &from,
                                 schema,
                             )
+                            .map(|planned| planned.to_patch())
                         {
                             plan.add_error(PlanError::new(id, error.into()));
                             continue;

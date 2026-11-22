@@ -4415,6 +4415,10 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
             ),
         ]))),
     );
+    updated.directives.ignore_changes = vec![crate::resource::ParsedIgnorePath::new(vec![
+        crate::resource::ParsedIgnorePathSegment::Attribute("config".into()),
+        crate::resource::ParsedIgnorePathSegment::Attribute("issuer".into()),
+    ])];
     let update_id = updated.id.clone();
     let from = State::existing(
         update_id.clone(),
@@ -4442,6 +4446,10 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
     )
     .with_identifier("id-123");
 
+    let schemas = provider_boundary_constraint_schemas();
+    let updated = updated.with_dependency_phase(());
+    let updated = ResolvedResource::resolve_with_schemas(updated, &schemas)
+        .expect("fixture ignore paths resolve against the schema");
     let mut plan = Plan::new();
     plan.add(create_effect(created));
     plan.add(Effect::Update {
@@ -4449,12 +4457,11 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
             from.id.identity_display().to_string(),
         ),
         from: Box::new(from),
-        to: resolved(updated),
+        to: updated,
         changed_attributes: vec!["target".to_string(), "obsolete".to_string()],
     });
     provider.push_create(Ok(ok_state(&create_id)));
     provider.push_update(Ok(ok_state(&update_id)));
-    let schemas = provider_boundary_constraint_schemas();
     let input = ExecutionInput {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -4520,14 +4527,124 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
         panic!("update must publish update request provenance");
     };
     assert_eq!(
-        sent,
-        &BTreeSet::from([
+        sent.keys().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([
             "config".to_string(),
             "target".to_string(),
             "token".to_string(),
         ])
     );
     assert_eq!(removed, &BTreeSet::from(["obsolete".to_string()]));
+    assert_eq!(
+        sent["config"].grafted_leaves(),
+        &[crate::schema::LeafPath::from_segments([
+            crate::schema::LeafPathSegment::StructField("issuer".into()),
+        ]),]
+    );
+    assert!(sent["target"].grafted_leaves().is_empty());
+    assert!(sent["token"].grafted_leaves().is_empty());
+}
+
+#[tokio::test]
+async fn accepted_request_keeps_grafted_leaves_on_each_sent_op() {
+    let schemas = provider_boundary_constraint_schemas();
+    let bindings = ResolvedBindings::default();
+    let gate = ModuleConstraintGate::from_live_compositions(&[]);
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |session| {
+            let context = ProviderPreparationContext::for_test(
+                &bindings,
+                &gate,
+                &[],
+                &NoopNormalizer,
+                &schemas,
+                session,
+            );
+            for (changed_config, observed_config) in [(true, false), (true, true), (false, true)] {
+                let text = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+                let mut desired = make_resource("grafted-sent-op", &[]);
+                desired.set_attr("target", text("good-update"));
+                desired.set_attr("token", text("fixture-secret-4570"));
+                desired.set_attr(
+                    "config",
+                    Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                        ("issuer".into(), text("authored-issuer")),
+                        ("client_secret".into(), text("fixture-secret-4570")),
+                    ]))),
+                );
+                desired.directives.ignore_changes =
+                    vec![crate::resource::ParsedIgnorePath::new(vec![
+                        crate::resource::ParsedIgnorePathSegment::Attribute("config".into()),
+                        crate::resource::ParsedIgnorePathSegment::Attribute("issuer".into()),
+                    ])];
+                let mut observed = HashMap::from([
+                    ("target".into(), text("good-before")),
+                    ("obsolete".into(), text("remove-me")),
+                ]);
+                if observed_config {
+                    observed.insert(
+                        "config".into(),
+                        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                            "issuer".into(),
+                            text("observed-issuer"),
+                        )]))),
+                    );
+                }
+                let from = State::existing(
+                    desired.id.clone(),
+                    crate::test_support::snapshot_attributes(observed),
+                );
+                let mut changed = vec!["obsolete".into(), "target".into()];
+                if changed_config {
+                    changed.push("config".into());
+                }
+                let request = prepare_update_request(desired, from, &changed, &context)
+                    .await
+                    .expect("grafted patch must pass admission");
+                let op = request
+                    .patch()
+                    .ops
+                    .iter()
+                    .find(|op| op.key() == "config")
+                    .unwrap();
+                match op {
+                    crate::provider::PatchOp::Add { .. } => {
+                        assert!(changed_config && !observed_config);
+                    }
+                    crate::provider::PatchOp::Replace { .. } => {
+                        assert!(changed_config && observed_config);
+                    }
+                    crate::provider::PatchOp::Reassert { .. } => assert!(!changed_config),
+                    crate::provider::PatchOp::Remove { .. } => panic!("config must be sent"),
+                }
+                let accepted = AcceptedRequest::from_update_request(
+                    &request,
+                    SecretPreservingAttributes::from_provider_values(
+                        request.desired_for_fixture().attributes.iter(),
+                        request.from().attributes.iter(),
+                    ),
+                );
+                let AcceptedRequestKind::Update { sent, removed } = accepted.kind() else {
+                    panic!("expected accepted update");
+                };
+                assert_eq!(
+                    sent.keys().map(String::as_str).collect::<Vec<_>>(),
+                    ["config", "target", "token"]
+                );
+                assert_eq!(removed, &BTreeSet::from(["obsolete".into()]));
+                assert_eq!(
+                    sent["config"].grafted_leaves(),
+                    &[crate::schema::LeafPath::from_segments([
+                        crate::schema::LeafPathSegment::StructField("issuer".into()),
+                    ])]
+                );
+                assert!(sent["target"].grafted_leaves().is_empty());
+                assert!(sent["token"].grafted_leaves().is_empty());
+            }
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
