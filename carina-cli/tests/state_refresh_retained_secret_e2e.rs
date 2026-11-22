@@ -322,6 +322,54 @@ fn refresh_retained_call_with_visible_secret_argument_keeps_previous_hash() {
 }
 
 #[test]
+fn tp19_typed_lookup_validate_rejects_and_refresh_succeeds() {
+    let scenario = Scenario::new(
+        false,
+        "visible(lookup({ 'src-id' = src.computed }, src.identifier, src.computed))",
+    );
+    let resources = fs::read_to_string(&scenario.source).unwrap();
+    let untyped = format!("fn visible(x) {{ x }}\n{resources}");
+    fs::write(&scenario.source, &untyped).unwrap();
+    let before = scenario.apply_and_plan(&scenario.marker);
+    fs::write(
+        &scenario.source,
+        untyped.replacen(
+            "fn visible(x) { x }",
+            "fn visible(x: HttpsUrl): String { x }",
+            1,
+        ),
+    )
+    .unwrap();
+
+    let output = scenario.command(&["validate", "--json", "."]);
+    assert!(
+        !output.status.success(),
+        "validate must reject the typed lookup"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(&scenario.marker)
+            && !String::from_utf8_lossy(&output.stderr).contains(&scenario.marker),
+        "validation must keep fixture material protected"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("validate must return a JSON report"));
+    let errors = report["errors"].as_array().expect("validation errors");
+    assert_eq!(errors.len(), 1, "the typed lookup has one promise finding");
+    let message = errors[0]["message"]
+        .as_str()
+        .expect("diagnostic text")
+        .replace(&scenario.marker, "<MASKED>");
+    assert_eq!(
+        message,
+        "function 'visible': parameter 'x' is declared as HttpsUrl, but its argument has no known type, so validate cannot prove it fits. Pass a value known at validate, or give the argument a type that proves it fits."
+    );
+
+    let (after, _) = scenario.refresh_hash(&scenario.marker);
+    assert_eq!(after, before, "refresh must preserve the previous digest");
+    scenario.assert_hash(&scenario.state(), "src", &scenario.marker);
+}
+
+#[test]
 fn refresh_secret_reference_keeps_previous_hash() {
     let scenario = Scenario::new(false, "src.tags.nested");
     let source = fs::read_to_string(&scenario.source).unwrap();

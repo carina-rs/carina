@@ -3,12 +3,37 @@ use crate::schema::{AttributeType, PatternMatch, PatternSpec};
 
 #[test]
 fn tp17_reference_proof_requires_identity_length_pattern_and_member_evidence() {
-    use crate::schema::{StringIdentityLayer, StringMemberConstraints};
+    use crate::schema::{
+        AssignabilityEdge, AttributeSchema, ResourceSchema, SchemaRegistry, StringIdentityLayer,
+        StringMemberConstraints, ValidatedProviderSchemaWitness,
+    };
     let id = TypeIdentity::from_dotted("test.Name");
+    let other = TypeIdentity::from_dotted("test.Other");
     let reference = |identity, pattern, length| AttributeType::reference(identity, pattern, length);
     let target =
         |pattern, length| AttributeType::refined_string(Some(id.clone()), pattern, length, None);
-    let catalog = crate::parser::ProviderCustomTypes::default();
+    // Reference identities cannot be widening endpoints. Named Strings use
+    // the same scalar proof condition after successful identity admission.
+    let widening_source = AttributeType::refined_string(Some(other.clone()), None, None, None);
+    let schema = ResourceSchema::new("Values")
+        .attribute(AttributeSchema::optional("source", widening_source.clone()).build())
+        .attribute(AttributeSchema::optional("target", target(None, None)).build())
+        .validate()
+        .unwrap();
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![schema],
+        Default::default(),
+        Default::default(),
+        vec![AssignabilityEdge::new(other, id.clone()).unwrap()],
+    )
+    .unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert_provider_witness("test", &witness).unwrap();
+    let snapshot = crate::test_utils::loaded_fixture_snapshot(schemas);
+    let catalog = &snapshot
+        .provider_context()
+        .as_provider_context()
+        .custom_types;
     let owner = crate::parser::SchemaTypeOwner::Provider("test".into());
     let defs = std::collections::BTreeMap::new();
     let source = reference(id.clone(), None, None);
@@ -18,16 +43,12 @@ fn tp17_reference_proof_requires_identity_length_pattern_and_member_evidence() {
             .in_schema(&defs)
             .reference_relation_to(
                 same.in_schema(&defs)
-                    .with_authority(&catalog, SinkAuthority::Owner(&owner))
+                    .with_authority(catalog, SinkAuthority::Owner(&owner))
             )
             .type_proven()
     );
     for (case, source, target) in [
-        (
-            "different identity",
-            reference(TypeIdentity::from_dotted("test.Other"), None, None),
-            target(None, None),
-        ),
+        ("different identity", widening_source, target(None, None)),
         (
             "length not contained",
             reference(id.clone(), None, Some((Some(1), Some(128)))),
@@ -53,14 +74,17 @@ fn tp17_reference_proof_requires_identity_length_pattern_and_member_evidence() {
     ] {
         let sink = target
             .in_schema(&defs)
-            .with_authority(&catalog, SinkAuthority::Owner(&owner));
+            .with_authority(catalog, SinkAuthority::Owner(&owner));
+        let relation = source.in_schema(&defs).reference_relation_to(sink);
+        let proven = relation.type_proven();
         assert!(
-            !source
-                .in_schema(&defs)
-                .reference_relation_to(sink)
-                .type_proven(),
-            "{case}"
+            matches!(
+                relation.for_destination(),
+                AssignmentRelation::NeedsLocal(None)
+            ),
+            "{case}: identity admission must retain a value check"
         );
+        assert!(!proven, "{case}");
     }
 }
 
