@@ -668,8 +668,17 @@ type each bullet names; read that type's rustdoc for the details.
   in `validation/admission/configuration/` and is closed off from resource
   admission by its types. S3 backend URLs keep encryption on and
   auto-creation off. Function parameters/returns use
-  `check_resolved_constraints_at`. Member String failures retain their pattern/
-  length category and member label; identity failures run first.
+  `check_resolved_constraints_at`. Unknown values must be proven by their type;
+  otherwise validate reports a function-promise finding, emitted only by
+  `parser/retained/function_promises.rs`, carried in its own type, and never a
+  stop/parse error. Unknown returns reuse the body typed with declared parameter
+  types; nested-call verdicts are reused for relevant unknown outer arguments.
+  Calls inside modules use the child's declared argument types. Unavailable
+  schemas or upstream loads defer. Destroy/state refresh skip this pass through
+  `ValidationMode` (the `FullValidation` capability). Some String references into
+  narrower named or Int parameters still defer (carina#4594). Definite mismatches
+  remain declaration errors, including unused functions. Member String failures
+  retain their pattern/length category and member label; identity failures run first.
   Int-to-Float widening between identified scalars uses identity-bound containment
   too. Float pairs with identities on both sides retain strict declaration range
   containment; same-identity Float reference admission retains resolved-value

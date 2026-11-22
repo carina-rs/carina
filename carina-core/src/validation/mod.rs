@@ -16,6 +16,7 @@ pub use presentation::{
     ClientFindingKind, ConversionValidation, FindingSubject, OrdinaryFailure, OrdinaryFinding,
     PresentedConversion, PresentedFinding, PresentedFindings, ResourceAdmissionStep,
     ResourceValidationReport, SinkFindings, ValidationClientError, ValidationClientFailure,
+    merge_function_promise_diagnostics,
 };
 pub mod routing;
 pub mod typecheck;

@@ -38,6 +38,9 @@ fn parser_conversion_rejections_wait_for_the_presented_exit() {
                 PresentedFinding::Ordinary(error) => {
                     panic!("conversion rejection escaped its channel: {error}")
                 }
+                PresentedFinding::FunctionPromise(finding) => {
+                    panic!("expected a conversion rejection, got {finding}")
+                }
                 PresentedFinding::Conversion(error) => {
                     assert_eq!(error.code(), "conversion_unsupported_position");
                     assert!(error.location().span().start_column() > 1);

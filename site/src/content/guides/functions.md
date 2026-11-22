@@ -140,6 +140,51 @@ fn name(param1: type1, param2: type2): return_type {
 - **Return type** annotation is optional (`: String`)
 - The function body is a single expression (the return value)
 
+### Type promises at validate
+
+Each declared parameter and return type is a promise checked at every call,
+including calls inside modules. If the value is known at `validate`, Carina
+checks the value. Otherwise its type must prove that it fits the declaration;
+a broad `String` cannot prove a literal union or a provider's refined string
+type. A `String` reference argument into a provider's refined string parameter
+currently passes `validate`; this gap is tracked in [carina#4594](https://github.com/carina-rs/carina/issues/4594).
+An upstream export without a declared type cannot prove a promise either.
+Unknown results of built-ins typed as `Any`, such as `lookup`, also need value evidence.
+Unavailable provider schemas or failed upstream loads leave the promise check pending.
+Definite type mismatches and invalid annotations remain declaration errors,
+including in unused functions.
+
+`destroy` and `state refresh` skip checks for unproven function type promises, so
+a configuration rejected for that reason can still be destroyed or refreshed.
+Definite type mismatches still fail there.
+
+For an unknown return value, Carina types the body once with each parameter's
+declared type. For example, `fn pick(x: String): 'dev' | 'prod' { x }` accepts
+`pick('dev')`, but rejects `pick(src.identifier)` when `src.identifier` is an
+unknown `String`. Declaring `x` with a narrower type supplies the corresponding
+return evidence. Untyped parameters supply no type evidence for declared returns
+or typed parameters in nested calls.
+
+Calls inside a function body use the enclosing function's declared parameter
+types, once per declaration. A non-proving nested call is reported at each outer
+call whose relevant argument is unknown. An unused outer function does not
+trigger that validation error.
+
+Inside a module, unknown arguments use the types declared in that module's
+`arguments` block. For example, `env: 'dev' | 'prod'` proves `pick(env)` fits the
+same union even when the caller passes an unknown `String`. Known argument values
+still receive value checks. The caller-to-module boundary is checked separately.
+
+For `fn pick(x: 'dev' | 'prod'): String { x }`, passing that unknown `String`
+produces:
+
+```text
+function 'pick': parameter 'x' is declared as 'dev' | 'prod', but its argument has type String, so validate cannot prove it fits. Pass a value known at validate, or declare the parameter as String and let the resource attribute that receives it check the value.
+```
+
+Return errors name the return value and the body's type. An untyped upstream
+export error names the export and also suggests declaring its type.
+
 ### Local variables in functions
 
 Functions can have local `let` bindings before the final expression:

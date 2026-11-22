@@ -40,8 +40,8 @@ use crate::module_walk::ModuleWalk;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::wiring::ProviderLoad;
 use crate::wiring::{
-    NonEmptyValidationErrors, ParserCanonicalResourcePair, ValidationProviderCatalog,
-    ValidationProviderCatalogExt, WiringContext,
+    FullValidation, NonEmptyValidationErrors, ParserCanonicalResourcePair, ValidationMode,
+    ValidationProviderCatalog, ValidationProviderCatalogExt, WiringContext,
     compute_anonymous_identifiers_with_policy_with_ctx,
     compute_parser_pair_anonymous_identifiers_with_policy_with_ctx, resolve_file_names_with_ctx,
     validate_deferred_populate_refs_with_ctx,
@@ -275,12 +275,15 @@ pub(crate) fn collapse_errors(errors: Vec<AppError>) -> AppError {
 
 pub(crate) fn collapse_presented_errors(errors: Vec<crate::error::PresentedAppError>) -> AppError {
     collapse_errors(
-        errors
+        validate::merge_function_promise_errors(errors)
             .into_iter()
             .map(|error| match error {
                 crate::error::PresentedAppError::Ordinary(error) => error,
                 crate::error::PresentedAppError::Conversion(error) => {
                     AppError::Validation(error.to_string())
+                }
+                crate::error::PresentedAppError::FunctionPromise(finding) => {
+                    AppError::Validation(finding.to_string())
                 }
             })
             .collect(),
@@ -671,7 +674,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'s>(
     ctx: &'s WiringContext,
     enriched_context: &ValidationProviderCatalog,
     _load_errors: &HashMap<String, String>,
-    skip_resource_validation: bool,
+    mode: ValidationMode,
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
 ) -> Result<ResolvedConfig<'s>, NonEmptyValidationErrors> {
@@ -682,7 +685,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'s>(
         ctx,
         enriched_context,
         _load_errors,
-        skip_resource_validation,
+        mode,
         duplicate_declarations,
         name_resolution,
     );
@@ -708,7 +711,7 @@ pub(crate) fn validate_and_resolve_report_inner<'s>(
     ctx: &'s WiringContext,
     enriched_context: &ValidationProviderCatalog,
     _load_errors: &HashMap<String, String>,
-    skip_resource_validation: bool,
+    mode: ValidationMode,
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
 ) -> ConfigurationValidation<ResolvedConfig<'s>> {
@@ -728,7 +731,7 @@ pub(crate) fn validate_and_resolve_report_inner<'s>(
         enriched_context,
         _load_errors,
         duplicate_declarations,
-        skip_resource_validation,
+        mode,
         name_resolution,
         &mut authored_inputs,
         &mut warnings,
@@ -776,6 +779,55 @@ impl ValidationStopped {
     }
 }
 
+fn complete_function_promises<E, D, B: BindingAddress>(
+    _validation: &FullValidation,
+    file: &carina_core::parser::File<
+        E,
+        carina_core::resource::ParserPlaceholder,
+        carina_core::resource::ParserPlaceholder,
+        D,
+        B,
+    >,
+    base_dir: &ResolvedPath,
+    ctx: &WiringContext,
+    context: &ValidationProviderCatalog,
+    signatures: &module_resolver::ResolvedModuleSignatures,
+) -> Result<
+    Vec<carina_core::parser::Located<carina_core::parser::retained::FunctionTypePromise>>,
+    carina_core::parser::AnalysisTreeError,
+>
+where
+    E: Clone + carina_core::parser::ExportParamLike<carina_core::resource::ParserPlaceholder, B>,
+    D: Clone
+        + carina_core::parser::DeferredForPhaseTraversal<
+            carina_core::resource::ParserPlaceholder,
+            carina_core::resource::ParserPlaceholder,
+            B,
+        >,
+{
+    let configuration = carina_core::config_loader::load_buffer_configuration(
+        file,
+        ctx.schemas(),
+        context.catalog(),
+    );
+    if !configuration.judged().has_user_functions() {
+        return Ok(Vec::new());
+    }
+    let tree = carina_core::parser::AnalysisTree::try_from_file(file)?;
+    let (upstream, _) = carina_core::upstream_exports::resolve_upstream_exports_report(
+        base_dir,
+        &tree,
+        context,
+        Some(ctx.schemas()),
+    )?;
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+        file, ctx.schemas(), Some(&upstream), signatures, context,
+    );
+    Ok(configuration
+        .judged()
+        .function_type_promise_findings(&bindings))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_and_resolve_configuration<'s>(
     access: &crate::wiring::ValidationPipelineAccess,
@@ -785,7 +837,7 @@ fn validate_and_resolve_configuration<'s>(
     enriched_context: &ValidationProviderCatalog,
     _load_errors: &HashMap<String, String>,
     duplicate_declarations: &[DuplicateDeclaration],
-    skip_resource_validation: bool,
+    mode: ValidationMode,
     name_resolution: ConfigNameResolution,
     authored_inputs: &mut carina_core::input_rules::AuthoredInputs,
     warnings: &mut Vec<ConfigurationWarning>,
@@ -799,7 +851,7 @@ fn validate_and_resolve_configuration<'s>(
     // Binding-use and directive syntax validation are readiness invariants, not a
     // resource-validation preference. Keep the recursive module snapshots
     // available even on destroy/state recovery paths; the later optional
-    // policy checks remain gated by `skip_resource_validation`.
+    // policy checks remain gated by the validation mode.
     let module_walk = ModuleWalk::load(
         parsed.parsed(),
         base_dir,
@@ -820,14 +872,14 @@ fn validate_and_resolve_configuration<'s>(
     }
 
     let errors = validation;
-    if !skip_resource_validation {
+    if mode.checks_resources() {
         errors.extend(
             carina_core::parser::check_identifier_scope(parsed.parsed())
                 .into_iter()
                 .map(|error| AppError::Parse(Box::new(error))),
         );
     }
-    if !skip_resource_validation {
+    if mode.checks_resources() {
         match carina_core::parser::AnalysisTree::try_from_file(parsed.parsed()) {
             Ok(tree) => errors.extend(
                 carina_core::parser::check_provider_instance_routing(&tree)
@@ -841,14 +893,14 @@ fn validate_and_resolve_configuration<'s>(
         }
     }
 
-    if !skip_resource_validation {
+    if mode.checks_resources() {
         errors.extend(duplicate_declaration_errors(
             duplicate_declarations,
             &module_walk,
         ));
     }
 
-    if !skip_resource_validation {
+    if mode.checks_resources() {
         #[cfg(test)]
         tests::EXPORT_INFERENCE_RETRIES.set(tests::EXPORT_INFERENCE_RETRIES.get() + 1);
         let schema_checked_exports = match parsed.retry_unchecked_export_inference(
@@ -935,7 +987,7 @@ fn validate_and_resolve_configuration<'s>(
     if let Err(error) = parsed.resolve_resource_refs_in_session(enriched_context) {
         errors.push(AppError::AnalysisResolution(Box::new(error)));
     }
-    if !skip_resource_validation {
+    if mode.checks_resources() {
         let mut module_warnings = Vec::new();
         validate_module_internal_ref_types(
             ctx,
@@ -963,8 +1015,8 @@ fn validate_and_resolve_configuration<'s>(
     // Consume caller-authored uses before the shared module-call checker or
     // expansion can turn a typed pending slot into a secondary missing-
     // argument error. This authority is mandatory even for destroy/state
-    // recovery paths (`skip_resource_validation`): the flag may skip provider
-    // resource checks, but it cannot mint validation readiness.
+    // recovery paths: skipping provider resource checks cannot mint validation
+    // readiness.
     let binding_configuration = carina_core::config_loader::load_buffer_configuration(
         parsed.parsed(),
         ctx.schemas(),
@@ -997,7 +1049,7 @@ fn validate_and_resolve_configuration<'s>(
             carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
                 parsed.parsed(), ctx.schemas(), None, &imported_module_signatures, enriched_context,
             );
-        let reference_checks = if skip_resource_validation {
+        let reference_checks = if !mode.checks_resources() {
             carina_core::validation::ModuleCallReferenceChecks::Skipped
         } else {
             carina_core::validation::ModuleCallReferenceChecks::Enabled
@@ -1029,10 +1081,10 @@ fn validate_and_resolve_configuration<'s>(
     // checks established in #3711, the directory unit includes every imported
     // nested module, even when that import is never called. The ordinary-error
     // path collects expanded secrecy/placements but does not also emit the
-    // resolver's expansion-phase backstops. Destroy and state refresh set
-    // `skip_resource_validation = true`, bypass this walk, and rely on those
-    // backstops while still expanding modules.
-    if !skip_resource_validation {
+    // resolver's expansion-phase backstops. Destroy and state refresh use
+    // recovery mode, bypass this walk, and rely on those backstops while still
+    // expanding modules.
+    if mode.checks_resources() {
         errors.extend(validate_no_provider_in_modules(&module_walk));
         errors.extend(validate_no_state_blocks_in_modules(&module_walk));
         errors.extend(validate_no_backend_in_modules(&module_walk));
@@ -1047,7 +1099,7 @@ fn validate_and_resolve_configuration<'s>(
         // Dependency diagnostics are independent of unrelated argument-type
         // failures. The per-argument report preserves every sound result even
         // when expansion cannot proceed to the final graph check.
-        if !skip_resource_validation {
+        if mode.checks_resources() {
             // Resolution mutated the authored input. Seal this stage only on
             // the early-error path; success uses the shared expanded tree.
             match carina_core::parser::AnalysisTree::try_from_file(parsed.parsed()) {
@@ -1090,6 +1142,35 @@ fn validate_and_resolve_configuration<'s>(
         secrecy_errors.clear();
         extend_secrecy_errors(secrecy_errors, configuration.judged().secrecy());
         errors.include_file(graph);
+    }
+    // The completed module graph (or the complete root index on failure) owns
+    // promise diagnostics in full validation. Recovery never receives the
+    // capability needed to run this pass. Findings cannot stop validation.
+    if let ValidationMode::Full(full) = mode {
+        let promises = match &module_resolution {
+            module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
+                complete_function_promises(
+                    &full,
+                    graph,
+                    base_dir,
+                    ctx,
+                    enriched_context,
+                    &imported_module_signatures,
+                )
+            }
+            _ => complete_function_promises(
+                &full,
+                parsed.parsed(),
+                base_dir,
+                ctx,
+                enriched_context,
+                &imported_module_signatures,
+            ),
+        };
+        match promises {
+            Ok(findings) => errors.include_function_promises(findings),
+            Err(error) => errors.push(AppError::AnalysisInvariant(error)),
+        }
     }
     if had_ordinary_failure {
         extend_module_call_errors(errors, authored_module_call_findings);
@@ -1284,7 +1365,7 @@ fn validate_and_resolve_configuration<'s>(
         return Err(ValidationStopped::existing(errors));
     }
 
-    let expanded_analysis = if !skip_resource_validation {
+    let expanded_analysis = if mode.checks_resources() {
         let analysis = match parsed.analysis_tree() {
             Ok(tree) => tree,
             Err(error) => {
@@ -1421,7 +1502,7 @@ fn validate_and_resolve_configuration<'s>(
         }
     }
 
-    let identity_conflict_policy = if skip_resource_validation {
+    let identity_conflict_policy = if !mode.checks_resources() {
         carina_core::identifier::AnonymousIdentityConflictPolicy::RepresentabilityOnly
     } else {
         carina_core::identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived
@@ -1451,12 +1532,11 @@ fn validate_and_resolve_configuration<'s>(
 
     // Reject references to `upstream_state` fields that the upstream's
     // `exports { }` block does not declare. Gated like the other
-    // validations above so `destroy` / `state` (which pass
-    // `skip_resource_validation = true`) can still run when an upstream
-    // has drifted — those commands are the recovery path for exactly
-    // that situation. No state I/O: we parse the upstream's `.crn`
-    // files directly.
-    if !skip_resource_validation {
+    // validations above so `destroy` / `state` in recovery mode can still run
+    // when an upstream has drifted — those commands are the recovery path for
+    // exactly that situation. No state I/O: we parse the upstream's `.crn` files
+    // directly.
+    if mode.checks_resources() {
         // Identity assignment mutates the parsed resources. Seal their final
         // view only after the identity and move-target gate has succeeded.
         let analysis = match parsed.analysis_tree() {
@@ -1568,7 +1648,7 @@ mod tests {
             &'s WiringContext,
             &ValidationProviderCatalog,
             &HashMap<String, String>,
-            bool,
+            ValidationMode,
             &[DuplicateDeclaration],
             ConfigNameResolution,
         ) -> Result<ResolvedConfig<'s>, crate::wiring::NonEmptyValidationErrors>;

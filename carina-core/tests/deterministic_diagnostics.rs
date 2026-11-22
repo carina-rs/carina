@@ -572,3 +572,33 @@ fn unknown_module_argument_findings_keep_authored_order() {
         );
     });
 }
+
+#[test]
+fn tp18_authored_function_mismatches_keep_sibling_declaration_order() {
+    let parsed = directory("functions/references");
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let schemas = schemas();
+    let loaded = load_buffer_configuration(&parsed, &schemas, &config);
+    let bindings = loaded.parsed().binding_index(&config);
+    let findings = loaded.report().findings().to_vec();
+    assert!(
+        loaded.function_type_promise_findings(&bindings).is_empty(),
+        "definite mismatches belong entirely to the authored judgement"
+    );
+    assert_eq!(findings.len(), 4, "{findings:#?}");
+    for (finding, function) in findings.iter().zip(["zebra", "sink", "alpha", "sink"]) {
+        let error = finding.detail().to_string();
+        assert!(error.contains(&format!("function '{function}'")), "{error}");
+        assert!(
+            error.contains("expected Int") && error.contains("got String"),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        findings
+            .iter()
+            .map(|finding| finding_location(finding.location()))
+            .collect::<Vec<_>>(),
+        FUNCTION_LOCATIONS.map(|(file, line)| (file.to_owned(), line))
+    );
+}

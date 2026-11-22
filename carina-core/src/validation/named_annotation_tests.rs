@@ -1659,6 +1659,76 @@ fn enum_resource_binding_mismatch_keeps_the_exact_enum_name() {
 }
 
 #[test]
+fn tp5_named_reference_keeps_nonredundant_advice() {
+    let check = |snapshot: &LoadedProviderSnapshot, call: &str| {
+        let context = snapshot.provider_context().as_provider_context();
+        let parsed =
+            crate::parser::parse(&format!("let source = p.Values {{}}\n{call}\n"), context)
+                .unwrap();
+        let parsed = inference::apply_inference(parsed, snapshot.schema_registry(), context);
+        let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
+        super::tests::validate_function_promises_for_test(
+            &parsed,
+            &bindings,
+            snapshot.schema_registry(),
+        )
+    };
+    let same = snapshot(vec![(
+        "p",
+        vec![DraftType::reference(identity(), None, None)],
+    )]);
+    let scalar_call =
+        "fn f(x: aws.iam.Role.Name): String { 'accepted' }\nlet result = f(source.value0)";
+    assert_eq!(check(&same, scalar_call), Ok(()));
+
+    let other = TypeIdentity::from_schema_type("aws", "iam.Role", "OtherName");
+    let schema = ResourceSchema::new("Values")
+        .attribute(
+            AttributeSchema::provider_populated(
+                "value0",
+                DraftType::refined_string(Some(other.clone()), None, None, None),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::provider_populated(
+                "value1",
+                DraftType::refined_string_with_validator(
+                    identity(),
+                    None,
+                    None,
+                    crate::schema::legacy_validator(|_| Ok(())),
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![schema],
+        Default::default(),
+        Default::default(),
+        vec![crate::schema::AssignabilityEdge::new(other, identity()).unwrap()],
+    )
+    .unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert_provider_witness("p", &witness).unwrap();
+    let different = crate::test_utils::loaded_fixture_snapshot(schemas);
+    let errors = check(&different, scalar_call).unwrap_err();
+    assert_eq!(
+        errors,
+        "function 'f': parameter 'x' is declared as aws.iam.Role.Name, but its argument has type aws.iam.Role.OtherName, so validate cannot prove it fits. Pass a value known at validate, or declare the parameter as aws.iam.Role.OtherName and let the resource attribute that receives it check the value."
+    );
+
+    let composite_call = "fn f(x: struct { name: aws.iam.Role.Name }): String { 'accepted' }\nlet result = f({ name = source.value0 })";
+    assert_eq!(
+        check(&different, composite_call).unwrap_err(),
+        "function 'f': parameter 'x' is declared as struct { name: aws.iam.Role.Name }, but its argument has type map(aws.iam.Role.OtherName), so validate cannot prove it fits. Pass a value known at validate, or give the argument a type that proves it fits."
+    );
+}
+
+#[test]
 fn every_boundary_admits_same_identity_member_restrictions() {
     let snapshot = snapshot(vec![("p", vec![member(1, 128, None), member(1, 64, None)])]);
     let context = snapshot.provider_context().as_provider_context();

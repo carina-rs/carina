@@ -441,6 +441,8 @@ fn cidr_for_env(env: String): String {
 }
 ```
 
+See [function type promises](/guides/functions/#type-promises-at-validate) for parameter and return validation.
+
 ## Validate Expressions
 
 Validate expressions are boolean expressions used in `arguments` blocks for input validation and in `require` statements. They support comparison and logical operators.
