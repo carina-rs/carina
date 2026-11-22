@@ -6579,7 +6579,7 @@ where
                 record(reference.identity(), reference.diagnostic_path());
             });
         for (root, diagnostic_path) in roots {
-            if root.is_in_names(tree.binding_names()) {
+            if tree.is_defined_binding(&root) {
                 continue;
             }
             let occurrences: Vec<_> = deferred

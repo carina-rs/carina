@@ -439,6 +439,9 @@ fn parse_namespaced_id_value(
         {
             value = apply_postfix_path_segment(value, segment, &location)?;
         }
+        if let EvalValue::User(Value::Deferred(DeferredValue::ResourceRef { path })) = &mut value {
+            path.set_reference_locations(ctx.reference_locations(&pair));
+        }
         return Ok(value);
     }
 

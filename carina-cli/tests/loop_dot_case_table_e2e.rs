@@ -43,6 +43,20 @@ fn plan(root: &Path) -> serde_json::Value {
 
 #[test]
 fn loop_dot_case_table() {
+    run_case_table(|_| true);
+}
+
+#[test]
+fn loop_dot_review_round1_function_contexts() {
+    run_case_table(|row| row.id == "2-19");
+}
+
+#[test]
+fn loop_dot_review_round1_unrelated_cli_scope() {
+    run_case_table(|row| matches!(row.id, "2-20" | "2-21"));
+}
+
+fn run_case_table(include: impl Fn(&cases::Row) -> bool) {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
     let rows = cases::rows();
@@ -54,11 +68,11 @@ fn loop_dot_case_table() {
         String::from_utf8_lossy(&init.stderr)
     );
     let mut failures = Vec::new();
-    for row in rows {
+    for row in rows.into_iter().filter(include) {
         cases::fixture(root, &row);
         for &position in row.positions {
             cases::reader(root, position, row.reader);
-            let dot = diagnostics(root);
+            let mut dot = diagnostics(root);
             let label = format!("{}, {:?}, {position}, {}", row.id, row.kind, row.reader);
             match row.expected {
                 cases::Outcome::Validates if !dot.0 => failures.push(format!("{label}: {dot:?}")),
@@ -68,11 +82,32 @@ fn loop_dot_case_table() {
                         failures.push(format!("{label}: {dot:?}, expected {expected:?}"));
                     }
                 }
+                cases::Outcome::SurfaceErrors { cli, lsp } => {
+                    assert_ne!(cli, lsp, "each surface preserves main's wording");
+                    if dot.0 || dot.1 != cli {
+                        failures.push(format!("{label}: {dot:?}, expected {cli:?}"));
+                    }
+                }
                 cases::Outcome::SameAsSubscript(subscript) => {
                     cases::reader(root, position, subscript);
-                    let bracket = diagnostics(root);
-                    if dot != bracket || (row.id != "2-4" && !dot.0) {
+                    let mut bracket = diagnostics(root);
+                    if row.id == "2-6a" {
+                        for (observed, reader) in
+                            [(&mut dot, row.reader), (&mut bracket, subscript)]
+                        {
+                            assert_eq!(
+                                observed.1,
+                                [format!(
+                                    "deferred-for iterable `{reader}`: expected list iterable, got map"
+                                )]
+                            );
+                            observed.1[0] = observed.1[0].replace(reader, "<reader>");
+                        }
+                    }
+                    if dot != bracket || (!matches!(row.id, "2-4" | "2-6a") && !dot.0) {
                         failures.push(format!("{label}: dot {dot:?}, subscript {bracket:?}"));
+                    } else if row.id == "2-6a" && dot.0 {
+                        failures.push(format!("{label}: simple map iteration must be rejected"));
                     } else if dot.0 {
                         let bracket_plan = plan(root);
                         cases::reader(root, position, row.reader);

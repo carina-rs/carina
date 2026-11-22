@@ -37,6 +37,10 @@ pub(crate) struct LoopGroupRef<'a, B: BindingAddress> {
 }
 
 impl<'a, B: BindingAddress> LoopGroupRef<'a, B> {
+    pub(crate) fn binding(&self) -> &'a B {
+        self.handle.canonical_binding()
+    }
+
     fn new(handle: &'a UnexpandedStructuralHandle<B>) -> Option<Self> {
         let UnexpandedStructuralHandleKind::For(pattern) = handle.kind() else {
             return None;

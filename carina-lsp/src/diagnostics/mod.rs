@@ -2195,55 +2195,11 @@ impl DiagnosticRun<'_> {
                 },
             ),
         };
-        // Named loop children use the same identifier-scope authority as CLI
-        // validation, including its suggestions and complete in-scope names.
-        let scope_errors: HashMap<_, _> = merged
-            .filter(|_| {
-                preferred_analysis.is_some_and(|tree| {
-                    tree.binding_names()
-                        .iter()
-                        .any(|name| tree.is_loop_group(name))
-                })
-            })
-            .map(carina_core::parser::check_identifier_scope)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|error| match &error {
-                ParseError::UndefinedIdentifier { name, .. } => {
-                    Some((name.clone(), error.to_string()))
-                }
-                _ => None,
-            })
-            .collect();
         let undefined_references = preferred_analysis
             .map(|tree| {
-                self.undefined_reference_findings(
-                    tree,
-                    &known_bindings,
-                    &declared_providers,
-                    &scope_errors,
-                )
+                self.undefined_reference_findings(tree, &known_bindings, &declared_providers)
             })
             .unwrap_or_default();
-        let scope_error_calls: HashSet<_> = preferred_analysis
-            .into_iter()
-            .flat_map(|tree| tree.module_calls())
-            .filter(|call| {
-                !scope_errors.is_empty()
-                    && call.arguments().any(|(name, _)| {
-                        let Some(argument) = call.id().argument_value_location(name) else {
-                            return false;
-                        };
-                        undefined_references.iter().any(|finding| {
-                            let location = finding.location();
-                            location.file() == argument.file()
-                                && argument.span().start_byte() <= location.span().start_byte()
-                                && location.span().end_byte() <= argument.span().end_byte()
-                        })
-                    })
-            })
-            .map(|call| call.id().clone())
-            .collect();
         for finding in &undefined_references {
             diagnostics.extend(render_merged(
                 doc,
@@ -2940,6 +2896,9 @@ impl DiagnosticRun<'_> {
                     };
                     let (values, _prefixes_reported_by_file) = report.values.as_parts();
                     for error in values.errors() {
+                        if Self::loop_child_owns_module_lookup(preferred_tree, call, error) {
+                            continue;
+                        }
                         let finding = carina_core::parser::Located::new(
                             call.declaration_location().clone(),
                             error,
@@ -2949,8 +2908,7 @@ impl DiagnosticRun<'_> {
                             &finding,
                             DiagnosticSeverity::ERROR,
                             format!("{}: {}", resource.id(), finding.detail()),
-                        ) && !scope_error_calls.contains(call)
-                            && !rejected_calls.contains(&diagnostic.range)
+                        ) && !rejected_calls.contains(&diagnostic.range)
                             && !prior_diagnostics.contains(&diagnostic)
                             && !diagnostics.contains(&diagnostic)
                         {

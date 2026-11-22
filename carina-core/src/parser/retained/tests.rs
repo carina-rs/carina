@@ -347,6 +347,43 @@ fn keyed_loop_addressing_agrees_across_judgement_validation_and_expansion() {
 }
 
 #[test]
+fn loop_dot_retained_heads_match_subscript_diagnostics() {
+    for (pattern, iterable) in [("k, v", "({ a = 'x' })"), ("v", "['a']")] {
+        for alias in [false, true] {
+            for suffix in ["name", "missing", "name['bad']"] {
+                let mut observations = Vec::new();
+                for selection in [".a", "['a']"] {
+                    let (alias_source, head) = if alias {
+                        ("let alias = children\n", "alias")
+                    } else {
+                        ("", "children")
+                    };
+                    let (_, report) = source_schema_report(&format!(
+                        "let children = for {pattern} in {iterable} {{ mock.test.Source {{ name = v }} }}\n{alias_source}let selected = {head}{selection}.{suffix}"
+                    ));
+                    let selected = report
+                        .binding(&RelativeBindingName::new("selected"))
+                        .unwrap();
+                    observations.push((
+                        selected.static_type().cloned(),
+                        selected.check_owner(),
+                        report
+                            .findings()
+                            .iter()
+                            .map(|finding| finding.detail().to_string())
+                            .collect::<Vec<_>>(),
+                    ));
+                }
+                assert_eq!(
+                    observations[0], observations[1],
+                    "{pattern}, alias={alias}, {suffix}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn loop_dot_judgement_selects_a_key_and_owns_indexed_rejection() {
     for (pattern, iterable) in [("k, v", "({ a = 'x' })"), ("v", "['a']")] {
         let (_, report) = source_schema_report(&format!(

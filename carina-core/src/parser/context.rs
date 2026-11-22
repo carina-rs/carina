@@ -740,6 +740,27 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
         }
     }
 
+    pub(super) fn resolve_loop_dot_references(
+        &self,
+        value: Value,
+        source_line: usize,
+    ) -> Result<Value, ParseError> {
+        let heads: HashMap<_, _> = self
+            .bindings
+            .iter()
+            .filter_map(|(name, binding)| match binding {
+                ParseBinding::Structural { handle, .. } if handle.is_for_binding() => {
+                    Some((name.as_str(), handle))
+                }
+                _ => None,
+            })
+            .collect();
+        if heads.is_empty() {
+            return Ok(value);
+        }
+        crate::value_walk::resolve_loop_dot_references(&value, &heads, source_line)
+    }
+
     fn binding_scope(&self, name: &str) -> Option<&BindingScopeId> {
         match self.bindings.get(name) {
             Some(ParseBinding::Value { scope, .. } | ParseBinding::Structural { scope, .. }) => {

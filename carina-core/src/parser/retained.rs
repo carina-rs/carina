@@ -5844,22 +5844,19 @@ mod judgement {
             expressions,
             bindings: &bindings,
             structural_handles: file.parser_binding_metadata.structural_handles(),
-            structural_definitions: expressions
-                .definitions
+            structural_definitions: file
+                .parser_binding_metadata
+                .structural_handles()
                 .iter()
-                .filter_map(|(name, definition)| {
-                    file.parser_binding_metadata
-                        .structural_handles()
-                        .get(name)
-                        .map(|handle| {
-                            (
-                                (
-                                    definition.authored.location.instance.clone(),
-                                    definition.node_id(),
-                                ),
-                                handle,
-                            )
-                        })
+                .filter_map(|(name, handle)| {
+                    let definition = expressions.definitions.get(name)?;
+                    Some((
+                        (
+                            definition.authored.location.instance.clone(),
+                            definition.node_id(),
+                        ),
+                        handle,
+                    ))
                 })
                 .collect(),
             functions,
@@ -6040,6 +6037,29 @@ mod judgement {
         finish: bool,
     }
 
+    /// A structural head is resolved once. Dot consumers must handle the
+    /// loop-group arm through the selector before ordinary attribute lookup.
+    enum ResolvedHead<'a, B: BindingAddress> {
+        LoopGroup(crate::eval_value::LoopGroupRef<'a, B>),
+        Binding {
+            reference: NonLoopHead<B>,
+            lookup: crate::resource::binding_address::BindingLookup<B>,
+            kind: BindingHeadKind,
+        },
+    }
+
+    /// Minted only by head resolution's non-loop arms. Ordinary reference
+    /// inference requires this proof instead of accepting an arbitrary name.
+    struct NonLoopHead<B: BindingAddress> {
+        binding: B,
+    }
+
+    #[derive(Clone, Copy)]
+    enum BindingHeadKind {
+        Structural,
+        Ordinary,
+    }
+
     struct Judge<'a, B: BindingAddress> {
         authority: Arc<super::super::ProviderContext>,
         authored: IndexMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
@@ -6073,7 +6093,7 @@ mod judgement {
         upstream: Option<&'a crate::upstream_exports::UpstreamExports<B>>,
     }
 
-    impl<B: BindingAddress> Judge<'_, B> {
+    impl<'a, B: BindingAddress> Judge<'a, B> {
         fn is_list_literal(mut expression: &ExprValue<ParserPlaceholder, B>) -> bool {
             while matches!(
                 expression.authored.kind,
@@ -6533,32 +6553,6 @@ mod judgement {
             }
             result.data_mut().origin = Some(root.location.clone());
             result.data_mut().authority = Some(self.authority.clone());
-            if matches!(root.kind, ExprKind::Reference { .. }) {
-                let loop_reference = match &root.kind {
-                    ExprKind::Reference { binding, .. } => self
-                        .structural_handles
-                        .get(binding)
-                        .and_then(crate::eval_value::UnexpandedStructuralHandle::loop_group)
-                        .is_some(),
-                    _ => false,
-                };
-                if !loop_reference
-                    && matches!(
-                        result.judgement,
-                        ExprJudgement::Typed {
-                            kind: InferredKind::Ordinary(_),
-                            ..
-                        }
-                    )
-                {
-                    result.set_kind(InferredKind::Reference);
-                }
-                // The binding pass owns reference existence and field errors.
-                // A containing operation preserves that ownership.
-                if !result.is_enum_identifier() && !loop_reference {
-                    result.report_at(FailureOwner::BindingIndex);
-                }
-            }
             if let Some(failed) = children
                 .iter()
                 .enumerate()
@@ -6904,40 +6898,79 @@ mod judgement {
             result
         }
 
-        /// Resolve structural prefixes from the handle registry, including
-        /// lexical definition uses. A value's collection shape grants no loop authority.
-        fn structural_lookup(
+        fn head_for_handle(
+            handle: &'a crate::eval_value::UnexpandedStructuralHandle<B>,
+            binding: &B,
+        ) -> ResolvedHead<'a, B> {
+            use crate::resource::binding_address::BindingLookup;
+            match handle.loop_group() {
+                Some(group) => ResolvedHead::LoopGroup(group),
+                None => ResolvedHead::Binding {
+                    reference: NonLoopHead {
+                        binding: binding.clone(),
+                    },
+                    lookup: BindingLookup::new(handle.canonical_binding()),
+                    kind: BindingHeadKind::Structural,
+                },
+            }
+        }
+
+        fn resolve_head(&self, binding: &B) -> ResolvedHead<'a, B> {
+            self.structural_handles
+                .get(binding)
+                .map(|handle| Self::head_for_handle(handle, binding))
+                .unwrap_or_else(|| ResolvedHead::Binding {
+                    reference: NonLoopHead {
+                        binding: binding.clone(),
+                    },
+                    lookup: crate::resource::binding_address::BindingLookup::new(binding),
+                    kind: BindingHeadKind::Ordinary,
+                })
+        }
+
+        /// Preserve typed head authority through lexical definitions and
+        /// selections. Collection shapes never grant loop-group authority.
+        fn structural_head(
             &self,
             expression: &ExprValue<ParserPlaceholder, B>,
-        ) -> Option<crate::resource::binding_address::BindingLookup<B>> {
+        ) -> Option<ResolvedHead<'a, B>> {
             use crate::resource::binding_address::BindingLookup;
             let root = &expression.authored;
             if let Some(handle) = self
                 .structural_definitions
                 .get(&(root.location.instance.clone(), root.id))
             {
-                return Some(BindingLookup::new(handle.canonical_binding()));
+                return Some(Self::head_for_handle(handle, handle.canonical_binding()));
             }
             match &root.kind {
-                ExprKind::Binding { binding, .. } => self
-                    .structural_handles
-                    .get(binding)
-                    .map(|handle| BindingLookup::new(handle.canonical_binding())),
+                ExprKind::Binding { binding, .. } => match self.resolve_head(binding) {
+                    ResolvedHead::Binding {
+                        kind: BindingHeadKind::Ordinary,
+                        ..
+                    } => None,
+                    head => Some(head),
+                },
                 ExprKind::Definition | ExprKind::Alias | ExprKind::Parens => {
-                    self.structural_lookup(root.children.first()?)
+                    self.structural_head(root.children.first()?)
                 }
                 ExprKind::Access(step) => {
-                    let lookup = self.structural_lookup(root.children.first()?)?;
+                    let head = self.structural_head(root.children.first()?)?;
                     match step {
-                        PathSegment::Subscript { index } => Some(lookup.select(index)),
+                        PathSegment::Subscript { index } => {
+                            let lookup = match head {
+                                ResolvedHead::LoopGroup(group) => {
+                                    BindingLookup::new(group.binding())
+                                }
+                                ResolvedHead::Binding { lookup, .. } => lookup,
+                            };
+                            Some(self.resolve_head(lookup.select(index).binding()))
+                        }
                         PathSegment::Field { name } => {
-                            let group = self
-                                .structural_handles
-                                .get(lookup.binding())?
-                                .loop_group()?;
-                            crate::eval_value::select_dot(group, name)
-                                .ok()
-                                .map(|child| child.into_lookup())
+                            let ResolvedHead::LoopGroup(group) = head else {
+                                return None;
+                            };
+                            let child = crate::eval_value::select_dot(group, name).ok()?;
+                            Some(self.resolve_head(child.binding()))
                         }
                     }
                 }
@@ -6947,10 +6980,11 @@ mod judgement {
                     segments,
                     ..
                 } if segments.is_empty() => {
-                    let group = self.structural_handles.get(binding)?.loop_group()?;
-                    crate::eval_value::select_dot(group, attribute)
-                        .ok()
-                        .map(|child| child.into_lookup())
+                    let ResolvedHead::LoopGroup(group) = self.resolve_head(binding) else {
+                        return None;
+                    };
+                    let child = crate::eval_value::select_dot(group, attribute).ok()?;
+                    Some(self.resolve_head(child.binding()))
                 }
                 _ => None,
             }
@@ -6995,39 +7029,88 @@ mod judgement {
             attribute: &str,
             segments: &[PathSegment],
         ) -> InferredExpr {
-            if let Some(group) = self
-                .structural_handles
-                .get(binding)
-                .and_then(crate::eval_value::UnexpandedStructuralHandle::loop_group)
-            {
-                // Select the child before looking up a module output or a resource attribute.
-                let selection = crate::eval_value::select_dot(group, attribute);
-                let base = self
-                    .expressions
-                    .definitions
-                    .get(binding)
-                    .map(|definition| self.judge(definition));
-                let Some(base) = base else {
-                    return incomplete("authored loop group");
-                };
-                let child = match selection {
-                    Ok(child) => child,
-                    Err(rejected) => return Self::loop_dot_failure(rejected, &base),
-                };
-                let selected = self.access(&base, Some(&child.step()), binding.as_str());
-                if let Some((PathSegment::Field { name }, rest)) = segments.split_first()
-                    && (self.module_attributes.is_some_and(|outputs| {
-                        outputs.contains_key(&(child.binding().clone(), name.clone()))
-                    }) || matches!(
-                        self.bindings.get(child.binding().as_str()),
-                        Some(InferenceBinding::ModuleCall)
-                    ) || (!self.bindings.contains_key(child.binding().as_str())
-                        && !self.structural_handles.contains_key(child.binding())))
-                {
-                    return self.reference(child.binding(), name, rest);
+            let head = self.resolve_head(binding);
+            match head {
+                head @ ResolvedHead::LoopGroup(_) => {
+                    self.reference_from_head(binding, head, attribute, segments)
                 }
-                return self.access_path(selected, segments, child.binding().as_str());
+                head @ ResolvedHead::Binding { .. } => {
+                    let mut result = self.reference_from_head(binding, head, attribute, segments);
+                    if matches!(
+                        result.judgement,
+                        ExprJudgement::Typed {
+                            kind: InferredKind::Ordinary(_),
+                            ..
+                        }
+                    ) {
+                        result.set_kind(InferredKind::Reference);
+                    }
+                    // Binding-index ownership belongs to authored ordinary
+                    // references. Selected children keep subscript ownership.
+                    if !result.is_enum_identifier() {
+                        result.report_at(FailureOwner::BindingIndex);
+                    }
+                    result
+                }
             }
+        }
+
+        fn reference_from_head(
+            &mut self,
+            binding: &B,
+            head: ResolvedHead<'a, B>,
+            attribute: &str,
+            segments: &[PathSegment],
+        ) -> InferredExpr {
+            let group = match head {
+                ResolvedHead::LoopGroup(group) => group,
+                ResolvedHead::Binding { reference, .. } => {
+                    return self.binding_reference(reference, attribute, segments);
+                }
+            };
+            let selection = crate::eval_value::select_dot(group, attribute);
+            let base = self
+                .expressions
+                .definitions
+                .get(binding)
+                .map(|definition| self.judge(definition));
+            let Some(base) = base else {
+                return incomplete("authored loop group");
+            };
+            let child = match selection {
+                Ok(child) => child,
+                Err(rejected) => return Self::loop_dot_failure(rejected, &base),
+            };
+            let selected = self.access(&base, Some(&child.step()), binding.as_str());
+            if let Some((PathSegment::Field { name }, rest)) = segments.split_first() {
+                let child_head = self.resolve_head(child.binding());
+                if self.module_attributes.is_some_and(|outputs| {
+                    outputs.contains_key(&(child.binding().clone(), name.clone()))
+                }) || matches!(
+                    self.bindings.get(child.binding().as_str()),
+                    Some(InferenceBinding::ModuleCall)
+                ) || (!self.bindings.contains_key(child.binding().as_str())
+                    && matches!(
+                        &child_head,
+                        ResolvedHead::Binding {
+                            kind: BindingHeadKind::Ordinary,
+                            ..
+                        }
+                    ))
+                {
+                    return self.reference_from_head(child.binding(), child_head, name, rest);
+                }
+            }
+            self.access_path(selected, segments, child.binding().as_str())
+        }
+
+        fn binding_reference(
+            &mut self,
+            head: NonLoopHead<B>,
+            attribute: &str,
+            segments: &[PathSegment],
+        ) -> InferredExpr {
+            let binding = &head.binding;
             let steps = std::iter::once(PathSegment::Field {
                 name: attribute.to_owned(),
             })
@@ -7377,36 +7460,49 @@ mod judgement {
                     }
                 }
                 ExprKind::Access(step) => {
-                    if let Some(lookup) = self.structural_lookup(&root.children[0])
+                    if let Some(head) = self.structural_head(&root.children[0])
                         && let PathSegment::Field { name } = step
                     {
-                        if let Some(group) = self
-                            .structural_handles
-                            .get(lookup.binding())
-                            .and_then(crate::eval_value::UnexpandedStructuralHandle::loop_group)
-                        {
-                            return match self.loop_dot(group, name, &children[0]) {
-                                Ok(child) => {
-                                    self.access(&children[0], Some(&child.step()), lookup.as_str())
+                        match head {
+                            ResolvedHead::LoopGroup(group) => {
+                                let binding = group.binding().as_str();
+                                return match self.loop_dot(group, name, &children[0]) {
+                                    Ok(child) => {
+                                        self.access(&children[0], Some(&child.step()), binding)
+                                    }
+                                    Err(failure) => failure,
+                                };
+                            }
+                            ResolvedHead::Binding {
+                                reference,
+                                lookup,
+                                kind,
+                            } => {
+                                if let Some(output) = self.module_attributes.and_then(|outputs| {
+                                    outputs.get(&(lookup.binding().clone(), name.clone()))
+                                }) {
+                                    return InferredExpr::from(&self.refresh_module_output(output));
                                 }
-                                Err(failure) => failure,
-                            };
-                        }
-                        if let Some(output) = self.module_attributes.and_then(|outputs| {
-                            outputs.get(&(lookup.binding().clone(), name.clone()))
-                        }) {
-                            return InferredExpr::from(&self.refresh_module_output(output));
-                        }
-                        if !children[0].failed()
-                            && (matches!(
-                                self.bindings.get(lookup.as_str()),
-                                Some(InferenceBinding::ModuleCall)
-                            ) || (!self.bindings.contains_key(lookup.as_str())
-                                && !self.structural_handles.contains_key(lookup.binding())))
-                        {
-                            // Missing children retain ordinary reference-scope
-                            // ownership; module children retain their output authority.
-                            return self.reference(lookup.binding(), name, &[]);
+                                if !children[0].failed()
+                                    && (matches!(
+                                        self.bindings.get(lookup.as_str()),
+                                        Some(InferenceBinding::ModuleCall)
+                                    ) || (!self.bindings.contains_key(lookup.as_str())
+                                        && matches!(kind, BindingHeadKind::Ordinary)))
+                                {
+                                    let binding = lookup.binding().clone();
+                                    return self.reference_from_head(
+                                        &binding,
+                                        ResolvedHead::Binding {
+                                            reference,
+                                            lookup,
+                                            kind,
+                                        },
+                                        name,
+                                        &[],
+                                    );
+                                }
+                            }
                         }
                     }
                     self.access(&children[0], Some(step), "access base")

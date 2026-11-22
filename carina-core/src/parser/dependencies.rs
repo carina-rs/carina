@@ -313,10 +313,12 @@ impl UnexpandedDependencies<RelativeBindingName> {
                         Err(_) => {
                             // The retained rejection still carries its root operand.
                             // Anchor that operand without inventing a group attribute.
-                            lookup.record_origin(
-                                super::DeclarationLocation::from_pair(&reference, file, source),
-                                &mut self.binding_reference_origins,
-                            );
+                            if bindings.contains(&lookup.dependency()) {
+                                lookup.record_origin(
+                                    super::DeclarationLocation::from_pair(&reference, file, source),
+                                    &mut self.binding_reference_origins,
+                                );
+                            }
                             continue 'references;
                         }
                     };

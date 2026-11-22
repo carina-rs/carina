@@ -22577,6 +22577,51 @@ fn for_value_keys_bare_handle_hint() {
 }
 
 #[test]
+fn loop_dot_isolated_function_reads_resolve_to_selected_children() {
+    for (pattern, iterable) in [("k, item", "({ a = 'x' })"), ("item", "['a']")] {
+        for default in [false, true] {
+            for reader in ["children.a.name", "children['a'].name"] {
+                let function = if default {
+                    format!("fn selected(value: String = {reader}): String {{ value }}")
+                } else {
+                    format!("fn selected(): String {{ {reader} }}")
+                };
+                let source = format!(
+                    "let children = for {pattern} in {iterable} {{ mock.test.Source {{ name = item }} }}\n{function}\nlet other = mock.test.Source {{ name = selected() }}"
+                );
+                let parsed = parse(
+                    &source,
+                    &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                )
+                .unwrap();
+                let other = parsed
+                    .resources
+                    .iter()
+                    .find(|resource| {
+                        resource
+                            .binding
+                            .as_ref()
+                            .is_some_and(|binding| binding.as_str() == "other")
+                    })
+                    .unwrap();
+                let Value::Deferred(DeferredValue::ResourceRef { path }) =
+                    &other.attributes["name"]
+                else {
+                    panic!("{reader}, default={default}: expected a selected child reference");
+                };
+                assert_eq!(path.binding(), "children.a", "{reader}, default={default}");
+                assert_eq!(path.attribute(), "name", "{reader}, default={default}");
+                assert!(path.segments().is_empty(), "{reader}, default={default}");
+                assert!(
+                    path.reference_locations().is_some(),
+                    "{reader}, default={default}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn loop_dot_selects_the_key_before_the_resource_attribute() {
     for (pattern, iterable) in [("k, item", "({ name = 'x' })"), ("item", "['name']")] {
         for reader in ["children.name.name", "children['name'].name"] {

@@ -4,7 +4,7 @@ use carina_core::parser::ExportParamLike;
 use carina_core::validation::admission::configuration::backend::{
     BackendAttributeError, LocatedBackendError,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
@@ -1777,14 +1777,9 @@ impl DiagnosticRun<'_> {
         let export_bindings =
             inference_input.binding_index_in_session(None, &signatures, self.provider_context);
         let mut boundary_export_params = inferred_export_params.parameters().to_vec();
-        // A failed expression already owns its diagnostic, as in CLI validation.
-        // Do not add a reference mismatch at the enclosing export boundary.
-        boundary_export_params.retain(|parameter| {
-            !parameter.judgement().is_ok_and(|expression| {
-                expression.check_owner()
-                    == carina_core::parser::retained::ExpressionCheckOwner::Reported
-            })
-        });
+        // The shared core checks suppress an attached failure only when the
+        // expression already reports that same error. Distinct boundary
+        // mismatches still belong to this export.
         for parameter in &mut boundary_export_params {
             let Some(type_expr) = parameter.type_expr_opt_mut() else {
                 continue;
@@ -1822,7 +1817,6 @@ impl DiagnosticRun<'_> {
         tree: &carina_core::parser::AnalysisTree<'_>,
         defined_bindings: &HashSet<String>,
         declared_providers: &HashSet<String>,
-        scope_errors: &HashMap<String, String>,
     ) -> Vec<carina_core::parser::Located<carina_core::resource::SecretDiagnosticError<String>>>
     {
         let mut enum_namespaces = HashSet::new();
@@ -1852,22 +1846,59 @@ impl DiagnosticRun<'_> {
                 {
                     return None;
                 }
-                let finding =
-                    carina_core::parser::Located::new(
-                        reference.prefix_location().clone(),
+                let message = tree
+                    .undefined_loop_child_reference(reference)
+                    .unwrap_or_else(|| {
                         reference.render(|path| {
-                            scope_errors.get(path.binding()).cloned().unwrap_or_else(|| {
                             format!(
                                 "Undefined resource: '{}'. Define it with 'let {} = aws...'",
                                 path.binding(),
                                 path.binding()
                             )
                         })
-                        }),
-                    );
+                    });
+                let finding =
+                    carina_core::parser::Located::new(reference.prefix_location().clone(), message);
                 Some(finding)
             })
             .collect()
+    }
+
+    /// A caller's missing-child diagnostic owns the same lookup failure after
+    /// argument substitution. Other findings from the module remain independent.
+    pub(super) fn loop_child_owns_module_lookup(
+        tree: &carina_core::parser::AnalysisTree<'_>,
+        call: &carina_core::parser::ModuleCallId,
+        error: &carina_core::schema::TypeError,
+    ) -> bool {
+        use carina_core::resource::SecretDiagnosticError;
+        use carina_core::validation::admission::AdmissionReferenceError;
+        let carina_core::schema::TypeError::Reference { error, .. } = error else {
+            return false;
+        };
+        let SecretDiagnosticError::Public(AdmissionReferenceError::UnknownBinding {
+            binding, ..
+        }) = error.as_ref()
+        else {
+            return false;
+        };
+        let Some(authored_call) = tree.module_calls().find(|authored| authored.id() == call) else {
+            return false;
+        };
+        tree.value_references().iter().any(|value| {
+            let reference = value.reference();
+            reference.binding_matches(|key| key.matches_name(binding))
+                && authored_call.arguments().any(|(name, _)| {
+                    let Some(argument) = call.argument_value_location(name) else {
+                        return false;
+                    };
+                    let location = reference.location();
+                    location.file() == argument.file()
+                        && argument.span().start_byte() <= location.span().start_byte()
+                        && location.span().end_byte() <= argument.span().end_byte()
+                })
+                && tree.undefined_loop_child_reference(reference).is_some()
+        })
     }
 
     /// Check for unknown attributes on resource references (typo detection).

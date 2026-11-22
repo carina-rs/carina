@@ -6,6 +6,154 @@ mod loop_dot_cases;
 
 #[test]
 fn loop_dot_case_table_diagnostics_match_validate() {
+    run_loop_dot_case_table(|_| true);
+}
+
+#[test]
+fn loop_dot_review_round1_function_contexts() {
+    run_loop_dot_case_table(|row| row.id == "2-19");
+}
+
+#[test]
+fn loop_dot_review_round1_unrelated_lsp_wording_matches_main() {
+    run_loop_dot_case_table(|row| matches!(row.id, "2-20" | "2-21"));
+}
+
+#[test]
+fn loop_dot_review_round1_export_preserves_distinct_boundary_failure() {
+    use carina_core::binding_index::BindingIndex;
+    use carina_core::parser::ExportParamLike;
+
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let source = "provider mock {}\nlet src = mock.test.resource { name = 'source' }\nexports { out: Bool = src.comment ?? 1 }\n";
+    let document = create_document(source);
+    // Keep the authored expression available after its failure, as the LSP
+    // does, then compare the CLI's shared export validation with the LSP pass.
+    let parsed = carina_core::parser::parse_file(
+        source,
+        Path::new("test.crn"),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let configuration = carina_core::test_utils::load_canonical_buffer_configuration(
+        &parsed,
+        &engine.schemas,
+        &engine.provider_context,
+    );
+    let inferred = configuration.inferred_export_params();
+    let expression = inferred.parameters()[0].judgement().unwrap();
+    assert_eq!(
+        expression.check_owner(),
+        carina_core::parser::retained::ExpressionCheckOwner::Reported,
+    );
+    let expression_error = expression.static_type().unwrap_err().to_string();
+    let bindings = BindingIndex::from_parsed(&parsed, &engine.schemas, &engine.provider_context);
+    let mut cli_errors = carina_core::validation::validate_export_param_ref_types_with_bindings(
+        inferred.parameters(),
+        &bindings,
+    )
+    .unwrap_err()
+    .into_iter()
+    .map(|error| error.to_string())
+    .collect::<Vec<_>>();
+    assert_eq!(cli_errors.len(), 1, "{cli_errors:?}");
+    assert!(cli_errors[0].contains("Bool"), "{cli_errors:?}");
+    assert_ne!(cli_errors[0], expression_error);
+    let tree = carina_core::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+    let mut lsp_errors = engine.with_run_for_test(|run| {
+        run.check_inferred_export_types(
+            &document.for_diagnostics().unwrap(),
+            configuration.judged(),
+            &tree,
+        )
+        .into_iter()
+        .map(|diagnostic| diagnostic.message)
+        .collect::<Vec<_>>()
+    });
+    cli_errors.push(expression_error.clone());
+    lsp_errors.push(expression_error);
+    cli_errors.sort();
+    lsp_errors.sort();
+    assert_eq!(lsp_errors, cli_errors);
+}
+
+#[test]
+fn loop_dot_module_call_keeps_independent_type_errors() {
+    let directory = Directory::new(&[]);
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let row = loop_dot_cases::rows()
+        .into_iter()
+        .find(|row| row.id == "2-2" && row.kind == loop_dot_cases::Kind::Map)
+        .unwrap();
+    let root = directory.root.path();
+    loop_dot_cases::fixture(root, &row);
+    loop_dot_cases::write(
+        root,
+        "consumer/main.crn",
+        "mock.test.resource { name = 1 comment = value }\n",
+    );
+    let mut observations = Vec::new();
+    for reader in ["children.a_missing.name", "children['a_missing'].name"] {
+        let owner = loop_dot_cases::reader(root, "module argument", reader);
+        let path = root.join(owner);
+        let source = std::fs::read_to_string(&path).unwrap();
+        let document = create_document_at(&source, path.clone());
+        let merged = engine
+            .with_run_for_test(|run| {
+                run.parse_and_resolve_merged_with_buffer(
+                    &document.for_diagnostics().unwrap(),
+                    &carina_core::paths::ResolvedPath::new(root).unwrap(),
+                )
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                merged.module_resolution,
+                checks::MergedModuleResolution::Expanded { .. }
+            ),
+            "the independent error must be checked after module expansion"
+        );
+        let errors = engine
+            .analyze(&document, Some(&path))
+            .into_iter()
+            .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("Undefined identifier `children.a_missing`")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("expected String") && error.contains("got Int")),
+            "{errors:?}"
+        );
+        observations.push(errors);
+    }
+    assert_eq!(observations[0], observations[1]);
+}
+
+fn run_loop_dot_case_table(include: impl Fn(&loop_dot_cases::Row) -> bool) {
     let directory = Directory::new(&[]);
     let engine = DiagnosticEngine::new(
         loaded_providers_from_factories(vec![Box::new(
@@ -28,7 +176,7 @@ fn loop_dot_case_table_diagnostics_match_validate() {
             .collect::<Vec<_>>()
     };
     let mut failures = Vec::new();
-    for row in loop_dot_cases::rows() {
+    for row in loop_dot_cases::rows().into_iter().filter(include) {
         loop_dot_cases::fixture(root, &row);
         for &position in row.positions {
             let owner = loop_dot_cases::reader(root, position, row.reader);
@@ -38,11 +186,15 @@ fn loop_dot_case_table_diagnostics_match_validate() {
                 loop_dot_cases::Outcome::Error(errors) => {
                     errors.iter().map(|error| (*error).to_owned()).collect()
                 }
+                loop_dot_cases::Outcome::SurfaceErrors { cli, lsp } => {
+                    assert_ne!(cli, lsp, "each surface preserves main's wording");
+                    lsp.iter().map(|error| (*error).to_owned()).collect()
+                }
                 loop_dot_cases::Outcome::SameAsSubscript(subscript) => {
                     loop_dot_cases::reader(root, position, subscript);
                     let bracket = observe(owner);
-                    // These are the CLI table's bare-child outcomes. All other
-                    // subscript controls validate without errors.
+                    // Bare-child exports retain independent annotation errors
+                    // from the shared core boundary pass, alongside expression errors.
                     let expected: Vec<String> = if row.id == "2-4" {
                         match position {
                             "plain" | "if" => vec![
@@ -52,8 +204,12 @@ fn loop_dot_case_table_diagnostics_match_validate() {
                             "single interpolation" | "multipart interpolation" => vec![
                                 "mock.test.resource.other: 'children.a' is a resource handle, not a value",
                             ],
-                            "coalesce" | "export" => vec![
+                            "coalesce" => vec![
                                 "coalesce default type `String` does not match left type `mock.test.resource`",
+                            ],
+                            "export" => vec![
+                                "coalesce default type `String` does not match left type `mock.test.resource`",
+                                "export 'out': type mismatch for 'children.a': expected String, got mock.test.resource",
                             ],
                             "export plain" => vec![
                                 "export 'out': inferred resource handle mock.test.resource cannot cross a state boundary; export an identity value such as mock.test.resource.Id instead",
@@ -67,6 +223,10 @@ fn loop_dot_case_table_diagnostics_match_validate() {
                         .into_iter()
                         .map(str::to_owned)
                         .collect()
+                    } else if row.id == "2-6a" {
+                        vec![format!(
+                            "deferred-for iterable `{subscript}`: expected list iterable, got map"
+                        )]
                     } else {
                         Vec::new()
                     };
@@ -76,7 +236,14 @@ fn loop_dot_case_table_diagnostics_match_validate() {
                             row.id, row.kind
                         ));
                     }
-                    expected
+                    if row.id == "2-6a" {
+                        expected
+                            .into_iter()
+                            .map(|error| error.replace(subscript, row.reader))
+                            .collect()
+                    } else {
+                        expected
+                    }
                 }
             };
             if dot != expected {

@@ -4,6 +4,7 @@ use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
+    NoLoop,
     Map,
     ValueKeyed,
     Indexed,
@@ -17,6 +18,10 @@ pub enum Outcome {
     Validates,
     SameAsSubscript(&'static str),
     Error(&'static [&'static str]),
+    SurfaceErrors {
+        cli: &'static [&'static str],
+        lsp: &'static [&'static str],
+    },
 }
 
 #[derive(Debug)]
@@ -82,6 +87,25 @@ pub fn rows() -> Vec<Row> {
                 "children.a.tags",
                 &["iterable"][..],
                 SameAsSubscript("children['a'].tags"),
+            ),
+            (
+                "2-6a",
+                "a",
+                "children.a.tags",
+                &["simple iterable"][..],
+                SameAsSubscript("children['a'].tags"),
+            ),
+            (
+                "2-19",
+                "a",
+                "children.a.name",
+                &[
+                    "function body",
+                    "parameter default",
+                    "unused function body",
+                    "unused parameter default",
+                ][..],
+                SameAsSubscript("children['a'].name"),
             ),
             (
                 "2-7",
@@ -160,7 +184,16 @@ pub fn rows() -> Vec<Row> {
                 key: "my-key",
                 reader: "children.my-key.name",
                 positions,
-                expected,
+                expected: SurfaceErrors {
+                    cli: match expected {
+                        Error(errors) => errors,
+                        _ => unreachable!("subtraction errors"),
+                    },
+                    lsp: &[
+                        "Undefined resource: 'key'. Define it with 'let key = aws...'",
+                        "operator '-': left operand must be Int, got mock.test.resource",
+                    ],
+                },
             });
         }
         rows.push(Row {
@@ -184,6 +217,63 @@ pub fn rows() -> Vec<Row> {
             } else {
                 &["cannot apply access .zzz to list(mock.test.resource)"]
             }),
+        });
+    }
+    rows.push(Row {
+        id: "2-19",
+        kind: Indexed,
+        key: "a",
+        reader: "children.a.name",
+        positions: &[
+            "function body",
+            "parameter default",
+            "unused function body",
+            "unused parameter default",
+        ],
+        expected: Error(&["cannot apply access .a to list(mock.test.resource)"]),
+    });
+    for kind in [Map, ValueKeyed, Indexed] {
+        rows.push(Row {
+            id: "2-20",
+            kind,
+            key: "a",
+            reader: "nope.x",
+            positions: &["unrelated reference"],
+            expected: SurfaceErrors {
+                cli: if kind == Indexed {
+                    &["Undefined identifier `nope`. In-scope names: children, children[0], items, o (let / upstream_state / read / module / function / for / fn / arguments)"]
+                } else {
+                    &["Undefined identifier `nope`. In-scope names: children, children.a, items, o (let / upstream_state / read / module / function / for / fn / arguments)"]
+                },
+                lsp: &["Undefined resource: 'nope'. Define it with 'let nope = aws...'"],
+            },
+        });
+    }
+    for kind in [NoLoop, Map, ValueKeyed, Indexed] {
+        rows.push(Row {
+            id: "2-21",
+            kind,
+            key: "a",
+            reader: "foo.bar",
+            positions: &["unrelated reference"],
+            expected: SurfaceErrors {
+                cli: &["Undefined identifier `foo`. Did you mean `o`?"],
+                lsp: &["Undefined resource: 'foo'. Define it with 'let foo = aws...'"],
+            },
+        });
+    }
+    for kind in [Map, ValueKeyed, Indexed] {
+        rows.push(Row {
+            id: "2-19",
+            kind,
+            key: "a",
+            reader: "children.a.name ?? 'p'",
+            positions: &["function body", "parameter default"],
+            expected: if kind == Indexed {
+                Error(&["cannot apply access .a to list(mock.test.resource)"])
+            } else {
+                SameAsSubscript("children['a'].name ?? 'p'")
+            },
         });
     }
     rows.push(Row {
@@ -225,11 +315,13 @@ pub fn fixture(root: &Path, row: &Row) {
     use Kind::*;
     let key = row.key;
     let (items, iterable) = match row.kind {
+        NoLoop => ("{}".to_owned(), ""),
         Map | ModuleMap => (format!("{{ '{key}' = 'x' }}"), "k, v in items"),
         ValueKeyed | ModuleValueKeyed => (format!("['{key}']"), "v in items"),
         Indexed | ModuleIndexed => ("['a']".to_owned(), "(i, v) in items"),
     };
     let main = match row.kind {
+        NoLoop => format!("let items = {items}\n"),
         Map | ValueKeyed | Indexed => format!(
             "let items = {items}\nlet children = for {iterable} {{ mock.test.resource {{ name = v tags = {{ k = 'tag' }} }} }}\n"
         ),
@@ -262,7 +354,7 @@ pub fn fixture(root: &Path, row: &Row) {
 pub fn reader(root: &Path, position: &str, reader: &str) -> &'static str {
     let expression = match position {
         "single interpolation" => format!("\"${{{reader}}}\""),
-        "coalesce" | "export" => format!("{reader} ?? 'p'"),
+        "coalesce" | "export" | "unrelated reference" => format!("{reader} ?? 'p'"),
         "if" => format!("if true {{ {reader} }} else {{ 'p' }}"),
         "function argument" => format!("upper({reader})"),
         "multipart interpolation" => format!("\"x-${{{reader}}}\""),
@@ -270,6 +362,29 @@ pub fn reader(root: &Path, position: &str, reader: &str) -> &'static str {
         _ => reader.to_owned(),
     };
     let (other, exports, owner) = match position {
+        "function body"
+        | "parameter default"
+        | "unused function body"
+        | "unused parameter default" => {
+            let function = if position.ends_with("function body") {
+                format!("fn selected(): String {{ {expression} }}")
+            } else {
+                format!("fn selected(value: String = {expression}): String {{ value }}")
+            };
+            let other = if position.starts_with("unused") {
+                format!("{function}\n")
+            } else {
+                format!(
+                    "{function}\nlet other = mock.test.resource {{ name = 'other' comment = selected() }}\n"
+                )
+            };
+            (other, "exports {}\n".to_owned(), "other.crn")
+        }
+        "unrelated reference" => (
+            format!("let o = mock.test.resource {{ name = 'other' comment = {expression} }}\n"),
+            "exports {}\n".to_owned(),
+            "other.crn",
+        ),
         "export" => (
             String::new(),
             format!("exports {{ out: String = {expression} }}\n"),
@@ -291,6 +406,11 @@ pub fn reader(root: &Path, position: &str, reader: &str) -> &'static str {
         ),
         "iterable" => (
             format!("for k, t in {expression:<80} {{ mock.test.resource {{ name = t }} }}\n"),
+            "exports {}\n".to_owned(),
+            "other.crn",
+        ),
+        "simple iterable" => (
+            format!("for t in {expression:<80} {{ mock.test.resource {{ name = t }} }}\n"),
             "exports {}\n".to_owned(),
             "other.crn",
         ),
