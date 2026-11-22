@@ -992,22 +992,30 @@ fn check_fn_arg_type<Source: super::context::EvaluationSource>(
     let type_expr = resolved_type.as_type_expr();
 
     let provider_context = ctx.typecheck_provider_context();
-    let Some(resolved) = (value)
+    let knowledge = (value)
         .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
         .map(|proof| proof.into_classification())
-        .ok()
-        .and_then(|value| value.into_known().ok())
-    else {
-        return Ok(if requires_concrete_annotation_check(&type_expr) {
-            FunctionArgumentTypeCheck::AwaitingRuntimeValue
-        } else {
-            FunctionArgumentTypeCheck::Complete
-        });
+        .ok();
+    let partial = !matches!(
+        knowledge,
+        Some(crate::resource::knowledge::Classification::Known(_))
+    );
+    let check = match &knowledge {
+        Some(knowledge) => provider_context.check_known_parts(&type_expr, knowledge),
+        None => crate::validation::typecheck::TypeExprValueCheck::Assignable,
     };
-    let check = provider_context.check_resolved_constraints(&type_expr, &resolved);
     let result = finish_function_type_check(check, provider_context, site)
         .map_err(|mismatch| function_argument_type_error(fn_name, param_name, mismatch))?;
-    Ok(result)
+    Ok(
+        if partial
+            && matches!(result, FunctionArgumentTypeCheck::Complete)
+            && requires_concrete_annotation_check(&type_expr)
+        {
+            FunctionArgumentTypeCheck::AwaitingRuntimeValue
+        } else {
+            result
+        },
+    )
 }
 
 /// Shape-only annotations are checked against the declared source by the

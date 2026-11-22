@@ -54,6 +54,7 @@ pub(crate) fn judge_static_assignment<B: BindingAddress>(
     source: StaticAssignmentSource<'_>,
     expected: &TypeExpr,
     bindings: &BindingIndex<'_, B>,
+    known: &impl Fn(&crate::parser::retained::JudgedExpr) -> bool,
 ) -> Result<StaticAssignmentVerdict, StaticAssignmentError> {
     use StaticAssignmentError::{Mismatch, Resolution};
     use StaticAssignmentVerdict::{NeedsLocal, NeedsSchema};
@@ -63,6 +64,9 @@ pub(crate) fn judge_static_assignment<B: BindingAddress>(
     }
     let expected = super::super::resolve_type_expr(expected, config).map_err(|_| Resolution)?;
     if let StaticAssignmentSource::Judged(expression) = source {
+        if known(expression) {
+            return Ok(StaticAssignmentVerdict::Proven);
+        }
         let children: Vec<_> = match &expected {
             TypeExpr::Struct { fields } if expression.fields().next().is_some() => {
                 let mut children = Vec::new();
@@ -97,12 +101,18 @@ pub(crate) fn judge_static_assignment<B: BindingAddress>(
                     },
                     &expected,
                     bindings,
+                    known,
                 );
             }
         };
         let mut verdict = StaticAssignmentVerdict::Proven;
         for (field, ty) in children {
-            match judge_static_assignment(StaticAssignmentSource::Judged(field), ty, bindings)? {
+            match judge_static_assignment(
+                StaticAssignmentSource::Judged(field),
+                ty,
+                bindings,
+                known,
+            )? {
                 NeedsSchema => return Ok(NeedsSchema),
                 NeedsLocal => verdict = NeedsLocal,
                 StaticAssignmentVerdict::Proven => {}

@@ -154,7 +154,8 @@ fn conversion_lsp_parse_rejection_keeps_the_convert_range_and_cause() {
         .iter()
         .filter_map(|finding| match finding {
             carina_core::validation::PresentedFinding::Conversion(finding) => Some(finding),
-            carina_core::validation::PresentedFinding::Ordinary(_) => None,
+            carina_core::validation::PresentedFinding::Ordinary(_)
+            | carina_core::validation::PresentedFinding::FunctionPromise(_) => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(conversions.len(), 1);
@@ -327,7 +328,8 @@ fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outc
                 .iter()
                 .filter_map(|finding| match finding {
                     carina_core::validation::PresentedFinding::Conversion(finding) => Some(finding),
-                    carina_core::validation::PresentedFinding::Ordinary(_) => None,
+                    carina_core::validation::PresentedFinding::Ordinary(_)
+                    | carina_core::validation::PresentedFinding::FunctionPromise(_) => None,
                 })
                 .collect::<Vec<_>>();
             assert_eq!(conversions.len(), usize::from(converted), "{presented:?}");

@@ -2700,7 +2700,7 @@ mod type_resolution_policy_tests {
     fn non_call_reference_error_is_retained_without_module_call_routing() {
         let error = ResidualModuleResolutionError::new(
             ModuleError::ReferenceType(
-                crate::validation::ExpansionBoundaryReferenceErrors::attribute_for_test(
+                crate::validation::ExpansionBoundaryReferenceErrors::function_for_test(
                     "module call 'is only user-authored diagnostic text'",
                 ),
             ),

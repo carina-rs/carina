@@ -282,6 +282,9 @@ pub(crate) fn collapse_presented_errors(errors: Vec<crate::error::PresentedAppEr
                 crate::error::PresentedAppError::Conversion(error) => {
                     AppError::Validation(error.to_string())
                 }
+                crate::error::PresentedAppError::FunctionPromise(finding) => {
+                    AppError::Validation(finding.to_string())
+                }
             })
             .collect(),
     )
@@ -787,7 +790,7 @@ fn complete_function_promises<E, D, B: BindingAddress>(
     context: &ValidationProviderCatalog,
     signatures: &module_resolver::ResolvedModuleSignatures,
 ) -> Result<
-    Vec<carina_core::parser::Located<carina_core::static_type::InferenceError>>,
+    Vec<carina_core::parser::Located<carina_core::parser::retained::FunctionTypePromise>>,
     carina_core::parser::AnalysisTreeError,
 >
 where
@@ -1088,9 +1091,7 @@ fn validate_and_resolve_configuration<'s>(
 
     // Independent root failures still collect expanded secrecy findings. The
     // resolver and its conversion channel are consumed once on either path.
-    // Promise findings must not stop later independent validation checks.
-    let stops_validation = |error: &AppError| !matches!(error, AppError::ExpressionType(finding) if finding.detail().is_function_type_promise());
-    let had_ordinary_failure = errors.ordinary_failure_where(stops_validation).is_some();
+    let had_ordinary_failure = errors.ordinary_failure().is_some();
     if had_ordinary_failure {
         // Dependency diagnostics are independent of unrelated argument-type
         // failures. The per-argument report preserves every sound result even
@@ -1161,11 +1162,7 @@ fn validate_and_resolve_configuration<'s>(
         ),
     };
     match promises {
-        Ok(findings) => errors.extend(
-            findings
-                .into_iter()
-                .map(|finding| AppError::ExpressionType(Box::new(finding))),
-        ),
+        Ok(findings) => errors.include_function_promises(findings),
         Err(error) => errors.push(AppError::AnalysisInvariant(error)),
     }
     if had_ordinary_failure {
@@ -1183,7 +1180,7 @@ fn validate_and_resolve_configuration<'s>(
                 })?
                 .clone();
             extend_module_call_errors(errors, authored_module_call_findings);
-            if errors.ordinary_failure_where(stops_validation).is_some() {
+            if errors.ordinary_failure().is_some() {
                 return Err(ValidationStopped::existing(errors));
             }
             *graph
@@ -1396,9 +1393,6 @@ fn validate_and_resolve_configuration<'s>(
         &imported_module_signatures,
         enriched_context,
     );
-    let configuration = resolved_config
-        .canonicalized()
-        .judge(enriched_context.catalog());
     if let Err(ref_errors) = carina_core::validation::validate_export_param_ref_types_with_bindings(
         parsed.export_params,
         &bindings,
@@ -1448,6 +1442,9 @@ fn validate_and_resolve_configuration<'s>(
                 enriched_context.catalog(),
             ),
         );
+        let configuration = resolved_config
+            .canonicalized()
+            .judge(enriched_context.catalog());
         let admission_warnings = crate::wiring::resource_admission_report_in_run(
             ctx,
             configuration.judged(),
@@ -1493,7 +1490,7 @@ fn validate_and_resolve_configuration<'s>(
                     }),
             );
         }
-        if errors.ordinary_failure_where(stops_validation).is_some() {
+        if errors.ordinary_failure().is_some() {
             return Err(ValidationStopped::existing(errors));
         }
     }
@@ -1522,7 +1519,7 @@ fn validate_and_resolve_configuration<'s>(
     );
     // Downstream plan code assumes every resource has a stable id, so any
     // identity or move-target error must stop the pipeline here.
-    if errors.ordinary_failure_where(stops_validation).is_some() {
+    if errors.ordinary_failure().is_some() {
         return Err(ValidationStopped::existing(errors));
     }
 

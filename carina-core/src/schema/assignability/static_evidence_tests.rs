@@ -119,6 +119,7 @@ fn static_evidence_does_not_prove_provider_validator_widening() {
             ),
             &target,
             &bindings,
+            &|_| false,
         );
         assert!(matches!(verdict, Ok(crate::validation::admission::static_judgement::StaticAssignmentVerdict::NeedsLocal)), "{verdict:?}");
     }
@@ -165,6 +166,7 @@ fn static_evidence_proves_loaded_nominal_annotation() {
         StaticAssignmentSource::Expression(&resolved),
         &ty,
         &bindings,
+        &|_| false,
     );
     assert!(
         matches!(result, Ok(StaticAssignmentVerdict::Proven)),
@@ -179,6 +181,7 @@ fn static_evidence_proves_loaded_nominal_annotation() {
         StaticAssignmentSource::Reference(&reference),
         &ty,
         &bindings,
+        &|_| false,
     );
     assert!(
         matches!(result, Ok(StaticAssignmentVerdict::Proven)),

@@ -3235,7 +3235,6 @@ fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
             | inference::InferenceError::HeterogeneousCollection { .. }
             | inference::InferenceError::SchemaResolution { .. }
             | inference::InferenceError::TypeResolution { .. }
-            | inference::InferenceError::FunctionTypePromise { .. }
             | inference::InferenceError::UnknownType { .. }),
         )) => return Err(DeferredAccessTypeError::InvalidAccess { error }),
         // Dynamic result types and unavailable authorities cannot be checked
@@ -4494,23 +4493,6 @@ pub(crate) fn module_argument_reference_error(
     Some(ExpansionBoundaryReferenceErrors {
         errors: vec![ExpansionBoundaryReferenceError::ModuleCall(Box::new(error))],
     })
-}
-
-/// Validate resource/binding references at user-function parameter and return
-/// boundaries using the same BindingIndex + TypeInSchema relation as module,
-/// export, attribute, and provider-attribute references.
-///
-/// The shared value checker deliberately defers references. This pass supplies
-/// the missing binding authority: function-call arguments use their declared
-/// parameter type, and function bodies use the declared return type.
-pub fn validate_user_function_ref_types_with_bindings<
-    E: crate::parser::ExportParamLike,
-    D: crate::parser::DeferredForPhaseTraversal,
->(
-    parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
-    bindings: &BindingIndex<'_>,
-) -> Result<(), String> {
-    validate_user_function_ref_types_inner(parsed, bindings, UnknownReferencePolicy::Report)
 }
 
 mod user_function_refs {
@@ -6592,7 +6574,6 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
         }
         Err(crate::static_type::InferenceIssue::Failed(
             inference::InferenceError::UnknownType { .. }
-            | inference::InferenceError::FunctionTypePromise { .. }
             | inference::InferenceError::SchemaResolution { .. }
             | inference::InferenceError::TypeResolution { .. }
             | inference::InferenceError::UnknownBinding { .. }
@@ -7168,8 +7149,8 @@ fn check_export_ref<B: BindingAddress>(
 pub enum ExpansionBoundaryReferenceError {
     Attribute(String),
     Export(String),
-    Function(String),
     ModuleCall(Box<ModuleCallRefError>),
+    Function(String),
 }
 
 impl std::fmt::Display for ExpansionBoundaryReferenceError {
@@ -7213,9 +7194,9 @@ impl ExpansionBoundaryReferenceErrors {
     }
 
     #[cfg(test)]
-    pub(crate) fn attribute_for_test(message: &str) -> Self {
+    pub(crate) fn function_for_test(message: &str) -> Self {
         Self {
-            errors: vec![ExpansionBoundaryReferenceError::Attribute(
+            errors: vec![ExpansionBoundaryReferenceError::Function(
                 message.to_string(),
             )],
         }

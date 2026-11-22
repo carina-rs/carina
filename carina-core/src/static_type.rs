@@ -149,9 +149,6 @@ pub enum InferenceError {
     MissingEvidence(#[from] crate::parser::retained::MissingEvidence),
     #[error("{reason}", reason = crate::provider_text::DiagnosticText::new(reason))]
     UnknownType { reason: String },
-    /// A function promise needs value evidence; validation can collect other findings.
-    #[error("{reason}", reason = crate::provider_text::DiagnosticText::new(reason))]
-    FunctionTypePromise { reason: String },
     #[error(transparent)]
     SchemaResolution {
         error: Box<crate::schema::TypeError>,
@@ -190,9 +187,6 @@ pub enum InferenceError {
 impl crate::resource::InsideSecret for InferenceError {
     fn inside_secret(self) -> Self {
         match self {
-            Self::FunctionTypePromise { .. } => Self::FunctionTypePromise {
-                reason: crate::resource::INSIDE_SECRET_MESSAGE.into(),
-            },
             error @ (Self::InsideSecret {}
             | Self::SecretAssignmentMismatch { .. }
             | Self::HeterogeneousCollection { .. }
@@ -200,12 +194,6 @@ impl crate::resource::InsideSecret for InferenceError {
             | Self::InvalidIntegerArithmeticOperand { .. }) => error,
             _ => Self::InsideSecret {},
         }
-    }
-}
-
-impl InferenceError {
-    pub fn is_function_type_promise(&self) -> bool {
-        matches!(self, Self::FunctionTypePromise { .. })
     }
 }
 

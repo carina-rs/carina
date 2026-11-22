@@ -81,6 +81,7 @@ pub(crate) use cursor::{
     AuthoredForm, AuthoredNavigation, CursorKind, ProjectionAuthority, SourceReference,
     SyntheticSource, ValidationProjection,
 };
+pub use function_promises::FunctionTypePromise;
 
 /// The existing authored walk owns source diagnostics for expressions that
 /// require its policy. This is diagnostic ownership, not an admission proof.
@@ -1317,7 +1318,7 @@ impl<'a, E, D, B: BindingAddress> JudgedFile<'a, E, D, B> {
     pub fn function_type_promise_findings(
         &self,
         bindings: &crate::binding_index::BindingIndex<'_, B>,
-    ) -> Vec<Located<crate::static_type::InferenceError>>
+    ) -> Vec<Located<FunctionTypePromise>>
     where
         D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
@@ -3815,6 +3816,10 @@ mod judgement {
         }
     }
     impl JudgedExprData {
+        pub(crate) fn origin(&self) -> Option<&ExpressionLocation> {
+            self.origin.as_ref()
+        }
+
         pub(crate) fn concrete(&self) -> bool {
             matches!(self.judgement, ExprJudgement::Typed { kind, .. }
                 if kind.knowledge() == Classification::Known)

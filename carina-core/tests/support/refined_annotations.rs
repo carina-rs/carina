@@ -185,11 +185,24 @@ pub fn validate(dir: &Path, snapshot: &LoadedProviderSnapshot) -> Result<(), Str
     })?;
     let configuration =
         carina_core::config_loader::load_buffer_configuration(parsed, schemas, context);
-    let mut findings = configuration.judged().report().findings().to_vec();
+    let mut findings: Vec<_> = configuration
+        .judged()
+        .report()
+        .findings()
+        .iter()
+        .map(|finding| {
+            carina_core::parser::Located::new(
+                finding.location().clone(),
+                finding.detail().to_string(),
+            )
+        })
+        .collect();
     for finding in configuration
         .judged()
         .function_type_promise_findings(&bindings)
     {
+        let (location, message) = finding.into_parts();
+        let finding = carina_core::parser::Located::new(location, message.to_string());
         if !findings.contains(&finding) {
             findings.push(finding);
         }

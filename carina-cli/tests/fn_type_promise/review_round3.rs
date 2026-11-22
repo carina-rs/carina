@@ -62,7 +62,7 @@ fn tp9_b7_unknown_struct_and_map_members_need_value_checks() {
     parity(
         &directory,
         &[
-            "function 'sn': parameter 'x' is declared as struct { n: 'dev' | 'prod' }, but its argument has type map(String), so validate cannot prove it fits. Pass a value known at validate, or declare the parameter as map(String) and let the resource attribute that receives it check the value.",
+            "function 'sn': parameter 'x' is declared as struct { n: 'dev' | 'prod' }, but its argument has type map(String), so validate cannot prove it fits. Pass a value known at validate, or give the argument a type that proves it fits.",
             "function 'ms': parameter 'x' is declared as map('dev' | 'prod'), but its argument has type map(String), so validate cannot prove it fits. Pass a value known at validate, or declare the parameter as map(String) and let the resource attribute that receives it check the value.",
         ],
     );
@@ -165,7 +165,7 @@ fn tp9_computed_named_struct_member_needs_value_check() {
             "let a = test.Role { role_name = 'dev' }\nfn take(x: struct { n: test.RoleName }): String { 'accepted' }\nlet result = take({ n = lower(a.computed_name) })\n",
         ),
         &[
-            "function 'take': parameter 'x' is declared as struct { n: test.RoleName }, but its argument has type map(String), so validate cannot prove it fits. Pass a value known at validate, or declare the parameter as map(String) and let the resource attribute that receives it check the value.",
+            "function 'take': parameter 'x' is declared as struct { n: test.RoleName }, but its argument has type map(String), so validate cannot prove it fits. Pass a value known at validate, or give the argument a type that proves it fits.",
         ],
     );
 }

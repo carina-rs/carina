@@ -1725,11 +1725,21 @@ pub(super) fn validate_function_promises_for_test<
         schemas,
         bindings.provider_context(),
     );
-    let mut findings = configuration.judged().report().findings().to_vec();
+    let mut findings: Vec<_> = configuration
+        .judged()
+        .report()
+        .findings()
+        .iter()
+        .map(|finding| {
+            crate::parser::Located::new(finding.location().clone(), finding.detail().to_string())
+        })
+        .collect();
     for finding in configuration
         .judged()
         .function_type_promise_findings(bindings)
     {
+        let (location, message) = finding.into_parts();
+        let finding = crate::parser::Located::new(location, message.to_string());
         if !findings.contains(&finding) {
             findings.push(finding);
         }

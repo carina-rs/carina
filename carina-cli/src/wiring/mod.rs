@@ -1396,7 +1396,8 @@ impl<'a, T> ValidationReport<'a, T> {
                 .iter()
                 .filter_map(|error| match error {
                     crate::error::PresentedAppError::Ordinary(error) => Some(error),
-                    crate::error::PresentedAppError::Conversion(_) => None,
+                    crate::error::PresentedAppError::Conversion(_)
+                    | crate::error::PresentedAppError::FunctionPromise(_) => None,
                 })
                 .collect(),
         })

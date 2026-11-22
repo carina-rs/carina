@@ -1001,7 +1001,6 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
             CursorKind::Projected(authority) => authority.no_conversion(),
         }
     }
-
     pub(crate) fn covered_by(usage: AuthoredUse<'s, B>) -> Self {
         Self {
             kind: CursorKind::CoveredBy(usage),

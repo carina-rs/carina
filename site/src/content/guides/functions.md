@@ -144,7 +144,9 @@ Each declared parameter and return type is a promise checked at every call,
 including calls inside modules. If the value is known at `validate`, Carina
 checks the value. Otherwise its type must prove that it fits the declaration;
 a broad `String` cannot prove a literal union or a provider's refined string
-type. An upstream export without a declared type cannot prove a promise either.
+type. A `String` reference argument into a provider's refined string parameter
+currently passes `validate`; this gap is tracked in [carina#4594](https://github.com/carina-rs/carina/issues/4594).
+An upstream export without a declared type cannot prove a promise either.
 Unknown results of built-ins typed as `Any`, such as `lookup`, also need value evidence.
 Unavailable provider schemas or failed upstream loads leave the promise check pending.
 Definite type mismatches and invalid annotations remain declaration errors,

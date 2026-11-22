@@ -186,11 +186,25 @@ impl Diagnostic {
     }
 }
 
+fn diagnostic_order(finding: &Diagnostic) -> Option<(String, usize, usize)> {
+    let location = finding.location.as_ref()?;
+    let range = location.range.as_ref()?;
+    Some((
+        location.file.to_string(),
+        range.start.line,
+        range.start.column,
+    ))
+}
+
 /// Central conversion for residual application errors. Typed branches retain
 /// their own message authorities; the fallback uses the terminal's safe chain.
 fn presented_error_diagnostics(error: &crate::error::PresentedAppError) -> Vec<Diagnostic> {
     match error {
         crate::error::PresentedAppError::Ordinary(error) => error_diagnostics(error),
+        crate::error::PresentedAppError::FunctionPromise(finding) => vec![Diagnostic::located(
+            finding.detail().to_string(),
+            finding.location(),
+        )],
         crate::error::PresentedAppError::Conversion(finding) => vec![Diagnostic {
             code: Some(finding.code().to_owned()),
             ..Diagnostic::located(finding.message().to_owned(), finding.location())
@@ -511,10 +525,15 @@ impl ValidateReport {
     }
     fn finish(
         resources: Vec<String>,
-        errors: Vec<crate::error::PresentedAppError>,
+        mut errors: Vec<crate::error::PresentedAppError>,
         warnings: Vec<Warning>,
         events: Vec<HumanEvent>,
     ) -> Self {
+        errors.sort_by_cached_key(|error| {
+            presented_error_diagnostics(error)
+                .first()
+                .and_then(diagnostic_order)
+        });
         let outcome = match NonEmptyValidationErrors::from_presented(errors) {
             Ok(errors) => Outcome::Failure(errors),
             Err(_) => Outcome::Success(resources),
@@ -526,7 +545,7 @@ impl ValidateReport {
         }
     }
     fn output(&self) -> ValidateOutput {
-        let (status, resources, errors) = match &self.outcome {
+        let (status, resources, mut errors) = match &self.outcome {
             Outcome::Success(resources) => ("ok", resources.clone(), Vec::new()),
             Outcome::Failure(errors) => (
                 "error",
@@ -538,6 +557,7 @@ impl ValidateReport {
                     .collect(),
             ),
         };
+        errors.sort_by_cached_key(diagnostic_order);
         ValidateOutput {
             status,
             resource_count: resources.len(),

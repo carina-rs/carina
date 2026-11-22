@@ -20,6 +20,18 @@ use crate::validation::typecheck::{
 };
 use std::collections::BTreeSet;
 
+/// A non-stopping function finding. Only this policy pass can construct one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionTypePromise {
+    reason: String,
+}
+
+impl std::fmt::Display for FunctionTypePromise {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&crate::provider_text::DiagnosticText::new(&self.reason), f)
+    }
+}
+
 // Only ready evidence can be submitted to the shared admission relation.
 // Missing schemas, substitutions, and incomplete references have no judgement.
 enum Source<'a> {
@@ -42,7 +54,7 @@ enum ReadySource<'a> {
 
 struct Finding {
     node: (ExpressionInstance, NodeId),
-    diagnostic: Located<InferenceError>,
+    diagnostic: Located<FunctionTypePromise>,
 }
 
 impl ReadySource<'_> {
@@ -58,7 +70,7 @@ impl ReadySource<'_> {
         }
     }
 
-    fn diagnostic_source(&self) -> FunctionTypeSource<'_> {
+    fn diagnostic_source(&self, declared: &TypeExpr) -> FunctionTypeSource<'_> {
         match self {
             Self::UntypedExport(export) => FunctionTypeSource::UntypedExport(export),
             Self::UntypedParameter {
@@ -86,7 +98,11 @@ impl ReadySource<'_> {
             Self::Authored(expression) => match expression.static_type() {
                 Ok(ty) => FunctionTypeSource::Typed {
                     display: ty.to_string(),
-                    writable: Some(WritableType::expression(ty)),
+                    // A map-shaped literal can be evidence for a struct. Its
+                    // inferred homogeneous type is not a useful repair.
+                    writable: (!(matches!(declared, TypeExpr::Struct { .. })
+                        && matches!(ty, TypeExpr::Map(_))))
+                    .then(|| WritableType::expression(ty)),
                 },
                 Err(_) => FunctionTypeSource::Unknown,
             },
@@ -103,7 +119,7 @@ struct Relevance {
 
 #[derive(Clone)]
 struct BodyFinding {
-    error: InferenceError,
+    error: FunctionTypePromise,
     relevance: Relevance,
 }
 
@@ -124,6 +140,7 @@ struct Evidence<'a, 'index, B: BindingAddress> {
     projections: HashMap<(ExpressionInstance, NodeId), &'a Value<ParserPlaceholder, B>>,
     definitions: HashSet<&'a str>,
     untyped_parameters: HashMap<(ExpressionInstance, NodeId), (&'a str, &'a str)>,
+    syntax: HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
 }
 
 impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
@@ -167,7 +184,22 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
                 }
             }
         }
+        let mut syntax = HashMap::new();
+        let mut visited = HashSet::new();
+        let mut pending: Vec<_> = expressions
+            .roots
+            .iter()
+            .chain(expressions.definitions.values())
+            .collect();
+        while let Some(expression) = pending.pop() {
+            let node = &expression.authored;
+            if visited.insert((node.location.instance.clone(), node.id)) {
+                syntax.entry(node.location.clone()).or_insert(expression);
+                pending.extend(&node.children);
+            }
+        }
         Self {
+            syntax,
             expressions,
             report,
             bindings,
@@ -207,6 +239,7 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
                 ExprKind::Alias | ExprKind::Parens | ExprKind::Definition | ExprKind::Iterable => {
                     node.children.first()
                 }
+                ExprKind::Sink { .. } => node.sink_value(),
                 ExprKind::Sequence => node
                     .result_index()
                     .and_then(|index| node.children.get(index)),
@@ -252,6 +285,14 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
         self.known_value(expression).is_some()
     }
 
+    fn known_judgement(&self, expression: &JudgedExpr) -> bool {
+        expression.concrete()
+            || expression
+                .origin()
+                .and_then(|origin| self.syntax.get(origin))
+                .is_some_and(|expression| self.known(expression))
+    }
+
     fn known_in_body(&self, expression: &ExprValue<ParserPlaceholder, B>) -> bool {
         self.known(expression)
             || self
@@ -266,7 +307,7 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
         ty: &TypeExpr,
         name: &str,
         position: FunctionTypePosition<'_>,
-    ) -> Option<InferenceError> {
+    ) -> Option<FunctionTypePromise> {
         let judged = self
             .report
             .node(&expression.authored.location.instance, expression.node_id())?;
@@ -276,13 +317,15 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
         let Source::Ready(source) = self.evidence(expression) else {
             return None;
         };
-        match judge_static_assignment(source.assignment(), ty, self.bindings) {
-            Ok(StaticAssignmentVerdict::NeedsLocal) => Some(InferenceError::FunctionTypePromise {
+        match judge_static_assignment(source.assignment(), ty, self.bindings, &|expression| {
+            self.known_judgement(expression)
+        }) {
+            Ok(StaticAssignmentVerdict::NeedsLocal) => Some(FunctionTypePromise {
                 reason: format_function_type_promise_error(
                     name,
                     position,
                     ty,
-                    source.diagnostic_source(),
+                    source.diagnostic_source(ty),
                 ),
             }),
             // Existing judgement owns definite mismatches and annotation errors.
@@ -356,7 +399,7 @@ impl<'a, 'index, B: BindingAddress> Evidence<'a, 'index, B> {
         declaration: &'e AuthoredExpr<ParserPlaceholder, B>,
         call: &'e AuthoredExpr<ParserPlaceholder, B>,
         in_body: bool,
-    ) -> Vec<(&'e ExprValue<ParserPlaceholder, B>, InferenceError)> {
+    ) -> Vec<(&'e ExprValue<ParserPlaceholder, B>, FunctionTypePromise)> {
         let ExprKind::Function { signature, name } = &declaration.kind else {
             return Vec::new();
         };
@@ -800,7 +843,7 @@ pub(super) fn check<B: BindingAddress>(
     report: &ExpressionReport<B>,
     bindings: &BindingIndex<'_, B>,
     values: &ResolvedBindings<ParserPlaceholder, B>,
-) -> Vec<Located<InferenceError>> {
+) -> Vec<Located<FunctionTypePromise>> {
     let evidence = Evidence::new(expressions, report, bindings, values);
     let mut declarations = IndexMap::new();
     for node in report.syntax_nodes.values() {
@@ -876,14 +919,14 @@ pub(super) fn check<B: BindingAddress>(
 fn push_finding<B: BindingAddress>(
     findings: &mut Vec<Finding>,
     node: &AuthoredExpr<ParserPlaceholder, B>,
-    mut error: InferenceError,
+    mut error: FunctionTypePromise,
     report: &ExpressionReport<B>,
 ) {
     if report
         .node(&node.location.instance, node.id)
         .is_some_and(|judged| judged.diagnostic_is_secret())
     {
-        error = error.inside_secret();
+        error.reason = crate::resource::INSIDE_SECRET_MESSAGE.into();
     }
     let finding = Located::new(node.location.authored.clone(), error);
     let key = (node.location.instance.clone(), node.id);

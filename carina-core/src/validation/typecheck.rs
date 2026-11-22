@@ -70,9 +70,6 @@ impl fmt::Display for FunctionTypePosition<'_> {
     }
 }
 
-const UNKNOWN_FUNCTION_TYPE_ADVICE: &str =
-    "Pass a value known at validate, or give the argument a type that proves it fits.";
-
 /// Advice can name only a type with a DSL annotation spelling.
 pub(crate) struct WritableType(String);
 
@@ -147,8 +144,16 @@ pub(crate) fn format_function_type_promise_error(
             )
         }
     };
+    let unknown_advice = match position {
+        FunctionTypePosition::Parameter(_) => {
+            "Pass a value known at validate, or give the argument a type that proves it fits."
+        }
+        FunctionTypePosition::Return => {
+            "Pass a value known at validate, or give the return value a type that proves it fits."
+        }
+    };
     let advice = match source {
-        FunctionTypeSource::Unknown => UNKNOWN_FUNCTION_TYPE_ADVICE.into(),
+        FunctionTypeSource::Unknown => unknown_advice.into(),
         FunctionTypeSource::UntypedExport(_) => {
             "Pass a value known at validate, or declare the export's type.".into()
         }
@@ -156,11 +161,11 @@ pub(crate) fn format_function_type_promise_error(
             "Pass a value known at validate, or declare the type of parameter '{parameter}'."
         ),
         // A named reference can retain a value check even for its own type.
-        FunctionTypeSource::Typed { writable: None, .. } => UNKNOWN_FUNCTION_TYPE_ADVICE.into(),
+        FunctionTypeSource::Typed { writable: None, .. } => unknown_advice.into(),
         FunctionTypeSource::Typed {
             writable: Some(WritableType(ty)),
             ..
-        } if ty == declared.to_string() => UNKNOWN_FUNCTION_TYPE_ADVICE.into(),
+        } if ty == declared.to_string() => unknown_advice.into(),
         FunctionTypeSource::Typed {
             writable: Some(WritableType(ty)),
             ..
@@ -301,6 +306,48 @@ impl<'a> TypecheckProviderContext<'a> {
         value: &crate::resource::knowledge::KnownValue<'_, P, B>,
     ) -> TypeExprValueCheck<'a> {
         self.check_known_constraints(expected, value, ValueCheckEvidence::Resolved)
+    }
+
+    /// Check known collection members without treating pending members as values.
+    /// The caller retains the remaining runtime check for the whole argument.
+    pub(crate) fn check_known_parts<P: PlaceholderKind, B: BindingAddress>(
+        self,
+        expected: &TypeExpr,
+        value: &crate::resource::knowledge::Classification<'_, P, B>,
+    ) -> TypeExprValueCheck<'a> {
+        use crate::resource::knowledge::{Classification, ShapeView};
+        match value {
+            Classification::Known(value) => self.check_resolved_constraints(expected, value),
+            Classification::ShapeKnown(shape) => shape.visit(
+                |shape| match (expected, shape) {
+                    (TypeExpr::List(inner), ShapeView::List(items)) => {
+                        TypeExprValueCheck::all(items.iter().enumerate().map(|(index, item)| {
+                            self.check_known_parts(inner, item)
+                                .prepend(TypeExprValuePathSegment::ListIndex(index))
+                        }))
+                    }
+                    (TypeExpr::Map(inner), ShapeView::Map(entries)) => {
+                        TypeExprValueCheck::all(entries.iter().map(|(key, item)| {
+                            self.check_known_parts(inner, item)
+                                .prepend(TypeExprValuePathSegment::MapKey((*key).into()))
+                        }))
+                    }
+                    (TypeExpr::Struct { fields }, ShapeView::Map(entries)) => {
+                        TypeExprValueCheck::all(fields.iter().filter_map(|(name, ty)| {
+                            entries.get(name.as_str()).map(|item| {
+                                self.check_known_parts(ty, item)
+                                    .prepend(TypeExprValuePathSegment::StructField(name.clone()))
+                            })
+                        }))
+                    }
+                    _ => TypeExprValueCheck::Assignable,
+                },
+                |_| TypeExprValueCheck::Assignable,
+            ),
+            Classification::Pending(_) | Classification::Failed(_) => {
+                TypeExprValueCheck::Assignable
+            }
+        }
     }
 
     /// Persisted enum tags establish identity, but do not prove membership in
@@ -1526,7 +1573,7 @@ mod tests {
                 &TypeExpr::String,
                 FunctionTypeSource::Unknown,
             ),
-            "function 'f': return value is declared as String, but the body has no known type, so validate cannot prove it fits. Pass a value known at validate, or give the argument a type that proves it fits."
+            "function 'f': return value is declared as String, but the body has no known type, so validate cannot prove it fits. Pass a value known at validate, or give the return value a type that proves it fits."
         );
     }
 

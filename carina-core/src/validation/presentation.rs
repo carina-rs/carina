@@ -64,6 +64,7 @@ impl<E: ValidationClientError> std::fmt::Display for OrdinaryFinding<E> {
 pub enum PresentedFinding<E: ValidationClientError = std::convert::Infallible> {
     Ordinary(OrdinaryFinding<E>),
     Conversion(PresentedConversion),
+    FunctionPromise(crate::parser::Located<crate::parser::retained::FunctionTypePromise>),
 }
 
 /// A conversion after the validation report's consuming exit.
@@ -115,7 +116,9 @@ impl<E: ValidationClientError> PresentedFinding<E> {
     pub fn resource_id(&self) -> Option<&crate::resource::ResourceId> {
         match self {
             Self::Ordinary(OrdinaryFinding::Resource(finding)) => finding.resource_id(),
-            Self::Ordinary(OrdinaryFinding::Client(_)) | Self::Conversion(_) => None,
+            Self::Ordinary(OrdinaryFinding::Client(_))
+            | Self::Conversion(_)
+            | Self::FunctionPromise(_) => None,
         }
     }
     pub fn location(&self) -> Option<&crate::parser::DeclarationLocation> {
@@ -123,6 +126,7 @@ impl<E: ValidationClientError> PresentedFinding<E> {
             Self::Ordinary(OrdinaryFinding::Resource(finding)) => finding.location(),
             Self::Ordinary(OrdinaryFinding::Client(_)) => None,
             Self::Conversion(finding) => Some(finding.location()),
+            Self::FunctionPromise(finding) => Some(finding.location()),
         }
     }
     pub fn message(&self) -> String {
@@ -130,6 +134,7 @@ impl<E: ValidationClientError> PresentedFinding<E> {
             Self::Ordinary(OrdinaryFinding::Resource(finding)) => finding.message(),
             Self::Ordinary(OrdinaryFinding::Client(finding)) => finding.to_string(),
             Self::Conversion(finding) => finding.message().to_owned(),
+            Self::FunctionPromise(finding) => finding.detail().to_string(),
         }
     }
 }
@@ -139,6 +144,7 @@ impl<E: ValidationClientError> std::fmt::Display for PresentedFinding<E> {
         match self {
             Self::Ordinary(finding) => write!(f, "{finding}"),
             Self::Conversion(finding) => write!(f, "{finding}"),
+            Self::FunctionPromise(finding) => write!(f, "{finding}"),
         }
     }
 }
@@ -189,6 +195,7 @@ impl<E: ValidationClientError> IntoIterator for PresentedFindings<E> {
 pub struct ResourceValidationReport<E: ValidationClientError = std::convert::Infallible> {
     ordinary: Vec<(FindingSubject, OrdinaryFinding<E>)>,
     conversions: crate::ConversionFindings,
+    promises: Vec<crate::parser::Located<crate::parser::retained::FunctionTypePromise>>,
 }
 
 impl<E: ValidationClientError> std::fmt::Debug for ResourceValidationReport<E> {
@@ -223,6 +230,11 @@ impl<E: ValidationClientError> ResourceValidationReport<E> {
                 .into_findings()
                 .into_iter()
                 .map(|error| PresentedFinding::Conversion(PresentedConversion::new(error))),
+        );
+        findings.extend(
+            self.promises
+                .into_iter()
+                .map(PresentedFinding::FunctionPromise),
         );
         PresentedFindings(findings)
     }
@@ -318,6 +330,7 @@ pub struct ConversionValidation<E: ValidationClientError = std::convert::Infalli
     conversions: crate::ConversionFindings,
     coverage: crate::schema::value_validation::WalkCoverage,
     ordinary: Vec<(FindingSubject, OrdinaryFinding<E>)>,
+    promises: Vec<crate::parser::Located<crate::parser::retained::FunctionTypePromise>>,
     // Work memo: NodeId diagnostic dedup cannot undo repeated provider callbacks.
     admitted_uses: std::collections::HashMap<
         AdmissionUse,
@@ -331,6 +344,7 @@ impl<E: ValidationClientError> ConversionValidation<E> {
             conversions: Default::default(),
             coverage: Default::default(),
             ordinary: Vec::new(),
+            promises: Vec::new(),
             admitted_uses: Default::default(),
         }
     }
@@ -343,6 +357,16 @@ impl<E: ValidationClientError> Extend<E> for ConversionValidation<E> {
     }
 }
 impl<E: ValidationClientError> ConversionValidation<E> {
+    /// These findings are presented at completion and cannot stop admission.
+    pub fn include_function_promises(
+        &mut self,
+        findings: impl IntoIterator<
+            Item = crate::parser::Located<crate::parser::retained::FunctionTypePromise>,
+        >,
+    ) {
+        self.promises.extend(findings);
+    }
+
     pub fn push(&mut self, error: E) {
         self.ordinary.push((
             FindingSubject::Root,
@@ -453,20 +477,11 @@ impl<E: ValidationClientError> ConversionValidation<E> {
     }
 
     pub fn ordinary_failure(&self) -> Option<OrdinaryFailure> {
-        self.ordinary_failure_where(|_| true)
-    }
-
-    /// Retain every finding while allowing a client to finish independent
-    /// checks before selected errors stop the pipeline. Resource errors always stop.
-    pub fn ordinary_failure_where(
-        &self,
-        mut stops: impl FnMut(&E) -> bool,
-    ) -> Option<OrdinaryFailure> {
         self.ordinary.iter().find_map(|(_, finding)| match finding {
             OrdinaryFinding::Resource(_) => Some(OrdinaryFailure { _private: () }),
             OrdinaryFinding::Client(error) => match error.kind() {
-                ClientFindingKind::Error if stops(error) => Some(OrdinaryFailure { _private: () }),
-                ClientFindingKind::Error | ClientFindingKind::Notice => None,
+                ClientFindingKind::Error => Some(OrdinaryFailure { _private: () }),
+                ClientFindingKind::Notice => None,
             },
         })
     }
@@ -690,6 +705,7 @@ impl<E: ValidationClientError> ConversionValidation<E> {
         ResourceValidationReport {
             ordinary: self.ordinary,
             conversions: self.conversions,
+            promises: self.promises,
         }
     }
 }

@@ -777,7 +777,7 @@ where
     pub fn function_type_promise_findings(
         &self,
         bindings: &crate::binding_index::BindingIndex<'_, B>,
-    ) -> Vec<crate::parser::Located<crate::static_type::InferenceError>> {
+    ) -> Vec<crate::parser::Located<crate::parser::retained::FunctionTypePromise>> {
         self.file.function_type_promise_findings(bindings)
     }
     pub fn judged(&self) -> &Self {

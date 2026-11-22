@@ -175,12 +175,11 @@ fn function_reference_and_call_findings_keep_sibling_declaration_order() {
     let schemas = schemas();
     let loaded = load_buffer_configuration(&parsed, &schemas, &config);
     let bindings = loaded.parsed().binding_index(&config);
-    let mut findings = loaded.report().findings().to_vec();
-    for finding in loaded.function_type_promise_findings(&bindings) {
-        if !findings.contains(&finding) {
-            findings.push(finding);
-        }
-    }
+    let findings = loaded.report().findings().to_vec();
+    assert!(
+        loaded.function_type_promise_findings(&bindings).is_empty(),
+        "definite mismatches belong entirely to the authored judgement"
+    );
     assert_eq!(findings.len(), 4, "{findings:#?}");
     for (finding, function) in findings.iter().zip(["zebra", "sink", "alpha", "sink"]) {
         let error = finding.detail().to_string();
