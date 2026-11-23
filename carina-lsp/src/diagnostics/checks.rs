@@ -115,7 +115,8 @@ fn value_depends_on_module_output<'a>(
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
                 | DeferredValue::Unavailable { args, .. }
-                | DeferredValue::ResolvedFunctionCall { args, .. },
+                | DeferredValue::ResolvedFunctionCall { args, .. }
+                | DeferredValue::ProvisionalFunctionCall { args, .. },
             ) => {
                 pending.extend(args.iter().rev().filter_map(|argument| argument.value()));
             }
@@ -229,7 +230,7 @@ impl<'a> ContextFreeValue<'a> {
                 | Value::Deferred(DeferredValue::BindingRef { .. })
                 | Value::Deferred(DeferredValue::FunctionCall { .. })
                 | Value::Deferred(DeferredValue::Unavailable { .. })
-                | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+                | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. } | DeferredValue::ProvisionalFunctionCall { .. })
                 | Value::Deferred(DeferredValue::Access(_))
                 | Value::Deferred(DeferredValue::Unknown(_))
                 | Value::Deferred(DeferredValue::Placeholder(_))
@@ -344,6 +345,13 @@ fn contains_matching_function_call(value: &Value, matches_name: &impl Fn(&str) -
     match value {
         Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
             matches_name(name)
+                || args.iter().any(|arg| {
+                    arg.value()
+                        .is_some_and(|value| contains_matching_function_call(value, matches_name))
+                })
+        }
+        Value::Deferred(DeferredValue::ProvisionalFunctionCall { function, args, .. }) => {
+            matches_name(&function.name)
                 || args.iter().any(|arg| {
                     arg.value()
                         .is_some_and(|value| contains_matching_function_call(value, matches_name))

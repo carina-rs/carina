@@ -3967,7 +3967,39 @@ pub struct UserFunction<B: BindingAddress = RelativeBindingName> {
     pub body: UserFunctionBody<B>,
 }
 
+impl<B: BindingAddress> AsRef<UserFunction<B>> for UserFunction<B> {
+    fn as_ref(&self) -> &UserFunction<B> {
+        self
+    }
+}
+
 impl<B: BindingAddress> UserFunction<B> {
+    pub(crate) fn try_map_values<E>(
+        self,
+        mut map: impl FnMut(
+            Value<ParserPlaceholder, B>,
+            crate::value_walk::ExpressionEdge,
+        ) -> Result<Value<ParserPlaceholder, B>, E>,
+    ) -> Result<Self, E> {
+        use crate::value_walk::ExpressionEdge;
+        let mut function = self;
+        for (index, parameter) in function.params.iter_mut().enumerate() {
+            if let Some(value) = parameter.default.take() {
+                parameter.default = Some(map(value, ExpressionEdge::FunctionDefault(index))?);
+            }
+        }
+        function.local_lets = function
+            .local_lets
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, value, line))| {
+                map(value, ExpressionEdge::FunctionLocal(index)).map(|value| (name, value, line))
+            })
+            .collect::<Result<_, _>>()?;
+        function.body.value = map(function.body.value, ExpressionEdge::FunctionBody)?;
+        Ok(function)
+    }
+
     pub(crate) fn has_provisional_reference_heads(&self) -> bool {
         self.params
             .iter()
@@ -7004,7 +7036,7 @@ pub struct File<
     pub export_params: Vec<E>,
     pub backend: Option<BackendConfig<P, B>>,
     pub state_blocks: Vec<StateBlock<P, B>>,
-    pub user_functions: IndexMap<String, UserFunction<B>>,
+    pub user_functions: super::ClassifiedUserFunctions<B>,
     pub upstream_states: Vec<UpstreamState<B>>,
     pub wait_bindings: Vec<WaitBinding<B>>,
     pub requires: Vec<RequireBlock<P, B>>,
@@ -7109,7 +7141,7 @@ where
             export_params: Vec::new(),
             backend: None,
             state_blocks: Vec::new(),
-            user_functions: IndexMap::new(),
+            user_functions: super::ClassifiedUserFunctions::default(),
             upstream_states: Vec::new(),
             wait_bindings: Vec::new(),
             requires: Vec::new(),
@@ -9588,7 +9620,9 @@ fn deferred_iterable_kind<P: crate::resource::PlaceholderKind, B: BindingAddress
         }
         Value::Deferred(DeferredValue::Interpolation(_)) => "deferred interpolation",
         Value::Deferred(
-            DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
+            DeferredValue::FunctionCall { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::ProvisionalFunctionCall { .. },
         ) => "deferred function call",
         Value::Deferred(DeferredValue::Unavailable { .. }) => "unavailable function result",
         Value::Deferred(DeferredValue::Access(_)) => "deferred access expression",
@@ -9876,7 +9910,8 @@ fn normalize_substituted_value<B: BindingAddress>(
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. }
+            | DeferredValue::ProvisionalFunctionCall { args, .. },
         ) => {
             for arg in args.iter_mut() {
                 normalize_substituted_value(arg.walker_value_mut(), miss_policy)
@@ -10033,7 +10068,8 @@ fn normalize_substituted_lazily<B: BindingAddress>(
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. }
+            | DeferredValue::ProvisionalFunctionCall { args, .. },
         ) => {
             for argument in args {
                 normalize_substituted_lazily(argument.walker_value_mut())
@@ -10261,23 +10297,17 @@ mod substitute_placeholder_tests {
         ));
         parsed.user_functions.insert(
             "function_name".to_string(),
-            UserFunction {
-                type_annotations: Vec::new(),
-                name: "function_name".to_string(),
-                params: Vec::new(),
-                return_type: None,
-                return_type_span: None,
-                annotation_source_file: None,
-                local_lets: Vec::new(),
-                body: UserFunctionBody {
-                    location: ModuleCallId::test_dummy_in("test.crn")
-                        .declaration_location()
-                        .clone(),
-                    value: Value::Concrete(ConcreteValue::Int(1)),
-                    source_line: 1,
-                    source_file: None,
-                },
-            },
+            super::super::entry::top_level_user_functions_with_bindings(
+                &[(
+                    PathBuf::from("test.crn"),
+                    "fn function_name() { 1 }".to_owned(),
+                )],
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                &[],
+            )
+            .unwrap()
+            .shift_remove("function_name")
+            .unwrap(),
         );
         parsed.providers.push(ProviderConfig {
             name: "mock".to_string(),

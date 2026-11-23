@@ -59,6 +59,7 @@ pub(crate) fn contains_comparison_expression(value: &Value) -> bool {
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::ProvisionalFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::Unknown(_),
         ) => true,

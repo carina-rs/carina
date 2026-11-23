@@ -694,7 +694,7 @@ fn pending_secret_is_not_a_known_value_and_keeps_protected_sites() {
     );
 }
 
-fn function_leaf() -> crate::parser::UserFunction<RelativeBindingName> {
+fn function_leaf() -> crate::parser::ClassifiedUserFunction<RelativeBindingName> {
     crate::parser::parse_file(
         "fn leaf() { 1 }",
         std::path::Path::new("main.crn"),
@@ -716,7 +716,7 @@ fn function_body_graph_is_classified_once_per_call() {
     for level in 0..20 {
         let call = Parsed::Deferred(DeferredValue::ResolvedFunctionCall {
             function: function.clone(),
-            functions: Arc::new(indexmap::IndexMap::new()),
+            functions: Arc::new(Default::default()),
             args: vec![],
             source_line: 1.into(),
         });
@@ -727,7 +727,7 @@ fn function_body_graph_is_classified_once_per_call() {
     }
     let value = Parsed::Deferred(DeferredValue::ResolvedFunctionCall {
         function,
-        functions: Arc::new(indexmap::IndexMap::new()),
+        functions: Arc::new(Default::default()),
         args: vec![],
         source_line: 1.into(),
     });
@@ -772,7 +772,7 @@ fn secret_propagates_classification_errors() {
     let value = Value::<ParserPlaceholder, RelativeBindingName>::Deferred(DeferredValue::Secret(
         Box::new(Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
-            functions: std::sync::Arc::new(indexmap::IndexMap::new()),
+            functions: std::sync::Arc::new(Default::default()),
             args: vec![],
             source_line: 1.into(),
         }))
@@ -848,11 +848,11 @@ fn access_classification_only_visits_the_selected_member() {
 }
 
 fn lexical_call(
-    function: std::sync::Arc<crate::parser::UserFunction<RelativeBindingName>>,
+    function: std::sync::Arc<crate::parser::ClassifiedUserFunction<RelativeBindingName>>,
 ) -> Value<ParserPlaceholder, RelativeBindingName> {
     Value::Deferred(DeferredValue::ResolvedFunctionCall {
         function,
-        functions: std::sync::Arc::new(indexmap::IndexMap::new()),
+        functions: std::sync::Arc::new(Default::default()),
         args: vec![],
         source_line: 1.into(),
     })
@@ -873,7 +873,7 @@ fn shared_lexical_body_keeps_each_invocations_operand_timing() {
     let call = |argument: Parsed| {
         Parsed::Deferred(DeferredValue::ResolvedFunctionCall {
             function: Arc::clone(&function),
-            functions: Arc::new(indexmap::IndexMap::new()),
+            functions: Arc::new(Default::default()),
             args: vec![argument.into()],
             source_line: 1.into(),
         })

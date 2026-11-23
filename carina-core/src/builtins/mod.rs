@@ -836,7 +836,9 @@ pub(crate) fn value_type_name<B: BindingAddress>(value: &Value<NoPlaceholder, B>
         Value::Deferred(DeferredValue::IntegerArithmetic(_)) => "Int",
         Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation",
         Value::Deferred(
-            DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
+            DeferredValue::FunctionCall { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::ProvisionalFunctionCall { .. },
         ) => "FunctionCall",
         Value::Deferred(DeferredValue::Unavailable { .. }) => "Unavailable",
         Value::Deferred(DeferredValue::Access(_)) => "Access",

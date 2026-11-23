@@ -1087,6 +1087,12 @@ fn binding_value_assignable_to_enum<B: BindingAddress>(
                 args: _,
                 source_line: _,
             }
+            | crate::resource::DeferredValue::ProvisionalFunctionCall {
+                function: _,
+                functions: _,
+                args: _,
+                source_line: _,
+            }
             | crate::resource::DeferredValue::Access(_)
             | crate::resource::DeferredValue::Secret(_)
             | crate::resource::DeferredValue::Unknown(_)
@@ -1369,6 +1375,12 @@ fn deferred_value_mismatch<B: BindingAddress>(
                 source_line: _,
             }
             | crate::resource::DeferredValue::ResolvedFunctionCall {
+                function: _,
+                functions: _,
+                args: _,
+                source_line: _,
+            }
+            | crate::resource::DeferredValue::ProvisionalFunctionCall {
                 function: _,
                 functions: _,
                 args: _,
@@ -2591,7 +2603,8 @@ fn visit_refs_with_sink_inner<'a, P: PlaceholderKind, B: BindingAddress>(
         GenericValue::Deferred(
             crate::resource::DeferredValue::FunctionCall { args, .. }
             | crate::resource::DeferredValue::Unavailable { args, .. }
-            | crate::resource::DeferredValue::ResolvedFunctionCall { args, .. },
+            | crate::resource::DeferredValue::ResolvedFunctionCall { args, .. }
+            | crate::resource::DeferredValue::ProvisionalFunctionCall { args, .. },
         ) => {
             // The enclosing sink constrains the function result, not its
             // inputs. Function parameter sites are walked separately with
@@ -2993,7 +3006,8 @@ fn visit_computed_accesses_with_sink<'a, B: BindingAddress, E: InsideSecret>(
         GenericValue::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. }
+            | DeferredValue::ProvisionalFunctionCall { args, .. },
         ) => {
             for argument in args {
                 findings.extend(visit_computed_accesses_with_sink(
@@ -3413,6 +3427,7 @@ fn prove_integer_operand<B: BindingAddress>(
             | crate::resource::DeferredValue::FunctionCall { .. }
             | crate::resource::DeferredValue::Unavailable { .. }
             | crate::resource::DeferredValue::ResolvedFunctionCall { .. }
+            | crate::resource::DeferredValue::ProvisionalFunctionCall { .. }
             | crate::resource::DeferredValue::Access(_)
             | crate::resource::DeferredValue::Unknown(_),
         ) => None,
@@ -4751,6 +4766,19 @@ mod user_function_refs {
                     name.as_str(),
                     args,
                     function,
+                    result_sink.zip(context),
+                    bindings,
+                    unknown_policy,
+                    errors,
+                );
+            }
+            crate::resource::Value::Deferred(
+                crate::resource::DeferredValue::ProvisionalFunctionCall { function, args, .. },
+            ) => {
+                check_call(
+                    &function.name,
+                    args,
+                    Some(function),
                     result_sink.zip(context),
                     bindings,
                     unknown_policy,
@@ -8225,40 +8253,39 @@ fn resolve_file_type_exprs_with_annotations<
     }
     for function in parsed.user_functions.values_mut() {
         let previous_errors = errors.len();
-        for parameter in &mut function.params {
-            if let Some(ty) = &mut parameter.param_type {
-                let name = format!("{}' parameter '{}", function.name, parameter.name);
-                let location = annotation(TypeResolutionDeclarationKind::FunctionParameter, &name);
-                let site = ProviderTypeCheckSite::new(
+        let function_name = function.name.clone();
+        for (parameter_name, ty) in function.parameter_types_mut() {
+            let name = format!("{}' parameter '{}", function_name, parameter_name);
+            let location = annotation(TypeResolutionDeclarationKind::FunctionParameter, &name);
+            let site = ProviderTypeCheckSite::new(
+                location.clone(),
+                format!(
+                    "function '{}' parameter '{}'",
+                    function_name, parameter_name
+                ),
+            );
+            for error in resolve_declaration_type(ty, config, &site) {
+                errors.push(TypeResolutionDiagnostic::declaration(
+                    TypeResolutionDeclarationKind::FunctionParameter,
+                    name.clone(),
+                    error,
                     location.clone(),
-                    format!(
-                        "function '{}' parameter '{}'",
-                        function.name, parameter.name
-                    ),
-                );
-                for error in resolve_declaration_type(ty, config, &site) {
-                    errors.push(TypeResolutionDiagnostic::declaration(
-                        TypeResolutionDeclarationKind::FunctionParameter,
-                        name.clone(),
-                        error,
-                        location.clone(),
-                    ));
-                }
+                ));
             }
         }
-        if let Some(ty) = &mut function.return_type {
+        if let Some(ty) = function.return_type_mut() {
             let location = annotation(
                 TypeResolutionDeclarationKind::FunctionReturn,
-                &function.name,
+                &function_name,
             );
             let site = ProviderTypeCheckSite::new(
                 location.clone(),
-                format!("function '{}' return value", function.name),
+                format!("function '{}' return value", function_name),
             );
             for error in resolve_declaration_type(ty, config, &site) {
                 errors.push(TypeResolutionDiagnostic::declaration(
                     TypeResolutionDeclarationKind::FunctionReturn,
-                    function.name.clone(),
+                    function_name.clone(),
                     error,
                     location.clone(),
                 ));
@@ -10443,6 +10470,14 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
             source_line: _source_line,
         }) => false,
         crate::resource::Value::Deferred(
+            crate::resource::DeferredValue::ProvisionalFunctionCall {
+                function: _function,
+                functions: _functions,
+                args: _args,
+                source_line: _source_line,
+            },
+        ) => false,
+        crate::resource::Value::Deferred(
             crate::resource::DeferredValue::ResolvedFunctionCall {
                 function: _function,
                 functions: _functions,
@@ -11065,6 +11100,7 @@ fn attribute_value_findings_from<S: ExportSource, P: PlaceholderKind, B: Binding
                             crate::resource::DeferredValue::FunctionCall { .. }
                             | crate::resource::DeferredValue::Unavailable { .. }
                             | crate::resource::DeferredValue::ResolvedFunctionCall { .. }
+                            | crate::resource::DeferredValue::ProvisionalFunctionCall { .. }
                             | crate::resource::DeferredValue::Interpolation(_)
                             | crate::resource::DeferredValue::Secret(_)
                             | crate::resource::DeferredValue::Unknown(_)

@@ -939,6 +939,12 @@ fn value_to_json_inner<P: crate::resource::StateValueLeaf>(
             name: name.to_string(),
             context: ctx,
         }),
+        Value::Deferred(DeferredValue::ProvisionalFunctionCall { function, .. }) => {
+            Err(SerializationError::UnresolvedFunctionCall {
+                name: function.name.clone(),
+                context: ctx,
+            })
+        }
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
             Err(SerializationError::UnresolvedFunctionCall {
                 name: function.name.clone(),
@@ -1911,6 +1917,17 @@ fn format_value_into_context<P: ValueKind, B: BindingAddress>(
             }
             sink.write_token(ValueSpanKind::Structure, ")")
         }
+        Value::Deferred(DeferredValue::ProvisionalFunctionCall { function, args, .. }) => {
+            sink.write_token(ValueSpanKind::Other, &function.name)?;
+            sink.write_token(ValueSpanKind::Structure, "(")?;
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    sink.write_token(ValueSpanKind::Structure, ", ")?;
+                }
+                format_value_into_context(arg.walker_value(), sink, context)?;
+            }
+            sink.write_token(ValueSpanKind::Structure, ")")
+        }
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
             sink.write_token(ValueSpanKind::Other, &function.name)?;
             sink.write_token(ValueSpanKind::Structure, "(")?;
@@ -2218,7 +2235,8 @@ pub fn contains_secret<P: ValueKind, B: BindingAddress>(value: &Value<P, B>) -> 
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. }
+            | DeferredValue::ProvisionalFunctionCall { args, .. },
         ) => args
             .iter()
             .any(|argument| contains_secret(argument.walker_value())),
@@ -2282,7 +2300,7 @@ pub fn contains_unredacted_secret(value: &Value) -> bool {
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. } | DeferredValue::ProvisionalFunctionCall { args, .. },
         ) => {
             args.iter()
                 .any(|argument| contains_unredacted_secret(argument.walker_value()))
@@ -2553,6 +2571,7 @@ fn secret_value_requires_provider_material(value: &Value) -> bool {
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::ProvisionalFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::Unknown(_),
         ) => true,
@@ -2654,6 +2673,23 @@ fn redact_snapshot_secrets<P: PlaceholderKind>(
                 name: *name,
                 args: redacted,
                 reason: reason.clone(),
+                source_line: *source_line,
+            }))
+        }
+        Value::Deferred(DeferredValue::ProvisionalFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }) => {
+            let redacted = args
+                .iter()
+                .map(|argument| argument.try_map_value(redact_snapshot_secrets))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Deferred(DeferredValue::ProvisionalFunctionCall {
+                function: function.clone(),
+                functions: functions.clone(),
+                args: redacted,
                 source_line: *source_line,
             }))
         }
@@ -2837,6 +2873,19 @@ fn canonical_secret_template<P: PlaceholderKind>(
             );
             tagged("function_call", JsonValue::Object(call))
         }
+        Value::Deferred(DeferredValue::ProvisionalFunctionCall { function, args, .. }) => {
+            let mut call = Map::new();
+            call.insert("name".to_string(), JsonValue::String(function.name.clone()));
+            call.insert(
+                "args".to_string(),
+                JsonValue::Array(
+                    args.iter()
+                        .map(|argument| canonical_secret_template(argument.walker_value()))
+                        .collect::<Result<_, _>>()?,
+                ),
+            );
+            tagged("function_call", JsonValue::Object(call))
+        }
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
             let mut call = Map::new();
             call.insert("name".to_string(), JsonValue::String(function.name.clone()));
@@ -2905,7 +2954,7 @@ pub fn contains_redacted_secret<P: ValueKind, B: BindingAddress>(value: &Value<P
         }),
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. } | DeferredValue::ProvisionalFunctionCall { args, .. },
         ) => args
             .iter()
             .any(|argument| contains_redacted_secret(argument.walker_value())),
@@ -5825,6 +5874,7 @@ fn canonical_map_key_text<H: ValueKind, B: BindingAddress>(
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::ProvisionalFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::Secret(_)
             | DeferredValue::Unknown(_)
@@ -6338,6 +6388,7 @@ fn first_enum_identifier_inner<H: ValueKind, B: BindingAddress>(
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::ProvisionalFunctionCall { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. },

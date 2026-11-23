@@ -288,7 +288,8 @@ impl<P: PlaceholderKind, B: BindingAddress> SnapshotValue<P, B> {
             Self::Deferred(
                 DeferredValue::FunctionCall { args, .. }
                 | DeferredValue::Unavailable { args, .. }
-                | DeferredValue::ResolvedFunctionCall { args, .. },
+                | DeferredValue::ResolvedFunctionCall { args, .. }
+                | DeferredValue::ProvisionalFunctionCall { args, .. },
             ) => args.iter().enumerate().find_map(|(i, argument)| {
                 argument
                     .walker_value()

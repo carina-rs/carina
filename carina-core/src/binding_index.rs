@@ -709,7 +709,7 @@ pub struct BindingIndex<'a, B: BindingAddress = RelativeBindingName> {
     /// keep this index-only view keyed by the visible composition binding.
     pending_composition_handles: HashMap<B, HashMap<String, crate::parser::ResourceTypePath>>,
     registry: &'a SchemaRegistry,
-    user_functions: &'a indexmap::IndexMap<String, crate::parser::UserFunction<B>>,
+    user_functions: &'a crate::parser::ClassifiedUserFunctions<B>,
 }
 
 impl<'a, B: BindingAddress> BindingIndex<'a, B> {
@@ -1177,7 +1177,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     }
 
     pub(crate) fn user_function(&self, name: &str) -> Option<&'a crate::parser::UserFunction<B>> {
-        self.user_functions.get(name)
+        self.user_functions.get(name).map(|function| &**function)
     }
 
     /// Resolve the static type of one complete reference path.

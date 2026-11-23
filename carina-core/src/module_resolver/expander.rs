@@ -1721,6 +1721,12 @@ fn source_argument_name<B: BindingAddress, C: BindingAddress>(
                     args: _,
                     source_line: _,
                 }
+                | DeferredValue::ProvisionalFunctionCall {
+                    function: _,
+                    functions: _,
+                    args: _,
+                    source_line: _,
+                }
                 | DeferredValue::Unavailable {
                     name: _,
                     args: _,
@@ -2082,6 +2088,12 @@ fn authored_value_reference_path(value: &Value) -> Option<crate::resource::Autho
                 args: _,
                 source_line: _,
             }
+            | DeferredValue::ProvisionalFunctionCall {
+                function: _,
+                functions: _,
+                args: _,
+                source_line: _,
+            }
             | DeferredValue::Unavailable {
                 name: _,
                 args: _,
@@ -2223,6 +2235,12 @@ pub(crate) fn module_parameter_postfix<B: BindingAddress>(
                     source_line: _,
                 }
                 | DeferredValue::ResolvedFunctionCall {
+                    function: _,
+                    functions: _,
+                    args: _,
+                    source_line: _,
+                }
+                | DeferredValue::ProvisionalFunctionCall {
                     function: _,
                     functions: _,
                     args: _,
@@ -3656,6 +3674,12 @@ fn expand_module_composition(
                                 source_line: _,
                             }
                             | DeferredValue::ResolvedFunctionCall {
+                                function: _,
+                                functions: _,
+                                args: _,
+                                source_line: _,
+                            }
+                            | DeferredValue::ProvisionalFunctionCall {
                                 function: _,
                                 functions: _,
                                 args: _,

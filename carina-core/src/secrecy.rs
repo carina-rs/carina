@@ -758,12 +758,53 @@ struct Thunk<B: BindingAddress> {
     source: Source<B>,
     environment: Arc<Environment<B>>,
 }
+
+#[derive(Clone)]
+enum ValueFunction<B: BindingAddress> {
+    Classified(Arc<crate::parser::ClassifiedUserFunction<B>>),
+    Provisional(Arc<crate::parser::UserFunction<B>>),
+}
+
+impl<B: BindingAddress> std::ops::Deref for ValueFunction<B> {
+    type Target = crate::parser::UserFunction<B>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Classified(function) => function,
+            Self::Provisional(function) => function,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ValueFunctions<B: BindingAddress> {
+    Classified(Arc<crate::parser::ClassifiedUserFunctions<B>>),
+    Provisional(Arc<IndexMap<String, crate::parser::UserFunction<B>>>),
+}
+
+impl<B: BindingAddress> ValueFunctions<B> {
+    fn get(&self, name: &str) -> Option<ValueFunction<B>> {
+        match self {
+            Self::Classified(functions) => functions
+                .get(name)
+                .cloned()
+                .map(Arc::new)
+                .map(ValueFunction::Classified),
+            Self::Provisional(functions) => functions
+                .get(name)
+                .cloned()
+                .map(Arc::new)
+                .map(ValueFunction::Provisional),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Environment<B: BindingAddress> {
     id: usize,
     nodes: Arc<HashMap<(ExpressionInstance, NodeId), Thunk<B>>>,
     names: Arc<HashMap<String, Thunk<B>>>,
-    functions: Option<Arc<IndexMap<String, crate::parser::UserFunction<B>>>>,
+    functions: Option<ValueFunctions<B>>,
     conditions: Option<crate::parser::retained::ConditionSnapshot>,
     in_function: bool,
     module: Option<B>,
@@ -1210,8 +1251,8 @@ impl<B: BindingAddress> Owner<'_, B> {
     fn value_function_observations(
         &self,
         identity: &FunctionIdentity<B>,
-        function: &Arc<crate::parser::UserFunction<B>>,
-        functions: &IndexMap<String, crate::parser::UserFunction<B>>,
+        function: &ValueFunction<B>,
+        functions: &ValueFunctions<B>,
     ) -> ArgumentDependencies {
         if let Some(uses) = self.function_observations.borrow().get(identity) {
             return *uses;
@@ -1251,14 +1292,27 @@ impl<B: BindingAddress> Owner<'_, B> {
                             *name == crate::builtins::BuiltinFunction::flatten;
                         values.extend(args.iter().filter_map(FunctionArgument::value));
                     }
+                    Value::Deferred(DeferredValue::ProvisionalFunctionCall {
+                        function,
+                        args,
+                        ..
+                    }) => {
+                        let callee = functions
+                            .get(&function.name)
+                            .unwrap_or_else(|| ValueFunction::Provisional(function.clone()));
+                        dependencies.callees.insert(FunctionIdentity::Value(
+                            callee.body.location.clone(),
+                            module.clone(),
+                        ));
+                        pending.push(callee);
+                        values.extend(args.iter().map(FunctionArgument::walker_value));
+                    }
                     Value::Deferred(DeferredValue::ResolvedFunctionCall {
                         function, args, ..
                     }) => {
                         let callee = functions
                             .get(&function.name)
-                            .cloned()
-                            .map(Arc::new)
-                            .unwrap_or_else(|| function.clone());
+                            .unwrap_or_else(|| ValueFunction::Classified(function.clone()));
                         dependencies.callees.insert(FunctionIdentity::Value(
                             callee.body.location.clone(),
                             module.clone(),
@@ -1891,8 +1945,8 @@ enum Work<B: BindingAddress> {
         depth: usize,
     },
     ValueCall {
-        function: Arc<crate::parser::UserFunction<B>>,
-        functions: Arc<IndexMap<String, crate::parser::UserFunction<B>>>,
+        function: ValueFunction<B>,
+        functions: ValueFunctions<B>,
         count: usize,
         observations: Vec<ArgumentObservations>,
         arguments: Vec<Thunk<B>>,
@@ -3682,57 +3736,40 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                     );
                     self.schedule(operation, children, path, depth, work);
                 }
+                DeferredValue::ProvisionalFunctionCall {
+                    function,
+                    functions,
+                    args,
+                    source_line: _,
+                } => self.value_function_call(
+                    ValueFunction::Provisional(function.clone()),
+                    ValueFunctions::Provisional(functions.clone()),
+                    args,
+                    FunctionContext {
+                        environment,
+                        path,
+                        depth,
+                        work,
+                        values,
+                    },
+                ),
                 DeferredValue::ResolvedFunctionCall {
                     function,
                     functions,
                     args,
                     source_line: _,
-                } => {
-                    if let Some(syntax) = self
-                        .owner
-                        .syntax
-                        .secrecy_lexical_function(environment.module.as_ref(), &function.name)
-                    {
-                        self.function(
-                            syntax,
-                            args.iter()
-                                .map(|argument| thunk(argument.walker_value()))
-                                .collect(),
-                            FunctionContext {
-                                environment,
-                                path,
-                                depth,
-                                work,
-                                values,
-                            },
-                        );
-                        return;
-                    }
-                    let lexical_functions = environment
-                        .functions
-                        .clone()
-                        .unwrap_or_else(|| functions.clone());
-                    let lexical_function = lexical_functions
-                        .get(&function.name)
-                        .map(|function| Arc::new(function.clone()))
-                        .unwrap_or_else(|| function.clone());
-                    let arguments = args
-                        .iter()
-                        .map(|argument| thunk(argument.walker_value()))
-                        .collect::<Vec<_>>();
-                    self.push_call(arguments, depth, work, |observations, arguments| {
-                        Work::ValueCall {
-                            function: lexical_function,
-                            functions: lexical_functions,
-                            count: arguments.len(),
-                            observations,
-                            arguments,
-                            environment,
-                            path,
-                            depth,
-                        }
-                    });
-                }
+                } => self.value_function_call(
+                    ValueFunction::Classified(function.clone()),
+                    ValueFunctions::Classified(functions.clone()),
+                    args,
+                    FunctionContext {
+                        environment,
+                        path,
+                        depth,
+                        work,
+                        values,
+                    },
+                ),
                 DeferredValue::Access(access) => {
                     let path = std::iter::once(access.step().clone()).chain(path).collect();
                     work.push(Work::Enter {
@@ -3791,10 +3828,65 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             Value::Reference(never) | Value::Conversion(never) => match *never {},
         }
     }
+    fn value_function_call(
+        &mut self,
+        function: ValueFunction<B>,
+        functions: ValueFunctions<B>,
+        args: &[FunctionArgument<ParserPlaceholder, B>],
+        context: FunctionContext<'_, B>,
+    ) {
+        let FunctionContext {
+            environment,
+            path,
+            depth,
+            work,
+            values,
+        } = context;
+        let arguments = args
+            .iter()
+            .map(|argument| Thunk {
+                source: Source::Value(Arc::new(argument.walker_value().clone())),
+                environment: environment.clone(),
+            })
+            .collect::<Vec<_>>();
+        if let Some(syntax) = self
+            .owner
+            .syntax
+            .secrecy_lexical_function(environment.module.as_ref(), &function.name)
+        {
+            self.function(
+                syntax,
+                arguments,
+                FunctionContext {
+                    environment,
+                    path,
+                    depth,
+                    work,
+                    values,
+                },
+            );
+            return;
+        }
+        let lexical_functions = environment.functions.clone().unwrap_or(functions);
+        let lexical_function = lexical_functions.get(&function.name).unwrap_or(function);
+        self.push_call(arguments, depth, work, |observations, arguments| {
+            Work::ValueCall {
+                function: lexical_function,
+                functions: lexical_functions,
+                count: arguments.len(),
+                observations,
+                arguments,
+                environment,
+                path,
+                depth,
+            }
+        });
+    }
+
     fn begin_value_function(
         &mut self,
-        function: Arc<crate::parser::UserFunction<B>>,
-        functions: Arc<IndexMap<String, crate::parser::UserFunction<B>>>,
+        function: ValueFunction<B>,
+        functions: ValueFunctions<B>,
         args: Vec<Option<Evidence>>,
         observations: Vec<ArgumentObservations>,
         authored_arguments: Vec<Thunk<B>>,

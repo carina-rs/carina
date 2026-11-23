@@ -470,6 +470,7 @@ fn validate_operand_shape_at_stage<P: ValueKind, B: BindingAddress>(
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::ProvisionalFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::IntegerArithmetic(_),
         ) => Ok(()),

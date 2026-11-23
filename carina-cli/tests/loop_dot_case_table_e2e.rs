@@ -47,6 +47,16 @@ fn loop_dot_case_table() {
 }
 
 #[test]
+fn loop_dot_review_round3_bare_function_condition() {
+    run_case_table(|row| row.id == "2-25");
+}
+
+#[test]
+fn loop_dot_review_round3_whole_group_function() {
+    run_case_table(|row| row.id == "2-24");
+}
+
+#[test]
 fn loop_dot_review_round1_function_contexts() {
     run_case_table(|row| row.id == "2-19");
 }

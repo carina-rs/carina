@@ -2257,6 +2257,12 @@ fn deferred_value_variant<P: crate::resource::ValueKind>(value: &DeferredValue<P
             reason: _reason,
             source_line: _source_line,
         } => "Unavailable",
+        DeferredValue::ProvisionalFunctionCall {
+            function: _function,
+            functions: _functions,
+            args: _args,
+            source_line: _source_line,
+        } => "ProvisionalFunctionCall",
         DeferredValue::ResolvedFunctionCall {
             function: _function,
             functions: _functions,
@@ -4108,25 +4114,18 @@ mod tests {
             Err(ProtocolConvertError::DurationOutOfRange)
         ));
 
-        let resolved_function: std::sync::Arc<
-            crate::parser::UserFunction<crate::resource::AbsoluteBindingAddress>,
-        > = std::sync::Arc::new(crate::parser::UserFunction {
-            type_annotations: Vec::new(),
-            name: "fixture".to_string(),
-            params: Vec::new(),
-            return_type: None,
-            return_type_span: None,
-            annotation_source_file: None,
-            local_lets: Vec::new(),
-            body: crate::parser::UserFunctionBody {
-                location: crate::parser::ModuleCallId::test_dummy_in("test.crn")
-                    .declaration_location()
-                    .clone(),
-                value: Value::Concrete(ConcreteValue::Int(1)),
-                source_line: 0,
-                source_file: None,
-            },
-        });
+        let resolved_function = std::sync::Arc::new(
+            crate::parser::parse_file(
+                "fn fixture() { 1 }",
+                std::path::Path::new("test.crn"),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap()
+            .resolve_root_for_test()
+            .user_functions
+            .shift_remove("fixture")
+            .unwrap(),
+        );
         let access = crate::resource::apply_postfix_access(
             Value::Deferred(DeferredValue::Unknown(
                 crate::resource::ApplyTimeUnknown::UpstreamAllExports {
@@ -4173,7 +4172,7 @@ mod tests {
             }),
             Value::Deferred(DeferredValue::ResolvedFunctionCall {
                 function: resolved_function,
-                functions: std::sync::Arc::new(indexmap::IndexMap::new()),
+                functions: std::sync::Arc::new(Default::default()),
                 args: Vec::new(),
                 source_line: (0).into(),
             }),

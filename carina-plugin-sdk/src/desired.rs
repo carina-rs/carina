@@ -725,6 +725,7 @@ fn retain_native_value_metadata(tree: &mut DesiredValue, original: &Value, owner
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::ProvisionalFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::Unknown(_),
         ) => {}

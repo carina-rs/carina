@@ -186,6 +186,12 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
             name: name.to_string(),
             context: SerializationContext::WasmBoundary,
         }),
+        CoreValue::Deferred(DeferredValue::ProvisionalFunctionCall { function, .. }) => {
+            Err(SerializationError::UnresolvedFunctionCall {
+                name: function.name.clone(),
+                context: SerializationContext::WasmBoundary,
+            })
+        }
         CoreValue::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
             Err(SerializationError::UnresolvedFunctionCall {
                 name: function.name.clone(),
@@ -560,6 +566,12 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
             name: name.to_string(),
             context: SerializationContext::WasmBoundary,
         }),
+        CoreValue::Deferred(DeferredValue::ProvisionalFunctionCall { function, .. }) => {
+            Err(SerializationError::UnresolvedFunctionCall {
+                name: function.name.clone(),
+                context: SerializationContext::WasmBoundary,
+            })
+        }
         CoreValue::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
             Err(SerializationError::UnresolvedFunctionCall {
                 name: function.name.clone(),

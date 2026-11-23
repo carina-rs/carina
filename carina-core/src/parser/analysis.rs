@@ -1113,7 +1113,8 @@ fn require_integer_operator_provenance<P: ValueKind, B: BindingAddress>(
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. }
+            | DeferredValue::ProvisionalFunctionCall { args, .. },
         ) => {
             for argument in args {
                 check(argument.walker_value())?;
@@ -1185,6 +1186,7 @@ where
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::ProvisionalFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
@@ -2025,7 +2027,7 @@ pub struct AnalysisTree<
     value_references: Vec<AnalysisValueReference<B>>,
     validation_values: Vec<Located<FunctionValidationValue<'a, P, B>>>,
     iterables: Vec<AnalysisForRef<'a, P, B>>,
-    functions: &'a indexmap::IndexMap<String, super::UserFunction<B>>,
+    functions: &'a super::ClassifiedUserFunctions<B>,
     module_calls: &'a [super::ModuleCall<P, B>],
     binding_names: std::collections::HashSet<String>,
     module_definition: bool,

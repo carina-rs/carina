@@ -96,6 +96,37 @@ fn value_contains_module_if_inner<P: ModuleIfAuditPlaceholder, B: BindingAddress
                 })
                 .is_err()
         }),
+        Value::Deferred(DeferredValue::ProvisionalFunctionCall {
+            function,
+            functions: scope,
+            args,
+            source_line: _,
+        }) => {
+            if args.iter().any(|argument| {
+                argument
+                    .try_visit_values(&mut |value| {
+                        if value_contains_module_if_inner(value, functions, function_scopes) {
+                            Err(())
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .is_err()
+            }) {
+                return true;
+            }
+            let function_id = std::sync::Arc::as_ptr(function) as usize;
+            if functions.insert(function_id)
+                && user_function_contains_module_if(function, functions, function_scopes)
+            {
+                return true;
+            }
+            let scope_id = std::sync::Arc::as_ptr(scope) as usize;
+            function_scopes.insert(scope_id)
+                && scope.values().any(|function| {
+                    user_function_contains_module_if(function, functions, function_scopes)
+                })
+        }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions: scope,

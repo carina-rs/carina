@@ -121,10 +121,8 @@ impl ParserRewrite<AbsoluteBindingAddress> for ExpandedModuleRewrite<'_> {
     }
     fn resolved_call(
         &mut self,
-        function: &Arc<crate::parser::UserFunction<AbsoluteBindingAddress>>,
-        _functions: &Arc<
-            indexmap::IndexMap<String, crate::parser::UserFunction<AbsoluteBindingAddress>>,
-        >,
+        function: &Arc<crate::parser::ClassifiedUserFunction<AbsoluteBindingAddress>>,
+        _functions: &Arc<crate::parser::ClassifiedUserFunctions<AbsoluteBindingAddress>>,
         args: &[FunctionArgument<ParserPlaceholder, AbsoluteBindingAddress>],
         source_line: DiagnosticSourceLine,
     ) -> Result<Option<ModuleResolvedValue>, Self::Error> {

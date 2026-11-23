@@ -28,9 +28,9 @@ pub(super) fn parse_fn_def(
     let type_annotations =
         super::elements::function_type_annotations(&pair, preprocessed_file, ctx.source_file());
     let mut inner = pair.into_inner();
-    let name = next_pair(&mut inner, "function name", "fn_def")?
-        .as_str()
-        .to_string();
+    let name_pair = next_pair(&mut inner, "function name", "fn_def")?;
+    let declaration = ctx.declaration_location(&name_pair);
+    let name = name_pair.as_str().to_string();
 
     // Parse parameters (optional)
     let mut params = Vec::new();
@@ -61,7 +61,7 @@ pub(super) fn parse_fn_def(
                         }
                         _ => {
                             // This is the default expression
-                            let mut default_ctx = ctx.function_scope();
+                            let mut default_ctx = ctx.function_scope(declaration.clone());
                             default_ctx
                                 .replace_shared_user_functions(Arc::clone(&ctx.user_functions));
                             default_ctx
@@ -112,7 +112,7 @@ pub(super) fn parse_fn_def(
 
     // Create a context where parameters are registered as variables
     // so that param references in the body are resolved as variable refs
-    let mut body_ctx = ctx.function_scope();
+    let mut body_ctx = ctx.function_scope(declaration);
     body_ctx.replace_shared_user_functions(Arc::clone(&ctx.user_functions));
     body_ctx
         .seeded_user_functions
@@ -387,7 +387,10 @@ fn contains_deferred_user_function_call(value: &Value) -> bool {
                         .is_some_and(contains_deferred_user_function_call)
                 })
         }
-        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. }) => true,
+        Value::Deferred(
+            DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::ProvisionalFunctionCall { .. },
+        ) => true,
         Value::Concrete(ConcreteValue::List(values)) => {
             values.iter().any(contains_deferred_user_function_call)
         }
@@ -501,6 +504,11 @@ pub(crate) fn contains_module_argument_matching<B: BindingAddress>(
             source_line: _,
         })
         | GenericValue::Deferred(DeferredValue::ResolvedFunctionCall {
+            function: _,
+            functions: _,
+            args,
+            source_line: _,
+        } | DeferredValue::ProvisionalFunctionCall {
             function: _,
             functions: _,
             args,
@@ -1121,7 +1129,7 @@ pub(crate) fn construct_builtin_call(
     ctx: &ParseContext<'_, impl super::context::EvaluationSource>,
     line: usize,
 ) -> Result<EvalValue, ParseError> {
-    reject_builtin_handle_arguments(&args, line)
+    reject_builtin_handle_arguments(&args, line, None)
         .map_err(|error| builtin.protect_parse_error(error, line))?;
     let args = lower_function_arguments(args, line)
         .map_err(|error| builtin.protect_parse_error(error, line))?;
@@ -1135,11 +1143,7 @@ pub(crate) fn construct_builtin_call(
                 // Normalize successful authored inputs here. A failed static
                 // evaluation stays deferred so the normal strict/permissive
                 // resolver policy still owns unavailable values.
-                match try_evaluate_fn_value(value.clone(), ctx, line) {
-                    Ok(evaluated) => Ok(evaluated),
-                    Err(error) if contains_provisional_function_head(&value) => Err(error),
-                    Err(_) => Ok(value),
-                }
+                Ok(try_evaluate_fn_value(value.clone(), ctx, line).unwrap_or(value))
             } else {
                 Ok(value)
             }
@@ -1189,12 +1193,17 @@ pub(super) fn record_deferred_function_type_check<Source: super::context::Evalua
 pub(crate) fn reject_builtin_handle_arguments(
     args: &[EvalValue],
     line: usize,
+    location: Option<&super::DeclarationLocation>,
 ) -> Result<(), ParseError> {
     if let Some(handle) = args.iter().find_map(EvalValue::structural_handle_ref) {
-        return Err(ParseError::from_eval_value(
+        let error = ParseError::from_eval_value(
             crate::eval_value::EvalValueError::BareStructuralHandle(handle.bare_error()),
             line,
-        ));
+        );
+        return Err(match location {
+            Some(location) if handle.is_for_binding() => error.at(location),
+            _ => error,
+        });
     }
     Ok(())
 }
@@ -1221,7 +1230,7 @@ fn function_argument_type_error(
 
 pub(crate) fn validate_pending_function_type_check(
     check: &PendingFunctionTypeCheck,
-    functions: &IndexMap<String, UserFunction>,
+    functions: &super::ClassifiedUserFunctions,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), ParseError> {
     let ctx = ParseContext::for_evaluation_in_session(session);
@@ -1339,14 +1348,15 @@ pub(crate) fn evaluate_user_function<Source: super::context::EvaluationSource>(
             substitutions,
         } => (child_ctx, substitutions),
         PreparedUserFunctionCall::Deferred(args) => {
-            return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                function: ctx
-                    .resolved_user_function(&func.name)
-                    .unwrap_or_else(|| std::sync::Arc::new(func.clone())),
-                functions: ctx.shared_user_function_scope(),
-                args,
-                source_line: (call_line).into(),
-            }));
+            if let Some((function, functions)) = ctx.capture_user_function(&func.name) {
+                return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                    function,
+                    functions,
+                    args,
+                    source_line: call_line.into(),
+                }));
+            }
+            return Ok(provisional_function_call(func, args, ctx, call_line));
         }
     };
 
@@ -1397,18 +1407,28 @@ pub(crate) fn evaluate_user_function<Source: super::context::EvaluationSource>(
                     .clone()
                     .or_else(|| func.body.source_file.clone()),
             });
-            return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                function: ctx
-                    .resolved_user_function(&func.name)
-                    .unwrap_or_else(|| std::sync::Arc::new(func.clone())),
-                functions: ctx.shared_user_function_scope(),
-                args: func
-                    .params
-                    .iter()
-                    .map(|parameter| substitutions[&parameter.name].clone())
-                    .collect(),
-                source_line: call_line.into(),
-            }));
+            if let Some((function, functions)) = ctx.capture_user_function(&func.name) {
+                return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                    function,
+                    functions,
+                    args: func
+                        .params
+                        .iter()
+                        .map(|parameter| substitutions[&parameter.name].clone())
+                        .collect(),
+                    source_line: call_line.into(),
+                }));
+            } else {
+                return Ok(provisional_function_call(
+                    func,
+                    func.params
+                        .iter()
+                        .map(|parameter| substitutions[&parameter.name].clone())
+                        .collect(),
+                    ctx,
+                    call_line,
+                ));
+            }
         }
     }
     Ok(result)
@@ -1418,6 +1438,60 @@ pub(crate) fn evaluate_user_function<Source: super::context::EvaluationSource>(
 /// Consumers outside the parser use this instead of rebuilding a name lookup
 /// table from their current (and potentially different) module scope.
 pub(crate) fn evaluate_resolved_user_function(
+    function: &super::ClassifiedUserFunction,
+    functions: &Arc<super::ClassifiedUserFunctions>,
+    arguments: &[FunctionArgument],
+    config: &ProviderContext,
+    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    call_line: usize,
+) -> Result<Value, ParseError> {
+    let mut context = match session {
+        Some(session) => ParseContext::for_evaluation_in_session(session),
+        None => ParseContext::for_evaluation(config),
+    };
+    context.replace_classified_user_functions(Arc::clone(functions));
+    if !context.user_functions.contains_key(&function.name) {
+        let mut scope = (**functions).clone();
+        scope.insert(function.name.clone(), function.clone());
+        context.replace_classified_user_functions(Arc::new(scope));
+    }
+    evaluate_user_function(function, arguments, &context, call_line)
+}
+
+pub(super) fn defer_user_function_call(
+    function: &UserFunction,
+    args: Vec<FunctionArgument>,
+    ctx: &ParseContext<'_, impl super::context::EvaluationSource>,
+    line: usize,
+) -> Result<Value, ParseError> {
+    match ctx.capture_user_function(&function.name) {
+        Some((function, functions)) => Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args,
+            source_line: line.into(),
+        })),
+        None => Ok(provisional_function_call(function, args, ctx, line)),
+    }
+}
+
+fn provisional_function_call<Source: super::context::EvaluationSource>(
+    function: &UserFunction,
+    args: Vec<FunctionArgument>,
+    ctx: &ParseContext<'_, Source>,
+    line: usize,
+) -> Value {
+    Value::Deferred(DeferredValue::ProvisionalFunctionCall {
+        function: ctx
+            .resolved_user_function(&function.name)
+            .unwrap_or_else(|| Arc::new(function.clone())),
+        functions: Arc::clone(&ctx.user_functions),
+        args,
+        source_line: line.into(),
+    })
+}
+
+pub(crate) fn evaluate_provisional_user_function(
     function: &UserFunction,
     functions: &Arc<IndexMap<String, UserFunction>>,
     arguments: &[FunctionArgument],
@@ -1447,7 +1521,7 @@ pub fn contains_function_call(value: &Value) -> bool {
         }
         Value::Deferred(
             DeferredValue::FunctionCall { .. }
-            | DeferredValue::ResolvedFunctionCall { .. },
+            | DeferredValue::ResolvedFunctionCall { .. } | DeferredValue::ProvisionalFunctionCall { .. },
         ) => true,
         Value::Deferred(DeferredValue::Access(access)) => {
             contains_function_call(access.base())
@@ -1537,7 +1611,7 @@ pub(crate) fn apply_parser_closure(
 
     let mut all_args = captured_args.to_vec();
     all_args.extend(new_args.iter().cloned());
-    reject_builtin_handle_arguments(&all_args, line)?;
+    reject_builtin_handle_arguments(&all_args, line, None)?;
     if all_args.iter().all(is_static_eval) {
         return crate::builtins::apply_closure_with_config(
             name,
@@ -1578,6 +1652,30 @@ pub(super) fn try_evaluate_fn_value<Source: super::context::EvaluationSource>(
             deferred.then_value = try_evaluate_fn_value(deferred.then_value, ctx, containing_line)?;
             deferred.else_value = try_evaluate_fn_value(deferred.else_value, ctx, containing_line)?;
             Ok(Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred))))
+        }
+        Value::Deferred(DeferredValue::ProvisionalFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }) => {
+            let source_line = source_line.unwrap_or(containing_line);
+            let evaluated_args = args
+                .iter()
+                .map(|argument| {
+                    argument.try_map_value(|value| {
+                        try_evaluate_fn_value(value.clone(), ctx, source_line)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            evaluate_provisional_user_function(
+                &function,
+                &functions,
+                &evaluated_args,
+                ctx.config,
+                ctx.session,
+                source_line,
+            )
         }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,

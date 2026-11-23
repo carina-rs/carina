@@ -323,23 +323,89 @@ for key in keys({a = source.identifier, b = source.identifier}) {
 
 #[test]
 fn lexical_body_dependencies_are_part_of_user_call_knowledge() {
+    use carina_core::resource::{BindingAddress, ValueKind};
+    use carina_core::value_walk::{
+        Algebra, At, Children, ExprChildren, ExpressionEdge, ScopedLeaf, ScopedScalar, SecretAt,
+        SecretChild, SecretStep, Step, Transform, WalkRoot, transform,
+    };
     use std::sync::Arc;
+
+    // Add runtime evidence through the public fold while retaining the
+    // classified callee; raw function bodies cannot construct this capture.
+    struct ApplyFunctionBody;
+    impl Algebra<Transform> for ApplyFunctionBody {
+        type Output = ();
+        fn scalar<P: ValueKind, B: BindingAddress>(
+            &mut self,
+            at: &At<'_>,
+            value: ScopedScalar<'_, Transform, P, B>,
+        ) -> Step<Transform, (), P, B> {
+            if at
+                .expression_edges()
+                .contains(&ExpressionEdge::FunctionBody)
+            {
+                value.replace(
+                    Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
+                        PendingReRead::not_found(),
+                    ))),
+                    (),
+                )
+            } else {
+                value.keep(())
+            }
+        }
+        fn list<P: ValueKind, B: BindingAddress>(
+            &mut self,
+            _: &At<'_>,
+            children: Children<'_, Transform, P, B>,
+        ) -> Step<Transform, (), P, B> {
+            children.transform(self, |_| ())
+        }
+        fn map<P: ValueKind, B: BindingAddress>(
+            &mut self,
+            _: &At<'_>,
+            children: Children<'_, Transform, P, B>,
+        ) -> Step<Transform, (), P, B> {
+            children.transform(self, |_| ())
+        }
+        fn expression<P: ValueKind, B: BindingAddress>(
+            &mut self,
+            _: &At<'_>,
+            expression: ExprChildren<'_, Transform, P, B>,
+        ) -> Step<Transform, (), P, B> {
+            expression.transform(self, |_| ())
+        }
+        fn placeholder<P: ValueKind, B: BindingAddress>(
+            &mut self,
+            _: &At<'_>,
+            leaf: ScopedLeaf<'_, Transform, P, B>,
+        ) -> Step<Transform, (), P, B> {
+            leaf.keep(())
+        }
+        fn secret<P: ValueKind, B: BindingAddress>(
+            &mut self,
+            _: &SecretAt<'_>,
+            child: SecretChild<'_, Transform, P, B>,
+        ) -> SecretStep<Transform, (), P, B> {
+            child.transform(self)
+        }
+    }
     let parsed = carina_core::parser::parse_file(
         "fn captured() { 1 }",
         std::path::Path::new("functions.crn"),
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let mut function = parsed.user_functions["captured"].clone();
-    function.body.value = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
-        PendingReRead::not_found(),
-    )));
+    let function = parsed.user_functions["captured"].clone();
     let call: V = Value::Deferred(DeferredValue::ResolvedFunctionCall {
         function: Arc::new(function),
-        functions: Arc::new(indexmap::IndexMap::new()),
+        functions: Arc::new(Default::default()),
         args: vec![],
         source_line: 0.into(),
     });
+    let call = transform(WalkRoot::syntactic(), call, &mut ApplyFunctionBody)
+        .unwrap()
+        .into_value();
     let Classification::Pending(pending) = call
         .knowledge(&KnowledgeContext::validation())
         .map(|proof| proof.into_classification())

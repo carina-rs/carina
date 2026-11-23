@@ -2794,12 +2794,19 @@ fn expression<'a, P: PlaceholderKind, B: BindingAddress>(
         wait_on: WaitOn::Evaluation(kind),
     })
 }
-fn classify_function<'a, P: PlaceholderKind, B: BindingAddress, S: ClassificationStage>(
-    function: &'a Arc<crate::parser::UserFunction<B>>,
+fn classify_function<
+    'a,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    S: ClassificationStage,
+    F: AsRef<crate::parser::UserFunction<B>>,
+>(
+    function: &'a Arc<F>,
     cx: &KnowledgeContext<'_, P, B, S>,
     pos: &mut Position<'a, B>,
 ) -> Result<Arc<kernel::FunctionAnalysis<'a, B>>, KnowledgeError<B>> {
     let id = Arc::as_ptr(function) as usize;
+    let function = function.as_ref().as_ref();
     if pos.functions.contains(&id) {
         return Err(KnowledgeError::Cycle {
             operation: "user function",
@@ -3183,6 +3190,32 @@ fn classify_value<
                 }
             }
             Ok(expression(value, EvaluationKind::Builtin, inputs))
+        }
+        Value::Deferred(DeferredValue::ProvisionalFunctionCall {
+            function,
+            functions: _,
+            args,
+            source_line: _,
+        }) => {
+            let mut inputs = Vec::new();
+            for (i, arg) in args.iter().enumerate() {
+                if arg.value().is_some() || arg.pending_parameter().is_some() {
+                    inputs.push(Input::value(
+                        OperandStep::Argument(i),
+                        classify(arg.walker_value(), cx, pos)?,
+                    ));
+                }
+            }
+            let analysis = classify_function(function, cx, pos)?;
+            inputs.push(Input {
+                step: None,
+                selection: None,
+                value: InputValue::Lexical(analysis),
+                visible: true,
+                guard: None,
+                apply: false,
+            });
+            Ok(expression(value, EvaluationKind::UserFunction, inputs))
         }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,

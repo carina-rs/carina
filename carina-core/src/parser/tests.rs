@@ -17166,6 +17166,30 @@ fn parse_directory_files_rejects_function_call_let_cycle() {
 }
 
 #[test]
+fn parse_directory_files_preserves_cycle_through_unused_function_argument() {
+    let files = vec![
+        (
+            std::path::PathBuf::from("a.crn"),
+            "let A = ignore(B)".to_owned(),
+        ),
+        (std::path::PathBuf::from("b.crn"), "let B = A".to_owned()),
+        (
+            std::path::PathBuf::from("helpers.crn"),
+            "fn ignore(value) { 'known' }".to_owned(),
+        ),
+    ];
+    let error = crate::config_loader::parse_directory_files(
+        &files,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("an unused argument still owns its dependency");
+    assert_eq!(
+        error.to_string(),
+        "Cyclic let binding detected: A -> B -> A"
+    );
+}
+
+#[test]
 fn parse_directory_files_rejects_interpolation_let_cycle() {
     let files = vec![
         (

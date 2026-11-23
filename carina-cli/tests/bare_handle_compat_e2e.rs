@@ -45,6 +45,113 @@ fn validate_diagnostic_messages(root: &Path) -> (Vec<String>, Vec<String>) {
     (messages("errors"), messages("warnings"))
 }
 
+#[test]
+fn bare_function_condition_matches_main_with_and_without_loop() {
+    for (loop_source, line) in [
+        ("", 2),
+        (
+            "let children = for k, v in ({ a = 'x' }) { mock.test.resource { name = k } }\n",
+            3,
+        ),
+    ] {
+        for condition in ["prod", "(prod)"] {
+            let fixture = loop_reader_fixture("");
+            write_file(
+                fixture.path(),
+                "main.crn",
+                &format!(
+                    "let prod = true\n{loop_source}fn mode(): String {{ if {condition} {{ 'a' }} else {{ 'b' }} }}\n"
+                ),
+            );
+            let output = run(fixture.path(), &["validate", "."]);
+            assert_eq!(output.status.code(), Some(1));
+            assert_eq!(
+                output_text(&output),
+                format!(
+                    "Error: ./main.crn: Invalid expression at line {line}: if condition must be a Bool value, got: enum identifier prod\n"
+                ),
+                "loop present: {}",
+                !loop_source.is_empty(),
+            );
+        }
+    }
+}
+
+#[test]
+fn unused_function_argument_keeps_main_cycle_diagnostic() {
+    let fixture = loop_reader_fixture("");
+    for (name, source) in [
+        ("a.crn", "let A = ignore(B)\n"),
+        ("b.crn", "let B = A\n"),
+        ("helpers.crn", "fn ignore(value) { 'known' }\n"),
+    ] {
+        write_file(fixture.path(), name, source);
+    }
+    let output = run(fixture.path(), &["validate", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        output_text(&output),
+        "Error: .: Cyclic let binding detected: A -> B -> A\n"
+    );
+}
+
+#[test]
+fn whole_loop_group_in_called_and_uncalled_function_is_located() {
+    for called in [false, true] {
+        let fixture = loop_reader_fixture("");
+        let call = if called {
+            "let r = mock.test.resource { name = \"${n()}\" }\n"
+        } else {
+            ""
+        };
+        write_file(
+            fixture.path(),
+            "main.crn",
+            &format!(
+                "let children = for k, v in ({{ a = 'x' }}) {{ mock.test.resource {{ name = k }} }}\nfn n(): Int {{ length(children) }}\n{call}"
+            ),
+        );
+        let output = run(fixture.path(), &["validate", "."]);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            output_text(&output),
+            "Error: ./main.crn:2:15: Invalid expression at line 2: 'children' is a for binding, not a value; reference an instance attribute, e.g. 'children['key'].<attribute>'\n",
+            "called: {called}",
+        );
+        let output = run(fixture.path(), &["validate", ".", "--json"]);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["errors"][0]["location"]["range"]["start"],
+            serde_json::json!({"line": 2, "column": 15})
+        );
+        assert_eq!(
+            report["errors"][0]["location"]["range"]["end"],
+            serde_json::json!({"line": 2, "column": 31})
+        );
+    }
+}
+
+#[test]
+fn whole_loop_group_outside_functions_keeps_main_diagnostic_location() {
+    for reader in ["let n = length(children)", "exports { out = children }"] {
+        let fixture = loop_reader_fixture("");
+        write_file(
+            fixture.path(),
+            "main.crn",
+            &format!(
+                "let children = for k, v in ({{ a = 'x' }}) {{ mock.test.resource {{ name = k }} }}\n{reader}\n"
+            ),
+        );
+        let output = run(fixture.path(), &["validate", "."]);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            output_text(&output),
+            "Error: ./main.crn: Invalid expression at line 2: 'children' is a for binding, not a value; reference an instance attribute, e.g. 'children['key'].<attribute>'\n",
+            "{reader}",
+        );
+    }
+}
+
 fn assert_success(label: &str, output: &Output) {
     let text = output_text(output);
     assert!(output.status.success(), "{label} failed:\n{text}");

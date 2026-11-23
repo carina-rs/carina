@@ -178,6 +178,7 @@ pub(super) fn input_observation(value: &S<RelativeBindingName>) -> InputObservat
         S::Deferred(DeferredValue::Coalesce { .. }) => "Coalesce",
         S::Deferred(DeferredValue::FunctionCall { .. }) => "FunctionCall",
         S::Deferred(DeferredValue::ResolvedFunctionCall { .. }) => "ResolvedFunctionCall",
+        S::Deferred(DeferredValue::ProvisionalFunctionCall { .. }) => "ProvisionalFunctionCall",
         S::Deferred(DeferredValue::Interpolation(_)) => "Interpolation",
         S::Deferred(DeferredValue::IntegerArithmetic(_)) => "IntegerArithmetic",
         S::Deferred(DeferredValue::Access(_)) => "Access",
@@ -190,6 +191,6 @@ pub(super) fn input_observation(value: &S<RelativeBindingName>) -> InputObservat
             S::Deferred(DeferredValue::ResourceRef { path }) => Some(path.to_dot_string()),
             _ => None,
         },
-        coalesce_left_deferred: matches!(value,S::Deferred(DeferredValue::Coalesce {value,..}) if matches!(value.as_ref(),S::Deferred(DeferredValue::FunctionCall {..} | DeferredValue::ResolvedFunctionCall {..}))),
+        coalesce_left_deferred: matches!(value,S::Deferred(DeferredValue::Coalesce {value,..}) if matches!(value.as_ref(),S::Deferred(DeferredValue::FunctionCall {..} | DeferredValue::ResolvedFunctionCall {..} | DeferredValue::ProvisionalFunctionCall {..}))),
     }
 }

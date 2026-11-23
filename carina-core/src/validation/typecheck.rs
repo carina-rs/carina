@@ -902,6 +902,7 @@ fn check_constraint_value<'s, P: PlaceholderKind, B: BindingAddress>(
         Value::Deferred(
             DeferredValue::FunctionCall { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::ProvisionalFunctionCall { .. }
             | DeferredValue::Unavailable { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
@@ -1250,7 +1251,9 @@ pub(crate) fn value_kind_name<P: PlaceholderKind, B: BindingAddress>(
         Value::Deferred(DeferredValue::Coalesce { .. }) => "coalesce value",
         Value::Deferred(DeferredValue::Interpolation(_)) => "String",
         Value::Deferred(
-            DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
+            DeferredValue::FunctionCall { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::ProvisionalFunctionCall { .. },
         ) => "function result",
         Value::Deferred(DeferredValue::Unavailable { .. }) => "unavailable value",
         Value::Deferred(DeferredValue::Access(_)) => "access value",

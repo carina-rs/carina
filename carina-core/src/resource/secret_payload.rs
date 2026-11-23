@@ -102,6 +102,7 @@ fn mark_strings<P: ValueKind, B: BindingAddress>(value: &mut Value<P, B>) {
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. }
+            | DeferredValue::ProvisionalFunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. },
         ) => {
             for arg in args {

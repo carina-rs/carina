@@ -211,6 +211,14 @@ fn provider_analysis_failure(
 
 trait ProviderAttributeBindingPhase: BindingAddress {
     fn evaluate_resolved_user_function(
+        function: &super::ClassifiedUserFunction<Self>,
+        functions: &std::sync::Arc<super::ClassifiedUserFunctions<Self>>,
+        arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
+        config: &ProviderContext,
+        session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+        call_line: usize,
+    ) -> Result<GenericValue<ParserPlaceholder, Self>, ParseError>;
+    fn evaluate_provisional_user_function(
         function: &super::UserFunction<Self>,
         functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
         arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
@@ -222,8 +230,8 @@ trait ProviderAttributeBindingPhase: BindingAddress {
 
 impl ProviderAttributeBindingPhase for RelativeBindingName {
     fn evaluate_resolved_user_function(
-        function: &super::UserFunction<Self>,
-        functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
+        function: &super::ClassifiedUserFunction<Self>,
+        functions: &std::sync::Arc<super::ClassifiedUserFunctions<Self>>,
         arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
         config: &ProviderContext,
         session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
@@ -233,10 +241,44 @@ impl ProviderAttributeBindingPhase for RelativeBindingName {
             function, functions, arguments, config, session, call_line,
         )
     }
+    fn evaluate_provisional_user_function(
+        function: &super::UserFunction<Self>,
+        functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
+        arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
+        config: &ProviderContext,
+        session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+        call_line: usize,
+    ) -> Result<GenericValue<ParserPlaceholder, Self>, ParseError> {
+        super::functions::evaluate_provisional_user_function(
+            function, functions, arguments, config, session, call_line,
+        )
+    }
 }
 
 impl ProviderAttributeBindingPhase for AbsoluteBindingAddress {
     fn evaluate_resolved_user_function(
+        function: &super::ClassifiedUserFunction<Self>,
+        functions: &std::sync::Arc<super::ClassifiedUserFunctions<Self>>,
+        arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
+        _config: &ProviderContext,
+        session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+        call_line: usize,
+    ) -> Result<GenericValue<ParserPlaceholder, Self>, ParseError> {
+        match session {
+            Some(session) => crate::resolver::evaluate_module_resolved_user_function(
+                function, arguments, session, call_line,
+            ),
+            None => Ok(GenericValue::Deferred(
+                DeferredValue::ResolvedFunctionCall {
+                    function: std::sync::Arc::new(function.clone()),
+                    functions: std::sync::Arc::clone(functions),
+                    args: arguments.to_vec(),
+                    source_line: call_line.into(),
+                },
+            )),
+        }
+    }
+    fn evaluate_provisional_user_function(
         function: &super::UserFunction<Self>,
         functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
         arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
@@ -249,7 +291,7 @@ impl ProviderAttributeBindingPhase for AbsoluteBindingAddress {
                 function, arguments, session, call_line,
             ),
             None => Ok(GenericValue::Deferred(
-                DeferredValue::ResolvedFunctionCall {
+                DeferredValue::ProvisionalFunctionCall {
                     function: std::sync::Arc::new(function.clone()),
                     functions: std::sync::Arc::clone(functions),
                     args: arguments.to_vec(),
@@ -1472,7 +1514,7 @@ pub(crate) fn resolve_snapshot_function_calls_in_context(
     }
 
     let mut fn_ctx = super::ParseContext::for_evaluation(config);
-    fn_ctx.replace_user_functions(parsed.user_functions.clone());
+    fn_ctx.replace_classified_user_functions(std::sync::Arc::new(parsed.user_functions.clone()));
 
     // This snapshot preserves authored references for identity/dependency
     // provenance; it is not a second validation surface. Provider-backed
@@ -1709,7 +1751,7 @@ fn resolve_resource_refs_output<P: ResolveKind, E: ExportParamLike>(
     // path (would need to restore on every `?` exit), so we accept a
     // single map clone per call.
     let mut fn_ctx = super::ParseContext::for_evaluation(config);
-    fn_ctx.replace_user_functions(parsed.user_functions.clone());
+    fn_ctx.replace_classified_user_functions(std::sync::Arc::new(parsed.user_functions.clone()));
 
     let resource_source_files: HashMap<crate::resource::ResourceId, std::path::PathBuf> = parsed
         .resources
@@ -2244,7 +2286,8 @@ fn collect_reference_roots(
         GenericValue::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. }
+            | DeferredValue::ProvisionalFunctionCall { args, .. },
         ) => {
             for arg in args {
                 collect_reference_roots(arg.walker_value(), variables, structural, scope, roots);
@@ -2559,6 +2602,7 @@ fn resolve_value_with_binding_lookup<P: ResolveKind, B: ProviderAttributeBinding
                         | DeferredValue::Interpolation(_)
                         | DeferredValue::Unavailable { .. }
                         | DeferredValue::ResolvedFunctionCall { .. }
+                        | DeferredValue::ProvisionalFunctionCall { .. }
                         | DeferredValue::FunctionCall { .. }
                         | DeferredValue::Access(_)
                         | DeferredValue::Secret(_)
@@ -2772,7 +2816,8 @@ fn for_each_resolution_child<'a, B: BindingAddress>(
         }
         GenericValue::Deferred(
             DeferredValue::FunctionCall { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. }
+            | DeferredValue::ProvisionalFunctionCall { args, .. },
         ) => {
             for argument in args {
                 enqueue(argument.walker_value(), scope);
@@ -2894,6 +2939,39 @@ fn resolve_value_node<P: ResolveKind, B: ProviderAttributeBindingPhase>(
             } else {
                 Err(unavailable_builtin_error(*name, reason, *source_line))
             }
+        }
+        GenericValue::Deferred(DeferredValue::ProvisionalFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }) => {
+            let evaluation_line = source_line.get().unwrap_or(function.body.source_line);
+            let mut operands = Vec::new();
+            let resolved_args = args
+                .iter()
+                .map(|argument| {
+                    argument.try_map_value(|value| {
+                        let lowered = resolve(value)?;
+                        let (plain, operand) = P::split_operand(lowered);
+                        operands.push(operand);
+                        Ok::<_, ParseError>(plain)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            count(Event::UserFunction);
+            let evaluated = B::evaluate_provisional_user_function(
+                function,
+                functions,
+                &resolved_args,
+                config,
+                session,
+                evaluation_line,
+            );
+            if resolution.retains_failed_calls() && evaluated.is_err() {
+                return Ok(P::computed(operands, value.clone()));
+            }
+            evaluated.map(|plain| P::computed(operands, plain))
         }
         GenericValue::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
@@ -3126,6 +3204,7 @@ fn resolve_function_calls_only<P: ResolveKind, B: ProviderAttributeBindingPhase>
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::ProvisionalFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::Coalesce { .. }
             | DeferredValue::IntegerArithmetic(_)

@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     builtins::BuiltinFunction,
     integer_arithmetic::ValidatedIntegerExpr,
-    parser::{DeferredIfCondition, DeferredValueIf},
+    parser::{ClassifiedUserFunction, DeferredIfCondition, DeferredValueIf},
     resource::{AccessExpr, DiagnosticSourceLine, UnavailableReason},
 };
 
@@ -123,6 +123,12 @@ pub(super) enum Parts<'v, M: WalkMode, P: ValueKind + 'v, B: BindingAddress> {
         source_line: M::Input<'v, DiagnosticSourceLine>,
     },
     ResolvedCall {
+        function: M::Input<'v, Arc<ClassifiedUserFunction<B>>>,
+        functions: M::Input<'v, Arc<crate::parser::ClassifiedUserFunctions<B>>>,
+        args: M::Input<'v, Vec<FunctionArgument<P, B>>>,
+        source_line: M::Input<'v, DiagnosticSourceLine>,
+    },
+    ProvisionalCall {
         function: M::Input<'v, Arc<UserFunction<B>>>,
         functions: M::Input<'v, Arc<indexmap::IndexMap<String, UserFunction<B>>>>,
         args: M::Input<'v, Vec<FunctionArgument<P, B>>>,
@@ -149,6 +155,19 @@ impl<M: WalkMode, P: ValueKind, B: BindingAddress> Parts<'_, M, P, B> {
                 argument_values_len(M::borrow::<Vec<FunctionArgument<P, B>>>(args))
             }
             Self::ResolvedCall {
+                function,
+                functions,
+                args,
+                ..
+            } => {
+                function_values(M::borrow::<Arc<ClassifiedUserFunction<B>>>(function)).count()
+                    + M::borrow(functions)
+                        .values()
+                        .map(|function| function_values(function).count())
+                        .sum::<usize>()
+                    + argument_values_len(M::borrow::<Vec<FunctionArgument<P, B>>>(args))
+            }
+            Self::ProvisionalCall {
                 function,
                 functions,
                 args,
@@ -285,6 +304,20 @@ macro_rules! dispatch_variants {
                     name,
                     args,
                     reason,
+                    source_line
+                }
+            ),
+            Value::Deferred(DeferredValue::ProvisionalFunctionCall {
+                function,
+                functions,
+                args,
+                source_line,
+            }) => expr!(
+                ProvisionalFunctionCall,
+                Parts::ProvisionalCall {
+                    function,
+                    functions,
+                    args,
                     source_line
                 }
             ),
@@ -574,6 +607,30 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Inspect, P, B> {
             } => {
                 inspect_arguments(args, &at, algebra, &mut output)?;
             }
+            Self::ProvisionalCall {
+                function,
+                functions,
+                args,
+                source_line: _,
+            } => {
+                inspect_function(
+                    function,
+                    at.operand(ExpressionEdge::FunctionDefinition),
+                    algebra,
+                    &mut output,
+                )?;
+                let mut scope: Vec<_> = functions.iter().collect();
+                scope.sort_by(|left, right| left.0.cmp(right.0));
+                for (index, (_name, function)) in scope.into_iter().enumerate() {
+                    inspect_function(
+                        function,
+                        at.operand(ExpressionEdge::FunctionScope(index)),
+                        algebra,
+                        &mut output,
+                    )?;
+                }
+                inspect_arguments(args, &at, algebra, &mut output)?;
+            }
             Self::ResolvedCall {
                 function,
                 functions,
@@ -707,45 +764,23 @@ impl<O: WalkOutput> TransformFold<O> {
             })
             .collect()
     }
-    fn function<
+    fn function_candidate<
         B: BindingAddress,
         A: BoundTransform<crate::resource::ParserPlaceholder, B> + TransformOutput<Output = O>,
     >(
         &mut self,
-        mut function: UserFunction<B>,
+        function: &ClassifiedUserFunction<B>,
         at: At<'_>,
         algebra: &mut A,
-    ) -> Result<UserFunction<B>, WalkError> {
-        for (index, param) in function.params.iter_mut().enumerate() {
-            if let Some(value) = param.default.take() {
-                param.default = Some(self.value(
-                    value,
-                    at.operand(ExpressionEdge::FunctionDefault(index)),
-                    algebra,
-                )?);
-            }
-        }
-        function.local_lets = function
-            .local_lets
-            .into_iter()
-            .enumerate()
-            .map(|(index, (name, value, line))| {
-                self.value(
-                    value,
-                    at.operand(ExpressionEdge::FunctionLocal(index)),
-                    algebra,
-                )
-                .map(|value| (name, value, line))
-            })
-            .collect::<Result<_, _>>()?;
-        function.body.value = self.value(
-            function.body.value,
-            at.operand(ExpressionEdge::FunctionBody),
-            algebra,
-        )?;
-        Ok(function)
+    ) -> Result<Option<ClassifiedUserFunction<B>>, WalkError> {
+        let mut nested = Self::new();
+        let candidate = function
+            .try_map_values(|value, edge| nested.value(value, at.operand(edge), algebra))?;
+        self.output.extend(nested.output);
+        self.changed |= nested.changed;
+        Ok(nested.changed.then_some(candidate))
     }
-    fn function_candidate<
+    fn provisional_function_candidate<
         B: BindingAddress,
         A: BoundTransform<crate::resource::ParserPlaceholder, B> + TransformOutput<Output = O>,
     >(
@@ -755,7 +790,9 @@ impl<O: WalkOutput> TransformFold<O> {
         algebra: &mut A,
     ) -> Result<Option<UserFunction<B>>, WalkError> {
         let mut nested = Self::new();
-        let candidate = nested.function(function.clone(), at, algebra)?;
+        let candidate = function
+            .clone()
+            .try_map_values(|value, edge| nested.value(value, at.operand(edge), algebra))?;
         self.output.extend(nested.output);
         self.changed |= nested.changed;
         Ok(nested.changed.then_some(candidate))
@@ -895,6 +932,45 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Transform, P, B> {
                 reason,
                 source_line,
             }),
+            Self::ProvisionalCall {
+                function,
+                functions,
+                args,
+                source_line,
+            } => {
+                let candidate = walked.provisional_function_candidate(
+                    &function,
+                    at.operand(ExpressionEdge::FunctionDefinition),
+                    algebra,
+                )?;
+                let function = match candidate {
+                    Some(candidate) => Arc::new(candidate),
+                    None => function,
+                };
+                // Scope entries are separate stored definitions. Visit each
+                // exactly once; allocate a replacement map only after a change.
+                let mut scope: Vec<_> = functions.iter().collect();
+                scope.sort_by(|left, right| left.0.cmp(right.0));
+                let mut updates = Vec::new();
+                for (index, (name, function)) in scope.into_iter().enumerate() {
+                    if let Some(candidate) = walked.provisional_function_candidate(
+                        function,
+                        at.operand(ExpressionEdge::FunctionScope(index)),
+                        algebra,
+                    )? {
+                        updates.push((name.clone(), candidate));
+                    }
+                }
+                let functions = if updates.is_empty() {
+                    functions
+                } else {
+                    let mut changed = Arc::unwrap_or_clone(functions);
+                    changed.extend(updates);
+                    Arc::new(changed)
+                };
+                let args = walked.arguments(args, &at, algebra)?;
+                algebra.provisional_call(&at, function, functions, args, source_line)?
+            }
             Self::ResolvedCall {
                 function,
                 functions,

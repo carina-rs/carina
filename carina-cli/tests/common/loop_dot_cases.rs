@@ -51,6 +51,26 @@ pub fn rows() -> Vec<Row> {
     use Kind::*;
     use Outcome::*;
     let mut rows = Vec::new();
+    for kind in [NoLoop, Map] {
+        for reader in ["prod", "(prod)"] {
+            rows.push(Row {
+                id: "2-25",
+                kind,
+                key: "a",
+                reader,
+                positions: &["bare function condition"],
+                expected: Error(&["if condition must be a Bool value, got: enum identifier prod"]),
+            });
+        }
+    }
+    rows.push(Row {
+        id: "2-24",
+        kind: Map,
+        key: "a",
+        reader: "children",
+        positions: &["unused whole group function", "whole group function"],
+        expected: Error(&["'children' is a for binding, not a value; reference an instance attribute, e.g. 'children['key'].<attribute>'"]),
+    });
     for kind in [Map, ValueKeyed] {
         for (id, key, reader, positions, expected) in [
             (
@@ -357,12 +377,24 @@ pub fn fixture(root: &Path, row: &Row) {
         ValueKeyed | ModuleValueKeyed => (format!("['{key}']"), "v in items"),
         Indexed | ModuleIndexed => ("['a']".to_owned(), "(i, v) in items"),
     };
-    let main = match row.kind {
-        NoLoop => format!("let items = {items}\n"),
-        Map | ValueKeyed | Indexed => format!(
+    let main = match (row.id, row.kind) {
+        ("2-25", kind) => format!(
+            "let prod = true\n{}",
+            if kind == NoLoop {
+                ""
+            } else {
+                "let children = for k, v in ({ a = 'x' }) { mock.test.resource { name = k } }\n"
+            },
+        ),
+        ("2-24", _) => {
+            "let children = for k, v in ({ a = 'x' }) { mock.test.resource { name = k } }\n"
+                .to_owned()
+        }
+        (_, NoLoop) => format!("let items = {items}\n"),
+        (_, Map | ValueKeyed | Indexed) => format!(
             "let items = {items}\nlet children = for {iterable} {{ mock.test.resource {{ name = v tags = {{ k = 'tag' }} }} }}\n"
         ),
-        ModuleMap | ModuleValueKeyed | ModuleIndexed => format!(
+        (_, ModuleMap | ModuleValueKeyed | ModuleIndexed) => format!(
             "let items = {items}\nlet child = use {{ source = './child' }}\nlet mods = for {iterable} {{ child {{ value = v }} }}\n"
         ),
     };
@@ -390,6 +422,36 @@ pub fn fixture(root: &Path, row: &Row) {
 }
 
 pub fn reader(root: &Path, position: &str, reader: &str) -> &'static str {
+    if position == "bare function condition" {
+        let source = std::fs::read_to_string(root.join("main.crn")).unwrap();
+        let declarations = source.split("fn mode").next().unwrap();
+        write(
+            root,
+            "main.crn",
+            &format!(
+                "{declarations}fn mode(): String {{ if {reader} {{ 'a' }} else {{ 'b' }} }}\n"
+            ),
+        );
+        return "main.crn";
+    }
+    if matches!(
+        position,
+        "unused whole group function" | "whole group function"
+    ) {
+        let source = std::fs::read_to_string(root.join("main.crn")).unwrap();
+        let declaration = source.lines().next().unwrap();
+        let call = if position == "whole group function" {
+            "let r = mock.test.resource { name = \"${n()}\" }\n"
+        } else {
+            ""
+        };
+        write(
+            root,
+            "main.crn",
+            &format!("{declaration}\nfn n(): Int {{ length({reader}) }}\n{call}"),
+        );
+        return "main.crn";
+    }
     let expression = match position {
         "single interpolation" => format!("\"${{{reader}}}\""),
         "coalesce" | "export" | "unrelated reference" => format!("{reader} ?? 'p'"),

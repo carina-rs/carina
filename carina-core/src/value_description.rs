@@ -68,7 +68,9 @@ impl ValueDescription {
             }
             Value::Deferred(DeferredValue::Interpolation(_)) => "interpolation".to_string(),
             Value::Deferred(
-                DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
+                DeferredValue::FunctionCall { .. }
+                | DeferredValue::ResolvedFunctionCall { .. }
+                | DeferredValue::ProvisionalFunctionCall { .. },
             ) => "function call".to_string(),
             Value::Deferred(DeferredValue::Unavailable { .. }) => {
                 "unavailable function result".to_string()

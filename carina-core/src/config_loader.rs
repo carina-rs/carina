@@ -2093,13 +2093,12 @@ pub(crate) fn parse_directory_files_located_from_root(
     let mut pass1_union = ParsedFile::default();
     let mut pass_1a_local_variables = Vec::with_capacity(files.len());
     for (path, content) in files {
-        let parsed = parser::parse_with_directory_context(
+        let parsed = parser::parse_with_provisional_directory_context(
             content,
             path,
             config,
             &provisional_seeds,
-            &directory_functions,
-            false,
+            parser::DirectoryParsePhase::Provisional(&directory_functions),
         )
         .map_err(|error| LocatedParseError::in_input_file(path, error))?;
         pass_1a_local_variables.push(local_variable_names(&parsed));
@@ -2200,7 +2199,6 @@ pub(crate) fn parse_directory_files_located_from_root(
             config,
             &final_seeds,
             &directory_functions,
-            true,
         )
         .map_err(|error| LocatedParseError::in_input_file(path, error))?;
         record_parsed_file_source_metadata(&mut parsed, path, display_root);
@@ -2272,7 +2270,7 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
             .insert_resource_source_file(id, path.to_path_buf());
     }
     for function in parsed.user_functions.values_mut() {
-        function.body.source_file = Some(path.to_path_buf());
+        function.set_source_file(path);
     }
     let display_file = path
         .strip_prefix(display_root)
@@ -2344,18 +2342,17 @@ fn parse_local_variable_union(
     config: &ProviderContext,
     seeds: &[parser::BindingSeed<'_>],
     local_variables_by_file: &[HashSet<String>],
-    user_functions: &IndexMap<String, parser::UserFunction>,
+    user_functions: &parser::ClassifiedUserFunctions,
 ) -> Result<DirectorySeedState, LocatedParseError> {
     let mut variables = IndexMap::new();
     let mut metadata = crate::parser::ParserSeedMetadata::default();
     for ((path, content), local_variables) in files.iter().zip(local_variables_by_file.iter()) {
-        let mut parsed = parser::parse_with_directory_context(
+        let mut parsed = parser::parse_with_provisional_directory_context(
             content,
             path,
             config,
             seeds,
-            user_functions,
-            false,
+            parser::DirectoryParsePhase::Refining(user_functions),
         )
         .map_err(|error| LocatedParseError::in_input_file(path, error))?;
         parsed

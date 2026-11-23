@@ -56,12 +56,28 @@ pub(super) trait BoundTransform<P: ValueKind, B: BindingAddress>: TransformOutpu
     fn resolved_call(
         &mut self,
         _at: &At<'_>,
+        function: Arc<crate::parser::ClassifiedUserFunction<B>>,
+        functions: Arc<crate::parser::ClassifiedUserFunctions<B>>,
+        args: Vec<FunctionArgument<P, B>>,
+        source_line: crate::resource::DiagnosticSourceLine,
+    ) -> Result<Value<P, B>, WalkError> {
+        Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }))
+    }
+
+    fn provisional_call(
+        &mut self,
+        _at: &At<'_>,
         function: Arc<crate::parser::UserFunction<B>>,
         functions: Arc<indexmap::IndexMap<String, crate::parser::UserFunction<B>>>,
         args: Vec<FunctionArgument<P, B>>,
         source_line: crate::resource::DiagnosticSourceLine,
     ) -> Result<Value<P, B>, WalkError> {
-        Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+        Ok(Value::Deferred(DeferredValue::ProvisionalFunctionCall {
             function,
             functions,
             args,

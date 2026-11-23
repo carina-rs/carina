@@ -1594,7 +1594,7 @@ fn typed_function_result(type_expr: TypeExpr) -> Value {
     function.return_type = Some(type_expr);
     Value::Deferred(crate::resource::DeferredValue::ResolvedFunctionCall {
         function: Arc::new(function),
-        functions: Arc::new(indexmap::IndexMap::new()),
+        functions: Arc::new(Default::default()),
         args: Vec::new(),
         source_line: 1.into(),
     })

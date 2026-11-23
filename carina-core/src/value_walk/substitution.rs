@@ -72,8 +72,8 @@ pub(super) trait ParserRewrite<B: BindingAddress> {
     }
     fn resolved_call(
         &mut self,
-        _function: &Arc<crate::parser::UserFunction<B>>,
-        _functions: &Arc<indexmap::IndexMap<String, crate::parser::UserFunction<B>>>,
+        _function: &Arc<crate::parser::ClassifiedUserFunction<B>>,
+        _functions: &Arc<crate::parser::ClassifiedUserFunctions<B>>,
         _args: &[FunctionArgument<ParserPlaceholder, B>],
         _source_line: DiagnosticSourceLine,
     ) -> Result<Option<Value<ParserPlaceholder, B>>, Self::Error> {
@@ -378,6 +378,12 @@ impl<'a, B: BindingAddress, R: ParserRewrite<B>> ParserTransform<'a, R, R::Error
                     args: _,
                     source_line: _,
                 }
+                | Parts::ProvisionalCall {
+                    function: _,
+                    functions: _,
+                    args: _,
+                    source_line: _,
+                }
                 | Parts::Evidence { value: _, edge: _ }) => {
                     let replacements = self.replacements;
                     let mut product = parts.transform(at, self, |_| ())?;
@@ -471,6 +477,12 @@ impl<B: BindingAddress, R: ParserRewrite<B>> BoundTransform<ParserPlaceholder, B
                 functions: _,
                 args: _,
                 source_line,
+            }
+            | Parts::ProvisionalCall {
+                function: _,
+                functions: _,
+                args: _,
+                source_line,
             } => *source_line,
             Parts::Access(access) => DiagnosticSourceLine::authored(access.source_line()),
             Parts::ModuleIf(conditional) => {
@@ -538,8 +550,8 @@ impl<B: BindingAddress, R: ParserRewrite<B>> BoundTransform<ParserPlaceholder, B
     fn resolved_call(
         &mut self,
         at: &At<'_>,
-        function: Arc<crate::parser::UserFunction<B>>,
-        functions: Arc<indexmap::IndexMap<String, crate::parser::UserFunction<B>>>,
+        function: Arc<crate::parser::ClassifiedUserFunction<B>>,
+        functions: Arc<crate::parser::ClassifiedUserFunctions<B>>,
         args: Vec<FunctionArgument<ParserPlaceholder, B>>,
         source_line: DiagnosticSourceLine,
     ) -> Result<Value<ParserPlaceholder, B>, WalkError> {

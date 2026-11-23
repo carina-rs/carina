@@ -216,6 +216,13 @@ fn format_value(value: &Value) -> String {
                 .collect();
             format!("{}({})", name, arg_strs.join(", "))
         }
+        Value::Deferred(DeferredValue::ProvisionalFunctionCall { function, args, .. }) => {
+            let arg_strs: Vec<_> = args
+                .iter()
+                .map(|argument| format_value(argument.walker_value()))
+                .collect();
+            format!("{}({})", function.name, arg_strs.join(", "))
+        }
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
             let arg_strs: Vec<_> = args
                 .iter()
@@ -654,7 +661,8 @@ impl RootConfigSignature {
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
                 | DeferredValue::Unavailable { args, .. }
-                | DeferredValue::ResolvedFunctionCall { args, .. },
+                | DeferredValue::ResolvedFunctionCall { args, .. }
+                | DeferredValue::ProvisionalFunctionCall { args, .. },
             ) => {
                 for arg in args {
                     Self::collect_typed_dependencies_in_scope(
@@ -1321,7 +1329,8 @@ impl ModuleSignature {
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
                 | DeferredValue::Unavailable { args, .. }
-                | DeferredValue::ResolvedFunctionCall { args, .. },
+                | DeferredValue::ResolvedFunctionCall { args, .. }
+                | DeferredValue::ProvisionalFunctionCall { args, .. },
             ) => {
                 for arg in args {
                     Self::collect_typed_dependencies_in_scope(

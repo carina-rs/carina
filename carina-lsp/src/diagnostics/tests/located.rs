@@ -10,6 +10,52 @@ fn loop_dot_case_table_diagnostics_match_validate() {
 }
 
 #[test]
+fn loop_dot_review_round3_function_diagnostics() {
+    run_loop_dot_case_table(|row| matches!(row.id, "2-24" | "2-25"));
+}
+
+#[test]
+fn loop_dot_review_round3_whole_group_function_location() {
+    let directory = Directory::new(&[]);
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let root = directory.root.path();
+    let row = loop_dot_cases::rows()
+        .into_iter()
+        .find(|row| row.id == "2-24")
+        .unwrap();
+    loop_dot_cases::fixture(root, &row);
+    for &position in row.positions {
+        let owner = loop_dot_cases::reader(root, position, row.reader);
+        let path = root.join(owner);
+        let source = std::fs::read_to_string(&path).unwrap();
+        let diagnostics: Vec<_> = engine
+            .analyze(&create_document_at(&source, path.clone()), Some(&path))
+            .into_iter()
+            .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
+        assert_eq!(diagnostics.len(), 1, "{position}: {diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].range.start,
+            tower_lsp::lsp_types::Position::new(1, 14),
+            "{position}"
+        );
+        assert_eq!(
+            diagnostics[0].range.end,
+            tower_lsp::lsp_types::Position::new(1, 30),
+            "{position}"
+        );
+    }
+}
+
+#[test]
 fn loop_dot_review_round1_function_contexts() {
     run_loop_dot_case_table(|row| row.id == "2-19");
 }

@@ -271,9 +271,15 @@ fn public_json_value(value: &SnapshotValue) -> Result<serde_json::Value, &'stati
             reason: _reason,
             source_line: _source_line,
         }) => Err("the value contains an unavailable function call"),
-        Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function: _function,
-            functions: _functions,
+        Value::Deferred(DeferredValue::ProvisionalFunctionCall {
+            function: _,
+            functions: _,
+            args: _args,
+            source_line: _source_line,
+        })
+        | Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function: _,
+            functions: _,
             args: _args,
             source_line: _source_line,
         }) => Err("the value contains an unresolved user function call"),
