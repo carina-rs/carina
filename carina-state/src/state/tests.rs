@@ -7551,6 +7551,7 @@ fn previous_secret_hash_wholly_ignored_key_is_protected() {
         SnapshotState::existing(resource.id.clone(), BTreeMap::new()),
         &["other"],
     ));
+    assert!(!request.sent_attributes().contains("computed"));
     let final_desired =
         FinalDesiredValues::for_test([(resource.id.clone(), resource.attributes.clone())]);
     for witness in [None, Some(&final_desired)] {
@@ -8304,9 +8305,9 @@ fn create_rows_agree_on_sent_membership_after_normalizer_drops_attribute() {
             );
             for (kind, row) in [("identified", identified), ("applied", applied)] {
                 let row = round_trip(&row);
-                // Applied nested objects can retain a protective secret hash;
+                // Applied nested secret objects can retain a protective hash;
                 // accepted write-only provenance is checked separately below.
-                if kind == "identified" || !nested {
+                if kind == "identified" || !(nested && secret) {
                     check_absent(
                         row.persisted_attributes().unwrap().contains_key("dropped"),
                         &format!("{kind} attributes"),
