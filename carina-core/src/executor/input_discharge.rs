@@ -86,7 +86,8 @@ impl PreparedCreateWriteback {
         &self.attributes
     }
 
-    pub(crate) fn sent_attributes(&self) -> &SentAttributes {
+    /// Attributes carried by the normalized create request.
+    pub fn sent_attributes(&self) -> &SentAttributes {
         &self.sent_attributes
     }
 }

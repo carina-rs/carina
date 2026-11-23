@@ -7309,8 +7309,7 @@ fn retained_write_only_previous_hash_cannot_prove_plaintext_equality() {
     assert!(selected.encoded.get("computed") == Some(&previous_value));
 }
 
-#[test]
-fn create_rows_agree_on_sent_membership_after_normalizer_drops_attribute() {
+fn dropped_key_create_rows(secret: bool, nested: bool) -> [ResourceState; 3] {
     use carina_core::executor::{
         ModuleConstraintGate, ProviderPreparationContext, prepare_initial_create,
     };
@@ -7350,14 +7349,43 @@ fn create_rows_agree_on_sent_membership_after_normalizer_drops_attribute() {
     }
 
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+    let dropped = if nested {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "value".into(),
+            string("consumed"),
+        )])))
+    } else {
+        string("consumed")
+    };
+    let dropped = if secret {
+        Value::Deferred(DeferredValue::Secret(Box::new(dropped).into()))
+    } else {
+        dropped
+    };
+    let dropped_type = if nested {
+        PatternAttributeType::struct_(
+            "Dropped",
+            vec![
+                PatternStructField::optional("value", PatternAttributeType::string())
+                    .write_only()
+                    .build(),
+            ],
+        )
+    } else {
+        PatternAttributeType::string()
+    };
+    let dropped_schema = PatternAttributeSchema::optional("dropped", dropped_type);
+    let dropped_schema = if nested {
+        dropped_schema
+    } else {
+        dropped_schema.write_only()
+    };
     let resource = Resource::with_provider("mock", "test.resource", "dropped-key", None)
         .with_attribute("name", string("retained"))
-        .with_attribute("dropped", string("consumed"));
+        .with_attribute("dropped", dropped);
     let schema = PatternResourceSchema::new("test.resource")
         .attribute(PatternAttributeSchema::optional("name", PatternAttributeType::string()).build())
-        .attribute(
-            PatternAttributeSchema::optional("dropped", PatternAttributeType::string()).build(),
-        )
+        .attribute(dropped_schema.build())
         .validate()
         .unwrap();
     let mut schemas = carina_core::schema::SchemaRegistry::new();
@@ -7415,8 +7443,8 @@ fn create_rows_agree_on_sent_membership_after_normalizer_drops_attribute() {
     );
     assert!(accepted.sent_attributes().contains("name"));
     assert!(!accepted.sent_attributes().contains("dropped"));
-    // Row builders receive the normalized request, so only retained send
-    // evidence could incorrectly add the dropped writeback key to explicit.
+    // Row builders receive the normalized request. The prepared writeback
+    // retains the dropped key for secret protection, but it is not send evidence.
     let transport = prepared.request().resource().as_inner().clone();
     let observed = State::existing(transport.id.clone(), transport.attributes.clone())
         .with_identifier("normalized-id");
@@ -7485,9 +7513,83 @@ fn create_rows_agree_on_sent_membership_after_normalizer_drops_attribute() {
         None,
     )
     .unwrap();
-    assert_explicit_struct_keys(&applied.explicit, &["name"]);
-    assert_eq!(in_flight.explicit, applied.explicit);
-    assert_eq!(identified.explicit, applied.explicit);
+    [in_flight, identified, applied]
+}
+
+#[test]
+fn create_rows_agree_on_sent_membership_after_normalizer_drops_attribute() {
+    let mut failures = Vec::new();
+    for secret in [false, true] {
+        for nested in [false, true] {
+            let [in_flight, identified, applied] = dropped_key_create_rows(secret, nested);
+            assert_explicit_struct_keys(&applied.explicit, &["name"]);
+            assert_eq!(in_flight.explicit, applied.explicit);
+            assert_eq!(identified.explicit, applied.explicit);
+            // Inspect the serialized rows as well as authoring metadata. Report only
+            // variant labels and selection names so failures never expose fixture values.
+            let round_trip = |row: &ResourceState| {
+                serde_json::from_value::<ResourceState>(serde_json::to_value(row).unwrap()).unwrap()
+            };
+            let in_flight = round_trip(&in_flight);
+            let CurrentInstance::CreateInFlight { pending } = in_flight.current() else {
+                panic!("in-flight row must retain its continuation");
+            };
+            let SentRecord::Persisted(envelope) = pending.sent() else {
+                panic!("in-flight row must persist its sent envelope");
+            };
+            let variant = if secret { "secret" } else { "public" };
+            let shape = if nested {
+                "nested write-only"
+            } else {
+                "top-level write-only"
+            };
+            let mut check_absent = |present: bool, selection: &str| {
+                if present {
+                    failures.push(format!("{variant} {shape}: {selection}"));
+                }
+            };
+            check_absent(
+                envelope.write_only().contains_key("dropped"),
+                "in-flight write_only",
+            );
+            check_absent(
+                envelope.secrets().contains_key("dropped"),
+                "in-flight secrets",
+            );
+            for (kind, row) in [("identified", identified), ("applied", applied)] {
+                let row = round_trip(&row);
+                // Applied nested objects can retain a protective secret hash;
+                // accepted write-only provenance is checked separately below.
+                if kind == "identified" || !nested {
+                    check_absent(
+                        row.persisted_attributes().unwrap().contains_key("dropped"),
+                        &format!("{kind} attributes"),
+                    );
+                }
+                if secret && let Some(value) = row.persisted_attributes().unwrap().get("dropped") {
+                    assert!(
+                        value.secret_hash().is_some(),
+                        "stored secret must remain hashed"
+                    );
+                }
+                check_absent(
+                    row.write_only_attributes()
+                        .iter()
+                        .any(|key| key == "dropped"),
+                    &format!("{kind} write_only"),
+                );
+                check_absent(
+                    row.nested_write_only().get("dropped").is_some(),
+                    &format!("{kind} nested_write_only"),
+                );
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "dropped request key was recorded in: {}",
+        failures.join("; "),
+    );
 }
 
 #[test]

@@ -1020,6 +1020,11 @@ impl SentAttributes {
     pub fn contains(&self, attribute: &str) -> bool {
         self.attributes.contains(attribute)
     }
+
+    /// Attribute names proven to have been sent by this operation.
+    pub fn as_set(&self) -> &BTreeSet<String> {
+        &self.attributes
+    }
 }
 
 /// Desired values paired with the send evidence from the same provider
@@ -2813,6 +2818,11 @@ impl From<PendingCreate> for FreshPendingCreate<ProviderCreateRecord> {
 }
 
 impl FreshPendingCreate {
+    /// Values and request membership retained from the same prepared create.
+    pub fn writeback(&self) -> &PreparedCreateWriteback {
+        &self.writeback
+    }
+
     /// Desired values retained by this continuation, with send membership
     /// expanded from the same prepared create's request attributes.
     pub fn sent_desired_attributes(&self) -> SentDesiredAttributes<'_> {
@@ -3247,6 +3257,11 @@ impl<S: TextState> IdentifiedCreate<S> {
 }
 
 impl<S: TextState> IdentifiedCreate<S, PreparedCreateWriteback> {
+    /// Values and request membership retained from the same prepared create.
+    pub fn writeback(&self) -> &PreparedCreateWriteback {
+        &self.writeback
+    }
+
     /// Resolved desired values and send evidence retained by the accepted
     /// create observation. Membership is expanded from the same prepared
     /// create's request attributes. Persisted continuations omit observable keys

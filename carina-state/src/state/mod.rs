@@ -14,9 +14,9 @@ use carina_core::plan::ReplacementPreviousAttributesForStateWriteback;
 use carina_core::provider::{
     AppliedIdentifier, EmptyAppliedIdentifier, HostCreateObservation, HostIdentifiedCreate,
     InFlightCreate, InFlightPersistence, NestedWriteOnlyRecord, PersistedAttributes,
-    PersistedAttributesError, RawSavedAttrs, Sent, SentDesiredAttributes, SentRecord,
-    StateTransformMap, UnknownCreateOutcome, merge_previous_secret_hashes_into_provider_value,
-    previous_hash,
+    PersistedAttributesError, RawSavedAttrs, Sent, SentAttributes, SentDesiredAttributes,
+    SentRecord, StateTransformMap, UnknownCreateOutcome,
+    merge_previous_secret_hashes_into_provider_value, previous_hash,
 };
 pub use carina_core::resource::DeposedKey;
 #[cfg(test)]
@@ -2878,22 +2878,23 @@ impl ResourceState {
 
     fn selected_sent_attributes<S>(
         resource: &ResolvedResource<S>,
+        request_attributes: &SentAttributes,
         sent: &Sent,
         existing: Option<&ResourceState>,
         preferred_hashes: Option<&PersistedAttributes>,
     ) -> Result<PersistedAttributes, ResourceStateEncodingError> {
-        let request_keys = resource.attributes.keys().cloned().collect::<BTreeSet<_>>();
-        if !sent.is_valid_for(&request_keys) {
+        let request_keys = request_attributes.as_set();
+        if !sent.is_valid_for(request_keys) {
             let attributes = match sent {
                 Sent::AllRequestAttributes => Vec::new(),
                 Sent::Only(attributes) => attributes
-                    .difference(&request_keys)
+                    .difference(request_keys)
                     .cloned()
                     .collect::<Vec<_>>(),
             };
             return Err(ResourceStateEncodingError::InvalidSentAttributes { attributes });
         }
-        let selected = sent.names(&request_keys);
+        let selected = sent.names(request_keys);
         let previous = existing.and_then(ResourceState::persisted_attributes);
         let mut encoded = HashMap::with_capacity(selected.len());
         for key in selected {
@@ -3106,6 +3107,7 @@ impl ResourceState {
             SentRecord::Request(sent) => {
                 let sent_values = Self::selected_sent_attributes(
                     writeback_resource,
+                    identified.writeback().sent_attributes(),
                     sent,
                     existing,
                     preferred_hashes,
@@ -3260,6 +3262,7 @@ impl ResourceState {
             InFlightPersistence::Fresh(fresh) => {
                 let selected = Self::selected_sent_attributes(
                     writeback_resource,
+                    fresh.writeback().sent_attributes(),
                     fresh.sent(),
                     existing,
                     preferred_hashes,
@@ -3408,11 +3411,6 @@ impl ResourceState {
             resource.id.provider.clone(),
         );
         let previous = existing.and_then(ResourceState::persisted_attributes);
-        let desired_keys = writeback_resource
-            .attributes
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
         let schema_write_only: BTreeSet<_> = schema_write_only_keys(schema).into_iter().collect();
         let carried_write_only = previous
             .map(|attributes| recorded_write_only_keys(schema, attributes, &[]))
@@ -3422,9 +3420,10 @@ impl ResourceState {
             RowBasis::Applied(request) => match request.kind() {
                 AcceptedRequestKind::Create => {
                     accepted.extend(
-                        desired_keys
-                            .iter()
-                            .filter(|key| schema_write_only.contains(*key))
+                        request
+                            .sent_attributes()
+                            .as_set()
+                            .intersection(&schema_write_only)
                             .cloned(),
                     );
                 }
@@ -3432,7 +3431,8 @@ impl ResourceState {
                     accepted.extend(
                         sent.iter()
                             .filter(|key| {
-                                desired_keys.contains(*key) && schema_write_only.contains(*key)
+                                writeback_resource.attributes.contains_key(*key)
+                                    && schema_write_only.contains(*key)
                             })
                             .cloned(),
                     );
@@ -3446,12 +3446,16 @@ impl ResourceState {
                 .filter(|key| !state.attributes.contains_key(*key))
                 .cloned(),
         );
-        let desired_fallback = Self::selected_sent_attributes(
-            writeback_resource,
-            &desired_fallback,
-            existing,
-            preferred_hashes,
-        )?;
+        let desired_fallback = match row_basis {
+            RowBasis::Applied(request) => Self::selected_sent_attributes(
+                writeback_resource,
+                request.sent_attributes(),
+                &desired_fallback,
+                existing,
+                preferred_hashes,
+            )?,
+            RowBasis::Imported | RowBasis::Carried => PersistedAttributes::default(),
+        };
 
         let mut selected = SelectedStateAttributes::try_from_provider_values(
             &state.attributes,
@@ -3538,9 +3542,10 @@ impl ResourceState {
             RowBasis::Applied(request) => match request.kind() {
                 AcceptedRequestKind::Create => (
                     NestedWriteOnlyRecord::default(),
-                    writeback_resource
-                        .attributes
-                        .keys()
+                    request
+                        .sent_attributes()
+                        .as_set()
+                        .iter()
                         .map(String::as_str)
                         .collect::<Vec<_>>(),
                 ),

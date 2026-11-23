@@ -309,13 +309,7 @@ async fn dispatch_create_with_attempt<P: HostProvider + ?Sized>(
 ) -> Result<HostCreateOutcome, HostCreateFailure> {
     let (request, writeback) = permit.into_write().into_parts();
     let id = request.resource().id.clone();
-    let request_attributes: BTreeSet<_> = request
-        .resource()
-        .as_resource()
-        .attributes
-        .keys()
-        .cloned()
-        .collect();
+    let request_attributes = writeback.sent_attributes().as_set();
     match provider.create(&id, request, attempt).await {
         Ok(outcome) => Ok(outcome),
         Err(failure) => match failure.into_kind() {
@@ -323,7 +317,7 @@ async fn dispatch_create_with_attempt<P: HostProvider + ?Sized>(
                 HostCreateFailure::outcome_unknown_at_dispatch(unknown, error),
             ),
             crate::provider::CreateFailureKind::IdentifierReported { identified, error } => {
-                let (identified, valid) = identified.validate_request_sent(&request_attributes);
+                let (identified, valid) = identified.validate_request_sent(request_attributes);
                 let identified = identified.into_writeback(writeback);
                 let error = if valid {
                     error
@@ -337,7 +331,7 @@ async fn dispatch_create_with_attempt<P: HostProvider + ?Sized>(
                 Err(HostCreateFailure::identifier_reported(identified, error))
             }
             crate::provider::CreateFailureKind::InFlight { pending, error } => {
-                let (pending, valid) = pending.validate_fresh_sent(&request_attributes);
+                let (pending, valid) = pending.validate_fresh_sent(request_attributes);
                 let pending = pending.into_writeback(writeback);
                 let error = if valid {
                     error
@@ -376,14 +370,7 @@ async fn dispatch_resume_create_raw<P: HostProvider + ?Sized>(
     let writeback = request.writeback().clone();
     let id = request.id().clone();
     let starting = request.pending_for_dispatch();
-    let request_attributes: BTreeSet<_> = request
-        .request()
-        .resource()
-        .as_resource()
-        .attributes
-        .keys()
-        .cloned()
-        .collect();
+    let request_attributes = writeback.sent_attributes().as_set();
     match provider.resume_create(request).await {
         Ok(outcome) if outcome.id() == &id => Ok(outcome.into_writeback(writeback)),
         Ok(_outcome) => Err(starting.into_writeback(writeback).into_resume_failure(
@@ -401,7 +388,7 @@ async fn dispatch_resume_create_raw<P: HostProvider + ?Sized>(
                         .for_resource(id),
                     ));
                 }
-                let (identified, valid) = identified.validate_request_sent(&request_attributes);
+                let (identified, valid) = identified.validate_request_sent(request_attributes);
                 let identified = identified.into_writeback(writeback);
                 let error = if valid {
                     error
@@ -424,7 +411,7 @@ async fn dispatch_resume_create_raw<P: HostProvider + ?Sized>(
                         .for_resource(id),
                     ));
                 }
-                let (pending, valid) = pending.validate_fresh_sent(&request_attributes);
+                let (pending, valid) = pending.validate_fresh_sent(request_attributes);
                 let pending = pending.into_writeback(writeback);
                 let error = if valid {
                     error
@@ -480,10 +467,11 @@ pub enum AcceptedRequestKind {
 
 impl AcceptedRequest {
     fn from_prepared_create(write: &PreparedWrite<CreateRequest>) -> Self {
+        let writeback = write.create_writeback();
         Self {
             kind: AcceptedRequestKind::Create,
-            sent_attributes: write.request().sent_attributes(),
-            resolved_desired_attributes: write.writeback().clone(),
+            sent_attributes: writeback.sent_attributes().clone(),
+            resolved_desired_attributes: writeback.attributes().clone(),
         }
     }
 
