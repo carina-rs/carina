@@ -16,6 +16,7 @@ pub use presentation::{
     ClientFindingKind, ConversionValidation, FindingSubject, OrdinaryFailure, OrdinaryFinding,
     PresentedConversion, PresentedFinding, PresentedFindings, ResourceAdmissionStep,
     ResourceValidationReport, SinkFindings, ValidationClientError, ValidationClientFailure,
+    merge_function_promise_diagnostics,
 };
 pub mod routing;
 pub mod typecheck;
@@ -6397,6 +6398,7 @@ enum DeferredIterableKind {
 enum DeferredIterableShape {
     List(Option<TypeExpr>),
     Map,
+    KeyedGroup,
     NonIterable(TypeExpr),
 }
 
@@ -6405,6 +6407,7 @@ impl From<crate::parser::retained::CollectionKind> for DeferredIterableShape {
         match kind {
             crate::parser::retained::CollectionKind::List => Self::List(None),
             crate::parser::retained::CollectionKind::Map => Self::Map,
+            crate::parser::retained::CollectionKind::KeyedGroup => Self::KeyedGroup,
         }
     }
 }
@@ -6742,6 +6745,12 @@ fn validate_for_iterable_operand(
             diagnostics.push(deferred_iterable_diagnostic(
                 context,
                 "expected map iterable, got list".to_string(),
+            ));
+        }
+        (expected, DeferredIterableShape::KeyedGroup) => {
+            diagnostics.push(deferred_iterable_diagnostic(
+                context,
+                format!("expected {expected} iterable, got keyed loop group"),
             ));
         }
         (expected, DeferredIterableShape::NonIterable(type_expr)) => {

@@ -2106,7 +2106,7 @@ fn settlement_includes_checks_from_binding_readiness() {
         &HashMap::new(),
         &parsed,
         &carina_core::paths::ResolvedPath::new(".").unwrap(),
-        true,
+        ValidationMode::Recovery,
         &[],
         crate::commands::ConfigNameResolution::EvaluatedOnly,
         |_parsed, catalog| {
@@ -15865,11 +15865,15 @@ fn reporting_load_findings_match_validation_source_policy() {
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    let validation =
-        provider_load_findings(&load.context, &load.load_errors, &parsed.providers, false)
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
+    let validation = provider_load_findings(
+        &load.context,
+        &load.load_errors,
+        &parsed.providers,
+        ValidationMode::from_skip_resource_validation(false),
+    )
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
     assert_eq!(reporting, validation);
     let skipped = load.load_findings(&parsed.providers, true);
     assert_eq!(skipped.len(), 1);

@@ -126,7 +126,8 @@ pub fn build_plan_scheduler_dependency_edges(
 }
 
 use crate::resource::ResolvedResourceId;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use crate::schema::LeafPath;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -137,7 +138,7 @@ use crate::parser::ResolvedProviderConfigs;
 use crate::provider::{
     AppliedIdentifier, CreateRequest, HostCreateFailure, HostCreateOutcome, HostError,
     HostIdentifiedCreate, HostNormalizer, HostPartialReadDiagnostic, HostProvider,
-    HostResumeFailure, HostResumeOutcome, InFlightCreate, PatchOp, ProviderReadyDataSource,
+    HostResumeFailure, HostResumeOutcome, InFlightCreate, PlannedPatchOp, ProviderReadyDataSource,
     ResumeCreateRequest, SentAttributes, SentDesiredAttributes, UnknownCreateOutcome,
     UpdateRequest,
 };
@@ -460,9 +461,21 @@ pub struct AcceptedRequest {
 pub enum AcceptedRequestKind {
     Create,
     Update {
-        sent: BTreeSet<String>,
+        sent: BTreeMap<String, SentKey>,
         removed: BTreeSet<String>,
     },
+}
+
+/// One sent update key and the observed leaves grafted into its payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentKey {
+    grafted_leaves: Vec<LeafPath>,
+}
+
+impl SentKey {
+    pub fn grafted_leaves(&self) -> &[LeafPath] {
+        &self.grafted_leaves
+    }
 }
 
 impl AcceptedRequest {
@@ -477,21 +490,27 @@ impl AcceptedRequest {
 
     fn from_update_request(write: &PreparedWrite<UpdateRequest>) -> Self {
         let request = write.request();
-        let sent_attributes = request.patch().sent_attributes();
-        let mut sent = BTreeSet::new();
+        let mut sent = BTreeMap::new();
         let mut removed = BTreeSet::new();
-        for op in &request.patch().ops {
+        for op in request.planned_ops() {
             match op {
-                PatchOp::Add { key, .. }
-                | PatchOp::Replace { key, .. }
-                | PatchOp::Reassert { key, .. } => {
-                    sent.insert(key.clone());
+                PlannedPatchOp::Add(sent_op)
+                | PlannedPatchOp::Replace(sent_op)
+                | PlannedPatchOp::Reassert(sent_op) => {
+                    let (key, grafted_leaves) = sent_op.sent_parts();
+                    sent.insert(
+                        key.to_string(),
+                        SentKey {
+                            grafted_leaves: grafted_leaves.to_vec(),
+                        },
+                    );
                 }
-                PatchOp::Remove { key } => {
+                PlannedPatchOp::Remove { key } => {
                     removed.insert(key.clone());
                 }
             }
         }
+        let sent_attributes = SentAttributes::only(sent.keys().cloned().collect());
         Self {
             kind: AcceptedRequestKind::Update { sent, removed },
             sent_attributes,

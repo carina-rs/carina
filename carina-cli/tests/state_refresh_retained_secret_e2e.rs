@@ -288,17 +288,85 @@ fn refresh_retained_secret_call_in_module_keeps_previous_hash() {
 
 #[test]
 fn refresh_retained_call_with_visible_secret_argument_keeps_previous_hash() {
+    use carina_core::resource::{DeferredValue, Value as ResourceValue};
+
     let scenario = Scenario::new(
         false,
         "visible(lookup({ 'src-id' = src.computed }, src.identifier, secret('__MARKER__')))",
     );
     let source = fs::read_to_string(&scenario.source).unwrap();
+    fs::write(&scenario.source, format!("fn visible(x) {{ x }}\n{source}")).unwrap();
+    let parsed = carina_core::config_loader::parse_directory(
+        &carina_core::paths::ResolvedPath::new(scenario.project.path()).unwrap(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_or_else(|_| panic!("the unannotated visible fixture must parse"))
+    .into_parsed();
+    let sink = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.as_str() == "sink")
+        })
+        .expect("the fixture must retain its sink resource");
+    let computed = &sink.attributes["computed"];
+    assert!(
+        matches!(computed, ResourceValue::Deferred(DeferredValue::FunctionCall { name, .. }) if name == "visible")
+            || matches!(computed, ResourceValue::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) if function.name == "visible"),
+        "visible(...) must remain a deferred call until its resource inputs resolve at apply"
+    );
+    scenario.assert_refresh_protected(&scenario.marker);
+}
+
+#[test]
+fn tp19_typed_lookup_validate_rejects_and_refresh_succeeds() {
+    let scenario = Scenario::new(
+        false,
+        "visible(lookup({ 'src-id' = src.computed }, src.identifier, src.computed))",
+    );
+    let resources = fs::read_to_string(&scenario.source).unwrap();
+    let untyped = format!("fn visible(x) {{ x }}\n{resources}");
+    fs::write(&scenario.source, &untyped).unwrap();
+    let before = scenario.apply_and_plan(&scenario.marker);
     fs::write(
         &scenario.source,
-        format!("fn visible(x: HttpsUrl): String {{ x }}\n{source}"),
+        untyped.replacen(
+            "fn visible(x) { x }",
+            "fn visible(x: HttpsUrl): String { x }",
+            1,
+        ),
     )
     .unwrap();
-    scenario.assert_refresh_protected(&scenario.marker);
+
+    let output = scenario.command(&["validate", "--json", "."]);
+    assert!(
+        !output.status.success(),
+        "validate must reject the typed lookup"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(&scenario.marker)
+            && !String::from_utf8_lossy(&output.stderr).contains(&scenario.marker),
+        "validation must keep fixture material protected"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("validate must return a JSON report"));
+    let errors = report["errors"].as_array().expect("validation errors");
+    assert_eq!(errors.len(), 1, "the typed lookup has one promise finding");
+    let message = errors[0]["message"]
+        .as_str()
+        .expect("diagnostic text")
+        .replace(&scenario.marker, "<MASKED>");
+    assert_eq!(
+        message,
+        "function 'visible': parameter 'x' is declared as HttpsUrl, but its argument has no known type, so validate cannot prove it fits. Pass a value known at validate, or give the argument a type that proves it fits."
+    );
+
+    let (after, _) = scenario.refresh_hash(&scenario.marker);
+    assert_eq!(after, before, "refresh must preserve the previous digest");
+    scenario.assert_hash(&scenario.state(), "src", &scenario.marker);
 }
 
 #[test]

@@ -50,6 +50,37 @@ fn attribute(report: &SecrecyReport, binding: &str, name: &str) -> Evidence {
         .clone()
 }
 
+#[test]
+fn bare_enum_shorthand_stays_public() {
+    let file = parsed("let vpc = mock.test.Vpc { instance_tenancy = dedicated }");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        Schema::new("test.Vpc")
+            .attribute(
+                Attribute::optional(
+                    "instance_tenancy",
+                    Type::enum_(
+                        crate::schema::enum_identity("InstanceTenancy", Some("mock.test.Vpc")),
+                        Some(vec!["dedicated".into()]),
+                        vec![],
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let report = secrecy_report(&file, &schemas);
+    assert_eq!(
+        attribute(&report, "vpc", "instance_tenancy"),
+        Evidence::Leaf(Secrecy::Public)
+    );
+    assert!(report.admitted().is_some(), "{report:?}");
+}
+
 const WAIT_ALIAS_TARGET: &str = r#"
 let seed = mock.test.Resource { name = "visible" comment = secret("canary") }
 "#;

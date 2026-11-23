@@ -361,6 +361,8 @@ let subnet_id = subnets[0].subnet_id
 
 Type expressions are used in `arguments`, `attributes`, and `exports` blocks, and in function parameters and return types.
 
+See [function type promises](/guides/functions/#type-promises-at-validate) for parameter and return validation.
+
 ### Simple Types
 
 ```crn

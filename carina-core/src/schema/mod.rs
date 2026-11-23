@@ -4338,6 +4338,18 @@ impl KnownAssignment<'_, '_> {
 }
 
 impl<'source, R: PatternForm> TypeInSchema<'source, R> {
+    pub(crate) fn iterable_element(self) -> Option<Self> {
+        let attr = match self.attr.shape_with_defs(self.defs) {
+            Shape::List { element_type, .. } => element_type,
+            Shape::Map { value, .. } => value,
+            _ => return None,
+        };
+        Some(Self {
+            attr,
+            defs: self.defs,
+        })
+    }
+
     /// Borrow the source declaration after resolving its own definition scope.
     pub(crate) fn resolve(self) -> Result<ResolvedAttrType<'source, R>, TypeError> {
         resolve_refs_on_path(self.attr, self.defs, &mut Vec::new())
@@ -4364,6 +4376,92 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     pub fn resolved_type_name(&self) -> String {
         let mut visited_refs = Vec::new();
         self.resolved_type_name_on_path(&mut visited_refs, false)
+    }
+
+    /// A DSL annotation spelling, when the source has one. Diagnostic names
+    /// for anonymous refinements and schema structs are not annotations.
+    pub(crate) fn writable_type_name(self) -> Option<String> {
+        fn spelling<R: PatternForm>(ty: TypeInSchema<'_, R>, depth: usize) -> Option<String> {
+            if depth == 0 {
+                return None;
+            }
+            let resolved = ty.resolve().ok()?;
+            let child =
+                |attr: &PatternAttributeType<R>| spelling(attr.in_schema(ty.defs), depth - 1);
+            Some(match resolved.as_attr().kind() {
+                AttrTypeKind::String {
+                    identity_layer,
+                    member_layer,
+                } => {
+                    let identity = identity_layer.parts();
+                    let member = member_layer.parts();
+                    if let Some(name) = identity.identity {
+                        name.to_string()
+                    } else if identity.pattern.is_none()
+                        && identity.length.is_none()
+                        && member.pattern.is_none()
+                        && member.length.is_none()
+                    {
+                        "String".into()
+                    } else {
+                        return None;
+                    }
+                }
+                AttrTypeKind::Int {
+                    identity_layer,
+                    member_layer,
+                } => {
+                    let identity = identity_layer.parts();
+                    if let Some(name) = identity.identity {
+                        name.to_string()
+                    } else if identity.range.is_none() && member_layer.parts().range.is_none() {
+                        "Int".into()
+                    } else {
+                        return None;
+                    }
+                }
+                AttrTypeKind::Float { binding, range } => match binding.identity() {
+                    Some(name) => name.to_string(),
+                    None if range.is_none() => "Float".into(),
+                    None => return None,
+                },
+                AttrTypeKind::Bool => "Bool".into(),
+                AttrTypeKind::Duration => "Duration".into(),
+                AttrTypeKind::Reference { identity, .. } | AttrTypeKind::Enum { identity, .. } => {
+                    identity.to_string()
+                }
+                AttrTypeKind::UnloadedSchemaType(ty) => ty.identity().to_string(),
+                AttrTypeKind::ResourceHandle {
+                    provider,
+                    resource_type,
+                } => format!("{provider}.{resource_type}"),
+                AttrTypeKind::StringLiteralSet { values } => values
+                    .iter()
+                    .map(|value| display_string_literal(value))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                AttrTypeKind::List { element_type, .. } => {
+                    format!("list({})", child(element_type)?)
+                }
+                AttrTypeKind::Map { key, value, .. } => {
+                    child(key)?;
+                    if !matches!(key.in_schema(ty.defs).resolve().ok()?.as_attr().kind(),
+                        AttrTypeKind::String { identity_layer, .. } if identity_layer.parts().identity.is_none())
+                    {
+                        return None;
+                    }
+                    format!("map({})", child(value)?)
+                }
+                AttrTypeKind::Union(members) => members
+                    .as_raw_slice()
+                    .iter()
+                    .map(child)
+                    .collect::<Option<Vec<_>>>()?
+                    .join(" | "),
+                AttrTypeKind::Struct { .. } | AttrTypeKind::Ref(_) => return None,
+            })
+        }
+        spelling(self, 32)
     }
 
     /// Expand scalar constraints only when ordinary names hide a difference.

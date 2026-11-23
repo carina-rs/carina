@@ -187,6 +187,166 @@ fn source_schema_report(source: &str) -> (crate::parser::ParsedFile, ExpressionR
 }
 
 #[test]
+fn keyed_loop_groups_have_no_value_type_or_collection_sink() {
+    for source in [
+        "let items = { a = 'x' }\nlet children = for k, v in items { mock.test.Source { name = v } }",
+        "let items = ['a']\nlet children = for item in items { mock.test.Source { name = item } }",
+    ] {
+        let (_, report) = source_schema_report(source);
+        let group = report
+            .binding(&RelativeBindingName::new("children"))
+            .unwrap();
+        assert!(
+            group.static_type().is_err(),
+            "{source}: {:?}",
+            group.static_type()
+        );
+        for sink in [
+            TypeExpr::Map(Box::new(TypeExpr::String)),
+            TypeExpr::List(Box::new(TypeExpr::String)),
+            TypeExpr::Struct {
+                fields: vec![("a".into(), TypeExpr::String)],
+            },
+        ] {
+            assert!(admit_expression(group, &sink).is_err(), "{source}: {sink}");
+        }
+    }
+}
+
+#[test]
+fn keyed_loop_addressing_agrees_across_judgement_validation_and_expansion() {
+    use crate::resource::{ForKeyError, ForLoopElement, LoopOriginKind};
+    use crate::validation::DeferredForIterableTypeDiagnostic;
+
+    fn loop_expression(expression: &ExprValue) -> Option<&ExprValue> {
+        if matches!(expression.authored.kind, ExprKind::For { .. }) {
+            return Some(expression);
+        }
+        expression
+            .authored
+            .children
+            .iter()
+            .find_map(loop_expression)
+    }
+
+    let config = config();
+    let sink = TypeExpr::List(Box::new(TypeExpr::String));
+    for (row, header, iterable, expected, expected_validation) in [
+        (
+            "bound indexed list",
+            "let children = for (i, x) in ",
+            "['a-b']",
+            "Indexed",
+            "Indexed",
+        ),
+        (
+            "bound value-keyed list",
+            "let children = for x in ",
+            "['a-b']",
+            "Keyed",
+            "Keyed",
+        ),
+        (
+            "unbound simple list",
+            "for x in ",
+            "['a-b']",
+            "Indexed",
+            "Indexed",
+        ),
+        (
+            "bound map",
+            "let children = for k, v in ",
+            "{ 'a-b' = 'a-b' }",
+            "Keyed",
+            "MapKeyed",
+        ),
+        (
+            "unbound map",
+            "for k, v in ",
+            "{ 'a-b' = 'a-b' }",
+            "Keyed",
+            "MapKeyed",
+        ),
+    ] {
+        let body = "{ mock.test.Source { name = 'child' } }";
+        let (parsed, report) =
+            source_schema_report(&format!("let items = {iterable}\n{header}items {body}"));
+        let expression = parsed
+            .parser_binding_metadata
+            .syntax()
+            .expressions()
+            .roots()
+            .iter()
+            .find_map(loop_expression)
+            .unwrap();
+        let judgement = match report
+            .expression(expression.location())
+            .unwrap()
+            .for_sink(&sink, &config)
+            .collection_kind()
+        {
+            Some(CollectionKind::KeyedGroup) => "Keyed",
+            Some(CollectionKind::List) => "Indexed",
+            other => panic!("{row}: unexpected judged group {other:?}"),
+        };
+
+        // An unresolved Int list reaches the authored validator without eager
+        // parser admission. Only bound simple loops set value_keys and reject
+        // its element type. Map loops never enter that path: their container
+        // rejection is a separate MapKeyed observation.
+        let probe = crate::parser::parse_file(
+            &format!("arguments {{ items: list(Int) }}\n{header}items {body}"),
+            Path::new("agreement.crn"),
+            &config,
+        )
+        .unwrap();
+        let schemas = SchemaRegistry::new();
+        let buffer = crate::config_loader::load_buffer_configuration(&probe, &schemas, &config);
+        let tree = crate::parser::AnalysisTree::try_from(buffer.parsed()).unwrap();
+        let findings = crate::validation::validate_for_iterable_types(&tree, &config);
+        let findings: Vec<_> = findings.iter().map(|finding| finding.detail()).collect();
+        let validation = match findings.as_slice() {
+            [] => "Indexed",
+            [
+                DeferredForIterableTypeDiagnostic::ForKey(ForKeyError::ElementType { kind: "Int" }),
+            ] => "Keyed",
+            [DeferredForIterableTypeDiagnostic::Iterable { message, .. }]
+                if message == "expected map iterable, got list" =>
+            {
+                "MapKeyed"
+            }
+            other => panic!("{row}: unexpected validation findings {other:?}"),
+        };
+
+        // Eager bound expansion calls admit_bound_for_addresses; unbound
+        // expansion records the actual key/index in its child provenance.
+        let resources: Vec<_> = parsed.iter_all_resources().collect();
+        let [crate::parser::ResourceRef::Resource(child)] = resources.as_slice() else {
+            panic!("{row}: expected one expanded child");
+        };
+        let expansion = match child.binding.as_ref().map(|binding| binding.as_str()) {
+            Some("children['a-b']") => "Keyed",
+            Some("children[0]") => "Indexed",
+            None => match child.loop_provenance.direct_origin().unwrap().kind() {
+                LoopOriginKind::For {
+                    element: ForLoopElement::Key(key),
+                } if key == "a-b" => "Keyed",
+                LoopOriginKind::For {
+                    element: ForLoopElement::Index(0),
+                } => "Indexed",
+                other => panic!("{row}: unexpected expanded child origin {other:?}"),
+            },
+            other => panic!("{row}: unexpected expanded child address {other:?}"),
+        };
+        assert_eq!(
+            [judgement, validation, expansion],
+            [expected, expected_validation, expected],
+            "{row}: [judge, validation, expansion]"
+        );
+    }
+}
+
+#[test]
 fn single_reference_interpolation_preserves_child_judgement_and_literal_folding() {
     for definition in [
         "let x = src.name",

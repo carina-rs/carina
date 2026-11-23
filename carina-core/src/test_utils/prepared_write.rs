@@ -87,6 +87,17 @@ pub fn update_permit<S, D>(
     try_update_permit(desired, from, changed).expect("fixture update passes provider preparation")
 }
 
+/// Preserve declared map/struct paths or provider constraints in update fixtures.
+pub fn update_permit_with_schemas<S, D>(
+    desired: &Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>,
+    from: SnapshotState,
+    changed: &[&str],
+    schemas: &SchemaRegistry,
+) -> UpdatePermit {
+    prepare_update(desired_resource(desired), from, changed, schemas)
+        .expect("fixture update passes provider preparation")
+}
+
 pub fn try_update_permit<S, D>(
     desired: &Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>,
     from: SnapshotState,
@@ -104,7 +115,16 @@ pub fn try_update_permit<S, D>(
         SchemaKind::Resource,
         &from.attributes.clone().into_iter().collect(),
     );
-    with_preparation(&schemas, |context| {
+    prepare_update(desired, from, changed, &schemas)
+}
+
+fn prepare_update(
+    desired: Resource,
+    from: SnapshotState,
+    changed: &[&str],
+    schemas: &SchemaRegistry,
+) -> Result<UpdatePermit, ProviderPreparationError> {
+    with_preparation(schemas, |context| {
         let request = super::provider_text::block_on(crate::executor::prepare_update_request(
             desired,
             from,
@@ -117,7 +137,7 @@ pub fn try_update_permit<S, D>(
         Ok(crate::replacement::update_permit_with_schemas_for_test(
             AppliedIdentifier::new("fixture-id").unwrap(),
             request,
-            &schemas,
+            schemas,
         ))
     })
 }

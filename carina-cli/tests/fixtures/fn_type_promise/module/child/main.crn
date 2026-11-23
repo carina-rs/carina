@@ -1,0 +1,3 @@
+let src = test.Thing { name = 'src' }
+fn promise(value: 'dev' | 'prod'): String { 'accepted' }
+test.Sink { name = 'sink' value = promise(src.identifier) }

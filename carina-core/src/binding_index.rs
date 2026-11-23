@@ -330,6 +330,12 @@ impl RefTypeMismatch {
 }
 
 impl ResolvedRefType {
+    pub(crate) fn iterable_constraints(
+        &self,
+    ) -> impl Iterator<Item = TypeInSchema<'_, crate::schema::Compiled>> {
+        self.constraints().filter_map(|ty| ty.iterable_element())
+    }
+
     pub(crate) fn reference_assignment<'a>(
         &'a self,
         sink: crate::schema::AssignmentSink<'a, crate::schema::Compiled>,
@@ -702,6 +708,7 @@ pub struct BindingIndex<'a, B: BindingAddress = RelativeBindingName> {
     entries: HashMap<String, BindingEntry<'a, B>>,
     module_argument_loops: HashMap<String, BindingEntry<'a, B>>,
     known_names: std::collections::HashSet<String>,
+    unavailable_upstreams: std::collections::HashSet<String>,
     resource_handles: HashMap<String, AttributeType>,
     /// Handle outputs are deliberately not inserted into a live composition
     /// until the expanded-graph seam can resolve them to complete resource
@@ -829,6 +836,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     {
         let mut entries = HashMap::new();
         let mut known_names = std::collections::HashSet::new();
+        let mut unavailable_upstreams = std::collections::HashSet::new();
         let mut resource_handles = HashMap::new();
         let mut pending_composition_handles: HashMap<
             B,
@@ -1058,6 +1066,8 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
                     .or_insert(BindingEntry {
                         target: BindingTarget::UpstreamState(exports),
                     });
+            } else {
+                unavailable_upstreams.insert(upstream.binding.to_string());
             }
         }
         let mut module_argument_loops = HashMap::new();
@@ -1101,6 +1111,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
             entries,
             module_argument_loops,
             known_names,
+            unavailable_upstreams,
             resource_handles,
             pending_composition_handles,
             registry,
@@ -1126,6 +1137,10 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
 
     pub(crate) fn provider_context(&self) -> &crate::parser::ProviderContext {
         &self.provider_context
+    }
+
+    pub(crate) fn upstream_is_unavailable(&self, name: &str) -> bool {
+        self.unavailable_upstreams.contains(name)
     }
 
     /// Consume assignment with this index's provider authority. Loaded paths
@@ -2413,7 +2428,7 @@ impl ResolvedBindings<ParserPlaceholder> {
         )
     }
 
-    fn build_validation<E, B: BindingAddress, Out: BindingAddress, D>(
+    pub(crate) fn build_validation<E, B: BindingAddress, Out: BindingAddress, D>(
         parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         mut map_value: impl FnMut(&Value<ParserPlaceholder, B>) -> Value<ParserPlaceholder, Out>,
         mut map_binding: impl FnMut(&B) -> Out,

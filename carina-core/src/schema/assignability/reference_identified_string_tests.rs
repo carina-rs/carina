@@ -30,12 +30,14 @@ fn assert_assignment(source: &AttributeType, target: &AttributeType, accepted: b
         source.resolved_type_name(),
         target.type_name(),
     );
-    let verdict = source.assignment_on_paths(
-        sink,
-        ReferenceAssignmentCheck::Full,
-        &mut Vec::new(),
-        &mut Vec::new(),
-    );
+    let verdict = source
+        .assignment_on_paths(
+            sink,
+            ReferenceAssignmentCheck::Full,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .for_destination();
     assert_eq!(
         !matches!(verdict, AssignmentRelation::Mismatch),
         accepted,
@@ -111,12 +113,14 @@ fn issue_4384_multi_owner_string_annotation_treats_reference_and_string_sources_
     // for these overlapping bounds, regardless of the source's scalar form.
     for source in [&source_string, &source_reference] {
         assert!(matches!(
-            TypeInSchema::schemaless(source).assignment_on_paths(
-                sink,
-                ReferenceAssignmentCheck::Full,
-                &mut Vec::new(),
-                &mut Vec::new(),
-            ),
+            TypeInSchema::schemaless(source)
+                .assignment_on_paths(
+                    sink,
+                    ReferenceAssignmentCheck::Full,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                )
+                .for_destination(),
             AssignmentRelation::NeedsLocal(None)
         ));
     }
@@ -136,12 +140,14 @@ fn issue_4384_original_reference_identity_evidence_is_rechecked() {
         TypeAssignability::Mismatch
     );
     assert!(matches!(
-        source.assignment_on_paths(
-            sink,
-            ReferenceAssignmentCheck::IdentifiedLeaves,
-            &mut Vec::new(),
-            &mut Vec::new()
-        ),
+        source
+            .assignment_on_paths(
+                sink,
+                ReferenceAssignmentCheck::IdentifiedLeaves,
+                &mut Vec::new(),
+                &mut Vec::new()
+            )
+            .for_destination(),
         AssignmentRelation::Mismatch
     ));
 }
@@ -169,12 +175,14 @@ fn issue_4384_reference_wire_scalar_flows_stay_accepted() {
     let sink =
         TypeInSchema::schemaless(&target).with_authority(&catalog, SinkAuthority::Owner(&owner));
     assert!(matches!(
-        TypeInSchema::schemaless(&source).assignment_on_paths(
-            sink,
-            ReferenceAssignmentCheck::Full,
-            &mut Vec::new(),
-            &mut Vec::new()
-        ),
+        TypeInSchema::schemaless(&source)
+            .assignment_on_paths(
+                sink,
+                ReferenceAssignmentCheck::Full,
+                &mut Vec::new(),
+                &mut Vec::new()
+            )
+            .for_destination(),
         AssignmentRelation::Assignable
     ));
 }
@@ -212,12 +220,14 @@ fn issue_4384_reference_identity_widening_requires_identity_bound_containment() 
             accepted,
             "{length:?}"
         );
-        let reference = source.assignment_on_paths(
-            sink,
-            ReferenceAssignmentCheck::Full,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        );
+        let reference = source
+            .assignment_on_paths(
+                sink,
+                ReferenceAssignmentCheck::Full,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .for_destination();
         assert!(
             matches!(
                 (reference, accepted),
@@ -249,12 +259,14 @@ fn issue_4384_reference_same_identity_defers_overlapping_destination_members() {
         TypeAssignability::Assignable
     );
     assert!(matches!(
-        TypeInSchema::schemaless(&source).assignment_on_paths(
-            sink,
-            ReferenceAssignmentCheck::Full,
-            &mut Vec::new(),
-            &mut Vec::new()
-        ),
+        TypeInSchema::schemaless(&source)
+            .assignment_on_paths(
+                sink,
+                ReferenceAssignmentCheck::Full,
+                &mut Vec::new(),
+                &mut Vec::new()
+            )
+            .for_destination(),
         AssignmentRelation::NeedsLocal(None)
     ));
 }
@@ -396,12 +408,14 @@ fn issue_4384_reference_widening_uses_only_the_sink_owners_edges() {
         );
         assert_eq!(
             !matches!(
-                source.assignment_on_paths(
-                    sink,
-                    ReferenceAssignmentCheck::Full,
-                    &mut Vec::new(),
-                    &mut Vec::new()
-                ),
+                source
+                    .assignment_on_paths(
+                        sink,
+                        ReferenceAssignmentCheck::Full,
+                        &mut Vec::new(),
+                        &mut Vec::new()
+                    )
+                    .for_destination(),
                 AssignmentRelation::Mismatch
             ),
             accepted,

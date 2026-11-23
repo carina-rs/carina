@@ -135,7 +135,8 @@ fn round5_generated_p1_covers_every_grammar_context() {
                 .iter()
                 .filter_map(|finding| match finding {
                     carina_core::validation::PresentedFinding::Conversion(error) => Some(error),
-                    carina_core::validation::PresentedFinding::Ordinary(_) => None,
+                    carina_core::validation::PresentedFinding::Ordinary(_)
+                    | carina_core::validation::PresentedFinding::FunctionPromise(_) => None,
                 })
                 .collect::<Vec<_>>();
             let expected = match context.placement {

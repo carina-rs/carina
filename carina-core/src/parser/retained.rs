@@ -72,6 +72,7 @@ pub(crate) use conversion::check as check_conversion;
 pub use conversion::{ConversionJudgement, TemplateDeferral};
 
 mod cursor;
+mod function_promises;
 pub use cursor::{
     AuthoredCursor, AuthoredSlots, AuthoredUse, CompletenessReport, EdgeRole, ExpansionInstanceId,
     JudgedNodeRef, JudgedSlot, NoAuthoredEvidence, NodeId, ProjectedPhase, ProjectionGeneration,
@@ -81,6 +82,7 @@ pub(crate) use cursor::{
     AuthoredForm, AuthoredNavigation, CursorKind, ProjectionAuthority, RowAttributes,
     SourceReference, SyntheticSource, ValidationProjection,
 };
+pub use function_promises::FunctionTypePromise;
 
 /// The existing authored walk owns source diagnostics for expressions that
 /// require its policy. This is diagnostic ownership, not an admission proof.
@@ -1539,6 +1541,36 @@ impl<'a, E, D, B: BindingAddress> JudgedFile<'a, E, D, B> {
     pub fn schemas(&self) -> &'a crate::schema::SchemaRegistry {
         self.schemas
     }
+    pub fn has_user_functions(&self) -> bool {
+        self.report()
+            .syntax_nodes
+            .values()
+            .any(|node| matches!(node.kind, ExprKind::Function { .. }))
+    }
+    /// Check unknown function-boundary values using the completed source index.
+    /// The authored judge has already typed each body with declared parameters.
+    pub fn function_type_promise_findings(
+        &self,
+        bindings: &crate::binding_index::BindingIndex<'_, B>,
+    ) -> Vec<Located<FunctionTypePromise>>
+    where
+        D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        if !self.has_user_functions() {
+            return Vec::new();
+        }
+        let values = crate::binding_index::ResolvedBindings::<ParserPlaceholder>::build_validation(
+            &self.file,
+            Clone::clone,
+            Clone::clone,
+        );
+        function_promises::check(
+            self.file.parser_binding_metadata.syntax().expressions(),
+            self.report(),
+            bindings,
+            &values,
+        )
+    }
     pub(crate) fn into_file(self) -> super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
         self.file
     }
@@ -1563,10 +1595,11 @@ where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     pub(crate) fn new(
-        mut file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         schemas: &'a crate::schema::SchemaRegistry,
         config: &super::ProviderContext,
     ) -> Self {
+        let mut file = file;
         judge_configuration(&mut file, schemas, config);
         Self {
             file,
@@ -1598,7 +1631,7 @@ pub(crate) fn judge_configuration<
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     prepare_slots(file, schemas);
-    let mut report = judge_expressions(file, schemas, config);
+    let mut report = judgement::judge_expressions(file, schemas, config);
     for parameter in &file.export_params {
         if let (Some(sink), Some(location)) =
             (parameter.type_expr_opt(), parameter.value_location())
@@ -3390,6 +3423,7 @@ mod judgement {
         BuiltinStringList(Classification),
         List(Classification),
         Map(Classification),
+        KeyedGroup(Classification),
         // Loop slots are inferred from the iterable, never annotated sources.
         LoopSlot,
     }
@@ -3403,14 +3437,15 @@ mod judgement {
                 | Self::BuiltinConstruction(knowledge)
                 | Self::BuiltinStringList(knowledge)
                 | Self::List(knowledge)
-                | Self::Map(knowledge) => knowledge,
+                | Self::Map(knowledge)
+                | Self::KeyedGroup(knowledge) => knowledge,
                 Self::Literal | Self::EnumIdentifier => Classification::Known,
                 Self::LoopSlot => Classification::Deferred,
             }
         }
     }
 
-    /// The intrinsic value shape does not depend on nominal identity or on
+    /// The intrinsic expression shape does not depend on nominal identity or on
     /// inferring a common element type. In particular an empty list still has
     /// a list shape, and a heterogeneous record is still a map.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3422,6 +3457,7 @@ mod judgement {
         Duration,
         List,
         Map,
+        KeyedGroup,
         Handle,
     }
 
@@ -3797,7 +3833,7 @@ mod judgement {
                 conversions: edges.sources(),
             }
         }
-        fn failed(&self) -> bool {
+        pub(crate) fn failed(&self) -> bool {
             self.data.failed()
         }
         pub(crate) fn statically_checked(&self) -> bool {
@@ -4072,6 +4108,10 @@ mod judgement {
         }
     }
     impl JudgedExprData {
+        pub(crate) fn origin(&self) -> Option<&ExpressionLocation> {
+            self.origin.as_ref()
+        }
+
         pub(crate) fn concrete(&self) -> bool {
             matches!(self.judgement, ExprJudgement::Typed { kind, .. }
                 if kind.knowledge() == Classification::Known)
@@ -4082,6 +4122,14 @@ mod judgement {
                         ..
                     }
                 )
+        }
+        pub(crate) fn known_empty_collection(&self) -> bool {
+            self.concrete()
+                && matches!(self.value_shape(), Some(ValueShape::List | ValueShape::Map))
+                && self.elements.is_empty()
+                && self.fields.is_empty()
+                && self.member.is_none()
+                && self.alternatives.is_empty()
         }
         fn failed(&self) -> bool {
             self.failure().is_some()
@@ -4256,6 +4304,14 @@ mod judgement {
                         shape: Some((CollectionKind::Map, _)),
                         ..
                     } => Some(ValueShape::Map),
+                    ExprJudgement::Typed {
+                        kind: InferredKind::KeyedGroup(_),
+                        ..
+                    }
+                    | ExprJudgement::ValueDependent {
+                        shape: Some((CollectionKind::KeyedGroup, _)),
+                        ..
+                    } => Some(ValueShape::KeyedGroup),
                     ExprJudgement::Rejected { source, .. } => collection_shape(source),
                     _ => None,
                 }
@@ -4268,7 +4324,17 @@ mod judgement {
                 .map(ToString::to_string)
                 .unwrap_or_else(|_| {
                     self.value_shape()
-                        .map(|shape| format!("{shape:?}"))
+                        .map(|shape| match shape {
+                            ValueShape::String => "string".into(),
+                            ValueShape::Int => "int".into(),
+                            ValueShape::Float => "float".into(),
+                            ValueShape::Bool => "bool".into(),
+                            ValueShape::Duration => "duration".into(),
+                            ValueShape::List => "list".into(),
+                            ValueShape::Map => "map".into(),
+                            ValueShape::KeyedGroup => "keyed loop group".into(),
+                            ValueShape::Handle => "handle".into(),
+                        })
                         .unwrap_or_else(|| "value-dependent expression".into())
                 })
         }
@@ -4349,6 +4415,10 @@ mod judgement {
                         shape: Some((CollectionKind::Map, knowledge)),
                         ..
                     } => Some(InferredKind::Map(*knowledge)),
+                    ExprJudgement::ValueDependent {
+                        shape: Some((CollectionKind::KeyedGroup, knowledge)),
+                        ..
+                    } => Some(InferredKind::KeyedGroup(*knowledge)),
                     _ => None,
                 }
             }
@@ -4422,6 +4492,7 @@ mod judgement {
                     Some(CollectionKind::List)
                 }
                 Some(InferredKind::Map(_)) => Some(CollectionKind::Map),
+                Some(InferredKind::KeyedGroup(_)) => Some(CollectionKind::KeyedGroup),
                 _ => None,
             }
         }
@@ -4431,6 +4502,8 @@ mod judgement {
     pub enum CollectionKind {
         List,
         Map,
+        /// A structural loop group with string subscripts, never a map value.
+        KeyedGroup,
     }
 
     /// The validator responsible for a diagnostic. This does not change
@@ -4620,6 +4693,23 @@ mod judgement {
             return Ok(mode.value_check());
         }
         if let TypeExpr::Union(members) = sink {
+            // Function boundaries compare whole declared unions. Requiring
+            // the source union to fit a single destination arm loses proof.
+            if context == AdmissionContext::Function
+                && expression.requires_declared_assignment()
+                && ty.is_some_and(|actual| {
+                    matches!(
+                        crate::validation::typecheck::inferred_type_assignment(
+                            sink,
+                            actual,
+                            &config.custom_types,
+                        ),
+                        crate::schema::TypeAssignability::Assignable
+                    )
+                })
+            {
+                return Ok(mode.value_check());
+            }
             if expression.requires_declared_assignment()
                 && ty == Some(&TypeExpr::String)
                 && !members.is_empty()
@@ -4678,7 +4768,8 @@ mod judgement {
                             })
                     })
                     .collect::<Result<_, _>>()?,
-                (CollectionKind::List | CollectionKind::Map, _) => {
+                (CollectionKind::KeyedGroup, _)
+                | (CollectionKind::List | CollectionKind::Map, _) => {
                     return Err(assignment_error(&expression, sink).into());
                 }
             };
@@ -6755,36 +6846,75 @@ mod judgement {
                 }
                 return alternatives(ty.cloned(), &candidates);
             };
-            let selected = match step {
-                PathSegment::Subscript {
-                    index: crate::resource::Subscript::Int { index },
-                } => usize::try_from(*index).ok().and_then(|index| {
-                    base.elements.get(index).or_else(|| {
+            let shape = base.value_shape();
+            let selected = match shape {
+                Some(ValueShape::KeyedGroup) => match step {
+                    PathSegment::Subscript {
+                        index: crate::resource::Subscript::Str { .. },
+                    } => base.member.as_deref(),
+                    PathSegment::Field { .. }
+                    | PathSegment::Subscript {
+                        index: crate::resource::Subscript::Int { .. },
+                    } => None,
+                },
+                Some(
+                    ValueShape::String
+                    | ValueShape::Int
+                    | ValueShape::Float
+                    | ValueShape::Bool
+                    | ValueShape::Duration
+                    | ValueShape::List
+                    | ValueShape::Map
+                    | ValueShape::Handle,
+                )
+                | None => match step {
+                    PathSegment::Subscript {
+                        index: crate::resource::Subscript::Int { index },
+                    } => usize::try_from(*index).ok().and_then(|index| {
+                        base.elements.get(index).or_else(|| {
+                            base.member
+                                .as_deref()
+                                .filter(|_| base.value_shape() == Some(ValueShape::List))
+                        })
+                    }),
+                    PathSegment::Subscript {
+                        index: crate::resource::Subscript::Str { key },
+                    } => base.fields.get(key.expose_plaintext()).or_else(|| {
                         base.member
                             .as_deref()
-                            .filter(|_| base.value_shape() == Some(ValueShape::List))
-                    })
-                }),
-                PathSegment::Subscript {
-                    index: crate::resource::Subscript::Str { key },
-                } => base.fields.get(key.expose_plaintext()).or_else(|| {
-                    base.member
-                        .as_deref()
-                        .filter(|_| base.value_shape() == Some(ValueShape::Map))
-                }),
-                PathSegment::Field { name } => base.fields.get(name).or_else(|| {
-                    base.member
-                        .as_deref()
-                        .filter(|_| base.value_shape() == Some(ValueShape::Map))
-                }),
+                            .filter(|_| base.value_shape() == Some(ValueShape::Map))
+                    }),
+                    PathSegment::Field { name } => base.fields.get(name).or_else(|| {
+                        base.member
+                            .as_deref()
+                            .filter(|_| base.value_shape() == Some(ValueShape::Map))
+                    }),
+                },
             };
             if let Some(selected) = selected {
                 return InferredExpr::from(selected);
             }
-            let ty = base
-                .static_type()
-                .cloned()
-                .and_then(|ty| self.narrow_declared(&ty, std::slice::from_ref(step), binding));
+            let ty = match shape {
+                Some(ValueShape::KeyedGroup) => Err(InferenceError::InvalidAccess {
+                    base_type: "keyed loop group".into(),
+                    step: step.clone(),
+                }
+                .into()),
+                Some(
+                    ValueShape::String
+                    | ValueShape::Int
+                    | ValueShape::Float
+                    | ValueShape::Bool
+                    | ValueShape::Duration
+                    | ValueShape::List
+                    | ValueShape::Map
+                    | ValueShape::Handle,
+                )
+                | None => base
+                    .static_type()
+                    .cloned()
+                    .and_then(|ty| self.narrow_declared(&ty, std::slice::from_ref(step), binding)),
+            };
             let mut result = declared(ty, base.concrete());
             result.report_at(
                 if base.check_owner() == ExpressionCheckOwner::BindingIndex {
@@ -7371,7 +7501,7 @@ mod judgement {
                     }
                     result
                 }
-                ExprKind::For { .. } => {
+                ExprKind::For { binding, bound, .. } => {
                     if let Some(collection) = children.first()
                         && collection.value_shape().is_some_and(|shape| {
                             !matches!(shape, ValueShape::List | ValueShape::Map)
@@ -7395,13 +7525,26 @@ mod judgement {
                     let Some(body) = children.last() else {
                         return incomplete("for body");
                     };
-                    let mut result = collection(
-                        body.static_type()
-                            .cloned()
-                            .map(|ty| TypeExpr::List(Box::new(ty))),
-                        CollectionKind::List,
-                        false,
-                    );
+                    let mut result = match (binding, *bound) {
+                        (super::super::ForBinding::Indexed(_, _), _)
+                        | (super::super::ForBinding::Simple(_), false) => collection(
+                            body.static_type()
+                                .cloned()
+                                .map(|ty| TypeExpr::List(Box::new(ty))),
+                            CollectionKind::List,
+                            false,
+                        ),
+                        (super::super::ForBinding::Map(_, _), _)
+                        | (super::super::ForBinding::Simple(_), true) => collection(
+                            Err(InferenceIssue::NotInferable(
+                                NotInferableReason::ValueDependent {
+                                    reason: "keyed loop group is not a value".into(),
+                                },
+                            )),
+                            CollectionKind::KeyedGroup,
+                            false,
+                        ),
+                    };
                     result.data_mut().member = Some(Arc::new(body.clone()));
                     result
                 }
@@ -7734,8 +7877,13 @@ mod judgement {
         result.set_kind(|knowledge| match shape {
             CollectionKind::List => InferredKind::List(knowledge),
             CollectionKind::Map => InferredKind::Map(knowledge),
+            CollectionKind::KeyedGroup => InferredKind::KeyedGroup(knowledge),
         });
-        result.report_at(FailureOwner::Boundary);
+        result.report_at(match shape {
+            // Binding-scope validation owns structural group value errors.
+            CollectionKind::KeyedGroup => FailureOwner::BindingScope,
+            CollectionKind::List | CollectionKind::Map => FailureOwner::Boundary,
+        });
         result
     }
 

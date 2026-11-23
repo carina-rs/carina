@@ -212,6 +212,7 @@ mod assignment;
 pub mod attributes;
 pub mod configuration;
 pub mod final_input;
+pub(crate) mod static_judgement;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
