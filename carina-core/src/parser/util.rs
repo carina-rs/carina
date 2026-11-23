@@ -67,9 +67,7 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Deferred(DeferredValue::IntegerArithmetic(_)) => "int",
         Value::Deferred(DeferredValue::Interpolation(_)) => "string",
         Value::Deferred(
-            DeferredValue::FunctionCall { .. }
-            | DeferredValue::ResolvedFunctionCall { .. }
-            | DeferredValue::ProvisionalFunctionCall { .. },
+            DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
         ) => "function call",
         Value::Deferred(DeferredValue::Unavailable { .. }) => "unavailable function result",
         Value::Deferred(DeferredValue::Access(_)) => "access expression",

@@ -1592,8 +1592,7 @@ fn contains_pending_reread(value: &Value) -> bool {
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. }
-            | DeferredValue::ProvisionalFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => args
             .iter()
             .any(|argument| contains_pending_reread(argument.walker_value())),
@@ -1863,10 +1862,7 @@ fn has_observable_content(value: &Value) -> bool {
         | Value::Deferred(DeferredValue::IntegerArithmetic(_))
         | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::FunctionCall { .. })
-        | Value::Deferred(
-            DeferredValue::ResolvedFunctionCall { .. }
-            | DeferredValue::ProvisionalFunctionCall { .. },
-        )
+        | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
         | Value::Deferred(DeferredValue::Access(_))
         | Value::Deferred(DeferredValue::Unknown(_))
         | Value::Deferred(DeferredValue::Unavailable { .. }) => true,

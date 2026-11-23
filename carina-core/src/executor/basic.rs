@@ -538,18 +538,6 @@ fn unresolved_attribute_diagnostic(
                 value,
             ))
         }
-        Value::Deferred(DeferredValue::ProvisionalFunctionCall { function, .. }) => {
-            let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
-            Some(unresolved_binding_message(
-                attribute_key,
-                UnresolvedSite::FunctionCall {
-                    name: function.name.clone(),
-                },
-                leaf,
-                bindings,
-                value,
-            ))
-        }
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
             let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
             Some(unresolved_binding_message(
@@ -719,8 +707,7 @@ fn collect_unresolved_bindings<'a>(
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. }
-            | DeferredValue::ProvisionalFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for a in args {
                 collect_unresolved_bindings(a.walker_value(), scope, out);

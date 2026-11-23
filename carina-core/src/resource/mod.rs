@@ -2799,7 +2799,6 @@ fn select_classified_segment<P: PlaceholderKind, B: BindingAddress>(
                     | DeferredValue::FunctionCall { .. }
                     | DeferredValue::Unavailable { .. }
                     | DeferredValue::ResolvedFunctionCall { .. }
-                    | DeferredValue::ProvisionalFunctionCall { .. }
                     | DeferredValue::Access(_)
                     | DeferredValue::Unknown(_)
                     | DeferredValue::Placeholder(_),
@@ -4107,20 +4106,25 @@ pub enum DeferredValue<P: ValueShape = NoPlaceholder, B: BindingAddress = Absolu
     ///         };
     /// }
     /// ```
+    /// There is no raw-scope deferred-call escape hatch.
+    ///
+    /// ```compile_fail,E0599
+    /// use carina_core::parser::UserFunction;
+    /// use carina_core::resource::{DeferredValue, ParserPlaceholder, RelativeBindingName};
+    /// use indexmap::IndexMap;
+    /// use std::sync::Arc;
+    /// fn capture(function: Arc<UserFunction>, functions: Arc<IndexMap<String, UserFunction>>) {
+    ///     let _: DeferredValue<ParserPlaceholder, RelativeBindingName> =
+    ///         DeferredValue::ProvisionalFunctionCall {
+    ///             function, functions, args: Vec::new(), source_line: 1.into(),
+    ///         };
+    /// }
+    /// ```
     ResolvedFunctionCall {
         function: std::sync::Arc<crate::parser::ClassifiedUserFunction<B>>,
         /// Lexical function scope captured with `function`. Function bodies
         /// may call sibling helpers after this outer call is deferred.
         functions: std::sync::Arc<crate::parser::ClassifiedUserFunctions<B>>,
-        args: Vec<FunctionArgument<P, B>>,
-        source_line: DiagnosticSourceLine,
-    },
-    /// A declaration-bootstrap call. Its unresolved definitions are retained
-    /// only while discovering bindings; final parsing rebuilds the call with
-    /// classified callees and a classified lexical scope.
-    ProvisionalFunctionCall {
-        function: std::sync::Arc<crate::parser::UserFunction<B>>,
-        functions: std::sync::Arc<IndexMap<String, crate::parser::UserFunction<B>>>,
         args: Vec<FunctionArgument<P, B>>,
         source_line: DiagnosticSourceLine,
     },
@@ -4156,7 +4160,6 @@ impl<P: ValueKind, B: BindingAddress> DeferredValue<P, B> {
             | Self::IntegerArithmetic(_)
             | Self::Interpolation(_)
             | Self::ResolvedFunctionCall { .. }
-            | Self::ProvisionalFunctionCall { .. }
             | Self::Access(_)
             | Self::Secret(_)
             | Self::Unknown(_)
@@ -4558,12 +4561,6 @@ where
                 }
                 .serialize(serializer)
             }
-            Self::ProvisionalFunctionCall { function, .. } => {
-                Err(serde::ser::Error::custom(format!(
-                    "deferred user-function call '{}' cannot be serialized before evaluation",
-                    function.name
-                )))
-            }
             Self::ResolvedFunctionCall { function, .. } => Err(serde::ser::Error::custom(format!(
                 "deferred user-function call '{}' cannot be serialized before evaluation",
                 function.name
@@ -4888,17 +4885,6 @@ impl<P: ValueShape, B: BindingAddress> fmt::Debug for DeferredValue<P, B> {
                 .field("name", name)
                 .field("args", args)
                 .field("reason", reason)
-                .field("source_line", source_line)
-                .finish(),
-            Self::ProvisionalFunctionCall {
-                function,
-                args,
-                source_line,
-                functions: _,
-            } => f
-                .debug_struct("ProvisionalFunctionCall")
-                .field("name", &function.name)
-                .field("args", args)
                 .field("source_line", source_line)
                 .finish(),
             Self::ResolvedFunctionCall {
@@ -5333,8 +5319,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
                 | DeferredValue::Unavailable { args, .. }
-                | DeferredValue::ResolvedFunctionCall { args, .. }
-                | DeferredValue::ProvisionalFunctionCall { args, .. },
+                | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => args.iter().any(|argument| {
                 argument
                     .walker_value()
@@ -5453,16 +5438,6 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                     name: *name,
                     args,
                     reason,
-                    source_line: source_line.nonzero(),
-                },
-                DeferredValue::ProvisionalFunctionCall {
-                    function,
-                    args,
-                    source_line,
-                    ..
-                } => DeferredValueRef::FunctionCall {
-                    name: &function.name,
-                    args,
                     source_line: source_line.nonzero(),
                 },
                 DeferredValue::ResolvedFunctionCall {
@@ -6456,12 +6431,6 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                     args: _,
                     source_line: _,
                 }
-                | DeferredValue::ProvisionalFunctionCall {
-                    function: _,
-                    functions: _,
-                    args: _,
-                    source_line: _,
-                }
                 | DeferredValue::Access(_)
                 | DeferredValue::Unknown(_)
                 | DeferredValue::Placeholder(_),
@@ -6521,8 +6490,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
                 | DeferredValue::Unavailable { args, .. }
-                | DeferredValue::ResolvedFunctionCall { args, .. }
-                | DeferredValue::ProvisionalFunctionCall { args, .. },
+                | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => {
                 for argument in args {
                     argument.operand.visit_values(&mut |value| {
@@ -6675,20 +6643,6 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                     .map(|argument| map_argument(argument, map))
                     .collect::<Result<_, _>>()?,
                 reason,
-                source_line,
-            }),
-            Self::Deferred(DeferredValue::ProvisionalFunctionCall {
-                function,
-                functions,
-                args,
-                source_line,
-            }) => Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-                function,
-                functions,
-                args: args
-                    .into_iter()
-                    .map(|argument| map_argument(argument, map))
-                    .collect::<Result<_, _>>()?,
                 source_line,
             }),
             Self::Deferred(DeferredValue::ResolvedFunctionCall {
@@ -7059,27 +7013,6 @@ impl<P: ValueKind, B: BindingAddress> DeferredValue<P, B> {
                 reason,
                 source_line,
             },
-            DeferredValue::ProvisionalFunctionCall {
-                function,
-                functions,
-                args,
-                source_line,
-            } => {
-                let function = (*function).clone().map_bindings(map);
-                let functions = functions
-                    .iter()
-                    .map(|(name, function)| (name.clone(), function.clone().map_bindings(map)))
-                    .collect();
-                DeferredValue::ProvisionalFunctionCall {
-                    function: Arc::new(function),
-                    functions: Arc::new(functions),
-                    args: args
-                        .into_iter()
-                        .map(|argument| argument.map_bindings(map))
-                        .collect(),
-                    source_line,
-                }
-            }
             DeferredValue::ResolvedFunctionCall {
                 function,
                 functions,
@@ -7254,20 +7187,6 @@ impl<P: ValueKind + PartialEq, B: BindingAddress> PartialEq for Value<P, B> {
                 Value::Deferred(DeferredValue::Interpolation(a)),
                 Value::Deferred(DeferredValue::Interpolation(b)),
             ) => a == b,
-            (
-                Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-                    function: af,
-                    args: aa,
-                    source_line: al,
-                    functions: _,
-                }),
-                Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-                    function: bf,
-                    args: ba,
-                    source_line: bl,
-                    functions: _,
-                }),
-            ) => af.name == bf.name && aa == ba && al == bl,
             (
                 Value::Deferred(DeferredValue::ResolvedFunctionCall {
                     function: af,
@@ -7470,8 +7389,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
                 | DeferredValue::Unavailable { args, .. }
-                | DeferredValue::ResolvedFunctionCall { args, .. }
-                | DeferredValue::ProvisionalFunctionCall { args, .. },
+                | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => {
                 for arg in args {
                     arg.walker_value_mut().canonicalize_in_place();
@@ -7607,8 +7525,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
                 | DeferredValue::Unavailable { args, .. }
-                | DeferredValue::ResolvedFunctionCall { args, .. }
-                | DeferredValue::ProvisionalFunctionCall { args, .. },
+                | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => {
                 for arg in args {
                     arg.walker_value()
@@ -7730,8 +7647,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
                 | DeferredValue::Unavailable { args, .. }
-                | DeferredValue::ResolvedFunctionCall { args, .. }
-                | DeferredValue::ProvisionalFunctionCall { args, .. },
+                | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => {
                 for arg in args {
                     arg.walker_value().visit_binding_refs_in_scope(scope, f);
@@ -7833,8 +7749,7 @@ pub fn value_contains_unknown<P: ValueKind, B: BindingAddress>(value: &Value<P, 
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. }
-            | DeferredValue::ProvisionalFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => args
             .iter()
             .any(|argument| value_contains_unknown(argument.walker_value())),
@@ -7970,13 +7885,6 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 | DeferredValue::Unavailable { name, args, .. },
             ) => {
                 name.hash(hasher);
-                args.len().hash(hasher);
-                for arg in args {
-                    arg.walker_value().hash_into(hasher);
-                }
-            }
-            Value::Deferred(DeferredValue::ProvisionalFunctionCall { function, args, .. }) => {
-                function.name.hash(hasher);
                 args.len().hash(hasher);
                 for arg in args {
                     arg.walker_value().hash_into(hasher);
@@ -10762,12 +10670,6 @@ fn unresolved_value_error<P: PlaceholderKind>(
             name: name.to_string(),
             context,
         }),
-        Value::Deferred(DeferredValue::ProvisionalFunctionCall { function, .. }) => {
-            Err(crate::value::SerializationError::UnresolvedFunctionCall {
-                name: function.name.clone(),
-                context,
-            })
-        }
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
             Err(crate::value::SerializationError::UnresolvedFunctionCall {
                 name: function.name.clone(),

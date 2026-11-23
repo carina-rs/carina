@@ -536,24 +536,6 @@ fn stamp_unresolved_upstream(
                 .collect::<Result<Vec<_>, _>>()?,
             source_line,
         }),
-        Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-            function,
-            functions,
-            args,
-            source_line,
-        }) => Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-            function,
-            functions,
-            args: args
-                .iter()
-                .map(|argument| {
-                    argument.try_map_value(|value| {
-                        stamp_unresolved_upstream(value.clone(), upstream_binding_names)
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            source_line,
-        }),
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,
@@ -1084,7 +1066,6 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
                             | DeferredValue::IntegerArithmetic(_)
                             | DeferredValue::FunctionCall { .. }
                             | DeferredValue::ResolvedFunctionCall { .. }
-                            | DeferredValue::ProvisionalFunctionCall { .. }
                             | DeferredValue::BindingRef { .. }
                             | DeferredValue::Access(_)
                             | DeferredValue::Unknown(_)
@@ -1164,7 +1145,6 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
             | DeferredValue::IntegerArithmetic(_)
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
-            | DeferredValue::ProvisionalFunctionCall { .. }
             | DeferredValue::Secret(_),
         ) => {
             let resolved = resolve_ref_value_inner(value, bindings, config)?;
@@ -1246,8 +1226,8 @@ fn function_annotation_site<B: BindingAddress>(
     ProviderTypeCheckSite::new(location.clone(), context)
 }
 
-fn evaluate_runtime_user_function<B: BindingAddress>(
-    function: &crate::parser::UserFunction<B>,
+fn evaluate_captured_user_function<B: BindingAddress>(
+    function: &crate::parser::ClassifiedUserFunction<B>,
     args: &[crate::resource::FunctionArgument<crate::resource::ParserPlaceholder, B>],
     bindings: &ResolvedBindings<crate::resource::ParserPlaceholder, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
@@ -1414,7 +1394,7 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
 }
 
 pub(crate) fn evaluate_module_resolved_user_function(
-    function: &crate::parser::UserFunction<AbsoluteBindingAddress>,
+    function: &crate::parser::ClassifiedUserFunction<AbsoluteBindingAddress>,
     arguments: &[crate::resource::FunctionArgument<
         crate::resource::ParserPlaceholder,
         AbsoluteBindingAddress,
@@ -1425,7 +1405,7 @@ pub(crate) fn evaluate_module_resolved_user_function(
     Value<crate::resource::ParserPlaceholder, AbsoluteBindingAddress>,
     crate::parser::ParseError,
 > {
-    evaluate_runtime_user_function(
+    evaluate_captured_user_function(
         function,
         arguments,
         &ResolvedBindings::default(),
@@ -1610,65 +1590,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
         Value::Deferred(DeferredValue::Unavailable { name, reason, .. }) => {
             Err(format!("{name}(): {reason}").into())
         }
-        Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-            function,
-            functions,
-            args,
-            source_line,
-        }) => {
-            let session = match config {
-                RuntimeContext::Session(session) => session,
-                RuntimeContext::Projection(_context) => return Ok(value.clone()),
-            };
 
-            // Declaration resolution already owns this failure. Preserve the
-            // call just as the parser's pending-function path does.
-            if session.function_declaration_failed(function) {
-                return Ok(value.clone());
-            }
-
-            let resolved_args = resolve_function_arguments(args, bindings, config)?;
-            if !resolved_args.iter().all(|argument| {
-                argument.handle().is_some()
-                    || argument.value().is_some_and(|value| {
-                        value
-                            .knowledge(&crate::resource::knowledge::KnowledgeContext::plan(
-                                bindings,
-                            ))
-                            .map(|proof| proof.into_classification())
-                            .is_ok_and(|knowledge| knowledge.into_known().is_ok())
-                    })
-            }) {
-                return Ok(Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-                    function: function.clone(),
-                    functions: functions.clone(),
-                    args: resolved_args,
-                    source_line: *source_line,
-                }));
-            }
-
-            let Some(parser_args) = parser_stage_function_arguments(&resolved_args) else {
-                return Ok(Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-                    function: function.clone(),
-                    functions: functions.clone(),
-                    args: resolved_args,
-                    source_line: *source_line,
-                }));
-            };
-            let evaluated = evaluate_runtime_user_function(
-                function,
-                &parser_args,
-                &ResolvedBindings::default(),
-                session,
-                source_line.get().unwrap_or(function.body.source_line),
-            )
-            .map_err(ResolutionError::from)?;
-            let evaluated = evaluated
-                .into_expanded()
-                .map(Value::into_placeholder_type)
-                .map_err(|error| error.to_string())?;
-            resolve_ref_value_inner(&evaluated, bindings, config)
-        }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,
@@ -1714,7 +1636,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                     source_line: *source_line,
                 }));
             };
-            let evaluated = evaluate_runtime_user_function(
+            let evaluated = evaluate_captured_user_function(
                 function,
                 &parser_args,
                 &ResolvedBindings::default(),
@@ -5086,7 +5008,7 @@ mod runtime_provider_type_tests {
             };
             let error =
                 crate::validation::deferred_types::with_session_for_test(&loaded, |session| {
-                    evaluate_runtime_user_function(&function, &arguments, &bindings, session, 8)
+                    evaluate_captured_user_function(&function, &arguments, &bindings, session, 8)
                 })
                 .unwrap_err();
             assert!(error.to_string().contains("rejected by ready"), "{error}");
@@ -5098,7 +5020,7 @@ mod runtime_provider_type_tests {
             };
             let error =
                 crate::validation::deferred_types::with_session_for_test(&partial, |session| {
-                    evaluate_runtime_user_function(&function, &arguments, &bindings, session, 8)
+                    evaluate_captured_user_function(&function, &arguments, &bindings, session, 8)
                 })
                 .unwrap_err();
             assert!(error.to_string().contains("rejected by ready"), "{error}");
@@ -5106,7 +5028,7 @@ mod runtime_provider_type_tests {
             let result = crate::validation::deferred_types::TypeCheckSession::run(
                 &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 |unloaded| {
-                    evaluate_runtime_user_function(&function, &arguments, &bindings, unloaded, 8)
+                    evaluate_captured_user_function(&function, &arguments, &bindings, unloaded, 8)
                         .unwrap();
                 },
             );

@@ -137,12 +137,6 @@ fn for_each_storage_child<'a, P: ValueShape, B: BindingAddress>(
                 functions: _,
                 args,
                 source_line: _,
-            }
-            | DeferredValue::ProvisionalFunctionCall {
-                function: _,
-                functions: _,
-                args,
-                source_line: _,
             } => {
                 for arg in args {
                     argument(arg, &mut enqueue);
@@ -291,17 +285,6 @@ impl<P: ValueShape, Q: ValueShape, B: BindingAddress> Copier<'_, P, Q, B> {
                     name: *name,
                     args: args.iter().map(|a| self.argument(a, child)).collect(),
                     reason: reason.clone(),
-                    source_line: *source_line,
-                },
-                DeferredValue::ProvisionalFunctionCall {
-                    function,
-                    functions,
-                    args,
-                    source_line,
-                } => DeferredValue::ProvisionalFunctionCall {
-                    function: function.clone(),
-                    functions: functions.clone(),
-                    args: args.iter().map(|a| self.argument(a, child)).collect(),
                     source_line: *source_line,
                 },
                 DeferredValue::ResolvedFunctionCall {
@@ -689,14 +672,7 @@ fn same_deferred<B: BindingAddress>(
         } => {
             matches!(b,DeferredValue::Unavailable {name:b,args:ba,source_line:bl,reason:br} if a==b && al.get()==bl.get() && ar==br && same_slice(aa,ba,same_argument))
         }
-        DeferredValue::ProvisionalFunctionCall {
-            function: a,
-            functions: af,
-            args: aa,
-            source_line: al,
-        } => {
-            matches!(b,DeferredValue::ProvisionalFunctionCall {function:b,functions:bf,args:ba,source_line:bl} if al.get()==bl.get() && same_function(a,b) && af.len()==bf.len() && af.iter().zip(bf.iter()).all(|((ak,av),(bk,bv))| ak==bk && same_function(av,bv)) && same_slice(aa,ba,same_argument))
-        }
+
         DeferredValue::ResolvedFunctionCall {
             function: a,
             functions: af,

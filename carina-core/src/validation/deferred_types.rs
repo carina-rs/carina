@@ -1150,7 +1150,6 @@ mod producer_tests {
                     .and_then(crate::parser::BoundaryExpression::value),
                 Some(crate::resource::Value::Deferred(
                     crate::resource::DeferredValue::ResolvedFunctionCall { .. }
-                        | crate::resource::DeferredValue::ProvisionalFunctionCall { .. }
                 ))
             ),
             "a sessionless pass must preserve the annotation and its handle argument"

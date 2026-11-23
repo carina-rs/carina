@@ -2257,12 +2257,6 @@ fn deferred_value_variant<P: crate::resource::ValueKind>(value: &DeferredValue<P
             reason: _reason,
             source_line: _source_line,
         } => "Unavailable",
-        DeferredValue::ProvisionalFunctionCall {
-            function: _function,
-            functions: _functions,
-            args: _args,
-            source_line: _source_line,
-        } => "ProvisionalFunctionCall",
         DeferredValue::ResolvedFunctionCall {
             function: _function,
             functions: _functions,

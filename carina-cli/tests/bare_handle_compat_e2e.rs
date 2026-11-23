@@ -551,6 +551,51 @@ fn indexed_loop_dot_reader_is_list_access_error_in_every_position() {
 }
 
 #[test]
+fn deferred_loop_function_value_chain_dot_matches_subscript() {
+    let fixture = loop_reader_fixture("");
+    let mut observations = Vec::new();
+    for reader in ["children.a.name", "children['a'].name"] {
+        write_file(
+            fixture.path(),
+            "main.crn",
+            &format!(
+                "let children = for k, v in ({{ a = 'x' }}) {{ mock.test.resource {{ name = k }} }}\n\
+                 let up = mock.test.resource {{ name = 'u' }}\n\
+                 fn sel(x: String): String {{ \"${{x}}-${{{reader}}}\" }}\n\
+                 let a = sel(up.name)\n\
+                 let b = length(a)\n\
+                 let c = \"${{a}}\"\n\
+                 let r = mock.test.resource {{ name = c comment = \"${{b}}\" }}\n"
+            ),
+        );
+        let validate = run(fixture.path(), &["validate", "."]);
+        assert_eq!(
+            validate.status.code(),
+            Some(1),
+            "{}",
+            output_text(&validate)
+        );
+        let validation = output_text(&validate);
+        assert_eq!(
+            validation
+                .matches("missing dependency edge to children.a provenance")
+                .count(),
+            2,
+            "{reader}: {validation}",
+        );
+        let plan = run(fixture.path(), &["plan", "--json", "."]);
+        assert_eq!(plan.status.code(), Some(1), "{}", output_text(&plan));
+        let planning = output_text(&plan);
+        assert_eq!(
+            planning, "Error: missing dependency edge to children.a provenance in ./main.crn\n",
+            "{reader}",
+        );
+        observations.push((validation, planning));
+    }
+    assert_eq!(observations[0], observations[1]);
+}
+
+#[test]
 fn keyed_loop_dot_plan_json_matches_subscript() {
     let mut failures = Vec::new();
     for (kind, source, subscript) in LOOP_READER_CASES.into_iter().take(2) {

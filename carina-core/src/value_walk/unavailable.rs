@@ -160,12 +160,6 @@ impl Algebra<Inspect> for UnavailableSearch {
                     args: _,
                     source_line: _,
                 }
-                | Parts::ProvisionalCall {
-                    function: _,
-                    functions: _,
-                    args: _,
-                    source_line: _,
-                }
                 | Parts::Access(_)
                 | Parts::Evidence { value: _, edge: _ } => None,
             }

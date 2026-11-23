@@ -378,12 +378,6 @@ impl<'a, B: BindingAddress, R: ParserRewrite<B>> ParserTransform<'a, R, R::Error
                     args: _,
                     source_line: _,
                 }
-                | Parts::ProvisionalCall {
-                    function: _,
-                    functions: _,
-                    args: _,
-                    source_line: _,
-                }
                 | Parts::Evidence { value: _, edge: _ }) => {
                     let replacements = self.replacements;
                     let mut product = parts.transform(at, self, |_| ())?;
@@ -473,12 +467,6 @@ impl<B: BindingAddress, R: ParserRewrite<B>> BoundTransform<ParserPlaceholder, B
                 source_line,
             }
             | Parts::ResolvedCall {
-                function: _,
-                functions: _,
-                args: _,
-                source_line,
-            }
-            | Parts::ProvisionalCall {
                 function: _,
                 functions: _,
                 args: _,

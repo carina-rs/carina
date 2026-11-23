@@ -520,23 +520,7 @@ fn rewrite_handle_output_refs<P: PlaceholderKind>(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rewritten)
         }
-        Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-            function,
-            functions,
-            args,
-            source_line,
-        }) => Ok(Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-            function: function.clone(),
-            functions: functions.clone(),
-            args: args
-                .iter()
-                .map(|argument| {
-                    argument
-                        .try_map_value(|value| rewrite_handle_output_refs(value, outputs, owner))
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            source_line: *source_line,
-        })),
+
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,

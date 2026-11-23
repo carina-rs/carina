@@ -1113,8 +1113,7 @@ fn require_integer_operator_provenance<P: ValueKind, B: BindingAddress>(
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. }
-            | DeferredValue::ProvisionalFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for argument in args {
                 check(argument.walker_value())?;
@@ -1186,7 +1185,6 @@ where
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
-            | DeferredValue::ProvisionalFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
@@ -3805,8 +3803,13 @@ mod diagnostic_order_tests {
         .into_parsed();
         let annotations = parsed
             .user_functions
-            .iter_mut()
-            .map(|(name, function)| (name.clone(), std::mem::take(&mut function.type_annotations)))
+            .values_mut()
+            .map(|function| {
+                (
+                    function.name.clone(),
+                    std::mem::take(&mut function.type_annotations),
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             annotations

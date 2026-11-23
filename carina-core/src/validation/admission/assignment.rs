@@ -190,7 +190,6 @@ impl<B: BindingAddress> CandidateOrigin<B> {
                 | DeferredValue::FunctionCall { .. }
                 | DeferredValue::Unavailable { .. }
                 | DeferredValue::ResolvedFunctionCall { .. }
-                | DeferredValue::ProvisionalFunctionCall { .. }
                 | DeferredValue::Access(_)
                 | DeferredValue::Secret(_)
                 | DeferredValue::Unknown(_),

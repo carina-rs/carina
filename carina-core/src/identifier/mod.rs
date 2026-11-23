@@ -299,10 +299,7 @@ fn value_has_authored_plan_time_expression<P: PlaceholderKind, B: BindingAddress
             })
         }
         Value::Deferred(DeferredValue::FunctionCall { args, .. })
-        | Value::Deferred(
-            DeferredValue::ResolvedFunctionCall { args, .. }
-            | DeferredValue::ProvisionalFunctionCall { args, .. },
-        ) => args
+        | Value::Deferred(DeferredValue::ResolvedFunctionCall { args, .. }) => args
             .iter()
             .all(|argument| value_has_authored_plan_time_expression(argument.walker_value())),
         Value::Deferred(DeferredValue::Access(access)) => {
@@ -2015,13 +2012,7 @@ fn deterministic_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
                 .collect();
             format!("FunctionCall({}({}))", name, arg_strs.join(", "))
         }
-        Value::Deferred(DeferredValue::ProvisionalFunctionCall { function, args, .. }) => {
-            let arg_strs: Vec<String> = args
-                .iter()
-                .map(|argument| deterministic_value_string(argument.walker_value()))
-                .collect();
-            format!("FunctionCall({}({}))", function.name, arg_strs.join(", "))
-        }
+
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
             let arg_strs: Vec<String> = args
                 .iter()

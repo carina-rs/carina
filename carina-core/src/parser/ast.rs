@@ -9620,9 +9620,7 @@ fn deferred_iterable_kind<P: crate::resource::PlaceholderKind, B: BindingAddress
         }
         Value::Deferred(DeferredValue::Interpolation(_)) => "deferred interpolation",
         Value::Deferred(
-            DeferredValue::FunctionCall { .. }
-            | DeferredValue::ResolvedFunctionCall { .. }
-            | DeferredValue::ProvisionalFunctionCall { .. },
+            DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
         ) => "deferred function call",
         Value::Deferred(DeferredValue::Unavailable { .. }) => "unavailable function result",
         Value::Deferred(DeferredValue::Access(_)) => "deferred access expression",
@@ -9910,8 +9908,7 @@ fn normalize_substituted_value<B: BindingAddress>(
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. }
-            | DeferredValue::ProvisionalFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for arg in args.iter_mut() {
                 normalize_substituted_value(arg.walker_value_mut(), miss_policy)
@@ -10068,8 +10065,7 @@ fn normalize_substituted_lazily<B: BindingAddress>(
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. }
-            | DeferredValue::ProvisionalFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for argument in args {
                 normalize_substituted_lazily(argument.walker_value_mut())

@@ -69,22 +69,6 @@ pub(super) trait BoundTransform<P: ValueKind, B: BindingAddress>: TransformOutpu
         }))
     }
 
-    fn provisional_call(
-        &mut self,
-        _at: &At<'_>,
-        function: Arc<crate::parser::UserFunction<B>>,
-        functions: Arc<indexmap::IndexMap<String, crate::parser::UserFunction<B>>>,
-        args: Vec<FunctionArgument<P, B>>,
-        source_line: crate::resource::DiagnosticSourceLine,
-    ) -> Result<Value<P, B>, WalkError> {
-        Ok(Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-            function,
-            functions,
-            args,
-            source_line,
-        }))
-    }
-
     /// Whole-argument replacement retains structural handles and their metadata.
     /// The engine inspects every original operand before accepting a replacement.
     /// Inserted arguments have the same nonrecursive semantics as leaf replacement.

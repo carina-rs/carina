@@ -146,8 +146,7 @@ fn visit_unknowns(
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. }
-            | DeferredValue::ProvisionalFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for arg in args {
                 visit_unknowns(arg.walker_value(), scope, f);

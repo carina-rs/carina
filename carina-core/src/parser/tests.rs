@@ -17,6 +17,49 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
 #[test]
+fn classified_phase_capture_miss_is_internal_error() {
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = parse("fn echo(value) { value }", &config).unwrap();
+    let function = &parsed.user_functions["echo"];
+    let mut context = context::ParseContext::for_evaluation(&config);
+    context
+        .replace_classified_user_functions(std::sync::Arc::new(ClassifiedUserFunctions::default()));
+    let result = functions::defer_user_function_call(function, Vec::new(), &context, 1);
+    assert!(
+        matches!(result, Err(ParseError::InternalError { ref expected, .. })
+            if expected == "classified user function 'echo'"),
+        "capture miss must not retain a raw function: {result:?}",
+    );
+}
+
+#[test]
+fn default_evaluation_context_cannot_defer_a_raw_function() {
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for source in [
+        "fn echo(value: 'known') { value }",
+        "fn echo(value): 'known' { value }",
+    ] {
+        let parsed = parse(source, &config).unwrap();
+        let context = context::ParseContext::for_evaluation(&config);
+        let argument =
+            ParsedFunctionArgument::from_value(Value::Deferred(DeferredValue::BindingRef {
+                binding: "later".into(),
+            }));
+        let result = functions::evaluate_user_function(
+            &parsed.user_functions["echo"],
+            &[argument],
+            &context,
+            1,
+        );
+        assert!(
+            matches!(result, Err(ParseError::InternalError { ref expected, .. })
+                if expected == "classified user function 'echo'"),
+            "{source}: {result:?}",
+        );
+    }
+}
+
+#[test]
 fn issue4398_arguments_members_parse() {
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     for source in [

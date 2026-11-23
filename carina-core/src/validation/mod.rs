@@ -1087,12 +1087,6 @@ fn binding_value_assignable_to_enum<B: BindingAddress>(
                 args: _,
                 source_line: _,
             }
-            | crate::resource::DeferredValue::ProvisionalFunctionCall {
-                function: _,
-                functions: _,
-                args: _,
-                source_line: _,
-            }
             | crate::resource::DeferredValue::Access(_)
             | crate::resource::DeferredValue::Secret(_)
             | crate::resource::DeferredValue::Unknown(_)
@@ -1375,12 +1369,6 @@ fn deferred_value_mismatch<B: BindingAddress>(
                 source_line: _,
             }
             | crate::resource::DeferredValue::ResolvedFunctionCall {
-                function: _,
-                functions: _,
-                args: _,
-                source_line: _,
-            }
-            | crate::resource::DeferredValue::ProvisionalFunctionCall {
                 function: _,
                 functions: _,
                 args: _,
@@ -2603,8 +2591,7 @@ fn visit_refs_with_sink_inner<'a, P: PlaceholderKind, B: BindingAddress>(
         GenericValue::Deferred(
             crate::resource::DeferredValue::FunctionCall { args, .. }
             | crate::resource::DeferredValue::Unavailable { args, .. }
-            | crate::resource::DeferredValue::ResolvedFunctionCall { args, .. }
-            | crate::resource::DeferredValue::ProvisionalFunctionCall { args, .. },
+            | crate::resource::DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             // The enclosing sink constrains the function result, not its
             // inputs. Function parameter sites are walked separately with
@@ -3006,8 +2993,7 @@ fn visit_computed_accesses_with_sink<'a, B: BindingAddress, E: InsideSecret>(
         GenericValue::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. }
-            | DeferredValue::ProvisionalFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for argument in args {
                 findings.extend(visit_computed_accesses_with_sink(
@@ -3427,7 +3413,6 @@ fn prove_integer_operand<B: BindingAddress>(
             | crate::resource::DeferredValue::FunctionCall { .. }
             | crate::resource::DeferredValue::Unavailable { .. }
             | crate::resource::DeferredValue::ResolvedFunctionCall { .. }
-            | crate::resource::DeferredValue::ProvisionalFunctionCall { .. }
             | crate::resource::DeferredValue::Access(_)
             | crate::resource::DeferredValue::Unknown(_),
         ) => None,
@@ -4766,19 +4751,6 @@ mod user_function_refs {
                     name.as_str(),
                     args,
                     function,
-                    result_sink.zip(context),
-                    bindings,
-                    unknown_policy,
-                    errors,
-                );
-            }
-            crate::resource::Value::Deferred(
-                crate::resource::DeferredValue::ProvisionalFunctionCall { function, args, .. },
-            ) => {
-                check_call(
-                    &function.name,
-                    args,
-                    Some(function),
                     result_sink.zip(context),
                     bindings,
                     unknown_policy,
@@ -10470,14 +10442,6 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
             source_line: _source_line,
         }) => false,
         crate::resource::Value::Deferred(
-            crate::resource::DeferredValue::ProvisionalFunctionCall {
-                function: _function,
-                functions: _functions,
-                args: _args,
-                source_line: _source_line,
-            },
-        ) => false,
-        crate::resource::Value::Deferred(
             crate::resource::DeferredValue::ResolvedFunctionCall {
                 function: _function,
                 functions: _functions,
@@ -11100,7 +11064,6 @@ fn attribute_value_findings_from<S: ExportSource, P: PlaceholderKind, B: Binding
                             crate::resource::DeferredValue::FunctionCall { .. }
                             | crate::resource::DeferredValue::Unavailable { .. }
                             | crate::resource::DeferredValue::ResolvedFunctionCall { .. }
-                            | crate::resource::DeferredValue::ProvisionalFunctionCall { .. }
                             | crate::resource::DeferredValue::Interpolation(_)
                             | crate::resource::DeferredValue::Secret(_)
                             | crate::resource::DeferredValue::Unknown(_)

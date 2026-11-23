@@ -15,6 +15,7 @@ use crate::resource::{
 };
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -62,8 +63,6 @@ pub(super) fn parse_fn_def(
                         _ => {
                             // This is the default expression
                             let mut default_ctx = ctx.function_scope(declaration.clone());
-                            default_ctx
-                                .replace_shared_user_functions(Arc::clone(&ctx.user_functions));
                             default_ctx
                                 .seeded_user_functions
                                 .extend(ctx.seeded_user_functions.iter().cloned());
@@ -113,7 +112,6 @@ pub(super) fn parse_fn_def(
     // Create a context where parameters are registered as variables
     // so that param references in the body are resolved as variable refs
     let mut body_ctx = ctx.function_scope(declaration);
-    body_ctx.replace_shared_user_functions(Arc::clone(&ctx.user_functions));
     body_ctx
         .seeded_user_functions
         .extend(ctx.seeded_user_functions.iter().cloned());
@@ -251,7 +249,8 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
     // Build substitution map: param_name -> value, and type-check annotated params
     let mut substitutions: HashMap<String, FunctionArgument> = HashMap::new();
     let mut effective_args = Vec::with_capacity(func.params.len());
-    let requires_session = ctx.session.is_none()
+    let requires_session = !ctx.is_provisional()
+        && ctx.session.is_none()
         && !ctx.config.custom_types_loaded()
         && func
             .return_type
@@ -269,13 +268,14 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
         // directory/module resolver has the complete function table and the
         // caller's actual argument shape. Everything else can be reduced now
         // so the parameter check sees the concrete value.
-        let argument = if function_argument_must_remain_deferred(&argument) {
+        let argument = if ctx.is_provisional() || function_argument_must_remain_deferred(&argument)
+        {
             argument
         } else {
             argument.try_map_value(|value| try_evaluate_fn_value(value.clone(), ctx, call_line))?
         };
         // Type-check if the parameter has a type annotation
-        if param.param_type.is_some() {
+        if param.param_type.is_some() && !ctx.is_provisional() {
             match check_fn_arg_type(func, param, &argument, ctx, call_line, None)? {
                 FunctionArgumentTypeCheck::Complete => {}
                 FunctionArgumentTypeCheck::AwaitingRuntimeValue => {
@@ -301,10 +301,12 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
     // resolver can check the same parameter after it learns the nested
     // callee's result. Evaluating the body now would silently discard an
     // unused deferred argument (`f(g(1))` where `f` returns a constant).
-    if effective_args.iter().any(|argument| {
-        function_argument_must_remain_deferred(argument)
-            || argument.value().is_some_and(contains_function_call)
-    }) {
+    if !ctx.is_provisional()
+        && effective_args.iter().any(|argument| {
+            function_argument_must_remain_deferred(argument)
+                || argument.value().is_some_and(contains_function_call)
+        })
+    {
         return Ok(PreparedUserFunctionCall::Deferred(effective_args));
     }
 
@@ -318,7 +320,7 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
             source_column: None,
             source_file: None,
         });
-        if defer_value_call {
+        if defer_value_call && !ctx.is_provisional() {
             return Ok(PreparedUserFunctionCall::Deferred(effective_args));
         }
     }
@@ -329,15 +331,20 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
 
     // Evaluate local lets, substituting and resolving each one
     for (let_name, let_expr, source_line) in &func.local_lets {
+        let let_expr = discovery_parameter_values(let_expr, &substitutions, ctx)?;
         let local = crate::value_walk::substitute_function_call_argument(
-            &FunctionArgument::from_value(let_expr.clone()),
+            &FunctionArgument::from_value(let_expr.into_owned()),
             &substitutions,
             *source_line,
         )
         .map_err(|error| locate_function_body_error(func, error))?
         .try_map_value(|value| {
-            try_evaluate_fn_value(value.clone(), &child_ctx, *source_line)
-                .map_err(|error| locate_function_body_error(func, error))
+            if ctx.is_provisional() {
+                Ok(value.clone())
+            } else {
+                try_evaluate_fn_value(value.clone(), &child_ctx, *source_line)
+                    .map_err(|error| locate_function_body_error(func, error))
+            }
         })?;
 
         let local = match local.handle() {
@@ -346,10 +353,12 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
                 FunctionArgument::from_handle(handle.clone().with_alias(let_name.clone()))
             }
             None => {
-                child_ctx.set_variable(
-                    let_name.clone(),
-                    local.value().expect("checked value function local").clone(),
-                );
+                let value = if ctx.is_provisional() {
+                    local.walker_value()
+                } else {
+                    local.value().expect("checked value function local")
+                };
+                child_ctx.set_variable(let_name.clone(), value.clone());
                 local
             }
         };
@@ -360,6 +369,36 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
         child_ctx: Box::new(child_ctx),
         substitutions,
     })
+}
+
+/// Discovery inlines expressions without deciding whether a forwarded module
+/// parameter is a value or a handle. Its neutral placeholder must survive until
+/// classified calls can perform that substitution after argument binding.
+fn discovery_parameter_values<'v>(
+    value: &'v Value,
+    substitutions: &HashMap<String, FunctionArgument>,
+    ctx: &ParseContext<'_, impl super::context::EvaluationSource>,
+) -> Result<Cow<'v, Value>, ParseError> {
+    if !ctx.is_provisional()
+        || !substitutions
+            .values()
+            .any(|argument| argument.pending_parameter().is_some())
+    {
+        return Ok(Cow::Borrowed(value));
+    }
+    value
+        .clone()
+        .try_map_placeholder(&mut |placeholder| {
+            if let ParserPlaceholder::FnParam { name } | ParserPlaceholder::FnLocal { name } =
+                &placeholder
+                && let Some(argument) = substitutions.get(name)
+                && argument.pending_parameter().is_some()
+            {
+                return Ok(argument.walker_value().clone());
+            }
+            Ok(Value::Deferred(DeferredValue::Placeholder(placeholder)))
+        })
+        .map(Cow::Owned)
 }
 
 fn function_argument_must_remain_deferred(argument: &FunctionArgument) -> bool {
@@ -387,10 +426,7 @@ fn contains_deferred_user_function_call(value: &Value) -> bool {
                         .is_some_and(contains_deferred_user_function_call)
                 })
         }
-        Value::Deferred(
-            DeferredValue::ResolvedFunctionCall { .. }
-            | DeferredValue::ProvisionalFunctionCall { .. },
-        ) => true,
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. }) => true,
         Value::Concrete(ConcreteValue::List(values)) => {
             values.iter().any(contains_deferred_user_function_call)
         }
@@ -504,11 +540,6 @@ pub(crate) fn contains_module_argument_matching<B: BindingAddress>(
             source_line: _,
         })
         | GenericValue::Deferred(DeferredValue::ResolvedFunctionCall {
-            function: _,
-            functions: _,
-            args,
-            source_line: _,
-        } | DeferredValue::ProvisionalFunctionCall {
             function: _,
             functions: _,
             args,
@@ -1348,25 +1379,23 @@ pub(crate) fn evaluate_user_function<Source: super::context::EvaluationSource>(
             substitutions,
         } => (child_ctx, substitutions),
         PreparedUserFunctionCall::Deferred(args) => {
-            if let Some((function, functions)) = ctx.capture_user_function(&func.name) {
-                return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                    function,
-                    functions,
-                    args,
-                    source_line: call_line.into(),
-                }));
-            }
-            return Ok(provisional_function_call(func, args, ctx, call_line));
+            return defer_user_function_call(func, args, ctx, call_line);
         }
     };
 
+    let body = discovery_parameter_values(&func.body.value, &substitutions, ctx)?;
     let substituted_body = crate::value_walk::substitute_function_parameters(
-        &func.body.value,
+        &body,
         &substitutions,
         func.body.source_line,
         crate::value_walk::RewritePosition::Value,
     )
     .map_err(|error| locate_function_body_error(func, error))?;
+    if ctx.is_provisional() {
+        // Discovery needs expression shape, not evaluation or annotation
+        // failures. The classified parse owns both and supplies their location.
+        return Ok(substituted_body.canonicalize());
+    }
     let result = try_evaluate_fn_value(substituted_body, &child_ctx, func.body.source_line)
         .map_err(|error| locate_function_body_error(func, error))?
         .canonicalize();
@@ -1407,28 +1436,15 @@ pub(crate) fn evaluate_user_function<Source: super::context::EvaluationSource>(
                     .clone()
                     .or_else(|| func.body.source_file.clone()),
             });
-            if let Some((function, functions)) = ctx.capture_user_function(&func.name) {
-                return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                    function,
-                    functions,
-                    args: func
-                        .params
-                        .iter()
-                        .map(|parameter| substitutions[&parameter.name].clone())
-                        .collect(),
-                    source_line: call_line.into(),
-                }));
-            } else {
-                return Ok(provisional_function_call(
-                    func,
-                    func.params
-                        .iter()
-                        .map(|parameter| substitutions[&parameter.name].clone())
-                        .collect(),
-                    ctx,
-                    call_line,
-                ));
-            }
+            return defer_user_function_call(
+                func,
+                func.params
+                    .iter()
+                    .map(|parameter| substitutions[&parameter.name].clone())
+                    .collect(),
+                ctx,
+                call_line,
+            );
         }
     }
     Ok(result)
@@ -1464,50 +1480,19 @@ pub(super) fn defer_user_function_call(
     ctx: &ParseContext<'_, impl super::context::EvaluationSource>,
     line: usize,
 ) -> Result<Value, ParseError> {
-    match ctx.capture_user_function(&function.name) {
-        Some((function, functions)) => Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function,
-            functions,
-            args,
-            source_line: line.into(),
-        })),
-        None => Ok(provisional_function_call(function, args, ctx, line)),
+    if ctx.is_provisional() {
+        // Discovery can inline a body locally, but cannot capture its raw
+        // definition or scope. Its expression values are discarded before
+        // refinement; the classified pass reconstructs every deferred call.
+        return evaluate_user_function(function, &args, ctx, line);
     }
-}
-
-fn provisional_function_call<Source: super::context::EvaluationSource>(
-    function: &UserFunction,
-    args: Vec<FunctionArgument>,
-    ctx: &ParseContext<'_, Source>,
-    line: usize,
-) -> Value {
-    Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-        function: ctx
-            .resolved_user_function(&function.name)
-            .unwrap_or_else(|| Arc::new(function.clone())),
-        functions: Arc::clone(&ctx.user_functions),
+    let (function, functions) = ctx.capture_user_function(&function.name)?;
+    Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+        function,
+        functions,
         args,
         source_line: line.into(),
-    })
-}
-
-pub(crate) fn evaluate_provisional_user_function(
-    function: &UserFunction,
-    functions: &Arc<IndexMap<String, UserFunction>>,
-    arguments: &[FunctionArgument],
-    config: &ProviderContext,
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
-    call_line: usize,
-) -> Result<Value, ParseError> {
-    let mut context = match session {
-        Some(session) => ParseContext::for_evaluation_in_session(session),
-        None => ParseContext::for_evaluation(config),
-    };
-    context.replace_shared_user_functions(Arc::clone(functions));
-    if !context.user_functions.contains_key(&function.name) {
-        context.insert_user_function(function.name.clone(), function.clone());
-    }
-    evaluate_user_function(function, arguments, &context, call_line)
+    }))
 }
 
 fn locate_function_body_error(func: &UserFunction, error: ParseError) -> ParseError {
@@ -1521,7 +1506,7 @@ pub fn contains_function_call(value: &Value) -> bool {
         }
         Value::Deferred(
             DeferredValue::FunctionCall { .. }
-            | DeferredValue::ResolvedFunctionCall { .. } | DeferredValue::ProvisionalFunctionCall { .. },
+            | DeferredValue::ResolvedFunctionCall { .. },
         ) => true,
         Value::Deferred(DeferredValue::Access(access)) => {
             contains_function_call(access.base())
@@ -1652,30 +1637,6 @@ pub(super) fn try_evaluate_fn_value<Source: super::context::EvaluationSource>(
             deferred.then_value = try_evaluate_fn_value(deferred.then_value, ctx, containing_line)?;
             deferred.else_value = try_evaluate_fn_value(deferred.else_value, ctx, containing_line)?;
             Ok(Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred))))
-        }
-        Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-            function,
-            functions,
-            args,
-            source_line,
-        }) => {
-            let source_line = source_line.unwrap_or(containing_line);
-            let evaluated_args = args
-                .iter()
-                .map(|argument| {
-                    argument.try_map_value(|value| {
-                        try_evaluate_fn_value(value.clone(), ctx, source_line)
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            evaluate_provisional_user_function(
-                &function,
-                &functions,
-                &evaluated_args,
-                ctx.config,
-                ctx.session,
-                source_line,
-            )
         }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,

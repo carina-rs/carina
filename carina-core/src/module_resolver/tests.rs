@@ -11795,13 +11795,15 @@ fn module_if_audit_checks_functions_in_sibling_declaration_order() {
                 ExpandedValue::Concrete(ExpandedConcreteValue::String("no".into())),
             ),
         )));
-        expanded.user_functions["zebra"].body.value = conditional.clone();
-        expanded.user_functions["mango"].params[0].default = Some(conditional);
+        expanded.user_functions.get_mut("zebra").unwrap().body.value = conditional.clone();
+        expanded.user_functions.get_mut("mango").unwrap().params[0].default = Some(conditional);
         let error = crate::module_resolver::ensure_expanded_root_graph(&expanded).unwrap_err();
         assert!(
             matches!(error, ModuleError::UnexpandedModuleTemplate { context } if context == "function body")
         );
-        expanded.user_functions.move_index(0, 1);
+        let mut functions: Vec<_> = expanded.user_functions.into_iter().collect();
+        functions.swap(0, 1);
+        expanded.user_functions = functions.into_iter().collect();
         let error = crate::module_resolver::ensure_expanded_root_graph(&expanded).unwrap_err();
         assert!(
             matches!(error, ModuleError::UnexpandedModuleTemplate { context } if context == "function parameter default")

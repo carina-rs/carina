@@ -624,8 +624,7 @@ fn loop_expression_is_local<P: PlaceholderKind, B: BindingAddress>(value: &Value
         }
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. }
-            | DeferredValue::ProvisionalFunctionCall { args, .. },
+            | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => args.iter().all(|argument| {
             argument.handle().is_none() && loop_expression_is_local(argument.walker_value())
         }),

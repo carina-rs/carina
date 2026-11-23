@@ -3191,32 +3191,7 @@ fn classify_value<
             }
             Ok(expression(value, EvaluationKind::Builtin, inputs))
         }
-        Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-            function,
-            functions: _,
-            args,
-            source_line: _,
-        }) => {
-            let mut inputs = Vec::new();
-            for (i, arg) in args.iter().enumerate() {
-                if arg.value().is_some() || arg.pending_parameter().is_some() {
-                    inputs.push(Input::value(
-                        OperandStep::Argument(i),
-                        classify(arg.walker_value(), cx, pos)?,
-                    ));
-                }
-            }
-            let analysis = classify_function(function, cx, pos)?;
-            inputs.push(Input {
-                step: None,
-                selection: None,
-                value: InputValue::Lexical(analysis),
-                visible: true,
-                guard: None,
-                apply: false,
-            });
-            Ok(expression(value, EvaluationKind::UserFunction, inputs))
-        }
+
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions: _,

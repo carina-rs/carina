@@ -128,12 +128,6 @@ pub(super) enum Parts<'v, M: WalkMode, P: ValueKind + 'v, B: BindingAddress> {
         args: M::Input<'v, Vec<FunctionArgument<P, B>>>,
         source_line: M::Input<'v, DiagnosticSourceLine>,
     },
-    ProvisionalCall {
-        function: M::Input<'v, Arc<UserFunction<B>>>,
-        functions: M::Input<'v, Arc<indexmap::IndexMap<String, UserFunction<B>>>>,
-        args: M::Input<'v, Vec<FunctionArgument<P, B>>>,
-        source_line: M::Input<'v, DiagnosticSourceLine>,
-    },
     Access(M::Input<'v, AccessExpr<P, B>>),
     Evidence {
         value: M::Input<'v, Value<P, B>>,
@@ -161,19 +155,6 @@ impl<M: WalkMode, P: ValueKind, B: BindingAddress> Parts<'_, M, P, B> {
                 ..
             } => {
                 function_values(M::borrow::<Arc<ClassifiedUserFunction<B>>>(function)).count()
-                    + M::borrow(functions)
-                        .values()
-                        .map(|function| function_values(function).count())
-                        .sum::<usize>()
-                    + argument_values_len(M::borrow::<Vec<FunctionArgument<P, B>>>(args))
-            }
-            Self::ProvisionalCall {
-                function,
-                functions,
-                args,
-                ..
-            } => {
-                function_values(M::borrow::<Arc<UserFunction<B>>>(function)).count()
                     + M::borrow(functions)
                         .values()
                         .map(|function| function_values(function).count())
@@ -304,20 +285,6 @@ macro_rules! dispatch_variants {
                     name,
                     args,
                     reason,
-                    source_line
-                }
-            ),
-            Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-                function,
-                functions,
-                args,
-                source_line,
-            }) => expr!(
-                ProvisionalFunctionCall,
-                Parts::ProvisionalCall {
-                    function,
-                    functions,
-                    args,
                     source_line
                 }
             ),
@@ -607,30 +574,6 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Inspect, P, B> {
             } => {
                 inspect_arguments(args, &at, algebra, &mut output)?;
             }
-            Self::ProvisionalCall {
-                function,
-                functions,
-                args,
-                source_line: _,
-            } => {
-                inspect_function(
-                    function,
-                    at.operand(ExpressionEdge::FunctionDefinition),
-                    algebra,
-                    &mut output,
-                )?;
-                let mut scope: Vec<_> = functions.iter().collect();
-                scope.sort_by(|left, right| left.0.cmp(right.0));
-                for (index, (_name, function)) in scope.into_iter().enumerate() {
-                    inspect_function(
-                        function,
-                        at.operand(ExpressionEdge::FunctionScope(index)),
-                        algebra,
-                        &mut output,
-                    )?;
-                }
-                inspect_arguments(args, &at, algebra, &mut output)?;
-            }
             Self::ResolvedCall {
                 function,
                 functions,
@@ -780,23 +723,6 @@ impl<O: WalkOutput> TransformFold<O> {
         self.changed |= nested.changed;
         Ok(nested.changed.then_some(candidate))
     }
-    fn provisional_function_candidate<
-        B: BindingAddress,
-        A: BoundTransform<crate::resource::ParserPlaceholder, B> + TransformOutput<Output = O>,
-    >(
-        &mut self,
-        function: &UserFunction<B>,
-        at: At<'_>,
-        algebra: &mut A,
-    ) -> Result<Option<UserFunction<B>>, WalkError> {
-        let mut nested = Self::new();
-        let candidate = function
-            .clone()
-            .try_map_values(|value, edge| nested.value(value, at.operand(edge), algebra))?;
-        self.output.extend(nested.output);
-        self.changed |= nested.changed;
-        Ok(nested.changed.then_some(candidate))
-    }
 }
 /// Transform one typed argument through the same fold used by call operands.
 /// Whole-argument replacement still inventories every original Secret operand.
@@ -932,45 +858,6 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Transform, P, B> {
                 reason,
                 source_line,
             }),
-            Self::ProvisionalCall {
-                function,
-                functions,
-                args,
-                source_line,
-            } => {
-                let candidate = walked.provisional_function_candidate(
-                    &function,
-                    at.operand(ExpressionEdge::FunctionDefinition),
-                    algebra,
-                )?;
-                let function = match candidate {
-                    Some(candidate) => Arc::new(candidate),
-                    None => function,
-                };
-                // Scope entries are separate stored definitions. Visit each
-                // exactly once; allocate a replacement map only after a change.
-                let mut scope: Vec<_> = functions.iter().collect();
-                scope.sort_by(|left, right| left.0.cmp(right.0));
-                let mut updates = Vec::new();
-                for (index, (name, function)) in scope.into_iter().enumerate() {
-                    if let Some(candidate) = walked.provisional_function_candidate(
-                        function,
-                        at.operand(ExpressionEdge::FunctionScope(index)),
-                        algebra,
-                    )? {
-                        updates.push((name.clone(), candidate));
-                    }
-                }
-                let functions = if updates.is_empty() {
-                    functions
-                } else {
-                    let mut changed = Arc::unwrap_or_clone(functions);
-                    changed.extend(updates);
-                    Arc::new(changed)
-                };
-                let args = walked.arguments(args, &at, algebra)?;
-                algebra.provisional_call(&at, function, functions, args, source_line)?
-            }
             Self::ResolvedCall {
                 function,
                 functions,

@@ -1052,7 +1052,6 @@ fn typed_resource_attribute_admissions<
                 | DeferredValue::ModuleIf(_)
                 | DeferredValue::FunctionCall { .. }
                 | DeferredValue::ResolvedFunctionCall { .. }
-                | DeferredValue::ProvisionalFunctionCall { .. }
                 | DeferredValue::Unavailable { .. }
                 | DeferredValue::Secret(_)
                 | DeferredValue::Unknown(_)
@@ -1262,7 +1261,6 @@ fn typed_resource_attribute_admissions<
                 | DeferredValue::Interpolation(_)
                 | DeferredValue::FunctionCall { .. }
                 | DeferredValue::ResolvedFunctionCall { .. }
-                | DeferredValue::ProvisionalFunctionCall { .. }
                 | DeferredValue::Unavailable { .. }
                 | DeferredValue::Secret(_)
                 | DeferredValue::Unknown(_)

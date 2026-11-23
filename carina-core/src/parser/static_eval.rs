@@ -243,41 +243,7 @@ pub(crate) fn evaluate_static_value(
                 .into_value()
                 .map_err(|error| ParseError::from_eval_value(error, 0))
         }
-        Value::Deferred(DeferredValue::ProvisionalFunctionCall {
-            ref function,
-            ref functions,
-            ref args,
-            source_line,
-        }) => {
-            if !value
-                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-                .map(|proof| proof.into_classification())
-                .is_ok_and(|knowledge| knowledge.permits_static_evaluation())
-            {
-                return Err(ParseError::InvalidExpression {
-                    line: source_line.get().unwrap_or(function.body.source_line),
-                    message: format!(
-                        "for iterable function call '{}' depends on a runtime value; all arguments must be statically known at parse time",
-                        function.name
-                    ),
-                });
-            }
-            let line = source_line.get().unwrap_or(function.body.source_line);
-            let evaluated_args = args
-                .iter()
-                .map(|argument| {
-                    argument.try_map_value(|value| evaluate_static_value(value.clone(), config))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            super::functions::evaluate_provisional_user_function(
-                function,
-                functions,
-                &evaluated_args,
-                config,
-                None,
-                line,
-            )
-        }
+
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             ref function,
             ref functions,

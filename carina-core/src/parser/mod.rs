@@ -151,10 +151,9 @@ pub use entry::{
     top_level_upstream_state_spans,
 };
 pub(crate) use entry::{
-    BindingSeed, DirectoryParsePhase, parse_with_directory_context,
-    parse_with_provisional_directory_context, top_level_argument_names,
-    top_level_let_binding_names, top_level_user_functions_in_files,
-    top_level_user_functions_with_bindings,
+    BindingSeed, discover_directory_declarations, parse_with_directory_context,
+    parse_with_refining_directory_context, top_level_argument_names, top_level_let_binding_names,
+    top_level_user_functions_in_files, top_level_user_functions_with_bindings,
 };
 #[cfg(test)]
 pub(crate) use entry::{parse, parse_and_resolve, parse_with_seeded_bindings};
