@@ -7014,7 +7014,9 @@ mod tests {
             provider_attributes,
         )
         .with_identifier("provider-id");
-        let accepted_create = AcceptedRequest::create_for_test();
+        let accepted_create = AcceptedRequest::from_create_permit_for_test(
+            &carina_core::test_utils::prepared_write::create_permit(&applied),
+        );
         let prior = ResourceState::from_provider_state_for_resource_and_schema(
             &applied,
             &provider_state,

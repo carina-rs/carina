@@ -32,6 +32,7 @@ pub use carina_provider_protocol::types::{
 
 use crate::binding_index::SecretPreservingAttributes;
 use crate::effect::PlanOp;
+use crate::executor::PreparedCreateWriteback;
 use crate::parser::{ProviderConfig, StateBlockAddress};
 #[cfg(test)]
 use crate::provider_text::OpaqueFixtureDisplay as _;
@@ -95,15 +96,20 @@ pub type HostUpdateOutcomeKind = UpdateOutcomeKind<Bound>;
 pub type HostPartialReadDiagnostic = PartialReadDiagnostic<Bound>;
 pub type HostCreateObservation = CreateObservation<Bound>;
 pub type HostUnobservedReason = UnobservedReason<Bound>;
-pub type HostIdentifiedCreate = IdentifiedCreate<Bound>;
-pub type HostCreateFailure = CreateFailure<Bound>;
-pub type HostCreateFailureKind = CreateFailureKind<Bound>;
-pub type HostResumeOutcome = ResumeOutcome<Bound>;
-pub type HostResumeOutcomeKind = ResumeOutcomeKind<Bound>;
-pub type HostCompletedResume = CompletedResume<Bound>;
-pub type HostPartialResume = PartialResume<Bound>;
-pub type HostResumeFailure = ResumeFailure<Bound>;
-pub type HostResumeFailureKind = ResumeFailureKind<Bound>;
+pub type HostIdentifiedCreate = IdentifiedCreate<Bound, PreparedCreateWriteback>;
+pub type HostCreateFailure = CreateFailure<Bound, PreparedCreateWriteback>;
+pub type HostCreateFailureKind = CreateFailureKind<Bound, PreparedCreateWriteback>;
+pub type HostResumeOutcome<W = PreparedCreateWriteback> = ResumeOutcome<Bound, W>;
+pub type HostResumeOutcomeKind<W = PreparedCreateWriteback> = ResumeOutcomeKind<Bound, W>;
+pub type HostCompletedResume = CompletedResume<Bound, PreparedCreateWriteback>;
+pub type HostPartialResume = PartialResume<Bound, PreparedCreateWriteback>;
+pub type HostResumeFailure<W = PreparedCreateWriteback> = ResumeFailure<Bound, W>;
+pub type HostResumeFailureKind<W = PreparedCreateWriteback> = ResumeFailureKind<Bound, W>;
+
+/// Provider-produced records have no desired values. Only dispatch can turn
+/// this stage into a host writeback record, supplying secret-preserving values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCreateRecord;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("provider reported a missing attribute absent from the resource schema")]
@@ -975,8 +981,6 @@ pub type HostResult<T> = ProviderResult<T, Bound>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentAttributes {
     attributes: BTreeSet<String>,
-    #[cfg(any(test, feature = "test-utils"))]
-    all_for_test: bool,
 }
 
 impl SentAttributes {
@@ -992,43 +996,24 @@ impl SentAttributes {
     }
 
     pub(crate) fn only(attributes: BTreeSet<String>) -> Self {
-        Self {
-            attributes,
-            #[cfg(any(test, feature = "test-utils"))]
-            all_for_test: false,
-        }
+        Self { attributes }
     }
 
-    #[cfg(any(test, feature = "test-utils"))]
-    pub(crate) fn all_for_test() -> Self {
-        Self {
-            attributes: BTreeSet::new(),
-            all_for_test: true,
-        }
-    }
-
-    fn from_create_sent<S, D>(
-        sent: &Sent,
-        resource: &Resource<
-            S,
-            crate::resource::NoPlaceholder,
-            crate::resource::AbsoluteBindingAddress,
-            D,
-        >,
-    ) -> Self {
+    fn from_create_sent(sent: &Sent, request_attributes: &Self) -> Self {
         match sent {
-            Sent::AllRequestAttributes => Self::from_resource(resource),
+            Sent::AllRequestAttributes => request_attributes.clone(),
             Sent::Only(attributes) => Self::only(attributes.clone()),
         }
     }
 
     /// Whether this operation sent `attribute` with a desired value.
     pub fn contains(&self, attribute: &str) -> bool {
-        #[cfg(any(test, feature = "test-utils"))]
-        if self.all_for_test {
-            return true;
-        }
         self.attributes.contains(attribute)
+    }
+
+    /// Attribute names proven to have been sent by this operation.
+    pub fn as_set(&self) -> &BTreeSet<String> {
+        &self.attributes
     }
 }
 
@@ -2955,9 +2940,12 @@ pub struct PendingCreate {
 
 /// Read-only record retained after a provider returns a fresh pending create.
 /// Unlike [`PendingCreate`], this is storage, not transition authority.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FreshPendingCreate {
+/// The provider stage carries [`ProviderCreateRecord`]; only the host stage
+/// carries [`PreparedCreateWriteback`] and can reach state writers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreshPendingCreate<W = PreparedCreateWriteback> {
     id: ResourceId,
+    writeback: Box<W>,
     token: PendingToken,
     progress: CreateProgress,
     sent: Sent,
@@ -2965,10 +2953,11 @@ pub struct FreshPendingCreate {
     started_at: Timestamp,
 }
 
-impl From<PendingCreate> for FreshPendingCreate {
+impl From<PendingCreate> for FreshPendingCreate<ProviderCreateRecord> {
     fn from(pending: PendingCreate) -> Self {
         Self {
             id: pending.id,
+            writeback: Box::new(ProviderCreateRecord),
             token: pending.token,
             progress: pending.progress,
             sent: pending.sent,
@@ -2979,6 +2968,26 @@ impl From<PendingCreate> for FreshPendingCreate {
 }
 
 impl FreshPendingCreate {
+    /// Values and request membership retained from the same prepared create.
+    pub fn writeback(&self) -> &PreparedCreateWriteback {
+        &self.writeback
+    }
+
+    /// Desired values retained by this continuation, with send membership
+    /// expanded from the same prepared create's request attributes.
+    pub fn sent_desired_attributes(&self) -> SentDesiredAttributes<'_> {
+        SentDesiredAttributes::new(
+            self.writeback.attributes().values().iter(),
+            SentAttributes::from_create_sent(&self.sent, self.writeback.sent_attributes()),
+        )
+    }
+
+    pub fn resolved_desired_attributes(&self) -> &SecretPreservingAttributes {
+        self.writeback.attributes()
+    }
+}
+
+impl<W> FreshPendingCreate<W> {
     pub fn token(&self) -> &PendingToken {
         &self.token
     }
@@ -2989,22 +2998,6 @@ impl FreshPendingCreate {
 
     pub fn sent(&self) -> &Sent {
         &self.sent
-    }
-
-    /// Desired values and send evidence retained by this fresh continuation.
-    pub fn sent_desired_attributes_for<'a, S, D>(
-        &self,
-        resource: &'a Resource<
-            S,
-            crate::resource::NoPlaceholder,
-            crate::resource::AbsoluteBindingAddress,
-            D,
-        >,
-    ) -> SentDesiredAttributes<'a> {
-        SentDesiredAttributes::new(
-            resource.attributes.iter(),
-            SentAttributes::from_create_sent(&self.sent, resource),
-        )
     }
 
     pub fn poll_after_secs(&self) -> u32 {
@@ -3315,26 +3308,6 @@ pub enum SentRecord {
     Persisted(PendingEnvelope),
 }
 
-impl SentRecord {
-    /// Recover attribute send evidence while it is still retained in request
-    /// form. Persisted continuations intentionally omit ordinary observable
-    /// attribute names, so they cannot claim a sent desired basis.
-    fn sent_attributes_for<S, D>(
-        &self,
-        resource: &Resource<
-            S,
-            crate::resource::NoPlaceholder,
-            crate::resource::AbsoluteBindingAddress,
-            D,
-        >,
-    ) -> Option<SentAttributes> {
-        match self {
-            Self::Request(sent) => Some(SentAttributes::from_create_sent(sent, resource)),
-            Self::Persisted(_envelope) => None,
-        }
-    }
-}
-
 /// What carina-core knows about a create for which the provider reported an
 /// identifier.
 #[derive(Debug)]
@@ -3364,17 +3337,40 @@ impl std::fmt::Display for UnobservedReason<Bound> {
 }
 
 /// A provider-reported identifier, its observation, and the accepted create's sent values.
+/// Provider records acquire the required [`PreparedCreateWriteback`] when
+/// dispatch converts them into [`HostIdentifiedCreate`] records.
+///
+/// Callers outside core cannot attach writeback to a provider-stage record.
+///
+/// ```compile_fail,E0624
+/// use carina_core::{
+///     executor::PreparedCreateWriteback,
+///     provider::{IdentifiedCreate, ProviderCreateRecord},
+///     provider_text::Unbound,
+/// };
+///
+/// fn forge(record: IdentifiedCreate<Unbound, ProviderCreateRecord>, writeback: PreparedCreateWriteback) {
+///     let _ = record.into_writeback(writeback);
+/// }
+/// ```
 #[derive(Debug)]
-pub struct IdentifiedCreate<S: TextState = Unbound> {
+pub struct IdentifiedCreate<S: TextState = Unbound, W = ProviderCreateRecord> {
     id: ResourceId,
     identifier: AppliedIdentifier,
     observation: CreateObservation<S>,
     sent: SentRecord,
     partial_read: Option<Box<PartialReadDiagnostic<S>>>,
-    resolved_desired_attributes: Option<SecretPreservingAttributes>,
+    writeback: W,
 }
 
 impl<S: TextState> IdentifiedCreate<S> {
+    pub(crate) fn into_writeback(
+        self,
+        attributes: PreparedCreateWriteback,
+    ) -> IdentifiedCreate<S, PreparedCreateWriteback> {
+        self.map_writeback(|ProviderCreateRecord| attributes)
+    }
+
     fn new(
         id: ResourceId,
         identifier: AppliedIdentifier,
@@ -3405,20 +3401,46 @@ impl<S: TextState> IdentifiedCreate<S> {
             observation,
             sent,
             partial_read: None,
-            resolved_desired_attributes: None,
+            writeback: ProviderCreateRecord,
         }
     }
+}
 
-    /// Construct the observation produced by a resumed in-flight create in
-    /// cross-crate tests.
-    #[cfg(feature = "test-utils")]
-    #[doc(hidden)]
-    pub fn from_in_flight_for_test(
-        pending: InFlightCreate,
-        identifier: AppliedIdentifier,
-        observation: CreateObservation<S>,
-    ) -> Self {
-        identified_from_resume(pending, identifier, observation)
+impl<S: TextState> IdentifiedCreate<S, PreparedCreateWriteback> {
+    /// Values and request membership retained from the same prepared create.
+    pub fn writeback(&self) -> &PreparedCreateWriteback {
+        &self.writeback
+    }
+
+    /// Resolved desired values and send evidence retained by the accepted
+    /// create observation. Membership is expanded from the same prepared
+    /// create's request attributes. Persisted continuations omit observable keys
+    /// and therefore cannot claim a sent desired basis.
+    pub fn sent_desired_attributes(&self) -> Option<SentDesiredAttributes<'_>> {
+        let SentRecord::Request(sent) = &self.sent else {
+            return None;
+        };
+        Some(SentDesiredAttributes::new(
+            self.writeback.attributes().values().iter(),
+            SentAttributes::from_create_sent(sent, self.writeback.sent_attributes()),
+        ))
+    }
+
+    pub fn resolved_desired_attributes(&self) -> &SecretPreservingAttributes {
+        self.writeback.attributes()
+    }
+}
+
+impl<S: TextState, W> IdentifiedCreate<S, W> {
+    fn map_writeback<T>(self, map: impl FnOnce(W) -> T) -> IdentifiedCreate<S, T> {
+        IdentifiedCreate {
+            id: self.id,
+            identifier: self.identifier,
+            observation: self.observation,
+            sent: self.sent,
+            partial_read: self.partial_read,
+            writeback: map(self.writeback),
+        }
     }
 
     pub fn id(&self) -> &ResourceId {
@@ -3441,32 +3463,6 @@ impl<S: TextState> IdentifiedCreate<S> {
         self.partial_read.as_deref()
     }
 
-    /// Resolved desired values and send evidence retained by the accepted
-    /// create observation.
-    pub fn sent_desired_attributes_for<'a, M, D>(
-        &'a self,
-        fallback_resource: &'a Resource<
-            M,
-            crate::resource::NoPlaceholder,
-            crate::resource::AbsoluteBindingAddress,
-            D,
-        >,
-    ) -> Option<SentDesiredAttributes<'a>> {
-        let sent = self.sent.sent_attributes_for(fallback_resource)?;
-        Some(match self.resolved_desired_attributes.as_ref() {
-            Some(attributes) => SentDesiredAttributes::new(attributes.values().iter(), sent),
-            None => SentDesiredAttributes::new(fallback_resource.attributes.iter(), sent),
-        })
-    }
-
-    pub(crate) fn with_resolved_desired_attributes(
-        mut self,
-        attributes: SecretPreservingAttributes,
-    ) -> Self {
-        self.resolved_desired_attributes = Some(attributes);
-        self
-    }
-
     fn with_partial_read(mut self, diagnostic: PartialReadDiagnostic<S>) -> Self {
         self.partial_read = Some(Box::new(diagnostic));
         self
@@ -3477,10 +3473,6 @@ impl<S: TextState> IdentifiedCreate<S> {
     #[doc(hidden)]
     pub fn with_partial_read_for_test(self, diagnostic: PartialReadDiagnostic<S>) -> Self {
         self.with_partial_read(diagnostic)
-    }
-
-    pub fn resolved_desired_attributes(&self) -> Option<&SecretPreservingAttributes> {
-        self.resolved_desired_attributes.as_ref()
     }
 
     pub fn into_parts(
@@ -3527,7 +3519,7 @@ impl<S: TextState> IdentifiedCreate<S> {
     }
 }
 
-impl IdentifiedCreate<Bound> {
+impl<W> IdentifiedCreate<Bound, W> {
     /// Materialize only the provider observation for runtime publication.
     /// Sent desired values are intentionally excluded.
     pub fn observed_state(&self) -> SnapshotState {
@@ -3546,16 +3538,16 @@ impl IdentifiedCreate<Bound> {
 
 pub type Observation<S = Unbound> = protocol_types::Observation<ReadOutcome, ProviderFailure<S>>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PendingRecord {
-    Fresh(FreshPendingCreate),
+#[derive(Debug, Clone, PartialEq)]
+enum PendingRecord<W> {
+    Fresh(FreshPendingCreate<W>),
     Persisted(PendingEnvelope),
 }
 
 /// Exhaustive borrowed view of how an in-flight create entered this process.
-pub enum InFlightPersistence<'a> {
+pub enum InFlightPersistence<'a, W = PreparedCreateWriteback> {
     /// Produced by a provider call in this process and not encoded yet.
-    Fresh(&'a FreshPendingCreate),
+    Fresh(&'a FreshPendingCreate<W>),
     /// Loaded from a validated persisted-state row.
     Persisted,
 }
@@ -3588,16 +3580,39 @@ pub enum InFlightPersistence<'a> {
 ///     let _ = pending.repend(token);
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InFlightCreate {
+#[derive(Debug, Clone, PartialEq)]
+pub struct InFlightCreate<W = PreparedCreateWriteback> {
     id: ResourceId,
-    pending: PendingRecord,
+    pending: PendingRecord<W>,
     started_at: Timestamp,
     // Host-owned destroy metadata; the containing state row persists it.
     pub(crate) dependency_bindings: Box<crate::resource::PersistedDestroyDependencies>,
 }
 
-impl Serialize for InFlightCreate {
+// Provider fixtures compare all continuation metadata across provider and host
+// stages. Only the host stage carries desired values.
+#[cfg(any(test, feature = "test-utils"))]
+impl PartialEq<InFlightCreate> for InFlightCreate<ProviderCreateRecord> {
+    fn eq(&self, other: &InFlightCreate) -> bool {
+        self.id == other.id
+            && self.started_at == other.started_at
+            && self.dependency_bindings == other.dependency_bindings
+            && match (&self.pending, &other.pending) {
+                (PendingRecord::Fresh(left), PendingRecord::Fresh(right)) => {
+                    left.id == right.id
+                        && left.token == right.token
+                        && left.progress == right.progress
+                        && left.sent == right.sent
+                        && left.poll_after_secs == right.poll_after_secs
+                        && left.started_at == right.started_at
+                }
+                (PendingRecord::Persisted(left), PendingRecord::Persisted(right)) => left == right,
+                _ => false,
+            }
+    }
+}
+
+impl<W> Serialize for InFlightCreate<W> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         struct Encoded<'a> {
@@ -3743,7 +3758,7 @@ impl<'de> Deserialize<'de> for StateRowInFlightCreate {
     }
 }
 
-impl InFlightCreate {
+impl InFlightCreate<ProviderCreateRecord> {
     pub(crate) fn from_pending(pending: PendingCreate) -> Self {
         let id = pending.id.clone();
         let started_at = pending.started_at.clone();
@@ -3755,12 +3770,43 @@ impl InFlightCreate {
         }
     }
 
+    pub(crate) fn into_writeback(self, attributes: PreparedCreateWriteback) -> InFlightCreate {
+        self.map_writeback(|ProviderCreateRecord| attributes)
+    }
+}
+
+impl<W> InFlightCreate<W> {
+    fn map_writeback<T>(self, map: impl FnOnce(W) -> T) -> InFlightCreate<T> {
+        let pending = match self.pending {
+            PendingRecord::Fresh(fresh) => PendingRecord::Fresh(FreshPendingCreate {
+                id: fresh.id,
+                writeback: Box::new(map(*fresh.writeback)),
+                token: fresh.token,
+                progress: fresh.progress,
+                sent: fresh.sent,
+                poll_after_secs: fresh.poll_after_secs,
+                started_at: fresh.started_at,
+            }),
+            PendingRecord::Persisted(envelope) => PendingRecord::Persisted(envelope),
+        };
+        InFlightCreate {
+            id: self.id,
+            pending,
+            started_at: self.started_at,
+            dependency_bindings: self.dependency_bindings,
+        }
+    }
+
+    fn into_provider_record(self) -> InFlightCreate<ProviderCreateRecord> {
+        self.map_writeback(|_| ProviderCreateRecord)
+    }
+
     /// Convert a continuation produced by a native provider or host adapter
     /// into the classified failure channel for an initial create.
     pub(crate) fn into_create_failure<S: TextState>(
         self,
         error: ProviderFailure<S>,
-    ) -> CreateFailure<S> {
+    ) -> CreateFailure<S, W> {
         CreateFailure::from_kind(CreateFailureKind::InFlight {
             pending: self,
             error,
@@ -3771,7 +3817,7 @@ impl InFlightCreate {
     pub(crate) fn into_resume_failure<S: TextState>(
         self,
         error: ProviderFailure<S>,
-    ) -> ResumeFailure<S> {
+    ) -> ResumeFailure<S, W> {
         ResumeFailure::from_kind(ResumeFailureKind::InFlight {
             pending: self,
             error,
@@ -3807,7 +3853,7 @@ impl InFlightCreate {
         &self.started_at
     }
 
-    pub fn persistence(&self) -> InFlightPersistence<'_> {
+    pub fn persistence(&self) -> InFlightPersistence<'_, W> {
         match &self.pending {
             PendingRecord::Fresh(pending) => InFlightPersistence::Fresh(pending),
             PendingRecord::Persisted(_envelope) => InFlightPersistence::Persisted,
@@ -3832,6 +3878,7 @@ impl InFlightCreate {
         let pending = match self.pending {
             PendingRecord::Fresh(FreshPendingCreate {
                 id,
+                writeback,
                 token: _old_token,
                 progress,
                 sent,
@@ -3839,6 +3886,7 @@ impl InFlightCreate {
                 started_at,
             }) => PendingRecord::Fresh(FreshPendingCreate {
                 id,
+                writeback,
                 token,
                 progress,
                 sent,
@@ -3862,6 +3910,7 @@ impl InFlightCreate {
         let pending = match self.pending {
             PendingRecord::Fresh(FreshPendingCreate {
                 id,
+                writeback,
                 token,
                 progress,
                 sent,
@@ -3869,6 +3918,7 @@ impl InFlightCreate {
                 started_at,
             }) => PendingRecord::Fresh(FreshPendingCreate {
                 id,
+                writeback,
                 token,
                 progress: match progress {
                     CreateProgress::Operating { .. } => CreateProgress::Operating {
@@ -4305,7 +4355,7 @@ fn report_cancelled_guest_create(attempt: CreateAttempt, may_have_dispatched: bo
 
 /// Inspectable classification carried by an opaque [`CreateFailure`].
 #[derive(Debug)]
-pub enum CreateFailureKind<S: TextState = Unbound> {
+pub enum CreateFailureKind<S: TextState = Unbound, W = ProviderCreateRecord> {
     /// No cloud resource remains. A `not-created` verdict means nothing was
     /// created: no request left the provider, or the cloud rejected it without
     /// creating anything.
@@ -4317,12 +4367,12 @@ pub enum CreateFailureKind<S: TextState = Unbound> {
     },
     /// The provider reported an identifier; resource existence may be unobserved.
     IdentifierReported {
-        identified: IdentifiedCreate<S>,
+        identified: IdentifiedCreate<S, W>,
         error: ProviderFailure<S>,
     },
     /// A resumable continuation is available, with an optional cloud identifier.
     InFlight {
-        pending: InFlightCreate,
+        pending: InFlightCreate<W>,
         error: ProviderFailure<S>,
     },
 }
@@ -4340,9 +4390,11 @@ pub enum CreateFailureKind<S: TextState = Unbound> {
 /// let _failure = CreateFailure(kind);
 /// ```
 #[derive(Debug)]
-pub struct CreateFailure<S: TextState = Unbound>(Box<CreateFailureKind<S>>);
+pub struct CreateFailure<S: TextState = Unbound, W = ProviderCreateRecord>(
+    Box<CreateFailureKind<S, W>>,
+);
 
-impl<S: TextState> std::fmt::Display for CreateFailure<S> {
+impl<S: TextState, W> std::fmt::Display for CreateFailure<S, W> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.kind() {
             CreateFailureKind::NoResource(_error) => {
@@ -4364,7 +4416,7 @@ impl<S: TextState> std::fmt::Display for CreateFailure<S> {
     }
 }
 
-impl std::error::Error for CreateFailure<Bound> {
+impl<W: std::fmt::Debug> std::error::Error for CreateFailure<Bound, W> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self.kind() {
             CreateFailureKind::NoResource(error) => Some(error),
@@ -4384,16 +4436,16 @@ impl std::error::Error for CreateFailure<Bound> {
     }
 }
 
-impl<S: TextState> CreateFailure<S> {
-    fn from_kind(kind: CreateFailureKind<S>) -> Self {
+impl<S: TextState, W> CreateFailure<S, W> {
+    fn from_kind(kind: CreateFailureKind<S, W>) -> Self {
         Self(Box::new(kind))
     }
 
-    pub fn kind(&self) -> &CreateFailureKind<S> {
+    pub fn kind(&self) -> &CreateFailureKind<S, W> {
         self.0.as_ref()
     }
 
-    pub fn into_kind(self) -> CreateFailureKind<S> {
+    pub fn into_kind(self) -> CreateFailureKind<S, W> {
         *self.0
     }
 
@@ -4416,13 +4468,13 @@ impl<S: TextState> CreateFailure<S> {
     }
 
     pub(crate) fn identifier_reported(
-        identified: IdentifiedCreate<S>,
+        identified: IdentifiedCreate<S, W>,
         error: ProviderFailure<S>,
     ) -> Self {
         Self::from_kind(CreateFailureKind::IdentifierReported { identified, error })
     }
 
-    pub(crate) fn in_flight(pending: InFlightCreate, error: ProviderFailure<S>) -> Self {
+    pub(crate) fn in_flight(pending: InFlightCreate<W>, error: ProviderFailure<S>) -> Self {
         Self::from_kind(CreateFailureKind::InFlight { pending, error })
     }
 
@@ -4451,8 +4503,8 @@ impl<S: TextState> CreateFailure<S> {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct ResumeOutcome<S: TextState = Unbound> {
-    kind: ResumeOutcomeKind<S>,
+pub struct ResumeOutcome<S: TextState = Unbound, W = ProviderCreateRecord> {
+    kind: ResumeOutcomeKind<S, W>,
 }
 
 /// A resumed create that completed with an applied state.
@@ -4468,10 +4520,16 @@ pub struct ResumeOutcome<S: TextState = Unbound> {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct CompletedResume<S: TextState = Unbound>(IdentifiedCreate<S>);
+pub struct CompletedResume<S: TextState = Unbound, W = ProviderCreateRecord>(
+    IdentifiedCreate<S, W>,
+);
 
 impl<S: TextState> CompletedResume<S> {
-    fn new(pending: InFlightCreate, identifier: AppliedIdentifier, state: AppliedState) -> Self {
+    fn new(
+        pending: InFlightCreate<ProviderCreateRecord>,
+        identifier: AppliedIdentifier,
+        state: AppliedState,
+    ) -> Self {
         let (_state_id, _observed_identifier, attributes) = state.into_parts();
         let state =
             AppliedState::from_snapshot_parts(pending.id().clone(), identifier.clone(), attributes);
@@ -4481,7 +4539,9 @@ impl<S: TextState> CompletedResume<S> {
             CreateObservation::Observed(state),
         ))
     }
+}
 
+impl<S: TextState, W> CompletedResume<S, W> {
     fn id(&self) -> &ResourceId {
         self.0.id()
     }
@@ -4490,19 +4550,12 @@ impl<S: TextState> CompletedResume<S> {
         self.0.identifier()
     }
 
-    pub(crate) fn with_resolved_desired_attributes(
-        self,
-        attributes: SecretPreservingAttributes,
-    ) -> Self {
-        Self(self.0.with_resolved_desired_attributes(attributes))
-    }
-
-    pub(crate) fn into_identified_create(self) -> IdentifiedCreate<S> {
+    pub(crate) fn into_identified_create(self) -> IdentifiedCreate<S, W> {
         self.0
     }
 }
 
-impl CompletedResume<Bound> {
+impl<W> CompletedResume<Bound, W> {
     pub fn observed_state(&self) -> SnapshotState {
         self.0.observed_state()
     }
@@ -4513,15 +4566,15 @@ impl CompletedResume<Bound> {
 /// The completed observation retains the persisted continuation's sent-value
 /// authority; unlike a resent create, this type never invents a new `Sent`.
 #[derive(Debug)]
-pub struct PartialResume<S: TextState = Unbound> {
-    completed: CompletedResume<S>,
+pub struct PartialResume<S: TextState = Unbound, W = ProviderCreateRecord> {
+    completed: CompletedResume<S, W>,
     diagnostic: PartialReadDiagnostic<S>,
     read_back_end: ReadBackEnd,
 }
 
 impl<S: TextState> PartialResume<S> {
     fn new(
-        pending: InFlightCreate,
+        pending: InFlightCreate<ProviderCreateRecord>,
         identifier: AppliedIdentifier,
         attributes: HashMap<String, Value>,
         diagnostic: PartialReadDiagnostic<S>,
@@ -4534,7 +4587,9 @@ impl<S: TextState> PartialResume<S> {
             read_back_end: ReadBackEnd::ProviderReported,
         }
     }
+}
 
+impl<S: TextState, W> PartialResume<S, W> {
     fn id(&self) -> &ResourceId {
         self.completed.id()
     }
@@ -4546,20 +4601,9 @@ impl<S: TextState> PartialResume<S> {
     pub fn diagnostic(&self) -> &PartialReadDiagnostic<S> {
         &self.diagnostic
     }
-
-    pub(crate) fn with_resolved_desired_attributes(
-        self,
-        attributes: SecretPreservingAttributes,
-    ) -> Self {
-        Self {
-            completed: self.completed.with_resolved_desired_attributes(attributes),
-            diagnostic: self.diagnostic,
-            read_back_end: self.read_back_end,
-        }
-    }
 }
 
-impl PartialResume<Bound> {
+impl PartialResume<Bound, PreparedCreateWriteback> {
     pub fn observed_state(&self) -> SnapshotState {
         self.diagnostic
             .clone()
@@ -4589,17 +4633,17 @@ impl PartialResume<Bound> {
 
 /// Read-only classification exposed by an opaque [`ResumeOutcome`].
 #[derive(Debug)]
-pub enum ResumeOutcomeKind<S: TextState = Unbound> {
-    Resumed(Box<CompletedResume<S>>),
+pub enum ResumeOutcomeKind<S: TextState = Unbound, W = ProviderCreateRecord> {
+    Resumed(Box<CompletedResume<S, W>>),
     /// The persisted create completed, but its read-back remains incomplete.
     /// This is distinct from `Resent`: no new create request or `sent` value
     /// was fabricated to finish the resumed continuation.
-    PartialSuccess(Box<PartialResume<S>>),
+    PartialSuccess(Box<PartialResume<S, W>>),
     Resent(Box<CreateOutcome<S>>),
 }
 
-impl<S: TextState> ResumeOutcome<S> {
-    fn resumed(completed: CompletedResume<S>) -> Self {
+impl<S: TextState, W> ResumeOutcome<S, W> {
+    fn resumed(completed: CompletedResume<S, W>) -> Self {
         Self {
             kind: ResumeOutcomeKind::Resumed(Box::new(completed)),
         }
@@ -4611,7 +4655,7 @@ impl<S: TextState> ResumeOutcome<S> {
         }
     }
 
-    fn partial(outcome: PartialResume<S>) -> Self {
+    fn partial(outcome: PartialResume<S, W>) -> Self {
         Self {
             kind: ResumeOutcomeKind::PartialSuccess(Box::new(outcome)),
         }
@@ -4632,11 +4676,11 @@ impl<S: TextState> ResumeOutcome<S> {
         outcome
     }
 
-    pub fn kind(&self) -> &ResumeOutcomeKind<S> {
+    pub fn kind(&self) -> &ResumeOutcomeKind<S, W> {
         &self.kind
     }
 
-    pub fn into_kind(self) -> ResumeOutcomeKind<S> {
+    pub fn into_kind(self) -> ResumeOutcomeKind<S, W> {
         self.kind
     }
 
@@ -4649,21 +4693,41 @@ impl<S: TextState> ResumeOutcome<S> {
     }
 }
 
+impl ResumeOutcome<Bound> {
+    pub(crate) fn into_writeback(self, attributes: PreparedCreateWriteback) -> HostResumeOutcome {
+        ResumeOutcome {
+            kind: match self.kind {
+                ResumeOutcomeKind::Resumed(completed) => ResumeOutcomeKind::Resumed(Box::new(
+                    CompletedResume(completed.0.into_writeback(attributes)),
+                )),
+                ResumeOutcomeKind::PartialSuccess(partial) => {
+                    ResumeOutcomeKind::PartialSuccess(Box::new(PartialResume {
+                        completed: CompletedResume(partial.completed.0.into_writeback(attributes)),
+                        diagnostic: partial.diagnostic,
+                        read_back_end: partial.read_back_end,
+                    }))
+                }
+                ResumeOutcomeKind::Resent(outcome) => ResumeOutcomeKind::Resent(outcome),
+            },
+        }
+    }
+}
+
 /// Inspectable classification carried by an opaque [`ResumeFailure`].
 #[derive(Debug)]
-pub enum ResumeFailureKind<S: TextState = Unbound> {
+pub enum ResumeFailureKind<S: TextState = Unbound, W = ProviderCreateRecord> {
     /// No cloud resource remains. A `not-created` verdict means nothing was
     /// created: no request left the provider, or the cloud rejected it without
     /// creating anything.
     NoResource(ProviderFailure<S>),
     /// The provider reported an identifier; resource existence may be unobserved.
     IdentifierReported {
-        identified: IdentifiedCreate<S>,
+        identified: IdentifiedCreate<S, W>,
         error: ProviderFailure<S>,
     },
     /// A resumable continuation is available, with an optional cloud identifier.
     InFlight {
-        pending: InFlightCreate,
+        pending: InFlightCreate<W>,
         error: ProviderFailure<S>,
     },
 }
@@ -4680,9 +4744,11 @@ pub enum ResumeFailureKind<S: TextState = Unbound> {
 /// let _failure = ResumeFailure(kind);
 /// ```
 #[derive(Debug)]
-pub struct ResumeFailure<S: TextState = Unbound>(Box<ResumeFailureKind<S>>);
+pub struct ResumeFailure<S: TextState = Unbound, W = ProviderCreateRecord>(
+    Box<ResumeFailureKind<S, W>>,
+);
 
-impl<S: TextState> std::fmt::Display for ResumeFailure<S> {
+impl<S: TextState, W> std::fmt::Display for ResumeFailure<S, W> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.kind() {
             ResumeFailureKind::NoResource(_error) => f.write_str("resumed create left no resource"),
@@ -4700,7 +4766,7 @@ impl<S: TextState> std::fmt::Display for ResumeFailure<S> {
     }
 }
 
-impl std::error::Error for ResumeFailure<Bound> {
+impl<W: std::fmt::Debug> std::error::Error for ResumeFailure<Bound, W> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self.kind() {
             ResumeFailureKind::NoResource(error) => Some(error),
@@ -4716,16 +4782,16 @@ impl std::error::Error for ResumeFailure<Bound> {
     }
 }
 
-impl<S: TextState> ResumeFailure<S> {
-    fn from_kind(kind: ResumeFailureKind<S>) -> Self {
+impl<S: TextState, W> ResumeFailure<S, W> {
+    fn from_kind(kind: ResumeFailureKind<S, W>) -> Self {
         Self(Box::new(kind))
     }
 
-    pub fn kind(&self) -> &ResumeFailureKind<S> {
+    pub fn kind(&self) -> &ResumeFailureKind<S, W> {
         self.0.as_ref()
     }
 
-    pub fn into_kind(self) -> ResumeFailureKind<S> {
+    pub fn into_kind(self) -> ResumeFailureKind<S, W> {
         *self.0
     }
 
@@ -4748,13 +4814,13 @@ impl<S: TextState> ResumeFailure<S> {
     }
 
     pub(crate) fn identifier_reported(
-        identified: IdentifiedCreate<S>,
+        identified: IdentifiedCreate<S, W>,
         error: ProviderFailure<S>,
     ) -> Self {
         Self::from_kind(ResumeFailureKind::IdentifierReported { identified, error })
     }
 
-    pub(crate) fn in_flight(pending: InFlightCreate, error: ProviderFailure<S>) -> Self {
+    pub(crate) fn in_flight(pending: InFlightCreate<W>, error: ProviderFailure<S>) -> Self {
         Self::from_kind(ResumeFailureKind::InFlight { pending, error })
     }
 }
@@ -5093,8 +5159,9 @@ pub struct ResumeRoutingMismatch {
 /// ```
 #[derive(Debug)]
 pub struct ResumeCreateRequest {
-    pending: InFlightCreate,
+    pending: InFlightCreate<ProviderCreateRecord>,
     request: CreateRequest,
+    writeback: PreparedCreateWriteback,
     authorization: ResumeAuthorization,
 }
 
@@ -5118,11 +5185,15 @@ enum ResumeAuthorization {
 pub struct PollCreateRequest {
     resumed: ResumedCreate,
     request: CreateRequest,
+    writeback: PreparedCreateWriteback,
 }
 
 impl PollCreateRequest {
-    pub(crate) fn new(pending: InFlightCreate, request: CreateRequest) -> Result<Self, HostError> {
-        if pending.id() != &request.resource().id {
+    pub(crate) fn new(
+        pending: InFlightCreate,
+        write: crate::executor::PreparedWrite<CreateRequest>,
+    ) -> Result<Self, HostError> {
+        if pending.id() != &write.request().resource().id {
             return Err(
                 HostError::internal("poll request belongs to another resource")
                     .for_resource(pending.id().clone()),
@@ -5136,10 +5207,11 @@ impl PollCreateRequest {
         };
         Ok(Self {
             resumed: ResumedCreate {
-                pending,
+                pending: pending.into_provider_record(),
                 identifier,
             },
-            request,
+            request: write.request().clone(),
+            writeback: write.create_writeback(),
         })
     }
 
@@ -5151,6 +5223,7 @@ impl PollCreateRequest {
         ResumeCreateRequest {
             pending: self.resumed.pending,
             request: self.request,
+            writeback: self.writeback,
             authorization: ResumeAuthorization::Poll(self.resumed.identifier),
         }
     }
@@ -5216,7 +5289,7 @@ impl Resume {
 /// ```
 #[derive(Debug)]
 pub struct ResumeAttempt {
-    pending: InFlightCreate,
+    pending: InFlightCreate<ProviderCreateRecord>,
     permit: crate::replacement::CreatePermit,
 }
 
@@ -5282,7 +5355,7 @@ impl ResumeAttempt {
 /// ```
 #[derive(Debug)]
 pub struct ResumedCreate {
-    pending: InFlightCreate,
+    pending: InFlightCreate<ProviderCreateRecord>,
     identifier: AppliedIdentifier,
 }
 
@@ -5356,7 +5429,7 @@ impl ResumedCreate {
 /// Canonicalized resumed-create witness. It intentionally cannot re-pend.
 #[derive(Debug)]
 pub struct FinishingResume {
-    pending: InFlightCreate,
+    pending: InFlightCreate<ProviderCreateRecord>,
     identifier: AppliedIdentifier,
 }
 
@@ -5396,7 +5469,7 @@ impl FinishingResume {
 }
 
 fn identified_from_resume<S: TextState>(
-    pending: InFlightCreate,
+    pending: InFlightCreate<ProviderCreateRecord>,
     identifier: AppliedIdentifier,
     observation: CreateObservation<S>,
 ) -> IdentifiedCreate<S> {
@@ -5430,8 +5503,9 @@ impl ResumeCreateRequest {
             });
         }
         Ok(Self {
-            pending,
+            pending: pending.into_provider_record(),
             request,
+            writeback: permit.prepared_write().create_writeback(),
             authorization: ResumeAuthorization::Resend(permit),
         })
     }
@@ -5455,7 +5529,11 @@ impl ResumeCreateRequest {
         &self.request
     }
 
-    pub(crate) fn pending_for_dispatch(&self) -> InFlightCreate {
+    pub(crate) fn writeback(&self) -> &PreparedCreateWriteback {
+        &self.writeback
+    }
+
+    pub(crate) fn pending_for_dispatch(&self) -> InFlightCreate<ProviderCreateRecord> {
         self.pending.clone()
     }
 
@@ -5479,7 +5557,7 @@ impl ResumeCreateRequest {
         (resume, self.request)
     }
 
-    pub(crate) fn into_in_flight(self) -> InFlightCreate {
+    pub(crate) fn into_in_flight(self) -> InFlightCreate<ProviderCreateRecord> {
         self.pending
     }
 }
@@ -5487,7 +5565,7 @@ impl ResumeCreateRequest {
 /// Linear attempt for a create explicitly re-sent by an unissued resume.
 #[derive(Debug)]
 pub struct ResentCreateAttempt {
-    previous: InFlightCreate,
+    previous: InFlightCreate<ProviderCreateRecord>,
     _permit: crate::replacement::CreatePermit,
 }
 
@@ -6096,7 +6174,7 @@ impl PartialReadDiagnostic<Unbound> {
         }
     }
 }
-impl IdentifiedCreate<Unbound> {
+impl<W> IdentifiedCreate<Unbound, W> {
     fn admit(&mut self, schemas: &SchemaRegistry) -> ProviderResult<()> {
         if let Some(diagnostic) = self.partial_read.take() {
             diagnostic.validate(&self.id, schemas)?;
@@ -6106,16 +6184,16 @@ impl IdentifiedCreate<Unbound> {
     }
 
     #[cfg(feature = "test-utils")]
-    pub fn failure_for_test(self) -> CreateFailure {
+    pub fn failure_for_test(self) -> CreateFailure<Unbound, W> {
         CreateFailure::identifier_reported(self, ProviderError::internal("fixture"))
     }
 
-    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostIdentifiedCreate {
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> IdentifiedCreate<Bound, W> {
         IdentifiedCreate {
             id: self.id,
             identifier: self.identifier,
             sent: self.sent,
-            resolved_desired_attributes: self.resolved_desired_attributes,
+            writeback: self.writeback,
             partial_read: self
                 .partial_read
                 .map(|diagnostic| Box::new(diagnostic.with_secrets(secrets))),
@@ -6188,7 +6266,7 @@ impl UpdateOutcome<Unbound> {
         }
     }
 }
-impl CreateFailure<Unbound> {
+impl<W> CreateFailure<Unbound, W> {
     pub(crate) fn admit(mut self, schemas: &SchemaRegistry) -> Self {
         if let CreateFailureKind::IdentifierReported { identified, error } = self.0.as_mut()
             && let Err(rejected) = identified.admit(schemas)
@@ -6198,8 +6276,8 @@ impl CreateFailure<Unbound> {
         self
     }
 
-    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostCreateFailure {
-        HostCreateFailure::from_kind(match self.into_kind() {
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> CreateFailure<Bound, W> {
+        CreateFailure::from_kind(match self.into_kind() {
             CreateFailureKind::NoResource(error) => {
                 CreateFailureKind::NoResource(error.with_secrets(secrets))
             }
@@ -6222,7 +6300,7 @@ impl CreateFailure<Unbound> {
         })
     }
 }
-impl ResumeFailure<Unbound> {
+impl<W> ResumeFailure<Unbound, W> {
     pub(crate) fn admit(mut self, schemas: &SchemaRegistry) -> Self {
         if let ResumeFailureKind::IdentifierReported { identified, error } = self.0.as_mut()
             && let Err(rejected) = identified.admit(schemas)
@@ -6232,8 +6310,8 @@ impl ResumeFailure<Unbound> {
         self
     }
 
-    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostResumeFailure {
-        HostResumeFailure::from_kind(match self.into_kind() {
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> ResumeFailure<Bound, W> {
+        ResumeFailure::from_kind(match self.into_kind() {
             ResumeFailureKind::NoResource(error) => {
                 ResumeFailureKind::NoResource(error.with_secrets(secrets))
             }
@@ -6294,9 +6372,11 @@ impl ResumeOutcome<Unbound> {
         }
         Ok(self)
     }
+}
 
-    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostResumeOutcome {
-        HostResumeOutcome {
+impl<W> ResumeOutcome<Unbound, W> {
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> ResumeOutcome<Bound, W> {
+        ResumeOutcome {
             kind: match self.kind {
                 ResumeOutcomeKind::Resumed(completed) => ResumeOutcomeKind::Resumed(Box::new(
                     CompletedResume(completed.0.with_secrets(secrets)),
@@ -6341,13 +6421,13 @@ impl PartialReadDiagnostic<Unbound> {
     }
 }
 #[cfg(test)]
-impl IdentifiedCreate<Unbound> {
+impl<W> IdentifiedCreate<Unbound, W> {
     #[doc(hidden)]
-    pub fn into_host_for_test(self) -> HostIdentifiedCreate {
+    pub fn into_host_for_test(self) -> IdentifiedCreate<Bound, W> {
         self.with_secrets(&RedactionSet::for_test(&[]))
     }
     #[doc(hidden)]
-    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostIdentifiedCreate {
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> IdentifiedCreate<Bound, W> {
         self.with_secrets(secrets)
     }
 }
@@ -6374,35 +6454,35 @@ impl UpdateOutcome<Unbound> {
     }
 }
 #[cfg(test)]
-impl CreateFailure<Unbound> {
+impl<W> CreateFailure<Unbound, W> {
     #[doc(hidden)]
-    pub fn into_host_for_test(self) -> HostCreateFailure {
+    pub fn into_host_for_test(self) -> CreateFailure<Bound, W> {
         self.with_secrets(&RedactionSet::for_test(&[]))
     }
     #[doc(hidden)]
-    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostCreateFailure {
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> CreateFailure<Bound, W> {
         self.with_secrets(secrets)
     }
 }
 #[cfg(test)]
-impl ResumeFailure<Unbound> {
+impl<W> ResumeFailure<Unbound, W> {
     #[doc(hidden)]
-    pub fn into_host_for_test(self) -> HostResumeFailure {
+    pub fn into_host_for_test(self) -> ResumeFailure<Bound, W> {
         self.with_secrets(&RedactionSet::for_test(&[]))
     }
     #[doc(hidden)]
-    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostResumeFailure {
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> ResumeFailure<Bound, W> {
         self.with_secrets(secrets)
     }
 }
 #[cfg(test)]
-impl ResumeOutcome<Unbound> {
+impl<W> ResumeOutcome<Unbound, W> {
     #[doc(hidden)]
-    pub fn into_host_for_test(self) -> HostResumeOutcome {
+    pub fn into_host_for_test(self) -> ResumeOutcome<Bound, W> {
         self.with_secrets(&RedactionSet::for_test(&[]))
     }
     #[doc(hidden)]
-    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostResumeOutcome {
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> ResumeOutcome<Bound, W> {
         self.with_secrets(secrets)
     }
 }
@@ -8285,11 +8365,11 @@ impl Provider<Bound> for ProviderRouter {
         id: &ResourceId,
         request: CreateRequest,
         attempt: CreateAttempt,
-    ) -> BoxFuture<'_, Result<HostCreateOutcome, HostCreateFailure>> {
+    ) -> BoxFuture<'_, Result<HostCreateOutcome, CreateFailure<Bound>>> {
         match self.get_provider_or_error(id) {
             Ok(provider) => provider.create(id, request, attempt),
             Err(error) => {
-                Box::pin(async move { Err(HostCreateFailure::not_created_at_dispatch(error)) })
+                Box::pin(async move { Err(CreateFailure::not_created_at_dispatch(error)) })
             }
         }
     }
@@ -8297,12 +8377,12 @@ impl Provider<Bound> for ProviderRouter {
     fn resume_create(
         &self,
         request: ResumeCreateRequest,
-    ) -> BoxFuture<'_, Result<HostResumeOutcome, HostResumeFailure>> {
+    ) -> BoxFuture<'_, Result<ResumeOutcome<Bound>, ResumeFailure<Bound>>> {
         match self.get_provider_or_error(request.id()) {
             Ok(provider) => provider.resume_create(request),
             Err(error) => {
                 let pending = request.into_in_flight();
-                Box::pin(async move { Err(HostResumeFailure::in_flight(pending, error)) })
+                Box::pin(async move { Err(ResumeFailure::in_flight(pending, error)) })
             }
         }
     }
@@ -11931,7 +12011,7 @@ mod tests {
             Timestamp::try_from("2026-10-23T08:00:00Z").expect("fixture timestamp is valid");
         let identifier = AppliedIdentifier::new("persisted-id").expect("valid identifier");
         let pending = PendingCreate::new(
-            id,
+            id.clone(),
             PendingToken::new("persisted-token"),
             CreateProgress::ReadingBack {
                 identifier: identifier.clone(),
@@ -11954,7 +12034,7 @@ mod tests {
         );
 
         let outcome = ResumedCreate {
-            pending,
+            pending: pending.into_provider_record(),
             identifier: identifier.clone(),
         }
         .partial(
@@ -11965,7 +12045,15 @@ mod tests {
             diagnostic.clone(),
         );
         let diagnostic = diagnostic.into_host_for_test();
-        let outcome = outcome.into_host_for_test();
+        let permit = crate::test_utils::prepared_write::create_permit(
+            &Resource::from_id(id).with_value_attributes(HashMap::from([(
+                "arn".to_string(),
+                Value::Concrete(ConcreteValue::String("known-arn".into())),
+            )])),
+        );
+        let outcome = outcome
+            .into_host_for_test()
+            .into_writeback(permit.prepared_write().create_writeback());
         let ResumeOutcomeKind::PartialSuccess(partial) = outcome.into_kind() else {
             panic!("resumed partial read-back must remain distinct from a resent create")
         };
@@ -12024,7 +12112,7 @@ mod tests {
             .await
             .classify();
 
-        let HostCreateFailureKind::OutcomeUnknown { unknown, error } =
+        let CreateFailureKind::OutcomeUnknown { unknown, error } =
             failure.into_host_for_test().into_kind()
         else {
             panic!("a sent guest call must not be classified as not_created")
@@ -12044,8 +12132,7 @@ mod tests {
             .await
             .classify();
 
-        let HostCreateFailureKind::NoResource(error) = failure.into_host_for_test().into_kind()
-        else {
+        let CreateFailureKind::NoResource(error) = failure.into_host_for_test().into_kind() else {
             panic!("a guest call with no dispatched request must remain not_created")
         };
         assert_eq!(error.to_string(), "guest trapped");
@@ -12074,8 +12161,7 @@ mod tests {
         drop(pending);
 
         let failure = classification.await.expect("classification task");
-        let HostCreateFailureKind::NoResource(error) = failure.into_host_for_test().into_kind()
-        else {
+        let CreateFailureKind::NoResource(error) = failure.into_host_for_test().into_kind() else {
             panic!("a host-denied pending request must not count as egress")
         };
         assert_eq!(error.to_string(), "malformed guest result");
@@ -12089,7 +12175,7 @@ mod tests {
             ProviderError::internal("returned value could not be decoded"),
         );
 
-        let HostCreateFailureKind::OutcomeUnknown { unknown, error } =
+        let CreateFailureKind::OutcomeUnknown { unknown, error } =
             failure.into_host_for_test().into_kind()
         else {
             panic!("the egress witness must mint an outcome-unknown failure")
@@ -12136,7 +12222,7 @@ mod tests {
     fn classified_resume_failure_display_is_context_only() {
         use std::error::Error as _;
 
-        let failure = ResumeFailure::no_resource_from_verdict(
+        let failure: ResumeFailure<Bound> = ResumeFailure::no_resource_from_verdict(
             ProviderError::not_found("leaf resume failure")
                 .with_secrets(&crate::provider_text::RedactionSet::for_test(&[])),
         );
@@ -12167,7 +12253,7 @@ mod tests {
     #[test]
     fn create_identified_post_error_note_indents_multiline_reason() {
         let id = ResourceId::with_provider_identity("test", "widget", "example", None);
-        let identified: HostIdentifiedCreate = IdentifiedCreate::from_create_observation(
+        let identified: IdentifiedCreate<Bound> = IdentifiedCreate::from_create_observation(
             id,
             AppliedIdentifier::new("widget-id").expect("fixture identifier is non-empty"),
             CreateObservation::Unobserved(UnobservedReason::ReadFailed(
@@ -17192,7 +17278,7 @@ mod composition_partial_tests {
             .pending(PendingToken::new("read-back"), 0)
             .persist(Default::default(), Default::default());
         let outcome = ResumedCreate {
-            pending,
+            pending: pending.into_provider_record(),
             identifier,
         }
         .partial(HashMap::new(), reason());

@@ -3,6 +3,8 @@
 pub mod configuration;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod loopback;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod prepared_write;
 pub mod resolver_kind;
 
 // Host boundary fixtures must not become guest display authority through

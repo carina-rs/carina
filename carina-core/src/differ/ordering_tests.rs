@@ -98,14 +98,13 @@ fn issue_4491_orphan_prevent_destroy_diagnostics_use_delete_order() {
 
 #[test]
 fn issue_4491_orphan_order_retains_persisted_dependencies_without_an_applied_snapshot() {
-    use crate::provider::{CreateAttempt, InFlightCreate, PendingToken, Sent};
+    use crate::provider::{CreateAttempt, PendingToken, Sent};
     let mut orphans = orphans(false);
     orphans.remove(&id("zulu"));
-    let pending = InFlightCreate::from_pending(CreateAttempt::new(id("zulu")).0.pending(
-        PendingToken::new("opaque"),
-        Sent::AllRequestAttributes,
-        1,
-    ));
+    let pending = CreateAttempt::new(id("zulu"))
+        .0
+        .pending(PendingToken::new("opaque"), Sent::AllRequestAttributes, 1)
+        .persist(Default::default(), Default::default());
     let mut child = Orphan::create_in_flight(pending, None, PersistedDirectives::default());
     child.set_dependency_bindings(
         PersistedDestroyDependencies::decode_persisted(
@@ -312,12 +311,11 @@ fn issue_4491_orphan_transformed_dependencies_drive_order_and_delete_edges() {
 
 #[test]
 fn issue_4491_stateless_orphan_dependencies_survive_current_round_trip() {
-    use crate::provider::{CreateAttempt, InFlightCreate, PendingToken, Sent};
-    let pending = InFlightCreate::from_pending(CreateAttempt::new(id("pending")).0.pending(
-        PendingToken::new("opaque"),
-        Sent::AllRequestAttributes,
-        1,
-    ));
+    use crate::provider::{CreateAttempt, PendingToken, Sent};
+    let pending = CreateAttempt::new(id("pending"))
+        .0
+        .pending(PendingToken::new("opaque"), Sent::AllRequestAttributes, 1)
+        .persist(Default::default(), Default::default());
     let failure = CreateAttempt::new(id("unknown")).0.outcome_unknown(
         crate::provider::EgressSent::for_test(),
         crate::provider::ProviderError::api_error("guest trapped"),

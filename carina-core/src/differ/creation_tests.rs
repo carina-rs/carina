@@ -1,7 +1,7 @@
 use super::*;
 use crate::effect::TemporaryName;
 use crate::input_rules::{InputCheckedPlan, InputWriteContext};
-use crate::provider::{AppliedIdentifier, CreateAttempt, InFlightCreate, PendingToken, Sent};
+use crate::provider::{AppliedIdentifier, CreateAttempt, PendingToken, Sent};
 use crate::resource::{DeferredValue, LoopSlot};
 use crate::schema::{AttributeSchema, InputPath, InputPredicate, InputRule, InputRuleCode};
 
@@ -252,7 +252,7 @@ fn creation_admission_classifies_resume_from_identifier_presence() {
         } else {
             attempt.pending(PendingToken::new("token"), Sent::AllRequestAttributes, 1)
         };
-        let pending = InFlightCreate::from_pending(pending);
+        let pending = pending.persist(Default::default(), Default::default());
         let mut plan = Plan::new();
         plan.add_resume_create(resource.clone(), pending.started_at().clone());
         let current = HashMap::from([(resource.id.clone(), Current::create_in_flight(pending))]);
@@ -567,20 +567,17 @@ fn input_scope_classification_table_covers_every_effect_variant() {
     let resource = resource(Some(string("valid-name")));
     let deleted = delete(&resource);
     let attempt = CreateAttempt::new(resource.id.clone()).0;
-    let unissued = InFlightCreate::from_pending(attempt.pending(
-        PendingToken::new("unissued"),
-        Sent::AllRequestAttributes,
-        1,
-    ));
-    let issued = InFlightCreate::from_pending(
-        CreateAttempt::new(resource.id.clone())
-            .0
-            .issued(
-                AppliedIdentifier::new("existing").unwrap(),
-                Sent::AllRequestAttributes,
-            )
-            .pending(PendingToken::new("issued"), 1),
-    );
+    let unissued = attempt
+        .pending(PendingToken::new("unissued"), Sent::AllRequestAttributes, 1)
+        .persist(Default::default(), Default::default());
+    let issued = CreateAttempt::new(resource.id.clone())
+        .0
+        .issued(
+            AppliedIdentifier::new("existing").unwrap(),
+            Sent::AllRequestAttributes,
+        )
+        .pending(PendingToken::new("issued"), 1)
+        .persist(Default::default(), Default::default());
     let DeferredCreatePayload {
         template,
         dependency_template,

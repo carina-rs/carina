@@ -2250,8 +2250,10 @@ mod tests {
         let stored_attributes = stored
             .map(|stored| BTreeMap::from([("items".to_string(), stored)]))
             .unwrap_or_default();
-        let sent = crate::executor::AcceptedRequest::create_for_test();
-        let sent_desired = sent.sent_desired_attributes(&resource);
+        let sent = crate::executor::AcceptedRequest::from_create_permit_for_test(
+            &crate::test_utils::prepared_write::create_permit(&resource),
+        );
+        let sent_desired = sent.sent_desired_attributes();
         let ExplicitFields::Struct { mut children } =
             build_from_resource_for_stored_values_after_send(
                 &resource,
@@ -2299,8 +2301,10 @@ mod tests {
                 ])),
             ),
         ]);
-        let create = crate::executor::AcceptedRequest::create_for_test();
-        let create_desired = create.sent_desired_attributes(&resource);
+        let create = crate::executor::AcceptedRequest::from_create_permit_for_test(
+            &crate::test_utils::prepared_write::create_permit(&resource),
+        );
+        let create_desired = create.sent_desired_attributes();
         let prior_explicit = build_from_resource_for_stored_values_after_send(
             &resource,
             None,
@@ -2323,8 +2327,17 @@ mod tests {
                 ])),
             ),
         ]);
-        let update = crate::executor::AcceptedRequest::update_for_test(&["description"], &[]);
-        let update_desired = update.sent_desired_attributes(&resource);
+        let update = crate::executor::AcceptedRequest::from_update_permit_for_test(
+            &crate::test_utils::prepared_write::update_permit(
+                &resource,
+                crate::resource::SnapshotState::existing(
+                    resource.id.clone(),
+                    std::collections::BTreeMap::new(),
+                ),
+                &["description"],
+            ),
+        );
+        let update_desired = update.sent_desired_attributes();
 
         let rebuilt = build_from_resource_for_stored_values_after_send(
             &resource,
@@ -3108,8 +3121,8 @@ mod tests {
     #[test]
     fn aligned_builder_pairing_matches_schema_aware_differ_pairing() {
         use crate::schema::{
-            CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
-            CompiledResourceSchema as ResourceSchema, CompiledStructField as StructField,
+            PatternAttributeSchema as AttributeSchema, PatternAttributeType as AttributeType,
+            PatternResourceSchema as ResourceSchema, PatternStructField as StructField,
         };
 
         let effect_type = AttributeType::enum_(
@@ -3126,9 +3139,14 @@ mod tests {
                 StructField::optional("description", AttributeType::string()).build(),
             ],
         );
-        let schema = ResourceSchema::new("example.Listener").attribute(
-            AttributeSchema::optional("items", AttributeType::unordered_list(item_type)).build(),
-        );
+        let validated_schema = ResourceSchema::new("example.Listener")
+            .attribute(
+                AttributeSchema::optional("items", AttributeType::unordered_list(item_type))
+                    .build(),
+            )
+            .validate()
+            .unwrap();
+        let schema = validated_schema.as_schema();
         let desired_item = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "effect".to_string(),
@@ -3154,15 +3172,19 @@ mod tests {
         let resource: Resource =
             Resource::new("example.Listener", "listener").with_attribute("items", desired);
         let stored_attributes = std::collections::BTreeMap::from([("items".to_string(), stored)]);
-        let sent = crate::executor::AcceptedRequest::create_for_test();
-        let sent_desired = sent.sent_desired_attributes(&resource);
+        let mut schemas = crate::schema::SchemaRegistry::new();
+        schemas.insert(&resource.id.provider, validated_schema.clone());
+        let sent = crate::executor::AcceptedRequest::from_create_permit_for_test(
+            &crate::test_utils::prepared_write::create_permit_with_schemas(&resource, &schemas),
+        );
+        let sent_desired = sent.sent_desired_attributes();
 
         let ExplicitFields::Struct { children } = build_from_resource_for_stored_values_after_send(
             &resource,
             None,
             &stored_attributes,
             &sent_desired,
-            Some(&schema),
+            Some(schema),
             &crate::differ::exact_comparison_context_for_tests(),
         ) else {
             panic!("expected resource-root Struct");
@@ -3297,20 +3319,33 @@ mod tests {
     }
 
     #[test]
-    fn aligned_builder_deferred_unknown_desired_value_is_leaf() {
-        let aligned = build_attribute_explicit(
+    fn read_builder_deferred_unknown_desired_value_is_leaf() {
+        let resource: Resource = Resource::new("example.Listener", "listener").with_attribute(
+            "items",
             Value::Deferred(DeferredValue::Unknown(
                 ApplyTimeUnknown::UpstreamAllExports {
                     binding: absolute_binding("upstream"),
                 },
             )),
-            Some(Value::Concrete(ConcreteValue::List(vec![rule(
+        );
+        // Unknown desired values cannot produce an accepted write.
+        assert!(crate::test_utils::prepared_write::try_create_permit(&resource).is_err());
+        let stored = BTreeMap::from([(
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![rule(
                 80,
                 Some("provider-default"),
-            )]))),
-        );
-
-        assert_eq!(aligned, ExplicitFields::Leaf);
+            )])),
+        )]);
+        let ExplicitFields::Struct { children } = build_from_read_resource_for_stored_values(
+            &resource,
+            &stored,
+            None,
+            &crate::differ::exact_comparison_context_for_tests(),
+        ) else {
+            panic!("expected resource-root Struct");
+        };
+        assert_eq!(children["items"], ExplicitFields::Leaf);
     }
 
     #[test]
