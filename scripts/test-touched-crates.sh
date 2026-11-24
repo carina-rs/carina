@@ -138,7 +138,7 @@ class TouchedCratesTests(unittest.TestCase):
 
     def test_cargo_execution_definitions_require_workspace(self):
         for filename in (
-            "scripts/verify.sh", "scripts/touched-crates.sh",
+            "scripts/verify.sh", "scripts/touched-crates.sh", "scripts/core-cross-checks.sh",
             "scripts/test-in-process-isolation.sh", "scripts/setup-nextest-user-dirs.sh",
             "scripts/require-wasm-fixtures.sh", "scripts/wasm-fixture-crates.txt",
             "rust-toolchain.toml", ".github/actions/rust-toolchain/action.yml",
@@ -177,6 +177,12 @@ class TouchedCratesTests(unittest.TestCase):
 
     def test_pinned_toolchain_guard_scripts_do_not_select_rust_crates(self):
         for filename in ("scripts/check-pinned-toolchain.sh", "scripts/test-check-pinned-toolchain.sh"):
+            with self.subTest(filename=filename):
+                self.assertEqual(self.scope(filename), "")
+
+    def test_script_unit_tests_do_not_select_rust_crates(self):
+        for filename in ("scripts/test-touched-crates.sh", "scripts/test-verify-sh.sh",
+                         "scripts/test-core-cross-checks.sh"):
             with self.subTest(filename=filename):
                 self.assertEqual(self.scope(filename), "")
 

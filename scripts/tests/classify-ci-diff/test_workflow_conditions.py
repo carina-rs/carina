@@ -217,6 +217,8 @@ class WorkflowConditionTests(unittest.TestCase):
                   'root.join("site/src/content/reference/registry");\n')
             inputs = {
                 "rust-toolchain.toml": True,
+                "scripts/core-cross-checks.sh": True,
+                "scripts/test-core-cross-checks.sh": True,
                 "site/src/content/providers/writing/schemas.md": True,
                 "site/src/content/reference/registry/static-registry.md": True,
                 "site/src/content/reference/dsl/types-and-values.md": True,
