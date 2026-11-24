@@ -331,6 +331,15 @@ run. When in doubt, run `scripts/verify.sh` without `--local`.
    dependent crates when a type or public API changed. PR CI runs the full
    check set; do not run `scripts/verify.sh --local`, a workspace-wide
    nextest, the determinism repeats or the parity script locally as a gate.
+   In addition, when `scripts/touched-crates.sh` prints `--workspace` (any
+   carina-core change, manifests, or other workspace-wide inputs), run
+   `bash scripts/core-cross-checks.sh` before pushing. It runs the core, CLI
+   and LSP suites and the core doctests, which compare core output with
+   recorded results or another route; these caught every test failure in PR
+   CI from 2026-11-16 to 11-23. The script skips itself when the diff is
+   narrower and, when a target directory is set, requires `target` to
+   resolve to it. Its filter is the one definition of the local selection
+   and lists each excluded test with the reason; CI still runs everything.
    When CI fails, read the failed job's log, fix it, and re-run only the
    failed tests locally before pushing.
    `scripts/verify.sh --local` remains available for debugging a CI failure
@@ -668,8 +677,17 @@ type each bullet names; read that type's rustdoc for the details.
   in `validation/admission/configuration/` and is closed off from resource
   admission by its types. S3 backend URLs keep encryption on and
   auto-creation off. Function parameters/returns use
-  `check_resolved_constraints_at`. Member String failures retain their pattern/
-  length category and member label; identity failures run first.
+  `check_resolved_constraints_at`. Unknown values must be proven by their type;
+  otherwise validate reports a function-promise finding, emitted only by
+  `parser/retained/function_promises.rs`, carried in its own type, and never a
+  stop/parse error. Unknown returns reuse the body typed with declared parameter
+  types; nested-call verdicts are reused for relevant unknown outer arguments.
+  Calls inside modules use the child's declared argument types. Unavailable
+  schemas or upstream loads defer. Destroy/state refresh skip this pass through
+  `ValidationMode` (the `FullValidation` capability). Some String references into
+  narrower named or Int parameters still defer (carina#4594). Definite mismatches
+  remain declaration errors, including unused functions. Member String failures
+  retain their pattern/length category and member label; identity failures run first.
   Int-to-Float widening between identified scalars uses identity-bound containment
   too. Float pairs with identities on both sides retain strict declaration range
   containment; same-identity Float reference admission retains resolved-value

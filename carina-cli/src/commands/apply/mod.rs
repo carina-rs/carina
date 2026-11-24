@@ -20,7 +20,7 @@ use carina_core::config_loader::{
 use carina_core::data_source_value::{DataSourceValues, ExecutableDataSourceValues};
 use carina_core::differ::Orphans;
 use carina_core::executor::{
-    AcceptedRequest, ExecutionCheckpointSink, ExecutionObserver, ExecutionOutcome, ExecutionResult,
+    ExecutionCheckpointSink, ExecutionObserver, ExecutionOutcome, ExecutionResult,
     LiveExecutionInput, ProviderCheckInputs, SavedExecutionInput, UnresolvedResource,
 };
 use carina_core::paths::ResolvedPath;
@@ -329,17 +329,16 @@ async fn create_checked_bootstrap_resource(
     color_mode: crate::output_style::ColorMode,
     operation_provider: &dyn HostProvider,
     comparison_provider: &ProviderRouter,
-    resource: Resource,
+    id: ResourceId,
     context: BootstrapCreateContext<'_>,
 ) -> Result<(), AppError> {
     crate::wiring::settle_type_checks(
         carina_core::validation::deferred_types::TypeCheckSession::run_async(
             context.provider_context,
             async |session| {
-                let id = resource.id.clone();
                 let prepared =
                     prepare_bootstrap_creation(color_mode, &id, &context, session).await?;
-                let request = prepared.request();
+                let resolved = prepared.request().resource().as_inner().clone();
                 let BootstrapCreateContext {
                     provider_context: _provider_context,
                     backend,
@@ -348,26 +347,24 @@ async fn create_checked_bootstrap_resource(
                     normalizer: _,
                     schemas,
                 } = context;
-                let resolved = request.resource().as_inner().clone();
                 let resolved_comparison =
                     comparison_provider.comparison_for(schemas, &resolved.id)?;
                 let owner_schema = resolved_comparison.owner_schema();
                 let schema = Some(owner_schema.schema().as_schema());
-                let accepted_request = AcceptedRequest::from_create_request(request);
                 let (create, create_cancellation) =
-                    carina_core::executor::dispatch_create(operation_provider, prepared);
+                    carina_core::executor::dispatch_create_for_writeback(operation_provider, prepared);
                 let outcome = create.await;
                 // Bootstrap creates are not part of the parallel executor, but they still
                 // retain the reporter until the guest call has settled.
                 drop(create_cancellation);
                 match outcome {
-                    Ok(outcome) => {
-                        let identifier = outcome.identifier().as_str().to_string();
-                        let (state, accepted_request, diagnostic, _read_back_end) =
-                            carina_core::executor::complete_create_for_writeback(
-                                outcome,
-                                accepted_request,
-                            );
+                    Ok(carina_core::executor::CreateWriteback {
+                        identifier,
+                        state,
+                        request: accepted_request,
+                        diagnostic,
+                        ..
+                    }) => {
                         let row = resolved_comparison.context().with_observation(|comparison| {
 carina_state::ResourceState::from_provider_state_for_resource_and_schema(
                     &resolved,
@@ -392,7 +389,7 @@ carina_state::ResourceState::from_provider_state_for_resource_and_schema(
                                 );
                                 AppError::StateBucketSeed(Box::new(
                                     crate::error::StateBucketSeedError::new(
-                                        identifier.clone(),
+                                        identifier.as_str().to_owned(),
                                         resource_address,
                                         source,
                                     ),
@@ -403,7 +400,7 @@ carina_state::ResourceState::from_provider_state_for_resource_and_schema(
                                 "{}",
                                 format_partial_state_bucket_create_warning(
                                     color_mode,
-                                    &carina_core::provider_text::DiagnosticText::new(&identifier),
+                                    &carina_core::provider_text::DiagnosticText::new(identifier.as_str()),
                                     &diagnostic
                                 )
                             );
@@ -499,7 +496,7 @@ async fn create_checked_bootstrap_resource_for_test(
         color_mode,
         operation_provider,
         &comparison_provider,
-        resource,
+        resource.id,
         BootstrapCreateContext {
             provider_context,
             backend,
@@ -2231,7 +2228,7 @@ async fn prepare_apply_storage(
                         color_mode,
                         &bucket_provider,
                         &bucket_provider,
-                        bucket_resource.clone(),
+                        bucket_resource.id.clone(),
                         BootstrapCreateContext {
                             provider_context: validated_config.context().provider_context(),
                             backend,

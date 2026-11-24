@@ -461,7 +461,8 @@ awscc.ec2.Vpc {
 }
 ```
 
-See [Expressions](/reference/dsl/expressions/) for details on function definitions.
+See [Expressions](/reference/dsl/expressions/) for function definitions and
+[function type promises](/guides/functions/#type-promises-at-validate) for annotation validation.
 
 ## Require Statement
 

@@ -60,8 +60,16 @@ async fn persisted_read_back_failure(incomplete: bool) -> String {
     } else {
         identified
     };
-    let identified =
-        identified.with_secrets_for_test(&crate::provider_text_fixtures::context(&[SECRET]));
+    let CreateFailureKind::IdentifierReported { identified, .. } =
+        dispatched_create_failure_for_test(
+            desired.as_inner(),
+            identified.failure_for_test(),
+            Some(schema.clone()),
+        )
+        .into_kind()
+    else {
+        panic!("dispatched read-back failure must retain the created identifier");
+    };
     let row = resource_state_from_observation_for_test(
         &desired,
         &identified,
@@ -91,11 +99,11 @@ async fn persisted_read_back_failure(incomplete: bool) -> String {
         reason["detail"]
             .as_str()
             .is_some_and(|text| text.contains("mock read-back")),
-        "read-back detail was not persisted: {content}"
+        "read-back detail was not persisted"
     );
     assert!(
         content.contains("read-context-4305"),
-        "non-secret diagnostic context was lost: {content}"
+        "non-secret diagnostic context was lost"
     );
     content
 }
@@ -105,11 +113,11 @@ async fn failed_read_back_secret_is_redacted_from_persisted_state_file() {
     let content = persisted_read_back_failure(false).await;
     assert!(
         !content.contains(SECRET),
-        "provider secret plaintext leaked into persisted PendingReRead detail: {content}"
+        "provider secret plaintext leaked into persisted PendingReRead detail"
     );
     assert!(
         content.contains(MASK),
-        "missing {MASK} in persisted read-back detail: {content}"
+        "missing {MASK} in persisted read-back detail"
     );
 }
 
@@ -118,10 +126,10 @@ async fn incomplete_read_back_secret_is_redacted_from_persisted_state_file() {
     let content = persisted_read_back_failure(true).await;
     assert!(
         !content.contains(SECRET),
-        "provider secret plaintext leaked into persisted partial_read.reason.detail: {content}"
+        "provider secret plaintext leaked into persisted partial_read.reason.detail"
     );
     assert!(
         content.contains(MASK),
-        "missing {MASK} in persisted partial-read detail: {content}"
+        "missing {MASK} in persisted partial-read detail"
     );
 }

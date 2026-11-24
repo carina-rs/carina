@@ -41,8 +41,11 @@ impl CreatePermit {
     pub fn request(&self) -> &crate::provider::CreateRequest {
         self.request.request()
     }
-    pub(crate) fn into_request(self) -> crate::provider::CreateRequest {
-        (*self.request).into_parts().0
+    pub(crate) fn prepared_write(&self) -> &super::PreparedWrite<crate::provider::CreateRequest> {
+        &self.request
+    }
+    pub(super) fn into_write(self) -> super::PreparedWrite<crate::provider::CreateRequest> {
+        *self.request
     }
 }
 
@@ -64,7 +67,7 @@ pub fn create_permit_with_schemas_for_test(
     );
     let attributes = request.resource().as_resource().resolved_attributes();
     let writeback = crate::binding_index::SecretPreservingAttributes::from_provider_values(
-        &attributes,
+        request.resource().protected_desired_tree().attributes(),
         &attributes,
     );
     let write = check
@@ -114,7 +117,7 @@ pub fn update_permit_with_schemas_for_test(
         .into_iter()
         .collect();
     let writeback = crate::binding_index::SecretPreservingAttributes::from_provider_values(
-        &attributes,
+        desired.protected_desired_tree().attributes(),
         &attributes,
     );
     let write = check
@@ -251,24 +254,15 @@ impl<S: Clone> ScheduledResume<S> {
         self,
         resource: &crate::resource::ResolvedResource<S>,
         write: super::PreparedWrite<crate::provider::CreateRequest>,
-    ) -> Result<
-        (
-            PreparedResume,
-            crate::binding_index::SecretPreservingAttributes,
-            super::AcceptedRequest,
-        ),
-        super::EffectFailureKind,
-    > {
-        let attributes = write.writeback().clone();
-        let accepted = super::AcceptedRequest::from_create_request(write.request())
-            .with_resolved_desired_attributes(attributes.clone());
+    ) -> Result<(PreparedResume, super::AcceptedRequest), super::EffectFailureKind> {
+        let accepted = super::AcceptedRequest::from_prepared_create(&write);
         let request = match self {
             Self::Resend { pending, create } => PreparedResume::Resend(
                 crate::provider::ResumeCreateRequest::new(*pending, create.authorize(write))
                     .map_err(super::EffectFailureKind::execution)?,
             ),
             Self::Poll(pending) => PreparedResume::Poll(
-                crate::provider::PollCreateRequest::new(*pending, write.into_parts().0)
+                crate::provider::PollCreateRequest::new(*pending, write)
                     .map_err(super::EffectFailureKind::execution)?,
             ),
             Self::Missing => {
@@ -278,7 +272,7 @@ impl<S: Clone> ScheduledResume<S> {
                 )));
             }
         };
-        Ok((request, attributes, accepted))
+        Ok((request, accepted))
     }
 }
 

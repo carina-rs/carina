@@ -1,6 +1,122 @@
 use super::*;
 use crate::provider_text_fixtures::*;
+use carina_core::test_utils::prepared_write;
+mod create_writeback_fixtures;
 mod provider_text_secret_redaction;
+use create_writeback_fixtures::{
+    create_attempt_for_test, create_fixture_provider, create_request_for_test,
+    dispatched_create_failure_for_test, ready_for_test, resumed_create_observation_for_test,
+};
+
+fn accepted_attributes_for_test(request: &AcceptedRequest) -> IndexMap<String, Value> {
+    request
+        .resolved_desired_attributes()
+        .values()
+        .iter()
+        .map(|(key, value)| (key.clone(), value.to_value_at(key).unwrap()))
+        .collect()
+}
+
+fn accepted_grafted_tags_update_for_test(
+    resource: &ResolvedResource,
+    state: &State,
+    grafted: &[LeafPath],
+) -> AcceptedRequest {
+    use carina_core::resource::ParsedIgnorePathSegment;
+    use carina_core::schema::{
+        LeafPathSegment, PatternAttributeSchema, PatternAttributeType, PatternResourceSchema,
+        PatternStructField,
+    };
+
+    fn value_type(value: &Value, path: &[LeafPathSegment]) -> PatternAttributeType {
+        let Some((segment, rest)) = path.split_first() else {
+            return carina_core::test_utils::fixture_value_type(value);
+        };
+        let Value::Concrete(ConcreteValue::Map(values)) = value else {
+            panic!("grafted fixture path traverses an object");
+        };
+        match segment {
+            LeafPathSegment::StructField(field) => PatternAttributeType::struct_(
+                "GraftedStateFixture",
+                values
+                    .iter()
+                    .map(|(key, value)| {
+                        let ty = if key == field {
+                            value_type(value, rest)
+                        } else {
+                            carina_core::test_utils::fixture_value_type(value)
+                        };
+                        PatternStructField::optional(key, ty).build()
+                    })
+                    .collect(),
+            ),
+            LeafPathSegment::MapKey(selected) => {
+                let mut types = values
+                    .iter()
+                    .map(|(key, value)| {
+                        if key == selected.expose_plaintext() {
+                            value_type(value, rest)
+                        } else {
+                            carina_core::test_utils::fixture_value_type(value)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let inner = if types.len() == 1 {
+                    types.pop().unwrap()
+                } else {
+                    // Preserve heterogeneous provider lists instead of using
+                    // the two-arm String/List canonicalization shorthand.
+                    types.extend([PatternAttributeType::bool(), PatternAttributeType::int()]);
+                    PatternAttributeType::union(types)
+                };
+                PatternAttributeType::map(inner)
+            }
+            LeafPathSegment::ListIndex(_) => panic!("authored ignore paths cannot index lists"),
+        }
+    }
+
+    let mut desired = resource.as_resource().clone();
+    desired.directives.ignore_changes = grafted
+        .iter()
+        .map(|path| {
+            let mut segments = vec![ParsedIgnorePathSegment::Attribute("tags".into())];
+            segments.extend(path.segments().iter().map(|segment| match segment {
+                LeafPathSegment::StructField(name) => {
+                    ParsedIgnorePathSegment::Attribute(name.clone())
+                }
+                LeafPathSegment::MapKey(key) => {
+                    ParsedIgnorePathSegment::MapKey(key.expose_plaintext().into())
+                }
+                LeafPathSegment::ListIndex(index) => ParsedIgnorePathSegment::ListIndex(*index),
+            }));
+            serde_json::from_value(serde_json::json!({ "segments": segments })).unwrap()
+        })
+        .collect();
+    let [path] = grafted else {
+        panic!("fixture declares one grafted path");
+    };
+    let schema = PatternResourceSchema::new(&resource.id.resource_type)
+        .attribute(
+            PatternAttributeSchema::optional(
+                "tags",
+                value_type(&desired.attributes["tags"], path.segments()),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(&resource.id.provider, schema);
+    let from = state.to_snapshot();
+    let request = AcceptedRequest::from_update_permit_for_test(
+        &prepared_write::update_permit_with_schemas(&desired, from, &["tags"], &schemas),
+    );
+    let AcceptedRequestKind::Update { sent, .. } = request.kind() else {
+        panic!("expected prepared update");
+    };
+    assert_eq!(sent["tags"].grafted_leaves(), grafted);
+    request
+}
 
 fn desired_value_comparison_for_test(
     schema: Option<&ResourceSchema>,
@@ -300,125 +416,6 @@ fn destroy_refresh_projection_preserves_persisted_deposed_error_context() {
     }] if identifier.as_str() == "persisted-id"),
         "refresh must preserve main's persisted-generation diagnostic context"
     );
-}
-
-// Capture an attempt only after a real provider-ready request has passed
-// admission and discharge. This helper is private to state writeback tests.
-fn create_attempt_for_test(id: ResourceId) -> carina_core::provider::CreateAttempt {
-    use carina_core::provider::*;
-    use std::future::Future;
-    use std::task::{Context, Poll, Waker};
-
-    struct CaptureAttempt(std::sync::Mutex<Option<CreateAttempt>>);
-
-    impl Provider for CaptureAttempt {
-        fn name(&self) -> &str {
-            "capture-attempt"
-        }
-        fn read(
-            &self,
-            _: &ResourceId,
-            _: &AppliedIdentifier,
-            _: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
-            panic!("unexpected fixture read")
-        }
-        fn read_data_source(
-            &self,
-            _: &ProviderReadyDataSource,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
-            panic!("unexpected fixture data-source read")
-        }
-        fn create(
-            &self,
-            _: &ResourceId,
-            _: CreateRequest,
-            attempt: CreateAttempt,
-        ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
-            *self.0.lock().unwrap() = Some(attempt);
-            Box::pin(std::future::pending())
-        }
-        fn resume_create(
-            &self,
-            _: ResumeCreateRequest,
-        ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
-            panic!("unexpected fixture resume")
-        }
-        fn update(
-            &self,
-            _: &ResourceId,
-            _: &AppliedIdentifier,
-            _: UpdateRequest,
-            _: UpdateAttempt,
-        ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
-            panic!("unexpected fixture update")
-        }
-        fn delete(
-            &self,
-            _attempt: carina_core::provider::DeleteAttempt,
-        ) -> BoxFuture<'_, ProviderResult<()>> {
-            panic!("unexpected fixture delete")
-        }
-        fn required_permissions(
-            &self,
-            _: &ResourceId,
-            _: carina_core::effect::PlanOp,
-        ) -> ProviderResult<Vec<String>> {
-            panic!("unexpected fixture permissions")
-        }
-    }
-
-    fn ready<F: Future>(future: F) -> F::Output {
-        let mut future = std::pin::pin!(future);
-        let mut context = Context::from_waker(Waker::noop());
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => output,
-            Poll::Pending => panic!("fixture preparation must complete synchronously"),
-        }
-    }
-
-    let provider = std::sync::Arc::new(CaptureAttempt(std::sync::Mutex::new(None)));
-    let bindings = carina_core::binding_index::ResolvedBindings::default();
-    let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let mut schemas = carina_core::schema::SchemaRegistry::new();
-    schemas.insert(
-        &id.provider,
-        carina_core::schema::PatternResourceSchema::new(&id.resource_type)
-            .validate()
-            .unwrap(),
-    );
-    carina_core::validation::deferred_types::with_session_for_test(
-        &carina_core::parser::LoadedProviderContext::empty_for_test(),
-        |type_checks| {
-            let preparation = carina_core::executor::ProviderPreparationContext::for_test(
-                &bindings,
-                &gate,
-                &[],
-                &NoopNormalizer,
-                &schemas,
-                type_checks,
-            );
-            let request = ready(carina_core::executor::prepare_create_request(
-                Resource::from_id(id),
-                &preparation,
-            ))
-            .expect("fixture passes provider preparation");
-            // This fixture only captures dispatch provenance; its schema has no input rules.
-            let prepared = carina_core::replacement::create_permit_for_test(request);
-            let boundary =
-                crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
-            let (create, _cancellation) =
-                carina_core::executor::dispatch_create(&boundary, prepared);
-            let mut create = std::pin::pin!(create);
-            assert!(
-                create
-                    .as_mut()
-                    .poll(&mut Context::from_waker(Waker::noop()))
-                    .is_pending()
-            );
-        },
-    );
-    provider.0.lock().unwrap().take().unwrap()
 }
 
 fn published_exports_from_state(state: &StateFile) -> PublishedExports {
@@ -2428,7 +2425,8 @@ fn from_provider_state_aligns_reordered_nested_and_provider_added_list_elements(
     )
     .with_identifier("listener-id");
 
-    let accepted = AcceptedRequest::create_for_test();
+    let accepted =
+        AcceptedRequest::from_create_permit_for_test(&prepared_write::create_permit(&resource));
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
         &provider_state,
@@ -2514,7 +2512,9 @@ fn state_writeback_uses_explicit_basis_per_sent_top_level_attribute() {
         &prior_provider,
         None,
         None,
-        RowBasis::Applied(&AcceptedRequest::create_for_test()),
+        RowBasis::Applied(&AcceptedRequest::from_create_permit_for_test(
+            &prepared_write::create_permit(&resource),
+        )),
         None,
     )
     .expect("create writeback records the server default");
@@ -2546,7 +2546,14 @@ fn state_writeback_uses_explicit_basis_per_sent_top_level_attribute() {
         ]),
     )
     .with_identifier("listener-id");
-    let update = AcceptedRequest::update_for_test(&["description"], &[]);
+    let update = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &updated,
+        carina_core::resource::SnapshotState::existing(
+            updated.id.clone(),
+            std::collections::BTreeMap::new(),
+        ),
+        &["description"],
+    ));
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&updated),
         &updated_provider,
@@ -3479,7 +3486,8 @@ fn carried_whole_value_clears_when_readded_field_has_a_unique_pair() {
         Diff::NoChange(_)
     ));
 
-    let accepted = AcceptedRequest::create_for_test();
+    let accepted =
+        AcceptedRequest::from_create_permit_for_test(&prepared_write::create_permit(&applied));
     let applied_row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&applied),
         &provider,
@@ -6330,7 +6338,8 @@ fn accepted_create_records_write_only_attributes() {
                 .write_only()
                 .build(),
         );
-    let request = AcceptedRequest::create_for_test();
+    let request =
+        AcceptedRequest::from_create_permit_for_test(&prepared_write::create_permit(&resource));
     let rs = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
         &provider_state,
@@ -6462,7 +6471,9 @@ fn accepted_create_does_not_record_write_only_attribute_absent_from_desired() {
         &provider_state,
         None,
         Some(&schema),
-        RowBasis::Applied(&AcceptedRequest::create_for_test()),
+        RowBasis::Applied(&AcceptedRequest::from_create_permit_for_test(
+            &prepared_write::create_permit(&resource),
+        )),
         None,
     )
     .unwrap();
@@ -6518,7 +6529,9 @@ fn accepted_write_only_does_not_overwrite_protected_provider_value() {
         &provider_state,
         None,
         Some(&schema),
-        RowBasis::Applied(&AcceptedRequest::create_for_test()),
+        RowBasis::Applied(&AcceptedRequest::from_create_permit_for_test(
+            &prepared_write::create_permit(&resource),
+        )),
         None,
     )
     .unwrap();
@@ -6711,6 +6724,16 @@ fn applied_previous_secret_hash_authority_requires_known_public_desired() {
     )])));
     let cases = [
         ("absent", None, true),
+        (
+            "resolved secret",
+            Some(Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    ["resolved", "fixture"].join("-").into(),
+                )))
+                .into(),
+            ))),
+            true,
+        ),
         ("known public tree", Some(public), false),
         (
             "plain literal",
@@ -6754,30 +6777,80 @@ fn applied_previous_secret_hash_authority_requires_known_public_desired() {
             expected_desired_key,
             "{label}: classify the entire desired value tree"
         );
-        let request = AcceptedRequest::update_for_test(&["computed"], &[]);
-        for (authority, protected) in [
+        let preparation = prepared_write::try_update_permit(
+            &resource,
+            SnapshotState::existing(resource.id.clone(), BTreeMap::new()),
+            &["computed"],
+        );
+        let unresolved = matches!(
+            label,
+            "reference"
+                | "binding"
+                | "unknown"
+                | "call"
+                | "nested reference"
+                | "literal interpolation remains deferred"
+                | "literal coalesce remains deferred"
+        );
+        let request = if unresolved {
+            assert!(
+                preparation.is_err(),
+                "{label}: unresolved desired inputs cannot be accepted"
+            );
+            None
+        } else {
+            Some(AcceptedRequest::from_update_permit_for_test(
+                &preparation.unwrap(),
+            ))
+        };
+        let request_attributes = request.as_ref().map(accepted_attributes_for_test);
+        let mut authorities = vec![
             (PreviousSecretHashAuthority::None, false),
             (
                 PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&previous),
                 true,
             ),
-            (
+        ];
+        if let Some(request) = &request {
+            authorities.push((
                 PreviousSecretHashAuthority::AcceptedWrite {
                     previous: &previous,
-                    request: &request,
-                    request_attributes: Cow::Borrowed(&resource.attributes),
+                    request,
+                    request_attributes: Cow::Borrowed(request_attributes.as_ref().unwrap()),
                     final_desired: None,
                 },
                 protected,
-            ),
-        ] {
+            ));
+        }
+        let writeback_resource = if label == "resolved secret" {
+            // Exercise previous-hash protection through the accepted request,
+            // without the row's desired shape masking the provider value first.
+            resolved(&Resource::from_id(resource.id.clone()))
+        } else {
+            resource.clone()
+        };
+        for (authority, protected) in authorities {
+            assert_eq!(
+                SelectedStateAttributes::decide_previous_secret_hash(
+                    &authority,
+                    "computed",
+                    PreviousSecretHashInput::ProviderValue(Some(&provider_value)),
+                    Some(desired_value_comparison_for_test(None)),
+                ),
+                if protected {
+                    PreviousSecretHashDecision::Protect
+                } else {
+                    PreviousSecretHashDecision::Release
+                },
+                "{label}: previous-hash authority must match the desired classification"
+            );
             let selected = SelectedStateAttributes {
                 encoded: BTreeMap::from([("computed".to_owned(), provider_value.clone())]),
                 write_only_keys: HashSet::new(),
                 retained_write_only: HashSet::new(),
             }
             .protect_for_resource(
-                &resource,
+                &writeback_resource,
                 authority,
                 None,
                 true,
@@ -6822,7 +6895,15 @@ fn previous_secret_hash_unsent_update_requires_provider_equality() {
         PersistedValue::encode_desired_value(&old, None).unwrap(),
     )]))
     .unwrap();
-    let request = AcceptedRequest::update_for_test(&["other"], &[]);
+    let mut request_resource = Resource::with_provider("mock", "test.resource", "sink", None);
+    request_resource.attributes = attributes.clone();
+    request_resource.set_attr("other", Value::Concrete(ConcreteValue::Bool(true)));
+    let request = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &request_resource,
+        SnapshotState::existing(request_resource.id.clone(), BTreeMap::new()),
+        &["other"],
+    ));
+    let request_attributes = accepted_attributes_for_test(&request);
     for (provider, expected) in [
         ("different", PreviousSecretHashDecision::Protect),
         ("public", PreviousSecretHashDecision::Release),
@@ -6837,7 +6918,7 @@ fn previous_secret_hash_unsent_update_requires_provider_equality() {
                 &PreviousSecretHashAuthority::AcceptedWrite {
                     previous: &previous,
                     request: &request,
-                    request_attributes: Cow::Borrowed(&attributes),
+                    request_attributes: Cow::Borrowed(&request_attributes),
                     final_desired: Some(&FinalDesiredAttributes::for_test(attributes.clone())),
                 },
                 "computed",
@@ -6963,14 +7044,24 @@ fn previous_secret_hash_unsent_update_beside_desired_secret_keeps_retained_leaf(
             let (resource, previous, selected) =
                 previous_secret_hash_desired_secret_sibling_fixture(observed_retained);
             let final_desired = FinalDesiredAttributes::for_test(resource.attributes.clone());
-            let request = AcceptedRequest::update_for_test(&["other_attribute"], &[]);
+            let desired = resource.as_resource().clone().with_attribute(
+                "other_attribute",
+                Value::Concrete(ConcreteValue::Bool(true)),
+            );
+            let request =
+                AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+                    &desired,
+                    SnapshotState::existing(resource.id.clone(), BTreeMap::new()),
+                    &["other_attribute"],
+                ));
+            let request_attributes = accepted_attributes_for_test(&request);
             let selected = selected
                 .protect_for_resource(
                     &resource,
                     PreviousSecretHashAuthority::AcceptedWrite {
                         previous: &previous,
                         request: &request,
-                        request_attributes: Cow::Borrowed(&resource.attributes),
+                        request_attributes: Cow::Borrowed(&request_attributes),
                         final_desired: has_final_desired.then_some(&final_desired),
                     },
                     None,
@@ -7029,7 +7120,7 @@ fn previous_secret_hash_grafted_map_row(
         HashMap::from([("tags".into(), sent_tags)]),
     )
     .with_identifier("sink-id");
-    let request = AcceptedRequest::update_with_grafted_leaves_for_test(&[("tags", grafted)], &[]);
+    let request = accepted_grafted_tags_update_for_test(&resource, &state, &grafted);
     ResourceState::from_provider_state_with_final_desired(
         &resource,
         &state,
@@ -7105,14 +7196,12 @@ fn previous_secret_hash_grafted_leaf_with_desired_secret_sibling_is_protected() 
         )]),
     )
     .with_identifier("sink-id");
-    let request = AcceptedRequest::update_with_grafted_leaves_for_test(
-        &[(
-            "tags",
-            vec![LeafPath::from_segments([LeafPathSegment::MapKey(
-                "retained".into(),
-            )])],
-        )],
-        &[],
+    let request = accepted_grafted_tags_update_for_test(
+        &resource,
+        &state,
+        &[LeafPath::from_segments([LeafPathSegment::MapKey(
+            "retained".into(),
+        )])],
     );
     let row = ResourceState::from_provider_state_with_final_desired(
         &resource,
@@ -7399,9 +7488,10 @@ fn previous_secret_hash_opaque_ancestor_with_desired_secret_sibling_is_protected
             grafted.push(LeafPathSegment::MapKey("nested".into()));
         }
         grafted.push(LeafPathSegment::MapKey("retained".into()));
-        let request = AcceptedRequest::update_with_grafted_leaves_for_test(
-            &[("tags", vec![LeafPath::from_segments(grafted)])],
-            &[],
+        let request = accepted_grafted_tags_update_for_test(
+            &resource,
+            &state,
+            &[LeafPath::from_segments(grafted)],
         );
         let final_desired =
             FinalDesiredValues::for_test([(resource.id.clone(), resource.attributes.clone())]);
@@ -7456,7 +7546,12 @@ fn previous_secret_hash_wholly_ignored_key_is_protected() {
     )
     .with_identifier("sink-id");
     // A wholly ignored key is absent from the accepted patch.
-    let request = AcceptedRequest::update_for_test(&["other"], &[]);
+    let request = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &resource,
+        SnapshotState::existing(resource.id.clone(), BTreeMap::new()),
+        &["other"],
+    ));
+    assert!(!request.sent_attributes().contains("computed"));
     let final_desired =
         FinalDesiredValues::for_test([(resource.id.clone(), resource.attributes.clone())]);
     for witness in [None, Some(&final_desired)] {
@@ -7632,7 +7727,6 @@ fn previous_secret_hash_decision_matrix() {
         ("omitted reference", Some(reference), None, false, false),
         ("omitted call", Some(call), None, false, false),
     ];
-    let request = AcceptedRequest::update_for_test(&["computed"], &[]);
     for previous in [&previous, &nested_previous] {
         for (label, desired, provider, applied_release, read_release) in &cases {
             let attributes = desired
@@ -7646,13 +7740,45 @@ fn previous_secret_hash_decision_matrix() {
                     DesiredKey::NotKnownPublic
                 );
             }
+            let mut request_resource =
+                Resource::with_provider("mock", "test.resource", "sink", None);
+            request_resource.attributes = attributes.clone();
+            let preparation = prepared_write::try_update_permit(
+                &request_resource,
+                SnapshotState::existing(request_resource.id.clone(), BTreeMap::new()),
+                &["computed"],
+            );
+            let unresolved = matches!(
+                *label,
+                "reference"
+                    | "retained call"
+                    | "map with reference leaf"
+                    | "list with deferred interpolation"
+                    | "omitted reference"
+                    | "omitted call"
+            );
+            let request = if unresolved {
+                assert!(
+                    preparation.is_err(),
+                    "{label}: unresolved desired inputs cannot be accepted"
+                );
+                None
+            } else {
+                Some(AcceptedRequest::from_update_permit_for_test(
+                    &preparation.unwrap(),
+                ))
+            };
+            let request_attributes = request.as_ref().map(accepted_attributes_for_test);
             let final_desired = FinalDesiredAttributes::for_test(attributes.clone());
             for (basis, applied) in [("applied", true), ("carried", false), ("imported", false)] {
                 let authority = if applied {
+                    let Some(request) = request.as_ref() else {
+                        continue;
+                    };
                     PreviousSecretHashAuthority::AcceptedWrite {
                         previous,
-                        request: &request,
-                        request_attributes: Cow::Borrowed(&attributes),
+                        request,
+                        request_attributes: Cow::Borrowed(request_attributes.as_ref().unwrap()),
                         final_desired: Some(&final_desired),
                     }
                 } else {
@@ -7770,7 +7896,15 @@ fn previous_secret_hash_unsent_update_uses_final_plan_desired() {
         resource.id.clone(),
         IndexMap::from([("computed".into(), public)]),
     )]);
-    let request = AcceptedRequest::update_for_test(&["other"], &[]);
+    let request_resource = resource
+        .as_resource()
+        .clone()
+        .with_attribute("other", Value::Concrete(ConcreteValue::Bool(true)));
+    let request = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &request_resource,
+        SnapshotState::existing(resource.id.clone(), BTreeMap::new()),
+        &["other"],
+    ));
     let row = ResourceState::from_provider_state_with_final_desired(
         &resource,
         &state,
@@ -7922,11 +8056,433 @@ fn retained_write_only_previous_hash_cannot_prove_plaintext_equality() {
     assert!(selected.encoded.get("computed") == Some(&previous_value));
 }
 
+fn dropped_key_create_rows(secret: bool, nested: bool) -> [ResourceState; 3] {
+    use carina_core::executor::{
+        ModuleConstraintGate, ProviderPreparationContext, prepare_initial_create,
+    };
+    use carina_core::provider::{
+        AppliedIdentifier, BoxFuture, HostCreateFailureKind, Observation, PendingToken,
+        ProviderError, ProviderNormalizer, ProviderResult, ReadOutcome, SavedAttrs,
+        StateTransformMap, ready_noop,
+    };
+    use carina_core::resource::ProviderResource;
+
+    struct DroppingNormalizer;
+    impl ProviderNormalizer for DroppingNormalizer {
+        fn normalize_desired<'a>(
+            &'a self,
+            resources: &'a mut [ProviderResource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            for resource in resources {
+                resource.attributes.shift_remove("dropped");
+            }
+            ready_noop()
+        }
+
+        fn normalize_state<'a>(
+            &'a self,
+            _: &'a mut StateTransformMap,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            ready_noop()
+        }
+
+        fn hydrate_read_state<'a>(
+            &'a self,
+            _: &'a mut StateTransformMap,
+            _: &'a SavedAttrs,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            ready_noop()
+        }
+    }
+
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+    let dropped = if nested {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "value".into(),
+            string("consumed"),
+        )])))
+    } else {
+        string("consumed")
+    };
+    let dropped = if secret {
+        Value::Deferred(DeferredValue::Secret(Box::new(dropped).into()))
+    } else {
+        dropped
+    };
+    let dropped_type = if nested {
+        PatternAttributeType::struct_(
+            "Dropped",
+            vec![
+                PatternStructField::optional("value", PatternAttributeType::string())
+                    .write_only()
+                    .build(),
+            ],
+        )
+    } else {
+        PatternAttributeType::string()
+    };
+    let dropped_schema = PatternAttributeSchema::optional("dropped", dropped_type);
+    let dropped_schema = if nested {
+        dropped_schema
+    } else {
+        dropped_schema.write_only()
+    };
+    let resource = Resource::with_provider("mock", "test.resource", "dropped-key", None)
+        .with_attribute("name", string("retained"))
+        .with_attribute("dropped", dropped);
+    let schema = PatternResourceSchema::new("test.resource")
+        .attribute(PatternAttributeSchema::optional("name", PatternAttributeType::string()).build())
+        .attribute(dropped_schema.build())
+        .validate()
+        .unwrap();
+    let mut schemas = carina_core::schema::SchemaRegistry::new();
+    schemas.insert("mock", schema.clone());
+    let mut configuration = carina_core::parser::ExpandedInferredFile::default();
+    configuration.resources.push(resource.clone()); // allow: direct — fixture test inspection
+    let checked = carina_core::resolved_graph::ResolvedInitialCreatePlan::from_configuration(
+        configuration,
+        &resource.id,
+        &schemas,
+    )
+    .unwrap()
+    .check_inputs_with_types(
+        &schemas,
+        &carina_core::input_rules::InputTypeContext::empty(),
+    )
+    .unwrap();
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let gate = ModuleConstraintGate::from_live_compositions(&[]);
+    let normalizer =
+        crate::provider_text_fixtures::normalizer("mock", Box::new(DroppingNormalizer));
+    let prepare = || {
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let context = ProviderPreparationContext::for_test(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &normalizer,
+                    &schemas,
+                    type_checks,
+                );
+                ready_for_test(prepare_initial_create(&checked, &context))
+                    .expect("normalized create passes preparation")
+                    .expect("create is ready")
+            },
+        )
+    };
+
+    let prepared = prepare();
+    let accepted = AcceptedRequest::from_create_permit_for_test(&prepared);
+    assert!(
+        accepted
+            .resolved_desired_attributes()
+            .values()
+            .contains_key("dropped")
+    );
+    assert!(
+        !prepared
+            .request()
+            .resource()
+            .attributes
+            .contains_key("dropped")
+    );
+    assert!(accepted.sent_attributes().contains("name"));
+    assert!(!accepted.sent_attributes().contains("dropped"));
+    // Row builders receive the normalized request. The prepared writeback
+    // retains the dropped key for secret protection, but it is not send evidence.
+    let transport = prepared.request().resource().as_inner().clone();
+    let observed = State::existing(transport.id.clone(), transport.attributes.clone())
+        .with_identifier("normalized-id");
+    let pending_provider = create_fixture_provider("mock", |attempt| {
+        Box::pin(std::future::ready(Err(attempt
+            .pending(
+                PendingToken::new("normalized-token"),
+                Sent::AllRequestAttributes,
+                1,
+            )
+            .preserve(ProviderError::internal("create remains in flight")))))
+    });
+    let boundary = crate::provider_text_fixtures::boundary(Box::new(pending_provider));
+    let (create, _cancellation) = carina_core::executor::dispatch_create(&boundary, prepared);
+    let Err(failure) = ready_for_test(create) else {
+        panic!("fixture must return an in-flight create");
+    };
+    let HostCreateFailureKind::InFlight { pending, .. } = failure.into_kind() else {
+        panic!("fixture must retain its continuation");
+    };
+    let observed_id = transport.id.clone();
+    let identified_provider = create_fixture_provider("mock", move |attempt| {
+        Box::pin(std::future::ready(Err(attempt
+            .issued(
+                AppliedIdentifier::new("normalized-id").unwrap(),
+                Sent::AllRequestAttributes,
+            )
+            .identifier_reported(
+                Observation::Read(ReadOutcome::not_found(observed_id.clone())),
+                ProviderError::internal("create observation failed"),
+            ))))
+    });
+    let boundary = crate::provider_text_fixtures::boundary(Box::new(identified_provider));
+    let (create, _cancellation) = carina_core::executor::dispatch_create(&boundary, prepare());
+    let Err(failure) = ready_for_test(create) else {
+        panic!("fixture must return an identified failure");
+    };
+    let HostCreateFailureKind::IdentifierReported { identified, .. } = failure.into_kind() else {
+        panic!("fixture must retain its identifier");
+    };
+    let resource = transport;
+    let in_flight = ResourceState::from_in_flight(
+        &resource,
+        &pending,
+        None,
+        Some(schema.as_schema()),
+        None,
+        &exact_comparison_context(),
+    )
+    .unwrap();
+    let identified = ResourceState::from_observation(
+        &resource,
+        &identified,
+        None,
+        Some(schema.as_schema()),
+        None,
+        &exact_comparison_context(),
+    )
+    .unwrap();
+    let applied = resource_state_from_provider_state_for_resource_and_schema_for_test(
+        &resource,
+        &observed,
+        None,
+        Some(schema.as_schema()),
+        RowBasis::Applied(&accepted),
+        None,
+    )
+    .unwrap();
+    [in_flight, identified, applied]
+}
+
+#[test]
+fn create_rows_agree_on_sent_membership_after_normalizer_drops_attribute() {
+    let mut failures = Vec::new();
+    for secret in [false, true] {
+        for nested in [false, true] {
+            let [in_flight, identified, applied] = dropped_key_create_rows(secret, nested);
+            assert_explicit_struct_keys(&applied.explicit, &["name"]);
+            assert_eq!(in_flight.explicit, applied.explicit);
+            assert_eq!(identified.explicit, applied.explicit);
+            // Inspect the serialized rows as well as authoring metadata. Report only
+            // variant labels and selection names so failures never expose fixture values.
+            let round_trip = |row: &ResourceState| {
+                serde_json::from_value::<ResourceState>(serde_json::to_value(row).unwrap()).unwrap()
+            };
+            let in_flight = round_trip(&in_flight);
+            let CurrentInstance::CreateInFlight { pending } = in_flight.current() else {
+                panic!("in-flight row must retain its continuation");
+            };
+            let SentRecord::Persisted(envelope) = pending.sent() else {
+                panic!("in-flight row must persist its sent envelope");
+            };
+            let variant = if secret { "secret" } else { "public" };
+            let shape = if nested {
+                "nested write-only"
+            } else {
+                "top-level write-only"
+            };
+            let mut check_absent = |present: bool, selection: &str| {
+                if present {
+                    failures.push(format!("{variant} {shape}: {selection}"));
+                }
+            };
+            check_absent(
+                envelope.write_only().contains_key("dropped"),
+                "in-flight write_only",
+            );
+            check_absent(
+                envelope.secrets().contains_key("dropped"),
+                "in-flight secrets",
+            );
+            for (kind, row) in [("identified", identified), ("applied", applied)] {
+                let row = round_trip(&row);
+                // Applied nested secret objects can retain a protective hash;
+                // accepted write-only provenance is checked separately below.
+                if kind == "identified" || !(nested && secret) {
+                    check_absent(
+                        row.persisted_attributes().unwrap().contains_key("dropped"),
+                        &format!("{kind} attributes"),
+                    );
+                }
+                if secret && let Some(value) = row.persisted_attributes().unwrap().get("dropped") {
+                    assert!(
+                        value.secret_hash().is_some(),
+                        "stored secret must remain hashed"
+                    );
+                }
+                check_absent(
+                    row.write_only_attributes()
+                        .iter()
+                        .any(|key| key == "dropped"),
+                    &format!("{kind} write_only"),
+                );
+                check_absent(
+                    row.nested_write_only().get("dropped").is_some(),
+                    &format!("{kind} nested_write_only"),
+                );
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "dropped request key was recorded in: {}",
+        failures.join("; "),
+    );
+}
+
+#[test]
+fn in_flight_create_explicit_matches_applied_after_request_canonicalization() {
+    use carina_core::provider::{HostCreateFailureKind, PendingToken, ProviderError};
+
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+    let password = string(&"metadata-fixture".repeat(2));
+    let resource = Resource::with_provider("mock", "test.resource", "canonicalized", None)
+        .with_attribute("name_prefix", string("generated-"))
+        .with_attribute(
+            "password",
+            Value::Deferred(DeferredValue::Secret(Box::new(password).into())),
+        );
+    // Canonicalization consumes the authored companion, and provider defaults
+    // introduce a request-only key. Preparation strips the secret wrapper from
+    // the transport while retaining it in the prepared writeback.
+    let mut request_resource = resource.clone();
+    request_resource.attributes.shift_remove("name_prefix");
+    request_resource.set_attr("name", string("generated-name"));
+    request_resource.set_attr(
+        "tags",
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "provider_default".into(),
+            string("enabled"),
+        )]))),
+    );
+    let schema = PatternResourceSchema::new("test.resource")
+        .attribute(
+            PatternAttributeSchema::optional("name_prefix", PatternAttributeType::string()).build(),
+        )
+        .attribute(PatternAttributeSchema::required("name", PatternAttributeType::string()).build())
+        .attribute(
+            PatternAttributeSchema::optional("password", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let prepared = carina_core::replacement::create_permit_for_test(create_request_for_test(
+        request_resource,
+        schema.clone(),
+    ));
+    let accepted = AcceptedRequest::from_create_permit_for_test(&prepared);
+    assert!(matches!(
+        accepted
+            .resolved_desired_attributes()
+            .values()
+            .get("password"),
+        Some(Value::Deferred(DeferredValue::Secret(_)))
+    ));
+    assert!(!matches!(
+        prepared.request().resource().attributes.get("password"),
+        Some(Value::Deferred(DeferredValue::Secret(_)))
+    ));
+    let observed: State = State::existing(
+        resource.id.clone(),
+        prepared.request().resource().attributes.clone(),
+    )
+    .with_identifier("canonicalized-id");
+    let provider = create_fixture_provider("mock", |attempt| {
+        Box::pin(std::future::ready(Err(attempt
+            .pending(
+                PendingToken::new("canonicalized-token"),
+                Sent::AllRequestAttributes,
+                1,
+            )
+            .preserve(ProviderError::internal("create remains in flight")))))
+    });
+    let boundary = crate::provider_text_fixtures::boundary(Box::new(provider));
+    let (create, _cancellation) = carina_core::executor::dispatch_create(&boundary, prepared);
+    let Err(failure) = ready_for_test(create) else {
+        panic!("fixture create must remain in flight")
+    };
+    let HostCreateFailureKind::InFlight { pending, .. } = failure.into_kind() else {
+        panic!("fixture must retain a fresh create continuation")
+    };
+    let resource = resolved(&resource);
+    let in_flight = ResourceState::from_in_flight(
+        &resource,
+        &pending,
+        None,
+        Some(schema.as_schema()),
+        None,
+        &exact_comparison_context(),
+    )
+    .unwrap();
+    let applied = resource_state_from_provider_state_for_resource_and_schema_for_test(
+        &resource,
+        &observed,
+        None,
+        Some(schema.as_schema()),
+        RowBasis::Applied(&accepted),
+        None,
+    )
+    .unwrap();
+
+    let ExplicitFields::Struct { children } = &applied.explicit else {
+        panic!("applied create must record resource authoring")
+    };
+    assert!(
+        children.contains_key("name_prefix"),
+        "applied authoring retains the consumed key"
+    );
+    assert!(
+        children.contains_key("tags"),
+        "applied authoring includes the sent provider default"
+    );
+    assert_eq!(in_flight.explicit, applied.explicit);
+    assert!(
+        applied
+            .persisted_attributes()
+            .unwrap()
+            .redacted_secret_hash("password")
+            .is_some(),
+        "applied writeback retains the prepared secret shape"
+    );
+
+    let CurrentInstance::CreateInFlight { pending } = in_flight.current() else {
+        panic!("in-flight row must retain its continuation")
+    };
+    let InFlightPersistence::Persisted = pending.persistence() else {
+        panic!("in-flight row must persist its sent envelope")
+    };
+    let SentRecord::Persisted(envelope) = pending.sent() else {
+        panic!("persisted continuation must retain its sent envelope")
+    };
+    assert!(
+        envelope
+            .secrets()
+            .get("password")
+            .is_some_and(|value| value.secret_hash().is_some()),
+        "authored secrecy must survive request canonicalization"
+    );
+}
+
 #[test]
 fn observation_previous_secret_hashes_release_only_equal_public_values() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, CreateFailureKind, HostCreateObservation,
-        HostIdentifiedCreate, Observation, PendingToken, ProviderError, ReadOutcome,
+        AppliedIdentifier, AppliedState, CreateFailureKind, Observation, PendingToken,
+        ProviderError, ReadOutcome,
     };
 
     // Observations cannot accept an accepted-write authority.
@@ -7976,11 +8532,7 @@ fn observation_previous_secret_hashes_release_only_equal_public_values() {
                     PersistedAttributes::default(),
                     PersistedAttributes::default(),
                 );
-            HostIdentifiedCreate::from_in_flight_for_test(
-                pending,
-                identifier.clone(),
-                HostCreateObservation::Observed(observed()),
-            )
+            resumed_create_observation_for_test(&resource, pending, observed(), None)
         } else {
             let failure = create_attempt_for_test(resource.id.clone())
                 .issued(identifier.clone(), Sent::AllRequestAttributes)
@@ -7988,7 +8540,7 @@ fn observation_previous_secret_hashes_release_only_equal_public_values() {
                     Observation::Read(ReadOutcome::found(observed())),
                     ProviderError::internal("synthetic post-create finishing failure"),
                 );
-            match failure.into_host_for_test().into_kind() {
+            match dispatched_create_failure_for_test(&resource, failure, None).into_kind() {
                 CreateFailureKind::IdentifierReported { identified, .. } => identified,
                 _ => panic!("fixture must produce an identifier-reported create"),
             }
@@ -8236,7 +8788,9 @@ fn accepted_write_only_keeps_raw_legacy_shaped_text_plain() {
         .with_identifier("plain-id"),
         None,
         Some(&schema),
-        RowBasis::Applied(&AcceptedRequest::create_for_test()),
+        RowBasis::Applied(&AcceptedRequest::from_create_permit_for_test(
+            &prepared_write::create_permit(&resource),
+        )),
         None,
     )
     .expect("marker-shaped desired plaintext is ordinary text");
@@ -8312,7 +8866,14 @@ fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove()
 
     // Add: a sent attribute without prior leaf provenance establishes it.
     let (added_resource, schema) = nested_write_only_state_fixture("add-secret");
-    let add = AcceptedRequest::update_for_test(&["config"], &[]);
+    let add = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &added_resource,
+        carina_core::resource::SnapshotState::existing(
+            added_resource.id.clone(),
+            std::collections::BTreeMap::new(),
+        ),
+        &["config"],
+    ));
     let added = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&added_resource),
         &provider_state(&added_resource),
@@ -8341,10 +8902,17 @@ fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove()
             .contains("add-secret")
     );
 
-    // Replace and Reassert both arrive at state writeback as a sent key. A
-    // replacement rotates the recorded hash; a reassert preserves it.
+    // Prepared replacements arrive at state writeback as a sent key. A new
+    // value rotates the recorded hash; repeating that value preserves it.
     let (replaced_resource, _) = nested_write_only_state_fixture("replace-secret");
-    let replace = AcceptedRequest::update_for_test(&["config"], &[]);
+    let replace = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &replaced_resource,
+        carina_core::resource::SnapshotState::existing(
+            replaced_resource.id.clone(),
+            std::collections::BTreeMap::new(),
+        ),
+        &["config"],
+    ));
     let replaced = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&replaced_resource),
         &provider_state(&replaced_resource),
@@ -8359,7 +8927,14 @@ fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove()
         replaced.nested_write_only().get("config")
     );
 
-    let reassert = AcceptedRequest::update_for_test(&["config"], &[]);
+    let reassert = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &replaced_resource,
+        carina_core::resource::SnapshotState::existing(
+            replaced_resource.id.clone(),
+            std::collections::BTreeMap::new(),
+        ),
+        &["config"],
+    ));
     let reasserted = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&replaced_resource),
         &provider_state(&replaced_resource),
@@ -8376,7 +8951,11 @@ fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove()
 
     let removed_resource =
         carina_core::resource::Resource::with_provider("mock", "test.Resource", "nested", None);
-    let remove = AcceptedRequest::update_for_test(&[], &["config"]);
+    let remove = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &removed_resource,
+        provider_state(&replaced_resource).to_snapshot(),
+        &["config"],
+    ));
     let removed = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&removed_resource),
         &ProviderState::<carina_core::resource::NoPlaceholder>::existing(
@@ -8442,7 +9021,14 @@ fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
         )]),
     )
     .with_identifier("resource-id");
-    let accepted = AcceptedRequest::update_for_test(&["config"], &[]);
+    let accepted = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &resource,
+        carina_core::resource::SnapshotState::existing(
+            resource.id.clone(),
+            std::collections::BTreeMap::new(),
+        ),
+        &["config"],
+    ));
 
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
@@ -8477,8 +9063,7 @@ fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
 #[test]
 fn resumed_persisted_create_records_nested_write_only_sent_values() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, HostCreateObservation as CreateObservation,
-        HostIdentifiedCreate as IdentifiedCreate, PendingToken, PersistedAttributes, Sent,
+        AppliedIdentifier, AppliedState, PendingToken, PersistedAttributes, Sent,
     };
 
     let (resource, schema) = nested_write_only_state_fixture("resumed-secret");
@@ -8512,10 +9097,21 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
         )]),
     )
     .unwrap();
-    let created = IdentifiedCreate::from_in_flight_for_test(
+    let request_schema = PatternResourceSchema::new("test.Resource")
+        .attribute(
+            PatternAttributeSchema::optional(
+                "config",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let created = resumed_create_observation_for_test(
+        &resource,
         pending,
-        identifier,
-        CreateObservation::Observed(observed_state),
+        observed_state,
+        Some(request_schema),
     );
 
     let row = resource_state_from_observation_for_test(
@@ -8545,10 +9141,8 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
 #[test]
 fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, HostCreateObservation as CreateObservation,
-        HostIdentifiedCreate as IdentifiedCreate,
-        HostPartialReadDiagnostic as PartialReadDiagnostic, PendingToken, PersistedAttributes,
-        Sent,
+        AppliedIdentifier, AppliedState, HostPartialReadDiagnostic as PartialReadDiagnostic,
+        PendingToken, PersistedAttributes, Sent,
     };
 
     for key in ["computed\x1b[2J".to_string(), "x".repeat(9000)] {
@@ -8575,12 +9169,11 @@ fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys()
         assert!(!label.contains('\x1b'));
         assert!(label.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
         assert_ne!(label, key);
-        let created = IdentifiedCreate::from_in_flight_for_test(
+        let created = resumed_create_observation_for_test(
+            &resource,
             pending,
-            identifier,
-            CreateObservation::Observed(
-                AppliedState::new(resource.id.clone(), "persisted-id", HashMap::new()).unwrap(),
-            ),
+            AppliedState::new(resource.id.clone(), "persisted-id", HashMap::new()).unwrap(),
+            None,
         )
         .with_partial_read_for_test(diagnostic);
         let row = resource_state_from_observation_for_test(
@@ -8607,10 +9200,8 @@ fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys()
 #[test]
 fn resumed_partial_create_records_exact_missing_attributes() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, HostCreateObservation as CreateObservation,
-        HostIdentifiedCreate as IdentifiedCreate,
-        HostPartialReadDiagnostic as PartialReadDiagnostic, PendingToken, PersistedAttributes,
-        Sent, SentRecord,
+        AppliedIdentifier, AppliedState, HostPartialReadDiagnostic as PartialReadDiagnostic,
+        PendingToken, PersistedAttributes, Sent, SentRecord,
     };
 
     let resource = Resource::with_provider("mock", "test.Widget", "example", None).with_attribute(
@@ -8640,12 +9231,8 @@ fn resumed_partial_create_records_exact_missing_attributes() {
             .try_into()
             .expect("nonempty partial attributes"),
     );
-    let created = IdentifiedCreate::from_in_flight_for_test(
-        pending,
-        identifier.clone(),
-        CreateObservation::Observed(observed_state),
-    )
-    .with_partial_read_for_test(diagnostic);
+    let created = resumed_create_observation_for_test(&resource, pending, observed_state, None)
+        .with_partial_read_for_test(diagnostic);
 
     let SentRecord::Persisted(envelope) = created.sent() else {
         panic!("resumed partial create must retain its persisted sent envelope")
@@ -8698,7 +9285,8 @@ fn unobserved_not_found_create_records_identifier_and_partial_read() {
             Observation::Read(ReadOutcome::not_found(resource.id.clone())),
             ProviderError::api_error("create access denied"),
         );
-    let identified = match failure.into_host_for_test().into_kind() {
+    let identified = match dispatched_create_failure_for_test(&resource, failure, None).into_kind()
+    {
         CreateFailureKind::IdentifierReported {
             identified,
             error: _,
@@ -8770,7 +9358,8 @@ fn unobserved_read_failed_observation_records_identifier_and_provider_error_deta
             Observation::ReadFailed(read_error),
             ProviderError::api_error("create finishing failed"),
         );
-    let identified = match failure.into_host_for_test().into_kind() {
+    let identified = match dispatched_create_failure_for_test(&resource, failure, None).into_kind()
+    {
         CreateFailureKind::IdentifierReported {
             identified,
             error: _,
@@ -8812,9 +9401,8 @@ fn unobserved_read_failed_observation_records_identifier_and_provider_error_deta
 fn identified_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappers() {
     use carina_core::differ::Diff;
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, HostCreateFailureKind as CreateFailureKind,
-        HostCreateObservation as CreateObservation, HostIdentifiedCreate as IdentifiedCreate,
-        Observation, PendingToken, PersistedAttributes, ProviderError, ReadOutcome, Sent,
+        AppliedIdentifier, AppliedState, HostCreateFailureKind as CreateFailureKind, Observation,
+        PendingToken, PersistedAttributes, ProviderError, ReadOutcome, Sent,
     };
     use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
     use carina_core::schema::SchemaRegistry;
@@ -8925,10 +9513,11 @@ fn identified_create_records_nested_leaf_from_desired_under_ancestor_secret_wrap
                 .issued(identifier.clone(), Sent::AllRequestAttributes)
                 .pending(PendingToken::new(format!("resume-{wrapper}")), 1)
                 .persist(PersistedAttributes::default(), sent_secrets);
-            IdentifiedCreate::from_in_flight_for_test(
+            resumed_create_observation_for_test(
+                &resource,
                 pending,
-                identifier.clone(),
-                CreateObservation::Observed(observed_state()),
+                observed_state(),
+                Some(schema.clone()),
             )
         } else {
             let failed = create_attempt_for_test(resource.id.clone())
@@ -8937,7 +9526,9 @@ fn identified_create_records_nested_leaf_from_desired_under_ancestor_secret_wrap
                     Observation::Read(ReadOutcome::found(observed_state())),
                     ProviderError::internal("synthetic post-create finishing failure"),
                 );
-            match failed.into_host_for_test().into_kind() {
+            match dispatched_create_failure_for_test(&resource, failed, Some(schema.clone()))
+                .into_kind()
+            {
                 CreateFailureKind::IdentifierReported {
                     identified,
                     error: _error,
@@ -9098,7 +9689,14 @@ fn from_provider_state_imported_demotion_releases_only_equal_public_value() {
                     .unwrap()
             );
         }
-        let request = AcceptedRequest::update_for_test(&["computed"], &[]);
+        let request = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+            &resource,
+            carina_core::resource::SnapshotState::existing(
+                resource.id.clone(),
+                std::collections::BTreeMap::new(),
+            ),
+            &["computed"],
+        ));
         let applied = resource_state_from_provider_state_for_resource_and_schema_for_test(
             &resolved(&resource),
             &provider,
@@ -9150,7 +9748,14 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
             .write_only()
             .build(),
     );
-    let request = AcceptedRequest::update_for_test(&["password"], &[]);
+    let request = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &resource,
+        carina_core::resource::SnapshotState::existing(
+            resource.id.clone(),
+            std::collections::BTreeMap::new(),
+        ),
+        &["password"],
+    ));
     let rs = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
         &provider_state,
@@ -9173,7 +9778,7 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
 }
 
 #[test]
-fn accepted_update_ignores_sent_non_write_only_key_absent_from_writeback_resource() {
+fn accepted_update_keeps_unsent_write_only_value_with_request_only_key() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
     use carina_core::schema::{
         CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
@@ -9192,7 +9797,15 @@ fn accepted_update_ignores_sent_non_write_only_key_absent_from_writeback_resourc
             .write_only()
             .build(),
     );
-    let request = AcceptedRequest::update_for_test(&["apply_time_normalized_key"], &[]);
+    let request_resource = resource.clone().with_attribute(
+        "apply_time_normalized_key",
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+    let request = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &request_resource,
+        SnapshotState::existing(resource.id.clone(), BTreeMap::new()),
+        &["apply_time_normalized_key"],
+    ));
 
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
@@ -10211,7 +10824,14 @@ fn conservative_list_authoring_round_trips_and_recovers_on_writeback() {
         Diff::NoChange(_)
     ));
 
-    let accepted = AcceptedRequest::update_for_test(&["rules"], &[]);
+    let accepted = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &desired,
+        carina_core::resource::SnapshotState::existing(
+            desired.id.clone(),
+            std::collections::BTreeMap::new(),
+        ),
+        &["rules"],
+    ));
     let rewritten = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&desired),
         &current,
@@ -10802,7 +11422,15 @@ fn previous_secret_hash_omitted_public_value_keeps_root_and_nested_hashes() {
     );
     let provider: State =
         State::existing(resource.id.clone(), BTreeMap::new()).with_identifier("sink-id");
-    let request = AcceptedRequest::update_for_test(&["other"], &[]);
+    let request_resource = resource
+        .as_resource()
+        .clone()
+        .with_attribute("other", Value::Concrete(ConcreteValue::Bool(true)));
+    let request = AcceptedRequest::from_update_permit_for_test(&prepared_write::update_permit(
+        &request_resource,
+        SnapshotState::existing(resource.id.clone(), BTreeMap::new()),
+        &["other"],
+    ));
     for previous in [
         secret.clone(),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([

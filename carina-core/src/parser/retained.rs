@@ -72,6 +72,7 @@ pub(crate) use conversion::check as check_conversion;
 pub use conversion::{ConversionJudgement, TemplateDeferral};
 
 mod cursor;
+mod function_promises;
 pub use cursor::{
     AuthoredCursor, AuthoredSlots, AuthoredUse, CompletenessReport, EdgeRole, ExpansionInstanceId,
     JudgedNodeRef, JudgedSlot, NoAuthoredEvidence, NodeId, ProjectedPhase, ProjectionGeneration,
@@ -81,6 +82,7 @@ pub(crate) use cursor::{
     AuthoredForm, AuthoredNavigation, CursorKind, ProjectionAuthority, RowAttributes,
     SourceReference, SyntheticSource, ValidationProjection,
 };
+pub use function_promises::FunctionTypePromise;
 
 /// The existing authored walk owns source diagnostics for expressions that
 /// require its policy. This is diagnostic ownership, not an admission proof.
@@ -1539,6 +1541,36 @@ impl<'a, E, D, B: BindingAddress> JudgedFile<'a, E, D, B> {
     pub fn schemas(&self) -> &'a crate::schema::SchemaRegistry {
         self.schemas
     }
+    pub fn has_user_functions(&self) -> bool {
+        self.report()
+            .syntax_nodes
+            .values()
+            .any(|node| matches!(node.kind, ExprKind::Function { .. }))
+    }
+    /// Check unknown function-boundary values using the completed source index.
+    /// The authored judge has already typed each body with declared parameters.
+    pub fn function_type_promise_findings(
+        &self,
+        bindings: &crate::binding_index::BindingIndex<'_, B>,
+    ) -> Vec<Located<FunctionTypePromise>>
+    where
+        D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        if !self.has_user_functions() {
+            return Vec::new();
+        }
+        let values = crate::binding_index::ResolvedBindings::<ParserPlaceholder>::build_validation(
+            &self.file,
+            Clone::clone,
+            Clone::clone,
+        );
+        function_promises::check(
+            self.file.parser_binding_metadata.syntax().expressions(),
+            self.report(),
+            bindings,
+            &values,
+        )
+    }
     pub(crate) fn into_file(self) -> super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
         self.file
     }
@@ -1563,10 +1595,11 @@ where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     pub(crate) fn new(
-        mut file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         schemas: &'a crate::schema::SchemaRegistry,
         config: &super::ProviderContext,
     ) -> Self {
+        let mut file = file;
         judge_configuration(&mut file, schemas, config);
         Self {
             file,
@@ -1598,7 +1631,7 @@ pub(crate) fn judge_configuration<
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     prepare_slots(file, schemas);
-    let mut report = judge_expressions(file, schemas, config);
+    let mut report = judgement::judge_expressions(file, schemas, config);
     for parameter in &file.export_params {
         if let (Some(sink), Some(location)) =
             (parameter.type_expr_opt(), parameter.value_location())
@@ -3808,7 +3841,7 @@ mod judgement {
                 conversions: edges.sources(),
             }
         }
-        fn failed(&self) -> bool {
+        pub(crate) fn failed(&self) -> bool {
             self.data.failed()
         }
         pub(crate) fn statically_checked(&self) -> bool {
@@ -4083,6 +4116,10 @@ mod judgement {
         }
     }
     impl JudgedExprData {
+        pub(crate) fn origin(&self) -> Option<&ExpressionLocation> {
+            self.origin.as_ref()
+        }
+
         pub(crate) fn concrete(&self) -> bool {
             matches!(self.judgement, ExprJudgement::Typed { kind, .. }
                 if kind.knowledge() == Classification::Known)
@@ -4093,6 +4130,14 @@ mod judgement {
                         ..
                     }
                 )
+        }
+        pub(crate) fn known_empty_collection(&self) -> bool {
+            self.concrete()
+                && matches!(self.value_shape(), Some(ValueShape::List | ValueShape::Map))
+                && self.elements.is_empty()
+                && self.fields.is_empty()
+                && self.member.is_none()
+                && self.alternatives.is_empty()
         }
         fn failed(&self) -> bool {
             self.failure().is_some()
@@ -4659,6 +4704,23 @@ mod judgement {
             return Ok(mode.value_check());
         }
         if let TypeExpr::Union(members) = sink {
+            // Function boundaries compare whole declared unions. Requiring
+            // the source union to fit a single destination arm loses proof.
+            if context == AdmissionContext::Function
+                && expression.requires_declared_assignment()
+                && ty.is_some_and(|actual| {
+                    matches!(
+                        crate::validation::typecheck::inferred_type_assignment(
+                            sink,
+                            actual,
+                            &config.custom_types,
+                        ),
+                        crate::schema::TypeAssignability::Assignable
+                    )
+                })
+            {
+                return Ok(mode.value_check());
+            }
             if expression.requires_declared_assignment()
                 && ty == Some(&TypeExpr::String)
                 && !members.is_empty()

@@ -823,6 +823,7 @@ enum ResumeFixture {
     IdentifierReportedNotFound,
     IdentifierReportedReadFailed,
     NoResource,
+    ResentInFlight,
     ResentInFlightWithInvalidSent,
 }
 
@@ -1046,6 +1047,7 @@ impl Provider for MockProvider {
             (!results.is_empty()).then(|| results.remove(0))
         };
         Box::pin(async move {
+            let valid_pending_sent = matches!(result, Some(ResumeFixture::ResentInFlight));
             match result.expect("unexpected resume_create") {
                 ResumeFixture::Resent => {
                     let id = request.id().clone();
@@ -1186,7 +1188,12 @@ impl Provider for MockProvider {
                     let (resume, _create_request) = request.into_parts();
                     Err(resume.no_resource(ProviderError::not_found("recorded create ended")))
                 }
-                ResumeFixture::ResentInFlightWithInvalidSent => {
+                ResumeFixture::ResentInFlight | ResumeFixture::ResentInFlightWithInvalidSent => {
+                    let sent = if valid_pending_sent {
+                        crate::provider::Sent::AllRequestAttributes
+                    } else {
+                        crate::provider::Sent::only(["outside_request"])
+                    };
                     let (resume, _create_request) = request.into_parts();
                     let attempt = match resume {
                         crate::provider::Resume::Unissued(attempt) => attempt.resend(),
@@ -1198,7 +1205,7 @@ impl Provider for MockProvider {
                     };
                     let pending = attempt.pending(
                         crate::provider::PendingToken::new("resent-token"),
-                        crate::provider::Sent::only(["outside_request"]),
+                        sent,
                         1,
                     );
                     Err(pending.preserve(ProviderError::timeout("resent create is pending")))
@@ -3369,6 +3376,66 @@ async fn resumed_partial_success_reports_once_and_preserves_partial_binding() {
 }
 
 #[tokio::test]
+async fn resume_writeback_retains_desired_secret_for_every_record() {
+    for fixture in [
+        ResumeFixture::Resumed,
+        ResumeFixture::Partial,
+        ResumeFixture::IdentifierReportedNotFound,
+        ResumeFixture::ResentInFlight,
+    ] {
+        let provider = MockProvider::new();
+        let source = make_resource("source", &[]).with_attribute(
+            "computed",
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "resume-secret".into(),
+                )))
+                .into(),
+            )),
+        );
+        let id = source.id.clone();
+        let pending = if matches!(fixture, ResumeFixture::ResentInFlight) {
+            persisted_unissued_create_for_executor(&id)
+        } else {
+            persisted_create_for_executor(&id)
+        };
+        let mut plan = Plan::new();
+        plan.add_resume_create(
+            resolved_fixture_resources(vec![source]).remove(0),
+            pending.started_at().clone(),
+        );
+        provider.push_resume(fixture);
+        let result = execute_lifecycle_fixture(
+            &provider,
+            &plan,
+            HashMap::from([(id.clone(), Current::CreateInFlight(pending))]),
+        )
+        .await;
+        let desired = match result
+            .applied_states
+            .get(&id)
+            .expect("resume retained its record")
+        {
+            Applied::Observed(identified) => identified.resolved_desired_attributes(),
+            Applied::CreateInFlight(pending) => {
+                let crate::provider::InFlightPersistence::Fresh(fresh) = pending.persistence()
+                else {
+                    panic!("resent pending create must retain fresh writeback values");
+                };
+                fresh.resolved_desired_attributes()
+            }
+            other => panic!("unexpected resume writeback: {other:?}"),
+        };
+        assert!(
+            desired
+                .values()
+                .get("computed")
+                .is_some_and(crate::value::contains_secret)
+        );
+    }
+}
+
+#[tokio::test]
 async fn resume_dispatch_validates_resent_sent_against_checked_request() {
     let provider = MockProvider::new();
     provider.push_resume(ResumeFixture::ResentInFlightWithInvalidSent);
@@ -4545,106 +4612,87 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
     assert!(sent["token"].grafted_leaves().is_empty());
 }
 
-#[tokio::test]
-async fn accepted_request_keeps_grafted_leaves_on_each_sent_op() {
+#[test]
+fn accepted_request_keeps_grafted_leaves_on_each_sent_op() {
     let schemas = provider_boundary_constraint_schemas();
-    let bindings = ResolvedBindings::default();
-    let gate = ModuleConstraintGate::from_live_compositions(&[]);
-    crate::validation::deferred_types::with_session_for_test_async(
-        &crate::parser::LoadedProviderContext::empty_for_test(),
-        async |session| {
-            let context = ProviderPreparationContext::for_test(
-                &bindings,
-                &gate,
-                &[],
-                &NoopNormalizer,
-                &schemas,
-                session,
+    for (changed_config, observed_config) in [(true, false), (true, true), (false, true)] {
+        let text = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+        let mut desired = make_resource("grafted-sent-op", &[]);
+        desired.set_attr("target", text("good-update"));
+        desired.set_attr("token", text("fixture-secret-4570"));
+        desired.set_attr(
+            "config",
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                ("issuer".into(), text("authored-issuer")),
+                ("client_secret".into(), text("fixture-secret-4570")),
+            ]))),
+        );
+        desired.directives.ignore_changes = vec![crate::resource::ParsedIgnorePath::new(vec![
+            crate::resource::ParsedIgnorePathSegment::Attribute("config".into()),
+            crate::resource::ParsedIgnorePathSegment::Attribute("issuer".into()),
+        ])];
+        let mut observed = HashMap::from([
+            ("target".into(), text("good-before")),
+            ("obsolete".into(), text("remove-me")),
+        ]);
+        if observed_config {
+            observed.insert(
+                "config".into(),
+                Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                    "issuer".into(),
+                    text("observed-issuer"),
+                )]))),
             );
-            for (changed_config, observed_config) in [(true, false), (true, true), (false, true)] {
-                let text = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
-                let mut desired = make_resource("grafted-sent-op", &[]);
-                desired.set_attr("target", text("good-update"));
-                desired.set_attr("token", text("fixture-secret-4570"));
-                desired.set_attr(
-                    "config",
-                    Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
-                        ("issuer".into(), text("authored-issuer")),
-                        ("client_secret".into(), text("fixture-secret-4570")),
-                    ]))),
-                );
-                desired.directives.ignore_changes =
-                    vec![crate::resource::ParsedIgnorePath::new(vec![
-                        crate::resource::ParsedIgnorePathSegment::Attribute("config".into()),
-                        crate::resource::ParsedIgnorePathSegment::Attribute("issuer".into()),
-                    ])];
-                let mut observed = HashMap::from([
-                    ("target".into(), text("good-before")),
-                    ("obsolete".into(), text("remove-me")),
-                ]);
-                if observed_config {
-                    observed.insert(
-                        "config".into(),
-                        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
-                            "issuer".into(),
-                            text("observed-issuer"),
-                        )]))),
-                    );
-                }
-                let from = State::existing(
-                    desired.id.clone(),
-                    crate::test_support::snapshot_attributes(observed),
-                );
-                let mut changed = vec!["obsolete".into(), "target".into()];
-                if changed_config {
-                    changed.push("config".into());
-                }
-                let request = prepare_update_request(desired, from, &changed, &context)
-                    .await
-                    .expect("grafted patch must pass admission");
-                let op = request
-                    .patch()
-                    .ops
-                    .iter()
-                    .find(|op| op.key() == "config")
-                    .unwrap();
-                match op {
-                    crate::provider::PatchOp::Add { .. } => {
-                        assert!(changed_config && !observed_config);
-                    }
-                    crate::provider::PatchOp::Replace { .. } => {
-                        assert!(changed_config && observed_config);
-                    }
-                    crate::provider::PatchOp::Reassert { .. } => assert!(!changed_config),
-                    crate::provider::PatchOp::Remove { .. } => panic!("config must be sent"),
-                }
-                let accepted = AcceptedRequest::from_update_request(
-                    &request,
-                    SecretPreservingAttributes::from_provider_values(
-                        request.desired_for_fixture().attributes.iter(),
-                        request.from().attributes.iter(),
-                    ),
-                );
-                let AcceptedRequestKind::Update { sent, removed } = accepted.kind() else {
-                    panic!("expected accepted update");
-                };
-                assert_eq!(
-                    sent.keys().map(String::as_str).collect::<Vec<_>>(),
-                    ["config", "target", "token"]
-                );
-                assert_eq!(removed, &BTreeSet::from(["obsolete".into()]));
-                assert_eq!(
-                    sent["config"].grafted_leaves(),
-                    &[crate::schema::LeafPath::from_segments([
-                        crate::schema::LeafPathSegment::StructField("issuer".into()),
-                    ])]
-                );
-                assert!(sent["target"].grafted_leaves().is_empty());
-                assert!(sent["token"].grafted_leaves().is_empty());
+        }
+        let from = State::existing(
+            desired.id.clone(),
+            crate::test_support::snapshot_attributes(observed),
+        );
+        let mut changed = vec!["obsolete".into(), "target".into()];
+        if changed_config {
+            changed.push("config".into());
+        }
+        let permit = crate::test_utils::prepared_write::update_permit_with_schemas(
+            &desired,
+            from,
+            &changed.iter().map(String::as_str).collect::<Vec<_>>(),
+            &schemas,
+        );
+        let request = permit.request();
+        let op = request
+            .patch()
+            .ops
+            .iter()
+            .find(|op| op.key() == "config")
+            .unwrap();
+        match op {
+            crate::provider::PatchOp::Add { .. } => {
+                assert!(changed_config && !observed_config);
             }
-        },
-    )
-    .await;
+            crate::provider::PatchOp::Replace { .. } => {
+                assert!(changed_config && observed_config);
+            }
+            crate::provider::PatchOp::Reassert { .. } => assert!(!changed_config),
+            crate::provider::PatchOp::Remove { .. } => panic!("config must be sent"),
+        }
+        let accepted = AcceptedRequest::from_update_permit_for_test(&permit);
+        let AcceptedRequestKind::Update { sent, removed } = accepted.kind() else {
+            panic!("expected accepted update");
+        };
+        assert_eq!(
+            sent.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["config", "target", "token"]
+        );
+        assert_eq!(removed, &BTreeSet::from(["obsolete".into()]));
+        assert_eq!(
+            sent["config"].grafted_leaves(),
+            &[crate::schema::LeafPath::from_segments([
+                crate::schema::LeafPathSegment::StructField("issuer".into()),
+            ])]
+        );
+        assert!(sent["target"].grafted_leaves().is_empty());
+        assert!(sent["token"].grafted_leaves().is_empty());
+    }
 }
 
 #[tokio::test]

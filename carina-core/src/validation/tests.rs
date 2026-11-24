@@ -1707,6 +1707,52 @@ fn function_ref_schema() -> SchemaRegistry {
     schemas
 }
 
+pub(super) fn validate_function_promises_for_test<
+    E: Clone
+        + crate::parser::ExportParamLike<
+            crate::resource::ParserPlaceholder,
+            crate::resource::RelativeBindingName,
+        >,
+>(
+    parsed: &crate::parser::File<E>,
+    bindings: &BindingIndex<'_>,
+    schemas: &SchemaRegistry,
+) -> Result<(), String> {
+    let configuration = crate::config_loader::load_buffer_configuration(
+        parsed,
+        schemas,
+        bindings.provider_context(),
+    );
+    let mut findings: Vec<_> = configuration
+        .judged()
+        .report()
+        .findings()
+        .iter()
+        .map(|finding| {
+            crate::parser::Located::new(finding.location().clone(), finding.detail().to_string())
+        })
+        .collect();
+    for finding in configuration
+        .judged()
+        .function_type_promise_findings(bindings)
+    {
+        let (location, message) = finding.into_parts();
+        let finding = crate::parser::Located::new(location, message.to_string());
+        if !findings.contains(&finding) {
+            findings.push(finding);
+        }
+    }
+    if findings.is_empty() {
+        Ok(())
+    } else {
+        Err(findings
+            .iter()
+            .map(|finding| finding.detail().to_string())
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+}
+
 #[test]
 fn function_call_reference_arguments_use_the_declared_parameter_type() {
     let parsed = crate::parser::parse(
@@ -11876,4 +11922,31 @@ fn review_r3_interpolation_reports_every_computed_access_error() {
     let parsed = crate::parser::parse("let src = mock.test.Source {}\nlet sink = mock.test.Sink { value = \"${[src.first][0][0]}-${[src.second][0][0]}\" }\n", &expression_validation_config()).unwrap();
     let error = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert_eq!(error.lines().count(), 2, "{error}");
+}
+
+#[test]
+fn tp18_authored_nested_call_uses_declared_return_type_as_argument_source() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.resource")
+            .attribute(
+                PatternAttributeSchema::provider_populated("count", PatternAttributeType::int())
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let check = |return_type: &str, body: &str| -> Result<(), String> {
+        let parsed = crate::parser::parse(&format!("let src = mock.test.resource {{}}\nfn f(x: Int): String {{ 'ok' }}\nfn g(y: Int): {return_type} {{ {body} }}\nlet result = f(g(src.count))"), &config).map_err(|error| error.to_string())?;
+        let bindings = BindingIndex::from_parsed(&parsed, &schemas, &config);
+        validate_function_promises_for_test(&parsed, &bindings, &schemas)
+    };
+    let error = check("String", "'str'").expect_err("g(): String must not satisfy f(Int)");
+    assert_eq!(
+        error,
+        "function 'f': parameter 'x': expected Int, got String"
+    );
+    check("Int", "y").unwrap();
 }

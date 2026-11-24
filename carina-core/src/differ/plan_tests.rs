@@ -443,15 +443,18 @@ fn current_variant_determines_create_update_or_plan_error() {
 #[test]
 fn desired_in_flight_plans_resume_never_create() {
     use crate::effect::Effect;
-    use crate::provider::{CreateAttempt, InFlightCreate, PendingToken, Sent};
+    use crate::provider::{CreateAttempt, PendingToken, Sent};
 
     let desired = Resource::new("test.resource", "managed");
     let id = desired.id.clone();
-    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).0.pending(
-        PendingToken::new("secret-provider-token"),
-        Sent::AllRequestAttributes,
-        1,
-    ));
+    let pending = CreateAttempt::new(id.clone())
+        .0
+        .pending(
+            PendingToken::new("secret-provider-token"),
+            Sent::AllRequestAttributes,
+            1,
+        )
+        .persist(Default::default(), Default::default());
     let started_at = pending.started_at().clone();
     let current = crate::resource::into_plan_input_current_map(
         HashMap::from([(id.clone(), Current::create_in_flight(pending))]),
@@ -487,15 +490,18 @@ fn desired_in_flight_plans_resume_never_create() {
 
 #[test]
 fn saved_resume_contains_no_token() {
-    use crate::provider::{CreateAttempt, InFlightCreate, PendingToken, Sent};
+    use crate::provider::{CreateAttempt, PendingToken, Sent};
 
     let desired = Resource::new("test.resource", "managed");
     let id = desired.id.clone();
-    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).0.pending(
-        PendingToken::new("must-not-enter-plan"),
-        Sent::AllRequestAttributes,
-        1,
-    ));
+    let pending = CreateAttempt::new(id.clone())
+        .0
+        .pending(
+            PendingToken::new("must-not-enter-plan"),
+            Sent::AllRequestAttributes,
+            1,
+        )
+        .persist(Default::default(), Default::default());
     let current = crate::resource::into_plan_input_current_map(
         HashMap::from([(id, Current::create_in_flight(pending))]),
         &SchemaRegistry::new(),
@@ -520,14 +526,13 @@ fn saved_resume_contains_no_token() {
 
 #[test]
 fn in_flight_orphan_is_create_in_flight_orphan_error() {
-    use crate::provider::{CreateAttempt, InFlightCreate, PendingToken, Sent};
+    use crate::provider::{CreateAttempt, PendingToken, Sent};
 
     let id = ResourceId::with_identity("test.resource", "orphan");
-    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).0.pending(
-        PendingToken::new("opaque"),
-        Sent::AllRequestAttributes,
-        1,
-    ));
+    let pending = CreateAttempt::new(id.clone())
+        .0
+        .pending(PendingToken::new("opaque"), Sent::AllRequestAttributes, 1)
+        .persist(Default::default(), Default::default());
     let orphans = Orphans::from(
         [Orphan::create_in_flight(
             pending,
@@ -707,7 +712,7 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
 #[test]
 fn changed_provider_instance_rejects_resume() {
     use crate::effect::Effect;
-    use crate::provider::{CreateAttempt, InFlightCreate, PendingToken, Sent};
+    use crate::provider::{CreateAttempt, PendingToken, Sent};
 
     let desired = Resource::with_provider(
         "mock",
@@ -722,11 +727,10 @@ fn changed_provider_instance_rejects_resume() {
         "managed",
         Some("issuing-route".to_string()),
     );
-    let pending = InFlightCreate::from_pending(CreateAttempt::new(persisted_id.clone()).0.pending(
-        PendingToken::new("opaque"),
-        Sent::AllRequestAttributes,
-        1,
-    ));
+    let pending = CreateAttempt::new(persisted_id.clone())
+        .0
+        .pending(PendingToken::new("opaque"), Sent::AllRequestAttributes, 1)
+        .persist(Default::default(), Default::default());
     let current = crate::resource::into_plan_input_current_map(
         HashMap::from([(desired_id.clone(), Current::create_in_flight(pending))]),
         &SchemaRegistry::new(),
@@ -2474,8 +2478,10 @@ fn unchanged_dsl_after_writeback_pairs_raw_saved_list_without_phantom_removal() 
             rule("server-default", true, true),
         ])),
     )]);
-    let sent = crate::executor::AcceptedRequest::create_for_test();
-    let sent_desired = sent.sent_desired_attributes(&authored);
+    let sent = crate::executor::AcceptedRequest::from_create_permit_for_test(
+        &crate::test_utils::prepared_write::create_permit(&authored),
+    );
+    let sent_desired = sent.sent_desired_attributes();
     let prior = crate::explicit::build_from_resource_for_stored_values_after_send(
         &authored,
         None,

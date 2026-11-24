@@ -73,6 +73,20 @@ shape_test!(issue_4384_map_in_union, "union_map");
 shape_test!(issue_4384_struct_in_union, "union_struct");
 
 #[test]
+fn tp16_unknown_reference_same_named_parameter_is_proven() {
+    let schemas = fixture::schemas(carina_core::schema::AttributeType::string());
+    let engine = engine_with_schemas(schemas.clone());
+    let directory = fixture::directory(
+        "fn forward(value: mock.keys.Key.Reference): String { 'ok' }\nmock.PlainStringSink { value = forward(r.key) }\n",
+        fixture::UNKNOWN_SOURCE,
+    );
+    let cli = cli_diagnostics(factories_for(&schemas), &directory);
+    let lsp = lsp_diagnostics(&engine, &directory, "main.crn");
+    assert!(cli.is_empty(), "{cli:?}");
+    assert!(lsp.is_empty(), "{lsp:?}");
+}
+
+#[test]
 fn issue_4384_same_identity_identityless_and_reference_sinks_stay_accepted() {
     for (control, target, reference) in fixture::accepted_targets() {
         for (shape, ty, expression) in fixture::shapes_for(target.clone()) {

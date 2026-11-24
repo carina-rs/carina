@@ -35,12 +35,12 @@ use carina_core::resource::{
     Value as GenericValue,
 };
 use carina_core::schema::{SchemaRegistry, TypeError};
-use carina_core::validation::DeferredAccessTypeError;
 #[cfg(test)]
 use carina_core::validation::admission::attributes::uses_resource_attribute_admission;
 use carina_core::validation::admission::attributes::{
     ClassificationDiagnostics, ResourceAttributeInputs, ValidationEvaluation,
 };
+use carina_core::validation::{DeferredAccessTypeError, merge_function_promise_diagnostics};
 
 #[derive(Debug)]
 enum OrdinaryDiagnostic {
@@ -944,6 +944,19 @@ impl std::ops::Deref for DiagnosticRun<'_> {
 }
 
 impl DiagnosticRun<'_> {
+    fn publication_key(&self, doc: &Document, file: &carina_core::parser::SourceFileId) -> PathBuf {
+        let identity = PathIdentity::new(file.path());
+        if identity == PathIdentity::new(doc.source_file()) {
+            doc.source_file().to_path_buf()
+        } else {
+            self.open_sources
+                .iter()
+                .find(|(path, _)| PathIdentity::new(path) == identity)
+                .map(|(path, _)| path.clone())
+                .unwrap_or_else(|| file.diagnostic_path())
+        }
+    }
+
     /// One publication seam for deferred prefixes: use the authored key only,
     /// never a module-call projection. Non-prefix findings retain their routes.
     fn publish_deferred_prefixes(
@@ -959,17 +972,8 @@ impl DiagnosticRun<'_> {
                 continue;
             };
             let path = location.file().path();
-            let identity = PathIdentity::new(path);
-            let is_current = identity == PathIdentity::new(doc.source_file());
-            let publication = if is_current {
-                doc.source_file().to_path_buf()
-            } else {
-                self.open_sources
-                    .iter()
-                    .find(|(path, _)| PathIdentity::new(path) == identity)
-                    .map(|(path, _)| path.clone())
-                    .unwrap_or_else(|| location.file().diagnostic_path())
-            };
+            let is_current = PathIdentity::new(path) == PathIdentity::new(doc.source_file());
+            let publication = self.publication_key(doc, location.file());
             let diagnostic = if path == doc.source_file() {
                 render_merged(
                     doc,
@@ -1700,6 +1704,7 @@ impl DiagnosticRun<'_> {
             self.collect_diagnostics_in(doc, current_file_path, &mut conversion_validation);
         conversion_validation.extend(ordinary.into_iter().map(OrdinaryDiagnostic::visible));
         let mut diagnostics = Vec::new();
+        let mut promises: BTreeMap<PathBuf, Vec<Diagnostic>> = BTreeMap::new();
         for finding in conversion_validation.complete().into_presented() {
             use carina_core::validation::{OrdinaryFinding, PresentedFinding};
             match finding {
@@ -1718,6 +1723,52 @@ impl DiagnosticRun<'_> {
                 PresentedFinding::Ordinary(OrdinaryFinding::Client(diagnostic)) => {
                     match *diagnostic {
                         OrdinaryDiagnostic::Visible(diagnostic) => diagnostics.push(*diagnostic),
+                    }
+                }
+                PresentedFinding::FunctionPromise(finding) => {
+                    let overrides = self.analysis_sources.borrow();
+                    let root_directory = doc.source_file().parent().map(PathIdentity::new);
+                    let current_root_context = self
+                        .open_sources
+                        .iter()
+                        .filter(|(path, _)| path.parent().map(PathIdentity::new) == root_directory)
+                        .all(|(path, buffer)| {
+                            overrides
+                                .analyzed_source(path)
+                                .is_some_and(|source| source.as_ref() == buffer.as_ref())
+                        });
+
+                    let path = finding.location().file().path();
+                    let diagnostic = if path == doc.source_file() {
+                        render_merged(
+                            doc,
+                            &finding,
+                            DiagnosticSeverity::ERROR,
+                            finding.detail().to_string(),
+                        )
+                    } else if current_root_context
+                        && path.parent().map(PathIdentity::new) != root_directory
+                    {
+                        analyzed_range(finding.location(), self.open_sources, &overrides).map(
+                            |range| Diagnostic {
+                                range,
+                                severity: Some(DiagnosticSeverity::ERROR),
+                                source: Some("carina".into()),
+                                message: finding.detail().to_string(),
+                                ..Default::default()
+                            },
+                        )
+                    } else {
+                        None
+                    };
+                    let Some(diagnostic) = diagnostic else {
+                        continue;
+                    };
+                    let destination = promises
+                        .entry(self.publication_key(doc, finding.location().file()))
+                        .or_default();
+                    if !destination.contains(&diagnostic) {
+                        destination.push(diagnostic);
                     }
                 }
                 PresentedFinding::Conversion(error) => {
@@ -1740,6 +1791,25 @@ impl DiagnosticRun<'_> {
             }
         }
 
+        let mut routed = self.routed_findings.borrow_mut();
+        for (path, mut promises) in promises {
+            let destination = if path == doc.source_file() {
+                &mut diagnostics
+            } else {
+                routed.entry(path).or_default()
+            };
+            promises.retain(|finding| !destination.contains(finding));
+            *destination = merge_function_promise_diagnostics(
+                std::mem::take(destination),
+                promises,
+                |finding| {
+                    Some((
+                        (),
+                        Some((finding.range.start.line, finding.range.start.character)),
+                    ))
+                },
+            );
+        }
         diagnostics
     }
 
@@ -2496,6 +2566,20 @@ impl DiagnosticRun<'_> {
                 binding_use_report,
                 export_value_bindings,
             } = validation_inputs;
+            let promise_findings = expanded_validation_inputs.as_ref().map_or_else(
+                || {
+                    pre_expansion_configuration
+                        .judged()
+                        .function_type_promise_findings(&binding_index)
+                },
+                |inputs| {
+                    inputs
+                        .configuration
+                        .judged()
+                        .function_type_promise_findings(&inputs.binding_index)
+                },
+            );
+            conversion_validation.include_function_promises(promise_findings);
             // Validate non-resource declarations authored in the open file,
             // even when no typed resource sink consumes them. Binding and
             // schema authority remains directory-wide, while source anchoring
@@ -3354,7 +3438,7 @@ impl DiagnosticEngine {
         self.analyze_with_open_sources(raw, current_file_path, &open_sources)
     }
 
-    /// Analyze the current document and route instantiated secrecy findings to
+    /// Analyze the current document and route instantiated findings to
     /// their authored files. Dirty module buffers suppress routed findings.
     /// Results iterate in file-path order.
     pub fn analyze_document_set(

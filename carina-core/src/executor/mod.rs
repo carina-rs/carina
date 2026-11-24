@@ -34,7 +34,7 @@ pub use delete::{
     DeleteCompletion, DeleteRelease, DeleteScheduleError, DeleteScheduler, ScheduledDelete,
     dispatch_delete, prepare_initial_delete,
 };
-pub use input_discharge::{DeletePermit, PreparedWrite};
+pub use input_discharge::{DeletePermit, PreparedCreateWriteback, PreparedWrite};
 pub use parallel::classify_stalled_effects;
 pub use scheduler::prepare_initial_create;
 pub use wait::StartMarker;
@@ -136,11 +136,11 @@ use crate::binding_index::{ResolvedBindings, SecretPreservingAttributes};
 use crate::effect::{DeletedInstanceKey, Effect};
 use crate::parser::ResolvedProviderConfigs;
 use crate::provider::{
-    AppliedIdentifier, CreateRequest, HostCreateFailure, HostCreateFailureKind, HostCreateOutcome,
-    HostError, HostIdentifiedCreate, HostNormalizer, HostPartialReadDiagnostic, HostProvider,
-    HostResumeFailure, HostResumeFailureKind, HostResumeOutcome, InFlightCreate, PlannedPatchOp,
-    ProviderReadyDataSource, ResumeCreateRequest, SentAttributes, SentDesiredAttributes,
-    UnknownCreateOutcome, UpdateRequest,
+    AppliedIdentifier, CreateRequest, HostCreateFailure, HostCreateOutcome, HostError,
+    HostIdentifiedCreate, HostNormalizer, HostPartialReadDiagnostic, HostProvider,
+    HostResumeFailure, HostResumeOutcome, InFlightCreate, PlannedPatchOp, ProviderReadyDataSource,
+    ResumeCreateRequest, SentAttributes, SentDesiredAttributes, UnknownCreateOutcome,
+    UpdateRequest,
 };
 #[cfg(test)]
 use crate::resource::ApplyTimeUnknown;
@@ -155,43 +155,79 @@ use parallel::execute_effects_sequential;
 
 pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 
-/// Prepare dispatch of an already checked create request while minting the
-/// unforgeable initial-attempt witness and its cancellation receiver inside
-/// core. The supervising caller must retain the receiver until the returned
+mod create_dispatch {
+    use super::{HostCreateFailure, HostCreateOutcome, HostProvider, dispatch_create_with_attempt};
+
+    /// Dispatch a permitted create with its cancellation receiver and raw host outcome.
+    pub fn dispatch_create<'a, P: HostProvider + ?Sized>(
+        provider: &'a P,
+        permit: crate::replacement::CreatePermit,
+    ) -> (
+        impl std::future::Future<Output = Result<HostCreateOutcome, HostCreateFailure>> + 'a,
+        crate::provider::CreateCallCancellationReceiver,
+    ) {
+        let (attempt, cancellation) = crate::provider::CreateAttempt::new(permit.target().clone());
+        (
+            dispatch_create_with_attempt(provider, permit, attempt),
+            cancellation,
+        )
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub use create_dispatch::dispatch_create;
+#[cfg(not(any(test, feature = "test-utils")))]
+pub(crate) use create_dispatch::dispatch_create;
+
+/// A completed create's identifier, provider state, and prepared writeback evidence.
+#[derive(Debug)]
+pub struct CreateWriteback {
+    pub identifier: crate::provider::AppliedIdentifier,
+    pub state: State,
+    pub request: AcceptedRequest,
+    pub diagnostic: Option<HostPartialReadDiagnostic>,
+    pub read_back_end: crate::provider::ReadBackEnd,
+}
+
+/// Dispatch a prepared create and retain its desired values for every writeback result.
+///
+/// Core mints the initial-attempt witness and cancellation receiver during
+/// dispatch. The supervising caller must retain the receiver until the returned
 /// future settles. Executor-owned abandonment paths drain it before saving
 /// the cancellation classification.
 /// A caller cannot replace the admitted request, even at the same identity:
 ///
 /// ```compile_fail,E0061
-/// use carina_core::{executor::dispatch_create, provider::{CreateRequest, HostProvider}, replacement::CreatePermit};
+/// use carina_core::{executor::dispatch_create_for_writeback, provider::{CreateRequest, HostProvider}, replacement::CreatePermit};
 /// fn create_dispatch_rejects_a_permit_for_another_target(provider: &dyn HostProvider, permit: CreatePermit, other: CreateRequest) {
-///     let _ = dispatch_create(provider, permit, other);
+///     let _ = dispatch_create_for_writeback(provider, permit, other);
 /// }
 /// ```
 ///
 /// Raw resource IDs cannot authorize a create, including a replacement:
 ///
 /// ```compile_fail,E0308
-/// use carina_core::{executor::dispatch_create, provider::HostProvider, resource::ResourceId};
+/// use carina_core::{executor::dispatch_create_for_writeback, provider::HostProvider, resource::ResourceId};
 /// fn bypass(provider: &dyn HostProvider, target: &ResourceId) {
-///     let _ = dispatch_create(provider, target);
+///     let _ = dispatch_create_for_writeback(provider, target);
 /// }
 /// ```
 /// The former raw dispatch shape cannot bypass either admission check:
 ///
 /// ```compile_fail,E0061
-/// use carina_core::{executor::dispatch_create, provider::{CreateRequest, HostProvider}, resource::ResourceId};
+/// use carina_core::{executor::dispatch_create_for_writeback, provider::{CreateRequest, HostProvider}, resource::ResourceId};
 /// fn bypass(provider: &dyn HostProvider, id: &ResourceId, request: CreateRequest) {
-///     let _ = dispatch_create(provider, id, request);
+///     let _ = dispatch_create_for_writeback(provider, id, request);
 /// }
 /// ```
 ///
 /// A discharged request alone cannot bypass scheduler readiness:
 ///
 /// ```compile_fail,E0308
-/// use carina_core::{executor::{dispatch_create, PreparedWrite}, provider::{CreateRequest, HostProvider}};
+/// use carina_core::{executor::{dispatch_create_for_writeback, PreparedWrite}, provider::{CreateRequest, HostProvider}};
 /// fn bypass(provider: &dyn HostProvider, discharged: PreparedWrite<CreateRequest>) {
-///     let _ = dispatch_create(provider, discharged);
+///     let _ = dispatch_create_for_writeback(provider, discharged);
 /// }
 /// ```
 ///
@@ -207,16 +243,30 @@ pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 ///     request.into()
 /// }
 /// ```
-pub fn dispatch_create<'a, P: HostProvider + ?Sized>(
+pub fn dispatch_create_for_writeback<'a, P: HostProvider + ?Sized>(
     provider: &'a P,
     permit: crate::replacement::CreatePermit,
 ) -> (
-    impl std::future::Future<Output = Result<HostCreateOutcome, HostCreateFailure>> + 'a,
+    impl std::future::Future<Output = Result<CreateWriteback, HostCreateFailure>> + 'a,
     crate::provider::CreateCallCancellationReceiver,
 ) {
-    let (attempt, cancellation) = crate::provider::CreateAttempt::new(permit.target().clone());
+    let request = AcceptedRequest::from_prepared_create(permit.prepared_write());
+    let (create, cancellation) = dispatch_create(provider, permit);
     (
-        dispatch_create_with_attempt(provider, permit, attempt),
+        async move {
+            create.await.map(|outcome| {
+                let identifier = outcome.identifier().clone();
+                let (state, request, diagnostic, read_back_end) =
+                    complete_create_for_writeback(outcome, request);
+                CreateWriteback {
+                    identifier,
+                    state,
+                    request,
+                    diagnostic,
+                    read_back_end,
+                }
+            })
+        },
         cancellation,
     )
 }
@@ -258,23 +308,18 @@ async fn dispatch_create_with_attempt<P: HostProvider + ?Sized>(
     permit: crate::replacement::CreatePermit,
     attempt: crate::provider::CreateAttempt,
 ) -> Result<HostCreateOutcome, HostCreateFailure> {
-    let request = permit.into_request();
+    let (request, writeback) = permit.into_write().into_parts();
     let id = request.resource().id.clone();
-    let request_attributes: BTreeSet<_> = request
-        .resource()
-        .as_resource()
-        .attributes
-        .keys()
-        .cloned()
-        .collect();
+    let request_attributes = writeback.sent_attributes().as_set();
     match provider.create(&id, request, attempt).await {
         Ok(outcome) => Ok(outcome),
         Err(failure) => match failure.into_kind() {
-            HostCreateFailureKind::OutcomeUnknown { unknown, error } => Err(
+            crate::provider::CreateFailureKind::OutcomeUnknown { unknown, error } => Err(
                 HostCreateFailure::outcome_unknown_at_dispatch(unknown, error),
             ),
-            HostCreateFailureKind::IdentifierReported { identified, error } => {
-                let (identified, valid) = identified.validate_request_sent(&request_attributes);
+            crate::provider::CreateFailureKind::IdentifierReported { identified, error } => {
+                let (identified, valid) = identified.validate_request_sent(request_attributes);
+                let identified = identified.into_writeback(writeback);
                 let error = if valid {
                     error
                 } else {
@@ -286,8 +331,9 @@ async fn dispatch_create_with_attempt<P: HostProvider + ?Sized>(
                 };
                 Err(HostCreateFailure::identifier_reported(identified, error))
             }
-            HostCreateFailureKind::InFlight { pending, error } => {
-                let (pending, valid) = pending.validate_fresh_sent(&request_attributes);
+            crate::provider::CreateFailureKind::InFlight { pending, error } => {
+                let (pending, valid) = pending.validate_fresh_sent(request_attributes);
+                let pending = pending.into_writeback(writeback);
                 let error = if valid {
                     error
                 } else {
@@ -299,7 +345,7 @@ async fn dispatch_create_with_attempt<P: HostProvider + ?Sized>(
                 };
                 Err(HostCreateFailure::in_flight(pending, error))
             }
-            HostCreateFailureKind::NoResource(error) => {
+            crate::provider::CreateFailureKind::NoResource(error) => {
                 Err(HostCreateFailure::not_created_at_dispatch(error))
             }
         },
@@ -307,7 +353,8 @@ async fn dispatch_create_with_attempt<P: HostProvider + ?Sized>(
 }
 
 /// Dispatch a checked resume request through the same sent-attribute
-/// validation seam as an initial create.
+/// validation seam as an initial create, using its prepared desired values
+/// to produce host records for state writeback.
 pub async fn dispatch_resume_create<P: HostProvider + ?Sized>(
     provider: &P,
     request: ResumeCreateRequest,
@@ -321,26 +368,20 @@ async fn dispatch_resume_create_raw<P: HostProvider + ?Sized>(
     provider: &P,
     request: ResumeCreateRequest,
 ) -> Result<HostResumeOutcome, HostResumeFailure> {
+    let writeback = request.writeback().clone();
     let id = request.id().clone();
     let starting = request.pending_for_dispatch();
-    let request_attributes: BTreeSet<_> = request
-        .request()
-        .resource()
-        .as_resource()
-        .attributes
-        .keys()
-        .cloned()
-        .collect();
+    let request_attributes = writeback.sent_attributes().as_set();
     match provider.resume_create(request).await {
-        Ok(outcome) if outcome.id() == &id => Ok(outcome),
-        Ok(_outcome) => Err(starting.into_resume_failure(
+        Ok(outcome) if outcome.id() == &id => Ok(outcome.into_writeback(writeback)),
+        Ok(_outcome) => Err(starting.into_writeback(writeback).into_resume_failure(
             HostError::internal("provider returned a resume outcome for another resource")
                 .for_resource(id),
         )),
         Err(failure) => match failure.into_kind() {
-            HostResumeFailureKind::IdentifierReported { identified, error } => {
+            crate::provider::ResumeFailureKind::IdentifierReported { identified, error } => {
                 if identified.id() != &id {
-                    return Err(starting.into_resume_failure(
+                    return Err(starting.into_writeback(writeback).into_resume_failure(
                         HostError::internal_caused_by(
                             "provider returned a resumed failure for another resource",
                             error,
@@ -348,7 +389,8 @@ async fn dispatch_resume_create_raw<P: HostProvider + ?Sized>(
                         .for_resource(id),
                     ));
                 }
-                let (identified, valid) = identified.validate_request_sent(&request_attributes);
+                let (identified, valid) = identified.validate_request_sent(request_attributes);
+                let identified = identified.into_writeback(writeback);
                 let error = if valid {
                     error
                 } else {
@@ -360,9 +402,9 @@ async fn dispatch_resume_create_raw<P: HostProvider + ?Sized>(
                 };
                 Err(HostResumeFailure::identifier_reported(identified, error))
             }
-            HostResumeFailureKind::InFlight { pending, error } => {
+            crate::provider::ResumeFailureKind::InFlight { pending, error } => {
                 if pending.id() != &id {
-                    return Err(starting.into_resume_failure(
+                    return Err(starting.into_writeback(writeback).into_resume_failure(
                         HostError::internal_caused_by(
                             "provider returned a resumed continuation for another resource",
                             error,
@@ -370,7 +412,8 @@ async fn dispatch_resume_create_raw<P: HostProvider + ?Sized>(
                         .for_resource(id),
                     ));
                 }
-                let (pending, valid) = pending.validate_fresh_sent(&request_attributes);
+                let (pending, valid) = pending.validate_fresh_sent(request_attributes);
+                let pending = pending.into_writeback(writeback);
                 let error = if valid {
                     error
                 } else {
@@ -382,7 +425,7 @@ async fn dispatch_resume_create_raw<P: HostProvider + ?Sized>(
                 };
                 Err(HostResumeFailure::in_flight(pending, error))
             }
-            HostResumeFailureKind::NoResource(error) => {
+            crate::provider::ResumeFailureKind::NoResource(error) => {
                 Err(HostResumeFailure::no_resource_from_verdict(error))
             }
         },
@@ -410,7 +453,7 @@ pub struct AcceptedRequest {
     /// Provider-ready desired attributes accepted for this operation. This is
     /// kept separate from the plan-time authored resource so state writeback
     /// masks secrets against the value shape actually sent to the provider.
-    resolved_desired_attributes: Option<SecretPreservingAttributes>,
+    resolved_desired_attributes: SecretPreservingAttributes,
 }
 
 /// Read-only shape of the request accepted by the provider.
@@ -436,19 +479,17 @@ impl SentKey {
 }
 
 impl AcceptedRequest {
-    /// Record a successful create from the checked request that was dispatched.
-    pub fn from_create_request(request: &CreateRequest) -> Self {
+    fn from_prepared_create(write: &PreparedWrite<CreateRequest>) -> Self {
+        let writeback = write.create_writeback();
         Self {
             kind: AcceptedRequestKind::Create,
-            sent_attributes: request.sent_attributes(),
-            resolved_desired_attributes: None,
+            sent_attributes: writeback.sent_attributes().clone(),
+            resolved_desired_attributes: writeback.attributes().clone(),
         }
     }
 
-    fn from_update_request(
-        request: &UpdateRequest,
-        resolved_desired_attributes: SecretPreservingAttributes,
-    ) -> Self {
+    fn from_update_request(write: &PreparedWrite<UpdateRequest>) -> Self {
+        let request = write.request();
         let mut sent = BTreeMap::new();
         let mut removed = BTreeSet::new();
         for op in request.planned_ops() {
@@ -473,68 +514,22 @@ impl AcceptedRequest {
         Self {
             kind: AcceptedRequestKind::Update { sent, removed },
             sent_attributes,
-            resolved_desired_attributes: Some(resolved_desired_attributes),
+            resolved_desired_attributes: write.writeback().clone(),
         }
     }
 
-    pub(crate) fn with_resolved_desired_attributes(
-        mut self,
-        attributes: SecretPreservingAttributes,
-    ) -> Self {
-        self.resolved_desired_attributes = Some(attributes);
-        self
-    }
-
-    /// Construct create provenance for fixtures and state-boundary tests.
+    /// Retain the exact prepared create's values and send membership in fixtures.
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
-    pub fn create_for_test() -> Self {
-        Self {
-            kind: AcceptedRequestKind::Create,
-            sent_attributes: SentAttributes::all_for_test(),
-            resolved_desired_attributes: None,
-        }
+    pub fn from_create_permit_for_test(permit: &crate::replacement::CreatePermit) -> Self {
+        Self::from_prepared_create(permit.prepared_write())
     }
 
-    /// Construct update provenance for fixtures and state-boundary tests.
+    /// Retain the exact prepared update's values and checked patch in fixtures.
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
-    pub fn update_for_test(sent: &[&str], removed: &[&str]) -> Self {
-        let sent = sent
-            .iter()
-            .map(|key| (*key, Vec::new()))
-            .collect::<Vec<_>>();
-        Self::update_with_grafted_leaves_for_test(&sent, removed)
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    #[doc(hidden)]
-    pub fn update_with_grafted_leaves_for_test(
-        sent: &[(&str, Vec<LeafPath>)],
-        removed: &[&str],
-    ) -> Self {
-        Self {
-            kind: AcceptedRequestKind::Update {
-                sent: sent
-                    .iter()
-                    .map(|(key, leaves)| {
-                        (
-                            (*key).to_string(),
-                            SentKey {
-                                grafted_leaves: leaves.clone(),
-                            },
-                        )
-                    })
-                    .collect(),
-                removed: removed.iter().map(|key| (*key).to_string()).collect(),
-            },
-            sent_attributes: SentAttributes::only(
-                sent.iter()
-                    .map(|(key, _leaves)| (*key).to_string())
-                    .collect(),
-            ),
-            resolved_desired_attributes: None,
-        }
+    pub fn from_update_permit_for_test(permit: &crate::replacement::UpdatePermit) -> Self {
+        Self::from_update_request(&permit.write)
     }
 
     pub fn kind(&self) -> &AcceptedRequestKind {
@@ -545,39 +540,23 @@ impl AcceptedRequest {
         &self.sent_attributes
     }
 
-    /// Return the desired values and sent-attribute membership proven by this
-    /// accepted request. Production executor paths retain resolved values;
-    /// provider-ready bootstrap and test paths may use the supplied resource
-    /// as their already-resolved fallback.
-    pub fn sent_desired_attributes<'a, S, D>(
-        &'a self,
-        fallback_resource: &'a Resource<
-            S,
-            crate::resource::NoPlaceholder,
-            crate::resource::AbsoluteBindingAddress,
-            D,
-        >,
-    ) -> SentDesiredAttributes<'a> {
-        match self.resolved_desired_attributes.as_ref() {
-            Some(attributes) => {
-                SentDesiredAttributes::new(attributes.values().iter(), self.sent_attributes.clone())
-            }
-            None => SentDesiredAttributes::new(
-                fallback_resource.attributes.iter(),
-                self.sent_attributes.clone(),
-            ),
-        }
+    /// Desired values and sent-attribute membership retained by the prepared write.
+    pub fn sent_desired_attributes(&self) -> SentDesiredAttributes<'_> {
+        SentDesiredAttributes::new(
+            self.resolved_desired_attributes.values().iter(),
+            self.sent_attributes.clone(),
+        )
     }
 
-    pub fn resolved_desired_attributes(&self) -> Option<&SecretPreservingAttributes> {
-        self.resolved_desired_attributes.as_ref()
+    pub fn resolved_desired_attributes(&self) -> &SecretPreservingAttributes {
+        &self.resolved_desired_attributes
     }
 }
 
 /// Convert a successful provider create into the state and provenance used by
 /// normal apply writeback. Partial-success diagnostics are folded into the
 /// state before it is persisted.
-pub fn complete_create_for_writeback(
+pub(crate) fn complete_create_for_writeback(
     outcome: HostCreateOutcome,
     request: AcceptedRequest,
 ) -> (

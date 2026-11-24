@@ -1115,6 +1115,53 @@ fn module_function_error_keeps_its_element_location() {
 }
 
 #[test]
+fn tp4_module_function_promise_is_routed_to_child() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("acm.Certificate")
+            .attribute(AttributeSchema::optional("domain_name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::provider_populated("status", AttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["aws".into()]);
+    for (declared, rejected) in [("'dev' | 'prod'", false), ("String", true)] {
+        let child = format!(
+            "arguments {{ env: {declared} }}\nfn pick(x: 'dev' | 'prod'): String {{ 'accepted' }}\nlet sink = aws.acm.Certificate {{ domain_name = pick(env) }}\n"
+        );
+        let root = "provider aws {}\nlet src = aws.acm.Certificate { domain_name = 'source' }\nlet child = use { source = './child' }\nchild { env = src.status }\n";
+        let directory = Directory::new(&[("main.crn", root), ("child/main.crn", &child)]);
+        let path = directory.root.path().join("main.crn");
+        let diagnostics =
+            engine.analyze_document_set(&create_document_at(root, path.clone()), Some(&path), &[]);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .flat_map(|(path, diagnostics)| diagnostics.iter().map(move |finding| (path, finding)))
+            .filter(|(_, finding)| finding.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
+        if rejected {
+            assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+            assert_eq!(errors[0].0, &directory.root.path().join("child/main.crn"));
+            assert_eq!(
+                errors[0].1.message,
+                "function 'pick': parameter 'x' is declared as 'dev' | 'prod', but its argument has type String, so validate cannot prove it fits. Pass a value known at validate, or declare the parameter as String and let the resource attribute that receives it check the value."
+            );
+            let column = child.lines().nth(2).unwrap().find("pick(env)").unwrap() as u32;
+            assert_eq!(
+                errors[0].1.range,
+                Range::new(Position::new(2, column), Position::new(2, column + 9))
+            );
+        } else {
+            assert!(errors.is_empty(), "{diagnostics:#?}");
+        }
+    }
+}
+
+#[test]
 fn provider_error_uses_sibling_attribute_location() {
     let directory = Directory::new(&[
         ("main.crn", "let regional = provider aws {}\n"),
