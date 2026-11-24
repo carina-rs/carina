@@ -361,6 +361,8 @@ let subnet_id = subnets[0].subnet_id
 
 Type expressions are used in `arguments`, `attributes`, and `exports` blocks, and in function parameters and return types.
 
+See [function type promises](/guides/functions/#type-promises-at-validate) for parameter and return validation.
+
 ### Simple Types
 
 ```crn
@@ -473,11 +475,9 @@ The `null` literal represents the absence of a value. It can only appear in [val
 // In a module, value is a declared argument.
 arguments {
   value: String
+  require value != null, 'Value must not be null'
 }
-
-require value != null, 'Value must not be null'
 ```
 
-A root-level `require` has no arguments in scope. For example,
-`require 'configured' != null, 'Value must not be null'` is valid at the root;
-a reference to a `let` binding or resource is an unknown-name error.
+A `require` belongs inside an `arguments` block and may reference any argument
+of the module, including arguments declared later or in sibling files.

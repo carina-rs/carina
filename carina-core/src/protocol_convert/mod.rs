@@ -1,0 +1,5569 @@
+#![deny(
+    clippy::wildcard_enum_match_arm,
+    clippy::match_wildcard_for_single_variants
+)]
+
+//! The single typed conversion seam between `carina-core` and the provider
+//! protocol.
+//!
+//! Schema encoding accepts validation witnesses, never mutable drafts:
+//!
+//! ```compile_fail
+//! use carina_core::protocol_convert::resource_schema_to_protocol;
+//! use carina_core::schema::ResourceSchema;
+//!
+//! let draft = ResourceSchema::new("test.Widget");
+//! let _ = resource_schema_to_protocol(&draft);
+//! ```
+//!
+//! Provider-config encoding has the same admission requirement:
+//!
+//! ```compile_fail
+//! use std::collections::BTreeMap;
+//! use carina_core::protocol_convert::config_schema_to_protocol;
+//! use carina_core::schema::AttributeType;
+//!
+//! let draft = BTreeMap::<String, AttributeType>::new();
+//! let _ = config_schema_to_protocol(&draft);
+//! ```
+
+use crate::provider_text::{DiagnosticText, ProviderKey};
+use std::collections::{BTreeMap, HashMap};
+use std::error::Error;
+use std::fmt;
+
+use carina_provider_protocol::types as protocol;
+use indexmap::IndexMap;
+
+use crate::provider::{
+    AppliedState, PartialReadDiagnostic, PatchOp, ProviderDirectiveProtocolParts,
+    ProviderDirectives, ReadOutcome, UpdateOutcome, UpdateOutcomeKind, UpdatePatch,
+};
+use crate::resource::{
+    ConcreteValue, DataSource, DeferredValue, RedactedSecretHash, Resource, ResourceId,
+    ResourceIdentity, ResourceIdentityError, ResourceIdentityState, SnapshotLeaf, SnapshotState,
+    SnapshotValue, State, Value,
+};
+use crate::schema::{
+    AttributeSchema as DraftAttributeSchema, AttributeSchemaParts,
+    AttributeType as DraftAttributeType, CharSet, Compiled,
+    CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+    CompiledStructField as StructField, ConfigSchemaValidationError, FieldGroup, FieldGroupKind,
+    IdentityMode, InputCondition, InputLiteral, InputMode, InputPath, InputPredicate, InputRule,
+    InputRuleCode, InputRuleError, InputRuleParts, InputRuleScope, InputRuleTarget, NonEmptyString,
+    RawShape, ResourceSchema as DraftResourceSchema, ResourceSchemaParts,
+    ResourceSchemaValidationError, ResourceValidation, SchemaKind, SchemaValidationIssueLocation,
+    StructField as DraftStructField, StructFieldParts, TypeIdentity, UniqueNameSpec,
+    ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    empty_defs_for_schema_walks, identity_leaf_is_scalar_or_enum,
+};
+
+mod error;
+
+pub(crate) use error::protocol_knowledge_error;
+pub use error::{ProtocolConvertError, WirePathKey, WirePathSegment};
+
+fn field_group_to_protocol(group: &FieldGroup) -> protocol::FieldGroup {
+    protocol::FieldGroup {
+        kind: match group.kind() {
+            FieldGroupKind::ExactlyOne => protocol::FieldGroupKind::ExactlyOne,
+            FieldGroupKind::AtLeastOne => protocol::FieldGroupKind::AtLeastOne,
+            FieldGroupKind::AtMostOne => protocol::FieldGroupKind::AtMostOne,
+        },
+        fields: group.fields().to_vec(),
+    }
+}
+
+fn protocol_to_field_group(group: &protocol::FieldGroup) -> Result<FieldGroup, SchemaDecodeError> {
+    let kind = match group.kind {
+        protocol::FieldGroupKind::ExactlyOne => FieldGroupKind::ExactlyOne,
+        protocol::FieldGroupKind::AtLeastOne => FieldGroupKind::AtLeastOne,
+        protocol::FieldGroupKind::AtMostOne => FieldGroupKind::AtMostOne,
+    };
+    FieldGroup::new(kind, group.fields.clone()).map_err(|error| SchemaDecodeError::InvalidSchema {
+        detail: "field group is invalid".into(),
+        resource_type: None,
+        attribute_path: Vec::new(),
+        schema_issue_location: None,
+        source: Some(Box::new(error)),
+    })
+}
+
+/// Typed failure while decoding untrusted provider schema records.
+#[derive(Debug)]
+pub enum SchemaDecodeError {
+    InvalidSchema {
+        detail: DiagnosticText,
+        resource_type: Option<ProviderKey>,
+        attribute_path: Vec<ProviderKey>,
+        schema_issue_location: Option<Box<SchemaValidationIssueLocation>>,
+        source: Option<Box<dyn Error + Send + Sync>>,
+    },
+    DuplicateReferenceForm {
+        identity: TypeIdentity,
+    },
+    InvalidProviderSchema(crate::schema::ProviderSchemaValidationError),
+}
+
+impl SchemaDecodeError {
+    fn new(detail: impl Into<String>) -> Self {
+        Self::InvalidSchema {
+            detail: DiagnosticText::new(detail),
+            resource_type: None,
+            attribute_path: Vec::new(),
+            schema_issue_location: None,
+            source: None,
+        }
+    }
+
+    fn from_default(error: ProtocolConvertError) -> Self {
+        Self::InvalidSchema {
+            detail: "schema default value conversion error".into(),
+            resource_type: None,
+            attribute_path: Vec::new(),
+            schema_issue_location: None,
+            source: Some(Box::new(error)),
+        }
+    }
+
+    fn config_schema_validation(error: ConfigSchemaValidationError) -> Self {
+        Self::InvalidSchema {
+            detail: "provider config schema is invalid".into(),
+            resource_type: None,
+            attribute_path: Vec::new(),
+            schema_issue_location: None,
+            source: Some(Box::new(error)),
+        }
+    }
+
+    fn resource_schema_validation(
+        resource_type: &str,
+        error: ResourceSchemaValidationError,
+    ) -> Self {
+        let schema_issue_location = error
+            .located_issues()
+            .next()
+            .map(|(location, _message)| location.clone());
+        Self::InvalidSchema {
+            detail: "resource schema is invalid".into(),
+            resource_type: Some(resource_type.into()),
+            attribute_path: Vec::new(),
+            schema_issue_location: schema_issue_location.map(Box::new),
+            source: Some(Box::new(error)),
+        }
+    }
+
+    fn conflicting_input_mode() -> Self {
+        Self::new("input mode cannot be both required and read-only")
+    }
+
+    fn conflicting_write_only_mode() -> Self {
+        Self::new("struct field cannot be both write-only and provider-populated")
+    }
+
+    fn conflicting_attribute_write_only_mode() -> Self {
+        Self::new("attribute cannot be both write-only and provider-populated")
+    }
+
+    fn incompatible_attribute_modifier(mode: InputMode, modifier: &str) -> Self {
+        Self::new(format!(
+            "{modifier} is not valid for {} attribute input mode",
+            input_mode_name(mode)
+        ))
+    }
+
+    fn incompatible_struct_field_modifier(mode: InputMode, modifier: &str) -> Self {
+        Self::new(format!(
+            "{modifier} is not valid for {} struct-field input mode",
+            input_mode_name(mode)
+        ))
+    }
+
+    fn identity_requires_create_only() -> Self {
+        Self::new("identity requires create_only")
+    }
+
+    fn when_present_identity_requires_optional() -> Self {
+        Self::new("when-present identity requires optional input")
+    }
+
+    fn identity_requires_scalar_or_enum() -> Self {
+        Self::new("identity value must have a scalar or enum type")
+    }
+
+    fn empty_custom_enum_namespace(name: &str) -> Self {
+        Self::InvalidSchema {
+            detail: "custom enum namespace is invalid".into(),
+            resource_type: None,
+            attribute_path: Vec::new(),
+            schema_issue_location: None,
+            source: Some(Box::new(ProtocolConvertError::EmptyCustomEnumNamespace {
+                name: name.to_string(),
+            })),
+        }
+    }
+
+    fn opaque_validator(kind: &str) -> Self {
+        Self::new(format!(
+            "non-null opaque validator payload on protocol {kind} cannot be reconstructed"
+        ))
+    }
+
+    fn protocol(error: ProtocolConvertError, detail: &'static str) -> Self {
+        Self::InvalidSchema {
+            detail: detail.into(),
+            resource_type: None,
+            attribute_path: Vec::new(),
+            schema_issue_location: None,
+            source: Some(Box::new(error)),
+        }
+    }
+
+    fn unsupported_custom_base(enclosing_custom_name: &str, base_kind: &'static str) -> Self {
+        Self::protocol(
+            ProtocolConvertError::LegacyCustomUnsupportedBase {
+                identity: enclosing_custom_name.to_string(),
+                base_kind,
+            },
+            "legacy Custom type cannot be represented without losing metadata",
+        )
+    }
+
+    fn legacy_custom_int_bound_out_of_range(enclosing_custom_name: &str, value: u64) -> Self {
+        Self::new(format!(
+            "legacy Custom wire type '{enclosing_custom_name}' integer bound {value} exceeds i64"
+        ))
+    }
+
+    fn prepend_attribute(mut self, name: &str) -> Self {
+        match &mut self {
+            Self::InvalidSchema {
+                detail: _detail,
+                resource_type: _resource_type,
+                attribute_path,
+                schema_issue_location: _schema_issue_location,
+                source: _source,
+            } => {
+                attribute_path.insert(0, name.into());
+            }
+            Self::DuplicateReferenceForm { identity: _ } | Self::InvalidProviderSchema(_) => {}
+        }
+        self
+    }
+
+    fn prepend_definition(mut self, name: &str) -> Self {
+        match &mut self {
+            Self::InvalidSchema {
+                detail: _detail,
+                resource_type: _resource_type,
+                attribute_path,
+                schema_issue_location,
+                source: _source,
+            } => {
+                let path = std::iter::once(ProviderKey::from(name))
+                    .chain(attribute_path.drain(..))
+                    .map(ProviderKey::into_string)
+                    .collect::<Vec<_>>()
+                    .join(".");
+                *schema_issue_location = Some(Box::new(SchemaValidationIssueLocation::Definition(
+                    path.into(),
+                )));
+            }
+            Self::DuplicateReferenceForm { identity: _ } | Self::InvalidProviderSchema(_) => {}
+        }
+        self
+    }
+
+    fn with_resource_type(mut self, resource_type: &str) -> Self {
+        match &mut self {
+            Self::InvalidSchema {
+                detail: _detail,
+                resource_type: current,
+                attribute_path: _attribute_path,
+                schema_issue_location: _schema_issue_location,
+                source: _source,
+            } => *current = Some(resource_type.into()),
+            Self::DuplicateReferenceForm { identity: _ } | Self::InvalidProviderSchema(_) => {}
+        }
+        self
+    }
+}
+
+impl fmt::Display for SchemaDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSchema {
+                detail,
+                resource_type,
+                attribute_path,
+                schema_issue_location,
+                source: _source,
+            } => {
+                if let Some(resource_type) = resource_type {
+                    write!(formatter, "resource '{resource_type}'")?;
+                    if !attribute_path.is_empty() {
+                        write!(
+                            formatter,
+                            " attribute '{}'",
+                            DiagnosticText::new(
+                                attribute_path
+                                    .iter()
+                                    .map(ProviderKey::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(".")
+                            )
+                        )?;
+                    } else if let Some(attribute_path) = schema_issue_location
+                        .as_deref()
+                        .and_then(SchemaValidationIssueLocation::attribute_path)
+                    {
+                        write!(
+                            formatter,
+                            " attribute '{}'",
+                            DiagnosticText::new(attribute_path)
+                        )?;
+                    }
+                    formatter.write_str(": ")?;
+                    if let Some(location) = schema_issue_location
+                        && location.attribute_path().is_none()
+                    {
+                        write!(formatter, "{location}: ")?;
+                    }
+                    formatter.write_str(detail)?;
+                } else if attribute_path.is_empty() {
+                    formatter.write_str(detail)?;
+                } else {
+                    write!(
+                        formatter,
+                        "attribute '{}': {}",
+                        DiagnosticText::new(
+                            attribute_path
+                                .iter()
+                                .map(ProviderKey::as_str)
+                                .collect::<Vec<_>>()
+                                .join(".")
+                        ),
+                        detail
+                    )?;
+                }
+            }
+            Self::DuplicateReferenceForm { identity } => {
+                write!(
+                    formatter,
+                    "duplicate reference form identity `{}`",
+                    DiagnosticText::new(identity.to_string())
+                )?;
+            }
+            Self::InvalidProviderSchema(error) => error.fmt(formatter)?,
+        }
+        Ok(())
+    }
+}
+
+impl Error for SchemaDecodeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidSchema {
+                detail: _detail,
+                resource_type: _resource_type,
+                attribute_path: _attribute_path,
+                schema_issue_location: _schema_issue_location,
+                source,
+            } => source
+                .as_deref()
+                .map(|source| source as &(dyn Error + 'static)),
+            Self::DuplicateReferenceForm { identity: _ } => None,
+            Self::InvalidProviderSchema(_error) => None,
+        }
+    }
+}
+
+fn input_charset_to_protocol(set: &CharSet) -> protocol::CharSet {
+    protocol::CharSet {
+        ranges: set
+            .ranges()
+            .iter()
+            .map(|(start, end)| protocol::CharRange {
+                start: u32::from(*start),
+                end: u32::from(*end),
+            })
+            .collect(),
+    }
+}
+
+fn input_literal_to_protocol(literal: &InputLiteral) -> protocol::InputLiteral {
+    match literal {
+        InputLiteral::Bool(value) => protocol::InputLiteral::Bool(*value),
+        InputLiteral::Int(value) => protocol::InputLiteral::Int(*value),
+        InputLiteral::Float(value) => protocol::InputLiteral::Float(*value),
+        InputLiteral::String(value) => protocol::InputLiteral::String(value.clone()),
+        InputLiteral::Enum {
+            identity,
+            api_value,
+        } => {
+            let TypeIdentity {
+                provider,
+                segments,
+                kind,
+            } = identity;
+            protocol::InputLiteral::Enum {
+                identity: protocol::TypeIdentity {
+                    provider: provider.clone().unwrap_or_default(),
+                    segments: segments.clone(),
+                    kind: kind.clone(),
+                },
+                api_value: api_value.clone(),
+            }
+        }
+    }
+}
+
+fn protocol_to_input_literal(literal: &protocol::InputLiteral) -> InputLiteral {
+    match literal {
+        protocol::InputLiteral::Bool(value) => InputLiteral::Bool(*value),
+        protocol::InputLiteral::Int(value) => InputLiteral::Int(*value),
+        protocol::InputLiteral::Float(value) => InputLiteral::Float(*value),
+        protocol::InputLiteral::String(value) => InputLiteral::String(value.clone()),
+        protocol::InputLiteral::Enum {
+            identity,
+            api_value,
+        } => {
+            let protocol::TypeIdentity {
+                provider,
+                segments,
+                kind,
+            } = identity;
+            InputLiteral::Enum {
+                identity: TypeIdentity {
+                    provider: if provider.is_empty() {
+                        None
+                    } else {
+                        Some(provider.clone())
+                    },
+                    segments: segments.clone(),
+                    kind: kind.clone(),
+                },
+                api_value: api_value.clone(),
+            }
+        }
+    }
+}
+
+fn input_condition_to_protocol(condition: &InputCondition) -> protocol::InputCondition {
+    match condition {
+        InputCondition::Always => protocol::InputCondition::Always,
+        InputCondition::Present(path) => {
+            protocol::InputCondition::Present(path.as_str().to_owned())
+        }
+        InputCondition::Equals { path, literal } => protocol::InputCondition::Equals {
+            path: path.as_str().to_owned(),
+            literal: input_literal_to_protocol(literal),
+        },
+        InputCondition::Not(inner) => {
+            protocol::InputCondition::Not(Box::new(input_condition_to_protocol(inner)))
+        }
+    }
+}
+
+fn protocol_to_input_condition(
+    condition: &protocol::InputCondition,
+    depth: usize,
+) -> Result<InputCondition, InputRuleError> {
+    if depth > crate::schema::MAX_INPUT_CONDITION_DEPTH {
+        return Err(InputRuleError::ConditionTooDeep);
+    }
+    Ok(match condition {
+        protocol::InputCondition::Always => InputCondition::Always,
+        protocol::InputCondition::Present(path) => {
+            InputCondition::Present(InputPath::new(path.clone())?)
+        }
+        protocol::InputCondition::Equals { path, literal } => InputCondition::Equals {
+            path: InputPath::new(path.clone())?,
+            literal: protocol_to_input_literal(literal),
+        },
+        protocol::InputCondition::Not(inner) => {
+            InputCondition::Not(Box::new(protocol_to_input_condition(inner, depth + 1)?))
+        }
+    })
+}
+
+fn input_rule_to_protocol(rule: &InputRule<Compiled>) -> protocol::InputRule {
+    let InputRuleParts {
+        scope,
+        target,
+        code,
+        condition,
+        predicate,
+    } = rule.parts();
+    let predicate = match predicate {
+        InputPredicate::Present => protocol::InputPredicate::Present,
+        InputPredicate::Absent => protocol::InputPredicate::Absent,
+        InputPredicate::Secret => protocol::InputPredicate::Secret,
+        InputPredicate::Equals(literal) => {
+            protocol::InputPredicate::Equals(input_literal_to_protocol(literal))
+        }
+        InputPredicate::Length { min, max } => protocol::InputPredicate::Length {
+            min: *min,
+            max: *max,
+        },
+        InputPredicate::AllowedChars(set) => {
+            protocol::InputPredicate::AllowedChars(input_charset_to_protocol(set))
+        }
+        InputPredicate::FirstChar(set) => {
+            protocol::InputPredicate::FirstChar(input_charset_to_protocol(set))
+        }
+        InputPredicate::LastChar(set) => {
+            protocol::InputPredicate::LastChar(input_charset_to_protocol(set))
+        }
+        InputPredicate::NoSubstring(token) => {
+            protocol::InputPredicate::NoSubstring(token.as_str().to_owned())
+        }
+        InputPredicate::NoPrefix(token) => {
+            protocol::InputPredicate::NoPrefix(token.as_str().to_owned())
+        }
+        InputPredicate::ForbiddenPrefix {
+            prefix,
+            ignore_ascii_case,
+        } => protocol::InputPredicate::ForbiddenPrefix {
+            prefix: prefix.as_str().to_owned(),
+            ignore_ascii_case: *ignore_ascii_case,
+        },
+        InputPredicate::NoSuffix(token) => {
+            protocol::InputPredicate::NoSuffix(token.as_str().to_owned())
+        }
+        InputPredicate::NoAdjacent { left, right } => protocol::InputPredicate::NoAdjacent {
+            left: input_charset_to_protocol(left),
+            right: input_charset_to_protocol(right),
+        },
+        InputPredicate::NotIpv4 => protocol::InputPredicate::NotIpv4,
+        InputPredicate::Matches(pattern) => {
+            protocol::InputPredicate::Matches(pattern.as_ref().clone())
+        }
+        InputPredicate::NotMatches(pattern) => {
+            protocol::InputPredicate::NotMatches(pattern.as_ref().clone())
+        }
+    };
+    protocol::InputRule {
+        scope: match scope {
+            InputRuleScope::CreateOnly => protocol::InputRuleScope::CreateOnly,
+            InputRuleScope::EveryWrite => protocol::InputRuleScope::EveryWrite,
+        },
+        target: match target {
+            InputRuleTarget::Value(path) => {
+                protocol::InputRuleTarget::Value(path.as_str().to_owned())
+            }
+            InputRuleTarget::MapKeys(path) => {
+                protocol::InputRuleTarget::MapKeys(path.as_str().to_owned())
+            }
+        },
+        code: code.as_str().to_owned(),
+        condition: input_condition_to_protocol(condition),
+        predicate,
+    }
+}
+
+fn protocol_to_input_charset(set: &protocol::CharSet) -> Result<CharSet, InputRuleError> {
+    let protocol::CharSet { ranges } = set;
+    let ranges = ranges
+        .iter()
+        .map(|range| {
+            let protocol::CharRange { start, end } = range;
+            let start = char::from_u32(*start).ok_or(InputRuleError::InvalidUnicodeScalar)?;
+            let end = char::from_u32(*end).ok_or(InputRuleError::InvalidUnicodeScalar)?;
+            Ok((start, end))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    CharSet::new(ranges)
+}
+
+fn protocol_to_input_rule(rule: &protocol::InputRule) -> Result<InputRule, InputRuleError> {
+    let protocol::InputRule {
+        scope,
+        target,
+        code,
+        condition,
+        predicate,
+    } = rule;
+    let scope = match scope {
+        protocol::InputRuleScope::CreateOnly => InputRuleScope::CreateOnly,
+        protocol::InputRuleScope::EveryWrite => InputRuleScope::EveryWrite,
+    };
+    let target = match target {
+        protocol::InputRuleTarget::Value(path) => {
+            InputRuleTarget::Value(InputPath::new(path.clone())?)
+        }
+        protocol::InputRuleTarget::MapKeys(path) => {
+            InputRuleTarget::MapKeys(InputPath::new(path.clone())?)
+        }
+    };
+    let code = InputRuleCode::new(code.clone())?;
+    let predicate = match predicate {
+        protocol::InputPredicate::Present => InputPredicate::Present,
+        protocol::InputPredicate::Absent => InputPredicate::Absent,
+        protocol::InputPredicate::Secret => InputPredicate::Secret,
+        protocol::InputPredicate::Equals(literal) => {
+            InputPredicate::Equals(protocol_to_input_literal(literal))
+        }
+        protocol::InputPredicate::Length { min, max } => InputPredicate::Length {
+            min: *min,
+            max: *max,
+        },
+        protocol::InputPredicate::AllowedChars(set) => {
+            InputPredicate::AllowedChars(protocol_to_input_charset(set)?)
+        }
+        protocol::InputPredicate::FirstChar(set) => {
+            InputPredicate::FirstChar(protocol_to_input_charset(set)?)
+        }
+        protocol::InputPredicate::LastChar(set) => {
+            InputPredicate::LastChar(protocol_to_input_charset(set)?)
+        }
+        protocol::InputPredicate::NoSubstring(token) => {
+            InputPredicate::NoSubstring(NonEmptyString::new(token.clone())?)
+        }
+        protocol::InputPredicate::NoPrefix(token) => {
+            InputPredicate::NoPrefix(NonEmptyString::new(token.clone())?)
+        }
+        protocol::InputPredicate::ForbiddenPrefix {
+            prefix,
+            ignore_ascii_case,
+        } => InputPredicate::ForbiddenPrefix {
+            prefix: NonEmptyString::new(prefix.clone())?,
+            ignore_ascii_case: *ignore_ascii_case,
+        },
+        protocol::InputPredicate::NoSuffix(token) => {
+            InputPredicate::NoSuffix(NonEmptyString::new(token.clone())?)
+        }
+        protocol::InputPredicate::NoAdjacent { left, right } => InputPredicate::NoAdjacent {
+            left: protocol_to_input_charset(left)?,
+            right: protocol_to_input_charset(right)?,
+        },
+        protocol::InputPredicate::NotIpv4 => InputPredicate::NotIpv4,
+        protocol::InputPredicate::Matches(pattern) => InputPredicate::Matches(pattern.clone()),
+        protocol::InputPredicate::NotMatches(pattern) => {
+            InputPredicate::NotMatches(pattern.clone())
+        }
+    };
+    Ok(InputRule::new(scope, target, code, predicate)
+        .with_condition(protocol_to_input_condition(condition, 1)?))
+}
+
+/// Convert a validated resource schema into its current protocol record.
+pub fn resource_schema_to_protocol(
+    schema: &ValidatedResourceSchema,
+) -> Result<protocol::ResourceSchema, ProtocolConvertError> {
+    let ResourceSchemaParts {
+        resource_type,
+        attributes,
+        description,
+        validation,
+        input_rules,
+        kind,
+        unique_name,
+        operation_config,
+        field_groups,
+        default_prevent_destroy,
+        default_wait_timeout,
+        default_wait_interval,
+        defs,
+    } = schema.parts();
+    // Protocol v20 has no resource wait-default fields. These are host-side
+    // execution policy, not provider metadata; projection intentionally omits
+    // them and round-trip tests pin that one-way behavior.
+    let _v18_omits_host_wait_defaults = (default_wait_timeout, default_wait_interval);
+
+    let attributes = attributes
+        .iter()
+        .map(|(name, attribute)| {
+            attribute_schema_to_protocol(attribute)
+                .map(|converted| (name.clone(), converted))
+                .map_err(|error| error.context(format!("attribute `{name}`")))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let defs = defs
+        .iter()
+        .map(|(name, definition)| {
+            attribute_type_to_protocol(definition)
+                .map(|converted| (name.clone(), converted))
+                .map_err(|error| error.context(format!("definition `{name}`")))
+        })
+        .collect::<Result<_, _>>()?;
+    let validators = match validation {
+        ResourceValidation::None => Vec::new(),
+        ResourceValidation::Declared(validators) => validators.clone(),
+    };
+    let kind = match kind {
+        SchemaKind::Resource => protocol::SchemaKind::Managed,
+        SchemaKind::DataSource => protocol::SchemaKind::DataSource,
+    };
+    let unique_name = match unique_name {
+        UniqueNameSpec::Attribute(attribute) => {
+            protocol::UniqueNameSpec::Attribute(attribute.clone())
+        }
+        UniqueNameSpec::Coexisting => protocol::UniqueNameSpec::Coexisting,
+        UniqueNameSpec::Conflicting => protocol::UniqueNameSpec::Conflicting,
+    };
+
+    Ok(protocol::ResourceSchema {
+        resource_type: resource_type.to_string(),
+        attributes,
+        description: description.map(str::to_owned),
+        kind,
+        unique_name,
+        operation_config: operation_config.cloned(),
+        validators,
+        input_rules: input_rules.iter().map(input_rule_to_protocol).collect(),
+        field_groups: field_groups.iter().map(field_group_to_protocol).collect(),
+        default_prevent_destroy,
+        defs,
+    })
+}
+
+/// Convert several validated schemas for SDK metadata serialization.
+pub fn resource_schemas_to_protocol<'a>(
+    schemas: impl IntoIterator<Item = &'a ValidatedResourceSchema>,
+) -> Result<Vec<protocol::ResourceSchema>, ProtocolConvertError> {
+    schemas
+        .into_iter()
+        .map(resource_schema_to_protocol)
+        .collect()
+}
+
+fn type_identity_to_protocol(identity: &TypeIdentity) -> String {
+    identity.to_string()
+}
+
+fn protocol_to_type_identity(identity: &str) -> TypeIdentity {
+    TypeIdentity::from_dotted(identity)
+}
+
+/// Project one aggregate provider-schema witness onto the version-22 envelope.
+pub fn provider_schema_to_protocol(
+    witness: &ValidatedProviderSchemaWitness,
+) -> Result<protocol::ProviderSchemaEnvelope, ProtocolConvertError> {
+    let crate::schema::ProviderSchemaWitnessParts {
+        resources,
+        config: _config_exported_separately,
+        reference_forms,
+        assignability_edges,
+        assignability_closure: _derived_closure,
+    } = witness.parts();
+    let resources = resource_schemas_to_protocol(resources)?;
+    let reference_forms = reference_forms
+        .iter()
+        .map(|(identity, form)| {
+            let form = match form {
+                protocol::ReferenceForm::Template { long } => {
+                    protocol::ReferenceForm::Template { long: long.clone() }
+                }
+            };
+            protocol::ReferenceFormDeclaration {
+                identity: type_identity_to_protocol(identity),
+                form,
+            }
+        })
+        .collect();
+    Ok(protocol::ProviderSchemaEnvelope {
+        resources,
+        reference_forms,
+        assignability_edges: assignability_edges
+            .iter()
+            .map(assignability_edge_to_protocol)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn assignability_edge_to_protocol(
+    edge: &crate::schema::AssignabilityEdge,
+) -> Result<protocol::AssignabilityEdgeDeclaration, ProtocolConvertError> {
+    let (source, sink) = edge.parts();
+    protocol::AssignabilityEdgeDeclaration::new(
+        type_identity_to_protocol(source),
+        type_identity_to_protocol(sink),
+    )
+    .map_err(|error| {
+        ProtocolConvertError::NonWireAttributeType {
+            kind: "assignability edge with indistinguishable wire identities",
+        }
+        .context(error.to_string())
+    })
+}
+
+fn protocol_to_assignability_edge(
+    edge: &protocol::AssignabilityEdgeDeclaration,
+) -> Result<crate::schema::AssignabilityEdge, SchemaDecodeError> {
+    let (source, sink) = edge.parts();
+    crate::schema::AssignabilityEdge::new(
+        protocol_to_type_identity(source),
+        protocol_to_type_identity(sink),
+    )
+    .map_err(SchemaDecodeError::InvalidProviderSchema)
+}
+
+/// Decode the version-23 provider-schema envelope and jointly admit resource,
+/// config, reference-form, and assignability declarations.
+pub fn protocol_to_provider_schema_witness(
+    envelope: &protocol::ProviderSchemaEnvelope,
+    config: ValidatedConfigSchema,
+) -> Result<ValidatedProviderSchemaWitness, SchemaDecodeError> {
+    let protocol::ProviderSchemaEnvelope {
+        resources,
+        reference_forms,
+        assignability_edges,
+    } = envelope;
+    let resources = protocol_to_resource_schemas(resources)?;
+    let mut forms = crate::schema::ReferenceForms::new();
+    for declaration in reference_forms {
+        let protocol::ReferenceFormDeclaration { identity, form } = declaration;
+        let identity = protocol_to_type_identity(identity);
+        let form = match form {
+            protocol::ReferenceForm::Template { long } => {
+                protocol::ReferenceForm::Template { long: long.clone() }
+            }
+        };
+        if forms.insert(identity.clone(), form).is_some() {
+            return Err(SchemaDecodeError::DuplicateReferenceForm { identity });
+        }
+    }
+    let edges = assignability_edges
+        .iter()
+        .map(protocol_to_assignability_edge)
+        .collect::<Result<_, _>>()?;
+    ValidatedProviderSchemaWitness::new(resources, config, forms, edges)
+        .map_err(SchemaDecodeError::InvalidProviderSchema)
+}
+
+/// Convert a validated provider-config schema to protocol attribute types.
+pub fn config_schema_to_protocol(
+    schema: &ValidatedConfigSchema,
+) -> Result<BTreeMap<String, protocol::AttributeType>, ProtocolConvertError> {
+    schema
+        .parts()
+        .iter()
+        .map(|(name, attribute_type)| {
+            attribute_type_to_protocol(attribute_type)
+                .map(|converted| (name.clone(), converted))
+                .map_err(|error| error.context(format!("config attribute `{name}`")))
+        })
+        .collect()
+}
+
+pub fn attribute_schema_to_protocol(
+    attribute: &AttributeSchema,
+) -> Result<protocol::AttributeSchema, ProtocolConvertError> {
+    let AttributeSchemaParts {
+        name,
+        attr_type,
+        declared_input_mode,
+        default,
+        description,
+        completions,
+        provider_name,
+        create_only,
+        removable,
+        block_name,
+        write_only,
+        keyed_partial_update,
+        identity_mode,
+        deferred_populate,
+    } = attribute.parts();
+    // Protocol v20 has no completion field. Completions are an in-process
+    // authoring aid, so JSON metadata projection intentionally omits them.
+    let _v18_omits_host_completions = completions;
+    let (required, read_only) = input_mode_to_protocol(declared_input_mode);
+    let default = default
+        .map(|value| {
+            value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map_err(protocol_knowledge_error)
+                .and_then(require_known_for_protocol)
+                .and_then(|known| try_core_to_protocol_value(&known))
+        })
+        .transpose()
+        .map_err(|error| error.context(format!("default for `{name}`")))?;
+    Ok(protocol::AttributeSchema {
+        name: name.to_string(),
+        attr_type: attribute_type_to_protocol(attr_type)?,
+        required,
+        keyed_partial_update: keyed_partial_update
+            .map(|keyed| keyed.key_field().as_str().to_string()),
+        default,
+        description: description.map(str::to_owned),
+        create_only,
+        read_only,
+        write_only,
+        block_name: block_name.map(str::to_owned),
+        provider_name: provider_name.map(str::to_owned),
+        removable,
+        identity: identity_mode_to_protocol(identity_mode),
+        deferred_populate,
+    })
+}
+
+/// Convert one core attribute type to its protocol representation.
+pub fn attribute_type_to_protocol(
+    attribute_type: &AttributeType,
+) -> Result<protocol::AttributeType, ProtocolConvertError> {
+    match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => Err(ProtocolConvertError::NonWireAttributeType {
+            kind: "UnloadedSchemaType",
+        }),
+        RawShape::Reference {
+            identity,
+            pattern,
+            length,
+        } => Ok(protocol::AttributeType::Reference {
+            identity: protocol::TypeIdentity {
+                provider: identity.provider.clone().unwrap_or_default(),
+                segments: identity.segments.clone(),
+                kind: identity.kind.clone(),
+            },
+            pattern: pattern.cloned(),
+            length,
+        }),
+        RawShape::String {
+            identity_layer,
+            member_layer,
+        } => {
+            let crate::schema::StringIdentityParts {
+                identity,
+                pattern,
+                length,
+                validate,
+                to_dsl,
+            } = identity_layer;
+            let crate::schema::StringMemberParts {
+                pattern: member_pattern,
+                length: member_length,
+            } = member_layer;
+            ensure_validator_identity("String", identity, validate)?;
+            let _validate_via_identity = validate;
+            Ok(protocol::AttributeType::String {
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: pattern.cloned(),
+                    length,
+                    validate: None,
+                    to_dsl: to_dsl.cloned(),
+                    identity: identity.map(type_identity_to_protocol),
+                },
+                member_layer: protocol::StringMemberConstraints {
+                    pattern: member_pattern.cloned(),
+                    length: member_length,
+                },
+            })
+        }
+        RawShape::Int {
+            identity_layer,
+            member_layer,
+        } => {
+            let crate::schema::IntIdentityParts {
+                identity,
+                range,
+                validate,
+            } = identity_layer;
+            let crate::schema::IntMemberParts {
+                range: member_range,
+            } = member_layer;
+            ensure_validator_identity("Int", identity, validate)?;
+            let _validate_via_identity = validate;
+            Ok(protocol::AttributeType::Int {
+                identity_layer: protocol::IntIdentityLayer {
+                    range,
+                    identity: identity.map(type_identity_to_protocol),
+                },
+                member_layer: protocol::IntMemberConstraints {
+                    range: member_range,
+                },
+            })
+        }
+        RawShape::Float {
+            identity,
+            range,
+            validate,
+        } => {
+            ensure_validator_identity("Float", identity, validate)?;
+            let _validate_via_identity = validate;
+            Ok(protocol::AttributeType::Float {
+                range,
+                identity: identity.map(type_identity_to_protocol),
+            })
+        }
+        RawShape::Bool => Ok(protocol::AttributeType::Bool),
+        RawShape::Duration => Ok(protocol::AttributeType::Duration),
+        RawShape::Enum {
+            identity,
+            base,
+            values,
+            dsl_aliases,
+            validate,
+            to_dsl,
+        } => {
+            let _validate_via_identity = validate;
+            match values {
+                Some(values) => {
+                    if to_dsl.is_some() {
+                        return Err(ProtocolConvertError::ClosedEnumWithTransform {
+                            identity: identity.clone(),
+                        });
+                    }
+                    if !matches!(
+                        base.raw_shape(),
+                        RawShape::String {
+                            identity_layer: crate::schema::StringIdentityParts {
+                                identity: None,
+                                pattern: None,
+                                length: None,
+                                validate: None,
+                                to_dsl: None,
+                            },
+                            member_layer: crate::schema::StringMemberParts {
+                                pattern: None,
+                                length: None
+                            }
+                        }
+                    ) {
+                        return Err(ProtocolConvertError::ClosedEnumUnsupportedBase {
+                            identity: identity.clone(),
+                            base_kind: base.type_name(),
+                        });
+                    }
+                    Ok(protocol::AttributeType::StringEnum {
+                        values: values.to_vec(),
+                        name: identity.kind.clone(),
+                        namespace: identity.dotted_prefix(),
+                        dsl_aliases: dsl_aliases.to_vec(),
+                    })
+                }
+                None => {
+                    if !dsl_aliases.is_empty() {
+                        return Err(ProtocolConvertError::OpenEnumWithAliases {
+                            identity: identity.clone(),
+                        });
+                    }
+                    let namespace = identity.dotted_prefix().ok_or_else(|| {
+                        ProtocolConvertError::OpenEnumWithoutNamespace {
+                            identity: identity.clone(),
+                        }
+                    })?;
+                    Ok(protocol::AttributeType::CustomEnum {
+                        name: identity.kind.clone(),
+                        base: Box::new(attribute_type_to_protocol(base)?),
+                        namespace,
+                        dsl_transform: to_dsl.cloned(),
+                    })
+                }
+            }
+        }
+        RawShape::List {
+            element_type,
+            ordered,
+            constraints,
+        } => Ok(protocol::AttributeType::List {
+            element_type: Box::new(attribute_type_to_protocol(element_type)?),
+            ordered,
+            length: constraints.length(),
+            elements: constraints.elements(),
+            validate: None,
+        }),
+        RawShape::Map {
+            key,
+            value,
+            constraints,
+        } => Ok(protocol::AttributeType::Map {
+            inner: Box::new(attribute_type_to_protocol(value)?),
+            key: Box::new(attribute_type_to_protocol(key)?),
+            length: constraints.length(),
+        }),
+        RawShape::Struct {
+            name,
+            fields,
+            field_groups,
+            input_rules,
+        } => Ok(protocol::AttributeType::Struct {
+            name: name.to_string(),
+            fields: fields
+                .iter()
+                .map(struct_field_to_protocol)
+                .collect::<Result<_, _>>()?,
+            field_groups: field_groups.iter().map(field_group_to_protocol).collect(),
+            input_rules: input_rules.iter().map(input_rule_to_protocol).collect(),
+        }),
+        RawShape::Union(members) => Ok(protocol::AttributeType::Union {
+            members: members
+                .iter()
+                .map(attribute_type_to_protocol)
+                .collect::<Result<_, _>>()?,
+        }),
+        RawShape::Ref(name) => Ok(protocol::AttributeType::Ref {
+            name: name.to_string(),
+        }),
+    }
+}
+
+fn ensure_validator_identity(
+    kind: &'static str,
+    identity: Option<&TypeIdentity>,
+    validate: Option<&crate::schema::CustomValidator>,
+) -> Result<(), ProtocolConvertError> {
+    if validate.is_some() && identity.is_none() {
+        Err(ProtocolConvertError::ValidatorWithoutIdentity { kind })
+    } else {
+        Ok(())
+    }
+}
+
+pub fn struct_field_to_protocol(
+    field: &StructField,
+) -> Result<protocol::StructField, ProtocolConvertError> {
+    let StructFieldParts {
+        name,
+        field_type,
+        declared_input_mode,
+        description,
+        provider_name,
+        block_name,
+        deferred_populate,
+        write_only,
+        create_only,
+        identity_mode,
+    } = field.parts();
+    let (required, read_only) = input_mode_to_protocol(declared_input_mode);
+    Ok(protocol::StructField {
+        name: name.to_string(),
+        field_type: attribute_type_to_protocol(field_type)?,
+        required,
+        description: description.map(str::to_owned),
+        block_name: block_name.map(str::to_owned),
+        provider_name: provider_name.map(str::to_owned),
+        read_only,
+        write_only,
+        create_only,
+        identity: identity_mode_to_protocol(identity_mode),
+        deferred_populate,
+    })
+}
+
+pub fn input_mode_to_protocol(input_mode: InputMode) -> (bool, bool) {
+    match input_mode {
+        InputMode::Optional => (false, false),
+        InputMode::Required => (true, false),
+        InputMode::ProviderPopulated => (false, true),
+    }
+}
+
+fn identity_mode_to_protocol(identity_mode: IdentityMode) -> protocol::IdentityMode {
+    match identity_mode {
+        IdentityMode::None => protocol::IdentityMode::None,
+        IdentityMode::Required => protocol::IdentityMode::Required,
+        IdentityMode::WhenPresent => protocol::IdentityMode::WhenPresent,
+    }
+}
+
+fn protocol_to_identity_mode(identity_mode: protocol::IdentityMode) -> IdentityMode {
+    match identity_mode {
+        protocol::IdentityMode::None => IdentityMode::None,
+        protocol::IdentityMode::Required => IdentityMode::Required,
+        protocol::IdentityMode::WhenPresent => IdentityMode::WhenPresent,
+    }
+}
+
+/// Decode a protocol resource schema and return a whole-schema witness.
+pub fn protocol_to_resource_schema(
+    schema: &protocol::ResourceSchema,
+) -> Result<ValidatedResourceSchema, SchemaDecodeError> {
+    let protocol::ResourceSchema {
+        resource_type,
+        attributes,
+        description,
+        kind,
+        unique_name,
+        operation_config,
+        validators,
+        field_groups,
+        input_rules,
+        default_prevent_destroy,
+        defs,
+    } = schema;
+
+    let mut core = DraftResourceSchema::new(resource_type.clone());
+    if let Some(description) = description {
+        core = core.with_description(description.clone());
+    }
+    if !validators.is_empty() {
+        core = core.with_declared_validators(validators.clone());
+    }
+    if *default_prevent_destroy {
+        core = core.default_prevent_destroy();
+    }
+    core = match kind {
+        protocol::SchemaKind::Managed => core,
+        protocol::SchemaKind::DataSource => core.as_data_source(),
+    };
+    core = match unique_name {
+        protocol::UniqueNameSpec::Attribute(attribute) => {
+            core.with_unique_name_attribute(attribute.clone())
+        }
+        protocol::UniqueNameSpec::Coexisting => core.with_coexisting_replacement(),
+        protocol::UniqueNameSpec::Conflicting => core.with_conflicting_replacement(),
+    };
+    if let Some(operation_config) = operation_config {
+        core = core.with_operation_config(operation_config.clone());
+    }
+    for (index, group) in field_groups.iter().enumerate() {
+        core = core.field_group(protocol_to_field_group(group).map_err(|error| {
+            error
+                .prepend_attribute(&format!("field_groups[{index}]"))
+                .with_resource_type(resource_type)
+        })?);
+    }
+
+    for (index, rule) in input_rules.iter().enumerate() {
+        let rule =
+            protocol_to_input_rule(rule).map_err(|error| SchemaDecodeError::InvalidSchema {
+                detail: "creation constraint is invalid".into(),
+                resource_type: Some(resource_type.as_str().into()),
+                attribute_path: Vec::new(),
+                schema_issue_location: Some(Box::new(SchemaValidationIssueLocation::InputRule(
+                    index,
+                ))),
+                source: Some(Box::new(error)),
+            })?;
+        core = core.input_rule(rule);
+    }
+
+    for (name, definition) in defs {
+        let definition = protocol_to_attribute_type(definition).map_err(|error| {
+            error
+                .prepend_definition(name)
+                .with_resource_type(resource_type)
+        })?;
+        core = core.with_def(name.clone(), definition);
+    }
+    for (map_name, attribute) in attributes {
+        let attribute = protocol_to_attribute_schema(attribute)
+            .map_err(|error| error.with_resource_type(resource_type))?;
+        if attribute.name() != map_name {
+            return Err(SchemaDecodeError::new(
+                "attribute map key does not match the attribute schema name",
+            )
+            .prepend_attribute(map_name)
+            .with_resource_type(resource_type));
+        }
+        core = core.attribute(attribute);
+    }
+    core.validate()
+        .map_err(|error| SchemaDecodeError::resource_schema_validation(resource_type, error))
+}
+
+/// Decode several untrusted protocol resource schema records.
+pub fn protocol_to_resource_schemas(
+    schemas: &[protocol::ResourceSchema],
+) -> Result<Vec<ValidatedResourceSchema>, SchemaDecodeError> {
+    schemas.iter().map(protocol_to_resource_schema).collect()
+}
+
+/// Decode protocol provider-config records and return a graph-validation witness.
+pub fn protocol_to_config_schema(
+    attribute_types: BTreeMap<String, protocol::AttributeType>,
+) -> Result<ValidatedConfigSchema, SchemaDecodeError> {
+    let attribute_types = attribute_types
+        .into_iter()
+        .map(|(name, attribute_type)| {
+            protocol_to_attribute_type(&attribute_type)
+                .map(|converted| (name.clone(), converted))
+                .map_err(|error| error.prepend_attribute(&name))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    ValidatedConfigSchema::validate(attribute_types)
+        .map_err(SchemaDecodeError::config_schema_validation)
+}
+
+pub fn protocol_to_attribute_schema(
+    attribute: &protocol::AttributeSchema,
+) -> Result<DraftAttributeSchema, SchemaDecodeError> {
+    let protocol::AttributeSchema {
+        name,
+        attr_type,
+        required,
+        keyed_partial_update,
+        default,
+        description,
+        create_only,
+        read_only,
+        write_only,
+        block_name,
+        provider_name,
+        removable,
+        identity,
+        deferred_populate,
+    } = attribute;
+
+    if *read_only && *write_only {
+        return Err(
+            SchemaDecodeError::conflicting_attribute_write_only_mode().prepend_attribute(name)
+        );
+    }
+    let input_mode = protocol_to_input_mode(*required, *read_only)
+        .map_err(|error| error.prepend_attribute(name))?;
+    let attr_type =
+        protocol_to_attribute_type(attr_type).map_err(|error| error.prepend_attribute(name))?;
+    let default = default
+        .as_ref()
+        .map(protocol_schema_default_to_core)
+        .transpose()
+        .map_err(SchemaDecodeError::from_default)
+        .map_err(|error| error.prepend_attribute(name))?;
+    let identity_mode = protocol_to_identity_mode(*identity);
+
+    if identity_mode.is_identity() && !*create_only {
+        return Err(SchemaDecodeError::identity_requires_create_only().prepend_attribute(name));
+    }
+    // References are checked once the resource's definitions are available.
+    if identity_mode.is_identity()
+        && identity_leaf_is_scalar_or_enum(
+            &attr_type,
+            empty_defs_for_schema_walks(),
+            &mut Vec::new(),
+        ) == Some(false)
+    {
+        return Err(SchemaDecodeError::identity_requires_scalar_or_enum().prepend_attribute(name));
+    }
+
+    match input_mode {
+        InputMode::Optional => {
+            if *deferred_populate {
+                return Err(SchemaDecodeError::incompatible_attribute_modifier(
+                    input_mode,
+                    "deferred_populate",
+                )
+                .prepend_attribute(name));
+            }
+            let mut builder = DraftAttributeSchema::optional(name.clone(), attr_type);
+            if let Some(default) = default {
+                builder = builder.with_default(default);
+            }
+            if let Some(description) = description {
+                builder = builder.with_description(description.clone());
+            }
+            if let Some(provider_name) = provider_name {
+                builder = builder.with_provider_name(provider_name.clone());
+            }
+            builder = match removable {
+                Some(true) => builder.removable(),
+                Some(false) => builder.non_removable(),
+                None => builder,
+            };
+            if let Some(block_name) = block_name {
+                builder = builder.with_block_name(block_name.clone());
+            }
+            if *write_only {
+                builder = builder.write_only();
+            }
+            if let Some(key_field) = keyed_partial_update {
+                builder = builder.keyed_partial_update(key_field.clone());
+            }
+            Ok(if *create_only {
+                let builder = builder.create_only();
+                let builder = match identity_mode {
+                    IdentityMode::None => builder,
+                    IdentityMode::Required => builder.identity(),
+                    IdentityMode::WhenPresent => builder.identity_when_present(),
+                };
+                builder.build()
+            } else {
+                builder.build()
+            })
+        }
+        InputMode::Required => {
+            if default.is_some() {
+                return Err(SchemaDecodeError::incompatible_attribute_modifier(
+                    input_mode, "default",
+                )
+                .prepend_attribute(name));
+            }
+            if removable.is_some() {
+                return Err(SchemaDecodeError::incompatible_attribute_modifier(
+                    input_mode,
+                    "removable",
+                )
+                .prepend_attribute(name));
+            }
+            if *deferred_populate {
+                return Err(SchemaDecodeError::incompatible_attribute_modifier(
+                    input_mode,
+                    "deferred_populate",
+                )
+                .prepend_attribute(name));
+            }
+            let mut builder = DraftAttributeSchema::required(name.clone(), attr_type);
+            if let Some(description) = description {
+                builder = builder.with_description(description.clone());
+            }
+            if let Some(provider_name) = provider_name {
+                builder = builder.with_provider_name(provider_name.clone());
+            }
+            if let Some(block_name) = block_name {
+                builder = builder.with_block_name(block_name.clone());
+            }
+            if *write_only {
+                builder = builder.write_only();
+            }
+            if let Some(key_field) = keyed_partial_update {
+                builder = builder.keyed_partial_update(key_field.clone());
+            }
+            Ok(if *create_only {
+                let builder = builder.create_only();
+                let builder = match identity_mode {
+                    IdentityMode::None => builder,
+                    IdentityMode::Required => builder.identity(),
+                    IdentityMode::WhenPresent => {
+                        return Err(SchemaDecodeError::when_present_identity_requires_optional()
+                            .prepend_attribute(name));
+                    }
+                };
+                builder.build()
+            } else {
+                builder.build()
+            })
+        }
+        InputMode::ProviderPopulated => {
+            for (present, modifier) in [
+                (default.is_some(), "default"),
+                (*create_only, "create_only"),
+                (*write_only, "write_only"),
+                (block_name.is_some(), "block_name"),
+                (removable.is_some(), "removable"),
+                (identity_mode.is_identity(), "identity"),
+                (keyed_partial_update.is_some(), "keyed_partial_update"),
+            ] {
+                if present {
+                    return Err(SchemaDecodeError::incompatible_attribute_modifier(
+                        input_mode, modifier,
+                    )
+                    .prepend_attribute(name));
+                }
+            }
+            let mut builder = DraftAttributeSchema::provider_populated(name.clone(), attr_type);
+            if let Some(description) = description {
+                builder = builder.with_description(description.clone());
+            }
+            if let Some(provider_name) = provider_name {
+                builder = builder.with_provider_name(provider_name.clone());
+            }
+            if *deferred_populate {
+                builder = builder.deferred_populate();
+            }
+            Ok(builder.build())
+        }
+    }
+}
+
+/// Decode one protocol attribute type, rebuilding core-owned validators by identity.
+pub fn protocol_to_attribute_type(
+    attribute_type: &protocol::AttributeType,
+) -> Result<DraftAttributeType, SchemaDecodeError> {
+    match attribute_type {
+        protocol::AttributeType::Reference {
+            identity,
+            pattern,
+            length,
+        } => {
+            let protocol::TypeIdentity {
+                provider,
+                segments,
+                kind,
+            } = identity;
+            Ok(DraftAttributeType::reference(
+                TypeIdentity::new(
+                    (!provider.is_empty()).then(|| provider.clone()),
+                    segments.clone(),
+                    kind.clone(),
+                ),
+                pattern.clone(),
+                *length,
+            ))
+        }
+        protocol::AttributeType::String {
+            identity_layer,
+            member_layer,
+        } => {
+            let protocol::StringIdentityLayer {
+                pattern,
+                length,
+                validate,
+                to_dsl,
+                identity,
+            } = identity_layer;
+            let protocol::StringMemberConstraints {
+                pattern: member_pattern,
+                length: member_length,
+            } = member_layer;
+            reject_opaque_validator("String", validate)?;
+            let identity_layer = decoded_string_identity(
+                decode_optional_identity(identity),
+                pattern.clone(),
+                *length,
+                to_dsl.clone(),
+            );
+            Ok(DraftAttributeType::string_member(
+                identity_layer,
+                crate::schema::StringMemberConstraints::new(member_pattern.clone(), *member_length),
+            ))
+        }
+        protocol::AttributeType::Int {
+            identity_layer,
+            member_layer,
+        } => {
+            let protocol::IntIdentityLayer { range, identity } = identity_layer;
+            let protocol::IntMemberConstraints {
+                range: member_range,
+            } = member_layer;
+            Ok(DraftAttributeType::int_member(
+                decoded_int_identity(decode_optional_identity(identity), *range),
+                crate::schema::IntMemberConstraints::new(*member_range),
+            ))
+        }
+        protocol::AttributeType::Float { range, identity } => Ok(decoded_refined_float(
+            decode_optional_identity(identity),
+            *range,
+        )),
+        protocol::AttributeType::Bool => Ok(DraftAttributeType::bool()),
+        protocol::AttributeType::Duration => Ok(DraftAttributeType::duration()),
+        protocol::AttributeType::StringEnum {
+            values,
+            name,
+            namespace,
+            dsl_aliases,
+        } => {
+            let identity = namespace
+                .as_deref()
+                .filter(|namespace| !namespace.is_empty())
+                .map(|namespace| crate::schema::enum_identity(name, Some(namespace)))
+                .unwrap_or_else(|| TypeIdentity::bare(name));
+            Ok(DraftAttributeType::enum_(
+                identity,
+                Some(values.clone()),
+                dsl_aliases.clone(),
+                None,
+                None,
+            ))
+        }
+        protocol::AttributeType::List {
+            element_type,
+            ordered,
+            length,
+            elements,
+            validate,
+        } => {
+            reject_opaque_validator("List", validate)?;
+            Ok(DraftAttributeType::refined_list(
+                protocol_to_attribute_type(element_type)?,
+                *ordered,
+                *length,
+                *elements,
+            ))
+        }
+        protocol::AttributeType::Map { inner, key, length } => Ok(DraftAttributeType::refined_map(
+            protocol_to_attribute_type(key)?,
+            protocol_to_attribute_type(inner)?,
+            *length,
+        )),
+        protocol::AttributeType::Struct {
+            name,
+            fields,
+            field_groups,
+            input_rules,
+        } => Ok(DraftAttributeType::struct_with_rules(
+            name.clone(),
+            fields
+                .iter()
+                .map(protocol_to_struct_field)
+                .collect::<Result<_, _>>()?,
+            field_groups
+                .iter()
+                .enumerate()
+                .map(|(index, group)| {
+                    protocol_to_field_group(group)
+                        .map_err(|error| error.prepend_attribute(&format!("field_groups[{index}]")))
+                })
+                .collect::<Result<_, _>>()?,
+            input_rules
+                .iter()
+                .enumerate()
+                .map(|(index, rule)| {
+                    protocol_to_input_rule(rule).map_err(|error| SchemaDecodeError::InvalidSchema {
+                        detail: "input rule is invalid".into(),
+                        resource_type: None,
+                        attribute_path: vec![format!("input_rules[{index}]").into()],
+                        schema_issue_location: None,
+                        source: Some(Box::new(error)),
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+        )),
+        protocol::AttributeType::Union { members } => Ok(DraftAttributeType::union(
+            members
+                .iter()
+                .map(protocol_to_attribute_type)
+                .collect::<Result<_, _>>()?,
+        )),
+        protocol::AttributeType::Custom {
+            name,
+            base,
+            pattern,
+            length,
+            validate,
+            to_dsl,
+        } => {
+            reject_opaque_validator("Custom", validate)?;
+            protocol_legacy_custom_to_core(name, base, pattern.clone(), *length, to_dsl.clone())
+        }
+        protocol::AttributeType::CustomEnum {
+            name,
+            base,
+            namespace,
+            dsl_transform,
+        } => {
+            if namespace.is_empty() {
+                return Err(SchemaDecodeError::empty_custom_enum_namespace(name));
+            }
+            let identity = crate::schema::enum_identity(name, Some(namespace.as_str()));
+            Ok(DraftAttributeType::enum_with_base(
+                identity,
+                protocol_to_attribute_type(base)?,
+                None,
+                Vec::new(),
+                None,
+                dsl_transform.clone(),
+            ))
+        }
+        protocol::AttributeType::Ref { name } => Ok(DraftAttributeType::ref_(name.clone())),
+    }
+}
+
+fn decode_optional_identity(identity: &Option<String>) -> Option<TypeIdentity> {
+    identity
+        .as_deref()
+        .filter(|identity| !identity.is_empty())
+        .map(protocol_to_type_identity)
+}
+
+fn reject_opaque_validator(
+    kind: &str,
+    validate: &Option<serde_json::Value>,
+) -> Result<(), SchemaDecodeError> {
+    if validate.is_some() {
+        Err(SchemaDecodeError::opaque_validator(kind))
+    } else {
+        Ok(())
+    }
+}
+
+fn decoded_string_identity(
+    identity: Option<TypeIdentity>,
+    pattern: Option<crate::schema::PatternSpec>,
+    length: Option<(Option<u64>, Option<u64>)>,
+    to_dsl: Option<protocol::DslTransform>,
+) -> crate::schema::StringIdentityLayer {
+    match identity {
+        Some(identity) => match crate::schema::builtin_validator(
+            crate::schema::RefinedScalarKind::String,
+            &identity,
+        ) {
+            Some(validate) => crate::schema::StringIdentityLayer::with_validator(
+                identity, pattern, length, validate, to_dsl,
+            ),
+            None => {
+                crate::schema::StringIdentityLayer::new(Some(identity), pattern, length, to_dsl)
+            }
+        },
+        None => crate::schema::StringIdentityLayer::new(None, pattern, length, to_dsl),
+    }
+}
+
+fn decoded_int_identity(
+    identity: Option<TypeIdentity>,
+    range: Option<(Option<i64>, Option<i64>)>,
+) -> crate::schema::IntIdentityLayer {
+    match identity {
+        Some(identity) => {
+            match crate::schema::builtin_validator(crate::schema::RefinedScalarKind::Int, &identity)
+            {
+                Some(validate) => {
+                    crate::schema::IntIdentityLayer::with_validator(identity, range, validate)
+                }
+                None => crate::schema::IntIdentityLayer::new(Some(identity), range),
+            }
+        }
+        None => crate::schema::IntIdentityLayer::new(None, range),
+    }
+}
+
+fn decoded_refined_float(
+    identity: Option<TypeIdentity>,
+    range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
+) -> DraftAttributeType {
+    match identity {
+        Some(identity) => match crate::schema::builtin_validator(
+            crate::schema::RefinedScalarKind::Float,
+            &identity,
+        ) {
+            Some(validate) => {
+                DraftAttributeType::refined_float_with_validator(identity, range, validate)
+            }
+            None => DraftAttributeType::refined_float(Some(identity), range),
+        },
+        None => DraftAttributeType::refined_float(None, range),
+    }
+}
+
+fn protocol_legacy_custom_to_core(
+    enclosing_name: &str,
+    base: &protocol::AttributeType,
+    pattern: Option<crate::schema::PatternSpec>,
+    length: Option<(Option<u64>, Option<u64>)>,
+    to_dsl: Option<protocol::DslTransform>,
+) -> Result<DraftAttributeType, SchemaDecodeError> {
+    if let protocol::AttributeType::Custom {
+        name: _inner_name,
+        base: inner_base,
+        pattern: inner_pattern,
+        length: inner_length,
+        validate: inner_validate,
+        to_dsl: inner_to_dsl,
+    } = base
+    {
+        reject_opaque_validator("Custom", inner_validate)?;
+        // Released v12 providers nest generic Custom records (for example
+        // `aws.ResourceId`) below the concrete attribute identity. The first
+        // outer record exclusively owns the identity, even when its name is
+        // empty; nested names only describe reusable bases.
+        return protocol_legacy_custom_to_core(
+            enclosing_name,
+            inner_base,
+            prefer_outer_legacy_custom_metadata(pattern, inner_pattern.clone()),
+            prefer_outer_legacy_custom_metadata(length, *inner_length),
+            prefer_outer_legacy_custom_metadata(to_dsl, inner_to_dsl.clone()),
+        );
+    }
+
+    match base {
+        protocol::AttributeType::Reference {
+            identity: _identity,
+            pattern: _pattern,
+            length: _length,
+        } => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            "Reference",
+        )),
+        protocol::AttributeType::String {
+            identity_layer:
+                protocol::StringIdentityLayer {
+                    pattern: base_pattern,
+                    length: base_length,
+                    validate: base_validate,
+                    to_dsl: base_to_dsl,
+                    identity: _base_identity,
+                },
+            member_layer:
+                protocol::StringMemberConstraints {
+                    pattern: member_pattern,
+                    length: member_length,
+                },
+        } => {
+            reject_legacy_custom_metadata(
+                enclosing_name,
+                "member_layer",
+                member_pattern.as_ref(),
+                "String",
+            )?;
+            reject_legacy_custom_metadata(
+                enclosing_name,
+                "member_layer",
+                member_length.as_ref(),
+                "String",
+            )?;
+            reject_opaque_validator("String", base_validate)?;
+            let identity = legacy_custom_identity(enclosing_name);
+            let pattern = prefer_outer_legacy_custom_metadata(pattern, base_pattern.clone());
+            let length = prefer_outer_legacy_custom_metadata(length, *base_length);
+            let to_dsl = prefer_outer_legacy_custom_metadata(to_dsl, base_to_dsl.clone());
+            Ok(DraftAttributeType::string_member(
+                decoded_string_identity(identity, pattern, length, to_dsl),
+                crate::schema::StringMemberConstraints::default(),
+            ))
+        }
+        protocol::AttributeType::Int {
+            identity_layer:
+                protocol::IntIdentityLayer {
+                    range: base_range,
+                    identity: _base_identity,
+                },
+            member_layer:
+                protocol::IntMemberConstraints {
+                    range: member_range,
+                },
+        } => {
+            reject_legacy_custom_metadata(
+                enclosing_name,
+                "member_layer",
+                member_range.as_ref(),
+                "Int",
+            )?;
+            reject_legacy_custom_metadata(enclosing_name, "pattern", pattern.as_ref(), "Int")?;
+            reject_legacy_custom_metadata(enclosing_name, "to_dsl", to_dsl.as_ref(), "Int")?;
+            let identity = legacy_custom_identity(enclosing_name);
+            let outer_range = length
+                .map(|(min, max)| {
+                    Ok((
+                        legacy_custom_int_bound(enclosing_name, min)?,
+                        legacy_custom_int_bound(enclosing_name, max)?,
+                    ))
+                })
+                .transpose()?;
+            let range = prefer_outer_legacy_custom_metadata(outer_range, *base_range);
+            Ok(DraftAttributeType::int_member(
+                decoded_int_identity(identity, range),
+                crate::schema::IntMemberConstraints::default(),
+            ))
+        }
+        protocol::AttributeType::Float {
+            range: base_range,
+            identity: _base_identity,
+        } => {
+            reject_legacy_custom_metadata(enclosing_name, "pattern", pattern.as_ref(), "Float")?;
+            reject_legacy_custom_metadata(enclosing_name, "length", length.as_ref(), "Float")?;
+            reject_legacy_custom_metadata(enclosing_name, "to_dsl", to_dsl.as_ref(), "Float")?;
+            let identity = legacy_custom_identity(enclosing_name);
+            Ok(decoded_refined_float(identity, *base_range))
+        }
+        protocol::AttributeType::List {
+            element_type,
+            ordered,
+            length: base_length,
+            elements,
+            validate: base_validate,
+        } => {
+            reject_opaque_validator("List", base_validate)?;
+            if !enclosing_name.is_empty() {
+                return Err(SchemaDecodeError::unsupported_custom_base(
+                    enclosing_name,
+                    "List",
+                ));
+            }
+            reject_legacy_custom_metadata(enclosing_name, "pattern", pattern.as_ref(), "List")?;
+            reject_legacy_custom_metadata(enclosing_name, "to_dsl", to_dsl.as_ref(), "List")?;
+            Ok(DraftAttributeType::refined_list(
+                protocol_to_attribute_type(element_type)?,
+                *ordered,
+                prefer_outer_legacy_custom_metadata(length, *base_length),
+                *elements,
+            ))
+        }
+        protocol::AttributeType::Bool => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            "Bool",
+        )),
+        protocol::AttributeType::Duration => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            "Duration",
+        )),
+        protocol::AttributeType::StringEnum {
+            values: _base_values,
+            name: _base_name,
+            namespace: _base_namespace,
+            dsl_aliases: _base_dsl_aliases,
+        } => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            "StringEnum",
+        )),
+        protocol::AttributeType::Map {
+            inner: _base_inner,
+            key: _base_key,
+            length: _base_length,
+        } => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            "Map",
+        )),
+        protocol::AttributeType::Struct {
+            name: _base_name,
+            fields: _base_fields,
+            field_groups: _base_field_groups,
+            input_rules: _base_input_rules,
+        } => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            "Struct",
+        )),
+        protocol::AttributeType::Union {
+            members: _base_members,
+        } => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            "Union",
+        )),
+        protocol::AttributeType::Custom {
+            name: _base_name,
+            base: _base,
+            pattern: _base_pattern,
+            length: _base_length,
+            validate: _base_validate,
+            to_dsl: _base_to_dsl,
+        } => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            "Custom",
+        )),
+        protocol::AttributeType::CustomEnum {
+            name: _base_name,
+            base: _base,
+            namespace: _base_namespace,
+            dsl_transform: _base_dsl_transform,
+        } => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            "CustomEnum",
+        )),
+        protocol::AttributeType::Ref { name: _base_name } => Err(
+            SchemaDecodeError::unsupported_custom_base(enclosing_name, "Ref"),
+        ),
+    }
+}
+
+fn legacy_custom_identity(enclosing_name: &str) -> Option<TypeIdentity> {
+    (!enclosing_name.is_empty()).then(|| TypeIdentity::from_dotted(enclosing_name))
+}
+
+fn prefer_outer_legacy_custom_metadata<T>(enclosing: Option<T>, base: Option<T>) -> Option<T> {
+    match (enclosing, base) {
+        (Some(value), _) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn reject_legacy_custom_metadata<T>(
+    identity: &str,
+    field: &'static str,
+    value: Option<&T>,
+    base_kind: &'static str,
+) -> Result<(), SchemaDecodeError> {
+    if value.is_some() {
+        Err(SchemaDecodeError::protocol(
+            ProtocolConvertError::LegacyCustomUnsupportedMetadata {
+                identity: identity.to_string(),
+                field,
+                base_kind,
+            },
+            "legacy Custom type carries metadata incompatible with its base",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn legacy_custom_int_bound(
+    enclosing_name: &str,
+    bound: Option<u64>,
+) -> Result<Option<i64>, SchemaDecodeError> {
+    bound
+        .map(|value| {
+            i64::try_from(value).map_err(|_error| {
+                SchemaDecodeError::legacy_custom_int_bound_out_of_range(enclosing_name, value)
+            })
+        })
+        .transpose()
+}
+
+pub fn protocol_to_struct_field(
+    field: &protocol::StructField,
+) -> Result<DraftStructField, SchemaDecodeError> {
+    let protocol::StructField {
+        name,
+        field_type,
+        required,
+        description,
+        block_name,
+        provider_name,
+        read_only,
+        write_only,
+        create_only,
+        identity,
+        deferred_populate,
+    } = field;
+    let input_mode = protocol_to_input_mode(*required, *read_only)
+        .map_err(|error| error.prepend_attribute(name))?;
+    let identity_mode = protocol_to_identity_mode(*identity);
+    if input_mode == InputMode::ProviderPopulated && *write_only {
+        return Err(SchemaDecodeError::conflicting_write_only_mode().prepend_attribute(name));
+    }
+    if identity_mode.is_identity() && !*create_only {
+        return Err(SchemaDecodeError::identity_requires_create_only().prepend_attribute(name));
+    }
+    if input_mode == InputMode::ProviderPopulated {
+        for (present, modifier) in [
+            (*create_only, "create_only"),
+            (identity_mode.is_identity(), "identity"),
+        ] {
+            if present {
+                return Err(SchemaDecodeError::incompatible_struct_field_modifier(
+                    input_mode, modifier,
+                )
+                .prepend_attribute(name));
+            }
+        }
+    }
+    let field_type =
+        protocol_to_attribute_type(field_type).map_err(|error| error.prepend_attribute(name))?;
+    if identity_mode.is_identity()
+        && identity_leaf_is_scalar_or_enum(
+            &field_type,
+            empty_defs_for_schema_walks(),
+            &mut Vec::new(),
+        ) == Some(false)
+    {
+        return Err(SchemaDecodeError::identity_requires_scalar_or_enum().prepend_attribute(name));
+    }
+
+    match input_mode {
+        InputMode::Optional => {
+            let mut builder = DraftStructField::optional(name.clone(), field_type);
+            if let Some(description) = description {
+                builder = builder.with_description(description.clone());
+            }
+            if let Some(provider_name) = provider_name {
+                builder = builder.with_provider_name(provider_name.clone());
+            }
+            if let Some(block_name) = block_name {
+                builder = builder.with_block_name(block_name.clone());
+            }
+            if *write_only {
+                builder = builder.write_only();
+            }
+            if *deferred_populate {
+                builder = builder.deferred_populate();
+            }
+            Ok(if *create_only {
+                let builder = builder.create_only();
+                let builder = match identity_mode {
+                    IdentityMode::None => builder,
+                    IdentityMode::Required => builder.identity(),
+                    IdentityMode::WhenPresent => builder.identity_when_present(),
+                };
+                builder.build()
+            } else {
+                builder.build()
+            })
+        }
+        InputMode::Required => {
+            let mut builder = DraftStructField::required(name.clone(), field_type);
+            if let Some(description) = description {
+                builder = builder.with_description(description.clone());
+            }
+            if let Some(provider_name) = provider_name {
+                builder = builder.with_provider_name(provider_name.clone());
+            }
+            if let Some(block_name) = block_name {
+                builder = builder.with_block_name(block_name.clone());
+            }
+            if *write_only {
+                builder = builder.write_only();
+            }
+            if *deferred_populate {
+                builder = builder.deferred_populate();
+            }
+            Ok(if *create_only {
+                let builder = builder.create_only();
+                let builder = match identity_mode {
+                    IdentityMode::None => builder,
+                    IdentityMode::Required => builder.identity(),
+                    IdentityMode::WhenPresent => {
+                        return Err(SchemaDecodeError::when_present_identity_requires_optional()
+                            .prepend_attribute(name));
+                    }
+                };
+                builder.build()
+            } else {
+                builder.build()
+            })
+        }
+        InputMode::ProviderPopulated => {
+            let mut builder = DraftStructField::provider_populated(name.clone(), field_type);
+            if let Some(description) = description {
+                builder = builder.with_description(description.clone());
+            }
+            if let Some(provider_name) = provider_name {
+                builder = builder.with_provider_name(provider_name.clone());
+            }
+            if let Some(block_name) = block_name {
+                builder = builder.with_block_name(block_name.clone());
+            }
+            if *deferred_populate {
+                builder = builder.deferred_populate();
+            }
+            Ok(builder.build())
+        }
+    }
+}
+
+fn protocol_to_input_mode(required: bool, read_only: bool) -> Result<InputMode, SchemaDecodeError> {
+    match (required, read_only) {
+        (false, false) => Ok(InputMode::Optional),
+        (true, false) => Ok(InputMode::Required),
+        (false, true) => Ok(InputMode::ProviderPopulated),
+        (true, true) => Err(SchemaDecodeError::conflicting_input_mode()),
+    }
+}
+
+fn input_mode_name(mode: InputMode) -> &'static str {
+    match mode {
+        InputMode::Optional => "optional user-input",
+        InputMode::Required => "required user-input",
+        InputMode::ProviderPopulated => "provider-populated",
+    }
+}
+
+/// Convert a recursively-known ordinary value to the protocol domain.
+/// Classification alone does not grant Secret transport permission.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{protocol_convert::try_core_to_protocol_value, resource::Value};
+/// fn bypass(raw:Value) { let _=try_core_to_protocol_value(&raw); }
+/// ```
+/// ```compile_fail,E0308
+/// use carina_core::{protocol_convert::try_core_to_protocol_value,resource::{Value,ConcreteValue,DeferredValue,AccessPath}};
+/// fn bypass(path:AccessPath){
+///     let raw=Value::Concrete(ConcreteValue::List(vec![Value::Deferred(DeferredValue::ResourceRef{path})]));
+///     let _=try_core_to_protocol_value(&raw);
+/// }
+/// ```
+pub fn try_core_to_protocol_value(
+    value: &crate::resource::knowledge::KnownValue<'_>,
+) -> Result<protocol::Value, ProtocolConvertError> {
+    use crate::resource::knowledge::KnownView;
+    value.visit(
+        |view| match view {
+            KnownView::String(value) => {
+                Ok(protocol::Value::String(value.expose_plaintext().to_owned()))
+            }
+            KnownView::EnumIdentifier(_) => Err(ProtocolConvertError::NonWireValue {
+                variant: "EnumIdentifier",
+            }),
+            KnownView::CanonicalEnum(value) => {
+                Ok(protocol::Value::String(value.api_value().to_owned()))
+            }
+            KnownView::Int(value) => Ok(protocol::Value::Int(value)),
+            KnownView::Float(value) => Ok(protocol::Value::Float(value)),
+            KnownView::Bool(value) => Ok(protocol::Value::Bool(value)),
+            KnownView::Duration(value) => i64::try_from(value.as_secs())
+                .map(protocol::Value::Int)
+                .map_err(|_| ProtocolConvertError::DurationOutOfRange),
+            KnownView::List(values) => values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    try_core_to_protocol_value(value)
+                        .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
+                })
+                .collect::<Result<_, _>>()
+                .map(protocol::Value::List),
+            KnownView::StringList(values) => Ok(protocol::Value::StringList(
+                values
+                    .iter()
+                    .map(|value| value.expose_plaintext().to_owned())
+                    .collect(),
+            )),
+            KnownView::Map(values) => values
+                .iter()
+                .map(|(key, value)| {
+                    try_core_to_protocol_value(value)
+                        .map(|value| (key.to_owned(), value))
+                        .map_err(|error| {
+                            error.at_value_path(WirePathSegment::Key(key.to_owned().into()))
+                        })
+                })
+                .collect::<Result<_, _>>()
+                .map(protocol::Value::Map),
+        },
+        |_| Err(ProtocolConvertError::NonWireValue { variant: "Secret" }),
+    )
+}
+
+/// The existing transport owner narrows classifier evidence before ordinary
+/// conversion. It preserves the first wire failure and its nested path.
+pub(crate) fn require_known_for_protocol<'a>(
+    knowledge: crate::resource::knowledge::Classification<'a>,
+) -> Result<crate::resource::knowledge::KnownValue<'a>, ProtocolConvertError> {
+    use crate::resource::knowledge::{Classification, ShapeView};
+    fn failure(knowledge: &Classification<'_>) -> Option<ProtocolConvertError> {
+        match knowledge {
+            Classification::Known(value) => try_core_to_protocol_value(value).err(),
+            Classification::Failed(value) => Some(protocol_knowledge_error(value.error())),
+            Classification::Pending(value) => value.visit(
+                |_, _, _| match value.to_value() {
+                    Value::Deferred(value) => Some(ProtocolConvertError::NonWireValue {
+                        variant: deferred_value_variant(&value),
+                    }),
+                    Value::Concrete(_) => None,
+                },
+                |_| Some(ProtocolConvertError::NonWireValue { variant: "Secret" }),
+            ),
+            Classification::ShapeKnown(value) => {
+                if let Value::Deferred(deferred) = value.to_value() {
+                    return Some(ProtocolConvertError::NonWireValue {
+                        variant: deferred_value_variant(&deferred),
+                    });
+                }
+                value.visit(
+                    |view| match view {
+                        ShapeView::List(items) => {
+                            items.iter().enumerate().find_map(|(index, item)| {
+                                failure(item)
+                                    .map(|error| error.at_value_path(WirePathSegment::Index(index)))
+                            })
+                        }
+                        ShapeView::Map(items) => items.iter().find_map(|(key, item)| {
+                            failure(item).map(|error| {
+                                error.at_value_path(WirePathSegment::Key((*key).to_owned().into()))
+                            })
+                        }),
+                    },
+                    |_| Some(ProtocolConvertError::NonWireValue { variant: "Secret" }),
+                )
+            }
+        }
+    }
+    knowledge.project_known(|value| {
+        failure(value).unwrap_or(ProtocolConvertError::NonWireValue {
+            variant: "Deferred",
+        })
+    })
+}
+
+fn deferred_value_variant<P: crate::resource::ValueKind>(value: &DeferredValue<P>) -> &'static str {
+    match value {
+        DeferredValue::ModuleIf(_) => "ModuleIf",
+        DeferredValue::ResourceRef { path: _path } => "ResourceRef",
+        DeferredValue::BindingRef { binding: _binding } => "BindingRef",
+        DeferredValue::Coalesce {
+            value: _value,
+            default: _default,
+        } => "Coalesce",
+        DeferredValue::IntegerArithmetic(_expression) => "IntegerArithmetic",
+        DeferredValue::Interpolation(_parts) => "Interpolation",
+        DeferredValue::FunctionCall {
+            name: _name,
+            args: _args,
+            source_line: _source_line,
+        } => "FunctionCall",
+        DeferredValue::Unavailable {
+            name: _name,
+            args: _args,
+            reason: _reason,
+            source_line: _source_line,
+        } => "Unavailable",
+        DeferredValue::ResolvedFunctionCall {
+            function: _function,
+            functions: _functions,
+            args: _args,
+            source_line: _source_line,
+        } => "ResolvedFunctionCall",
+        DeferredValue::Access(_access) => "Access",
+        DeferredValue::Secret(_inner) => "Secret",
+        DeferredValue::Unknown(_reason) => "Unknown",
+        DeferredValue::Placeholder(_leaf) => "Placeholder",
+    }
+}
+
+/// Decode an ordinary protocol value while preserving the typed StringList variant.
+pub fn protocol_to_core_value(value: &protocol::Value) -> Result<Value, ProtocolConvertError> {
+    match value {
+        protocol::Value::Bool(value) => Ok(Value::Concrete(ConcreteValue::Bool(*value))),
+        protocol::Value::Int(value) => Ok(Value::Concrete(ConcreteValue::Int(*value))),
+        protocol::Value::Float(value) => Ok(Value::Concrete(ConcreteValue::Float(*value))),
+        protocol::Value::String(value) => {
+            Ok(Value::Concrete(ConcreteValue::String(value.clone().into())))
+        }
+        protocol::Value::StringList(values) => Ok(Value::Concrete(ConcreteValue::StringList(
+            values.iter().cloned().map(Into::into).collect(),
+        ))),
+        protocol::Value::List(values) => Ok(Value::Concrete(ConcreteValue::List(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    protocol_to_core_value(value)
+                        .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
+                })
+                .collect::<Result<_, _>>()?,
+        ))),
+        protocol::Value::Map(values) => Ok(Value::Concrete(ConcreteValue::Map(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    protocol_to_core_value(value)
+                        .map(|converted| (key.clone(), converted))
+                        .map_err(|error| {
+                            error.at_value_path(WirePathSegment::Key(key.clone().into()))
+                        })
+                })
+                .collect::<Result<IndexMap<_, _>, _>>()?,
+        ))),
+    }
+}
+
+/// Decode a schema default through the JSON-compatible portable projection.
+/// Both protocol list variants become a core `List`, because JSON arrays do
+/// not retain the protocol's in-memory StringList tag.
+pub fn protocol_schema_default_to_core(
+    value: &protocol::Value,
+) -> Result<Value, ProtocolConvertError> {
+    match value {
+        protocol::Value::Bool(value) => Ok(Value::Concrete(ConcreteValue::Bool(*value))),
+        protocol::Value::Int(value) => Ok(Value::Concrete(ConcreteValue::Int(*value))),
+        protocol::Value::Float(value) => Ok(Value::Concrete(ConcreteValue::Float(*value))),
+        protocol::Value::String(value) => {
+            Ok(Value::Concrete(ConcreteValue::String(value.clone().into())))
+        }
+        protocol::Value::StringList(values) => Ok(Value::Concrete(ConcreteValue::List(
+            values
+                .iter()
+                .cloned()
+                .map(|value| Value::Concrete(ConcreteValue::String(value.into())))
+                .collect(),
+        ))),
+        protocol::Value::List(values) => Ok(Value::Concrete(ConcreteValue::List(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    protocol_schema_default_to_core(value)
+                        .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
+                })
+                .collect::<Result<_, _>>()?,
+        ))),
+        protocol::Value::Map(values) => Ok(Value::Concrete(ConcreteValue::Map(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    protocol_schema_default_to_core(value)
+                        .map(|converted| (key.clone(), converted))
+                        .map_err(|error| {
+                            error.at_value_path(WirePathSegment::Key(key.clone().into()))
+                        })
+                })
+                .collect::<Result<IndexMap<_, _>, _>>()?,
+        ))),
+    }
+}
+
+/// Convert an ordinary core value map to the provider protocol domain.
+pub fn try_core_to_protocol_value_map(
+    values: &HashMap<String, crate::resource::knowledge::KnownValue<'_>>,
+) -> Result<BTreeMap<String, protocol::Value>, ProtocolConvertError> {
+    values
+        .iter()
+        .map(|(key, value)| {
+            try_core_to_protocol_value(value)
+                .map(|converted| (key.clone(), converted))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
+        })
+        .collect()
+}
+
+/// Decode an ordinary provider protocol value map.
+pub fn protocol_to_core_value_map(
+    values: &BTreeMap<String, protocol::Value>,
+) -> Result<HashMap<String, Value>, ProtocolConvertError> {
+    values
+        .iter()
+        .map(|(key, value)| {
+            protocol_to_core_value(value)
+                .map(|converted| (key.clone(), converted))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
+        })
+        .collect()
+}
+
+/// Convert a value at a persisted-state position. Only this typed boundary
+/// may transport a redacted-secret digest.
+pub fn try_core_to_protocol_persisted_value(
+    value: &SnapshotValue,
+) -> Result<protocol::PersistedValue, ProtocolConvertError> {
+    match value {
+        Value::Concrete(ConcreteValue::String(value)) => Ok(protocol::PersistedValue::String(
+            value.expose_plaintext().to_string(),
+        )),
+        Value::Concrete(ConcreteValue::EnumIdentifier(_identifier)) => {
+            Err(ProtocolConvertError::NonWireValue {
+                variant: "EnumIdentifier",
+            })
+        }
+        Value::Concrete(ConcreteValue::CanonicalEnum(value)) => Ok(
+            protocol::PersistedValue::String(value.api_value().to_string()),
+        ),
+        Value::Concrete(ConcreteValue::Int(value)) => Ok(protocol::PersistedValue::Int(*value)),
+        Value::Concrete(ConcreteValue::Float(value)) => Ok(protocol::PersistedValue::Float(*value)),
+        Value::Concrete(ConcreteValue::Bool(value)) => Ok(protocol::PersistedValue::Bool(*value)),
+        Value::Concrete(ConcreteValue::Duration(value)) => i64::try_from(value.as_secs())
+            .map(protocol::PersistedValue::Int)
+            .map_err(|_error| ProtocolConvertError::DurationOutOfRange),
+        Value::Concrete(ConcreteValue::List(values)) => Ok(protocol::PersistedValue::List(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    try_core_to_protocol_persisted_value(value)
+                        .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
+                })
+                .collect::<Result<_, _>>()?,
+        )),
+        Value::Concrete(ConcreteValue::StringList(values)) => {
+            Ok(protocol::PersistedValue::StringList(
+                values
+                    .iter()
+                    .map(|value| value.expose_plaintext().to_string())
+                    .collect(),
+            ))
+        }
+        Value::Concrete(ConcreteValue::Map(values)) => Ok(protocol::PersistedValue::Map(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    try_core_to_protocol_persisted_value(value)
+                        .map(|converted| (key.clone(), converted))
+                        .map_err(|error| {
+                            error.at_value_path(WirePathSegment::Key(key.clone().into()))
+                        })
+                })
+                .collect::<Result<_, _>>()?,
+        )),
+        Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash })) => Ok(
+            protocol::PersistedValue::RedactedSecret(hash.encoded_digest()),
+        ),
+        Value::Deferred(deferred) => Err(ProtocolConvertError::NonWireValue {
+            variant: deferred_value_variant(deferred),
+        }),
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
+    }
+}
+
+/// Decode a value from a persisted-state position.
+pub fn protocol_to_core_persisted_value(
+    value: &protocol::PersistedValue,
+) -> Result<SnapshotValue, ProtocolConvertError> {
+    match value {
+        protocol::PersistedValue::Bool(value) => Ok(Value::Concrete(ConcreteValue::Bool(*value))),
+        protocol::PersistedValue::Int(value) => Ok(Value::Concrete(ConcreteValue::Int(*value))),
+        protocol::PersistedValue::Float(value) => Ok(Value::Concrete(ConcreteValue::Float(*value))),
+        protocol::PersistedValue::String(value) => {
+            Ok(Value::Concrete(ConcreteValue::String(value.clone().into())))
+        }
+        protocol::PersistedValue::RedactedSecret(digest) => {
+            let hash = RedactedSecretHash::from_encoded_digest(digest)
+                .ok_or(ProtocolConvertError::InvalidRedactedSecretDigest)?;
+            Ok(Value::Deferred(DeferredValue::Placeholder(
+                SnapshotLeaf::RedactedSecret { hash },
+            )))
+        }
+        protocol::PersistedValue::StringList(values) => Ok(Value::Concrete(
+            ConcreteValue::StringList(values.iter().cloned().map(Into::into).collect()),
+        )),
+        protocol::PersistedValue::List(values) => Ok(Value::Concrete(ConcreteValue::List(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    protocol_to_core_persisted_value(value)
+                        .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
+                })
+                .collect::<Result<_, _>>()?,
+        ))),
+        protocol::PersistedValue::Map(values) => Ok(Value::Concrete(ConcreteValue::Map(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    protocol_to_core_persisted_value(value)
+                        .map(|converted| (key.clone(), converted))
+                        .map_err(|error| {
+                            error.at_value_path(WirePathSegment::Key(key.clone().into()))
+                        })
+                })
+                .collect::<Result<IndexMap<_, _>, _>>()?,
+        ))),
+    }
+}
+
+/// Convert a core map at a persisted-state position.
+pub fn try_core_to_protocol_persisted_value_map(
+    values: &BTreeMap<String, SnapshotValue>,
+) -> Result<BTreeMap<String, protocol::PersistedValue>, ProtocolConvertError> {
+    values
+        .iter()
+        .map(|(key, value)| {
+            try_core_to_protocol_persisted_value(value)
+                .map(|converted| (key.clone(), converted))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
+        })
+        .collect()
+}
+
+/// Decode a persisted protocol value map.
+pub fn protocol_to_core_persisted_value_map(
+    values: &BTreeMap<String, protocol::PersistedValue>,
+) -> Result<BTreeMap<String, SnapshotValue>, ProtocolConvertError> {
+    values
+        .iter()
+        .map(|(key, value)| {
+            protocol_to_core_persisted_value(value)
+                .map(|converted| (key.clone(), converted))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
+        })
+        .collect()
+}
+
+/// Encode a core resource id. Provider-instance routing is host-local and the
+/// current protocol deliberately has no corresponding field.
+pub fn resource_id_to_protocol(id: &ResourceId) -> protocol::ResourceId {
+    let ResourceId {
+        provider,
+        resource_type,
+        identity,
+        provider_instance: _provider_instance,
+    } = id;
+    let identity = match identity {
+        ResourceIdentityState::Pending(_pending) => String::new(),
+        ResourceIdentityState::Resolved(identity) => identity.as_str().to_string(),
+    };
+    protocol::ResourceId {
+        provider: provider.clone(),
+        resource_type: resource_type.clone(),
+        identity,
+    }
+}
+
+/// Decode a current protocol resource id. The wire's empty identity is the pending
+/// sentinel, and provider-instance routing cannot be reconstructed.
+pub fn protocol_to_resource_id(id: &protocol::ResourceId) -> ResourceId {
+    let protocol::ResourceId {
+        provider,
+        resource_type,
+        identity,
+    } = id;
+    match ResourceIdentity::try_from(identity.clone()) {
+        Ok(identity) => ResourceId::with_provider_identity(
+            provider.clone(),
+            resource_type.clone(),
+            identity,
+            None,
+        ),
+        Err(ResourceIdentityError::Empty) => {
+            ResourceId::pending_with_provider(provider.clone(), resource_type.clone(), None)
+        }
+    }
+}
+
+/// Encode directives that have already been resolved for a provider boundary.
+pub fn directives_to_protocol(directives: &ProviderDirectives) -> protocol::Directives {
+    let ProviderDirectiveProtocolParts {
+        force_delete,
+        create_before_destroy,
+        prevent_destroy,
+        // Protection provenance is host policy metadata. WIT v13 transports
+        // only the three effective booleans.
+        prevent_destroy_source: _prevent_destroy_source,
+    } = directives.protocol_parts();
+    protocol::Directives {
+        force_delete,
+        create_before_destroy,
+        prevent_destroy,
+    }
+}
+
+/// Decode effective provider-visible directives without relabeling the wire
+/// boolean as an authored explicit opt-out.
+#[cfg(test)]
+fn protocol_to_directives(directives: &protocol::Directives) -> ProviderDirectives {
+    let protocol::Directives {
+        force_delete,
+        create_before_destroy,
+        prevent_destroy,
+    } = directives;
+    ProviderDirectives::from_effective_wire(*force_delete, *create_before_destroy, *prevent_destroy)
+}
+
+/// Encode a managed resource for the ordinary provider boundary.
+pub fn try_resource_to_protocol<S, D>(
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    directives: &ProviderDirectives,
+) -> Result<protocol::Resource, ProtocolConvertError> {
+    let Resource {
+        id,
+        attributes,
+        directives: _authored_directives,
+        // Host-only lifecycle metadata resolved and enforced around provider
+        // calls. It is intentionally absent from the WIT resource record.
+        resolved_ignore_changes: _resolved_ignore_changes,
+        prefixes: _prefixes,
+        binding: _binding,
+        dependencies: _dependencies,
+        module_source: _module_source,
+        default_tag_keys: _default_tag_keys,
+        loop_provenance: _loop_provenance,
+        quoted_string_attrs: _quoted_string_attrs,
+        authored_slots: _authored_slots,
+        declaration: _declaration,
+    } = resource;
+    let attributes = attributes
+        .iter()
+        .map(|(key, value)| {
+            try_core_to_protocol_value(&require_known_for_protocol(
+                (value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(protocol_knowledge_error)?,
+            )?)
+            .map(|converted| (key.clone(), converted))
+            .map_err(|error| error.context(format!("attribute `{key}`")))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(protocol::Resource {
+        id: resource_id_to_protocol(id),
+        attributes,
+        directives: directives_to_protocol(directives),
+    })
+}
+
+/// Encode a data source using the protocol's shared Resource record.
+pub fn try_data_source_to_protocol<S, D>(
+    data_source: &DataSource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    provider_directives: &ProviderDirectives,
+) -> Result<protocol::Resource, ProtocolConvertError> {
+    let DataSource {
+        id,
+        attributes,
+        directives: _authored_directives,
+        binding: _binding,
+        dependencies: _dependencies,
+        module_source: _module_source,
+        quoted_string_attrs: _quoted_string_attrs,
+        authored_slots: _authored_slots,
+        declaration: _declaration,
+    } = data_source;
+    let attributes = attributes
+        .iter()
+        .map(|(key, value)| {
+            try_core_to_protocol_value(&require_known_for_protocol(
+                (value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(protocol_knowledge_error)?,
+            )?)
+            .map(|converted| (key.clone(), converted))
+            .map_err(|error| error.context(format!("attribute `{key}`")))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(protocol::Resource {
+        id: resource_id_to_protocol(id),
+        attributes,
+        directives: directives_to_protocol(provider_directives),
+    })
+}
+
+/// A decoded provider resource whose effective directives remain separate from
+/// authored core directives.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct DecodedProviderResource<T> {
+    value: T,
+    directives: ProviderDirectives,
+}
+
+#[cfg(test)]
+impl<T> DecodedProviderResource<T> {
+    pub(crate) fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub(crate) fn directives(&self) -> &ProviderDirectives {
+        &self.directives
+    }
+
+    pub(crate) fn into_parts(self) -> (T, ProviderDirectives) {
+        (self.value, self.directives)
+    }
+}
+
+/// Decode a protocol Resource as a managed resource.
+#[cfg(test)]
+pub(crate) fn protocol_to_resource(
+    resource: &protocol::Resource,
+) -> Result<DecodedProviderResource<Resource>, ProtocolConvertError> {
+    let protocol::Resource {
+        id,
+        attributes,
+        directives,
+    } = resource;
+    let mut core = Resource::from_id(protocol_to_resource_id(id));
+    core.attributes = attributes
+        .iter()
+        .map(|(key, value)| {
+            protocol_to_core_value(value)
+                .map(|converted| (key.clone(), converted))
+                .map_err(|error| error.context(format!("attribute `{key}`")))
+        })
+        .collect::<Result<IndexMap<_, _>, _>>()?;
+    Ok(DecodedProviderResource {
+        value: core,
+        directives: protocol_to_directives(directives),
+    })
+}
+
+/// Decode a protocol Resource as a data source.
+#[cfg(test)]
+pub(crate) fn protocol_to_data_source(
+    resource: &protocol::Resource,
+) -> Result<DecodedProviderResource<DataSource>, ProtocolConvertError> {
+    let protocol::Resource {
+        id,
+        attributes,
+        directives,
+    } = resource;
+    let mut core =
+        DataSource::pending_with_provider(id.provider.clone(), id.resource_type.clone(), None);
+    core.id = protocol_to_resource_id(id);
+    core.attributes = attributes
+        .iter()
+        .map(|(key, value)| {
+            protocol_to_core_value(value)
+                .map(|converted| (key.clone(), converted))
+                .map_err(|error| error.context(format!("attribute `{key}`")))
+        })
+        .collect::<Result<IndexMap<_, _>, _>>()?;
+    Ok(DecodedProviderResource {
+        value: core,
+        directives: protocol_to_directives(directives),
+    })
+}
+
+/// Encode generic state through the ordinary value domain.
+pub fn try_state_to_protocol(state: &State) -> Result<protocol::State, ProtocolConvertError> {
+    let State {
+        id,
+        identifier,
+        attributes,
+        exists,
+        dependency_bindings: _dependency_bindings,
+        partial_read: _partial_read,
+    } = state;
+    Ok(protocol::State {
+        id: resource_id_to_protocol(id),
+        identifier: identifier.clone(),
+        attributes: attributes
+            .iter()
+            .map(|(key, value)| {
+                value
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(protocol_knowledge_error)
+                    .and_then(require_known_for_protocol)
+                    .and_then(|known| try_core_to_protocol_value(&known))
+                    .map(|value| (key.clone(), value))
+                    .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
+            })
+            .collect::<Result<_, _>>()?,
+        exists: *exists,
+    })
+}
+
+/// Decode generic ordinary-value state.
+pub fn protocol_to_state(state: &protocol::State) -> Result<State, ProtocolConvertError> {
+    let protocol::State {
+        id,
+        identifier,
+        attributes,
+        exists,
+    } = state;
+    if *exists {
+        let mut core = State::existing(
+            protocol_to_resource_id(id),
+            protocol_to_core_value_map(attributes)?,
+        );
+        if let Some(identifier) = identifier {
+            core = core.with_identifier(identifier.clone());
+        }
+        Ok(core)
+    } else {
+        Ok(State::not_found(protocol_to_resource_id(id)))
+    }
+}
+
+/// Encode generic state through the persisted value domain.
+pub fn try_state_to_persisted_protocol(
+    state: &SnapshotState,
+) -> Result<protocol::PersistedState, ProtocolConvertError> {
+    let State {
+        id,
+        identifier,
+        attributes,
+        exists,
+        dependency_bindings: _dependency_bindings,
+        partial_read: _partial_read,
+    } = state;
+    Ok(protocol::PersistedState {
+        id: resource_id_to_protocol(id),
+        identifier: identifier.clone(),
+        attributes: try_core_to_protocol_persisted_value_map(attributes)?,
+        exists: *exists,
+    })
+}
+
+/// Decode generic persisted state.
+pub fn protocol_persisted_state_to_core(
+    state: &protocol::PersistedState,
+) -> Result<SnapshotState, ProtocolConvertError> {
+    let protocol::PersistedState {
+        id,
+        identifier,
+        attributes,
+        exists,
+    } = state;
+    if *exists {
+        let mut core = State::existing(
+            protocol_to_resource_id(id),
+            protocol_to_core_persisted_value_map(attributes)?,
+        );
+        if let Some(identifier) = identifier {
+            core = core.with_identifier(identifier.clone());
+        }
+        Ok(core)
+    } else {
+        Ok(State::not_found(protocol_to_resource_id(id)))
+    }
+}
+
+/// Encode state known to exist through the ordinary value domain.
+pub fn try_applied_state_to_protocol(
+    state: &AppliedState,
+) -> Result<protocol::AppliedState, ProtocolConvertError> {
+    let AppliedState {
+        id,
+        identifier,
+        attributes,
+    } = state;
+    Ok(protocol::AppliedState {
+        id: resource_id_to_protocol(id),
+        identifier: identifier.clone(),
+        attributes: attributes
+            .iter()
+            .map(|(key, value)| {
+                let value = value
+                    .to_value_at(format!("{id}.{key}"))
+                    .map_err(ProtocolConvertError::UnavailableSecret)?;
+                try_core_to_protocol_value(&require_known_for_protocol(
+                    (value)
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .map_err(protocol_knowledge_error)?,
+                )?)
+                .map(|value| (key.clone(), value))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
+            })
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+/// Decode state known to exist from the ordinary value domain.
+pub fn protocol_applied_state_to_core(
+    state: &protocol::AppliedState,
+) -> Result<AppliedState, ProtocolConvertError> {
+    let protocol::AppliedState {
+        id,
+        identifier,
+        attributes,
+    } = state;
+    Ok(AppliedState::from_identifier(
+        protocol_to_resource_id(id),
+        identifier.clone(),
+        protocol_to_core_value_map(attributes)?,
+    ))
+}
+
+/// Encode a managed read outcome.
+pub fn try_read_outcome_to_protocol(
+    outcome: &ReadOutcome,
+) -> Result<protocol::ReadOutcome, ProtocolConvertError> {
+    match outcome {
+        ReadOutcome::NotFound { id } => Ok(protocol::ReadOutcome::NotFound {
+            id: resource_id_to_protocol(id),
+        }),
+        ReadOutcome::Found { state } => Ok(protocol::ReadOutcome::Found {
+            state: try_applied_state_to_protocol(state)?,
+        }),
+    }
+}
+
+/// Decode a managed read outcome.
+pub fn protocol_read_outcome_to_core(
+    outcome: &protocol::ReadOutcome,
+) -> Result<ReadOutcome, ProtocolConvertError> {
+    match outcome {
+        protocol::ReadOutcome::NotFound { id } => {
+            Ok(ReadOutcome::not_found(protocol_to_resource_id(id)))
+        }
+        protocol::ReadOutcome::Found { state } => {
+            Ok(ReadOutcome::found(protocol_applied_state_to_core(state)?))
+        }
+    }
+}
+
+fn try_applied_update_state_to_protocol(
+    state: &AppliedState,
+    state_after_patch: protocol::PersistedState,
+) -> Result<protocol::AppliedPersistedState, ProtocolConvertError> {
+    let AppliedState {
+        id,
+        identifier,
+        attributes: state_attributes,
+    } = state;
+    let protocol::PersistedState {
+        id: _state_after_patch_id,
+        identifier: _state_after_patch_identifier,
+        attributes: state_after_patch_attributes,
+        exists: _state_after_patch_exists,
+    } = state_after_patch;
+    let mut attributes = try_core_to_protocol_persisted_value_map(state_attributes)?;
+    for (key, value) in state_after_patch_attributes {
+        attributes.entry(key).or_insert(value);
+    }
+    Ok(protocol::AppliedPersistedState {
+        id: resource_id_to_protocol(id),
+        identifier: identifier.clone(),
+        attributes,
+    })
+}
+
+/// Encode an update outcome, retaining persisted write-only values from the
+/// state captured immediately after applying the patch.
+pub fn try_update_outcome_to_protocol(
+    outcome: &UpdateOutcome,
+    state_after_patch: protocol::PersistedState,
+) -> Result<protocol::UpdateOutcome, ProtocolConvertError> {
+    match outcome.kind() {
+        UpdateOutcomeKind::Success { state } => Ok(protocol::UpdateOutcome::Success {
+            state: try_applied_update_state_to_protocol(state, state_after_patch)?,
+        }),
+        UpdateOutcomeKind::PartialSuccess { state, diagnostic } => {
+            let PartialReadDiagnostic {
+                reason,
+                missing_attributes,
+            } = diagnostic;
+            Ok(protocol::UpdateOutcome::PartialSuccess {
+                state: try_applied_update_state_to_protocol(state, state_after_patch)?,
+                diagnostic: reason.text().partial_read_wire(
+                    missing_attributes
+                        .iter()
+                        .map(|name| name.as_str().to_owned())
+                        .collect(),
+                ),
+            })
+        }
+    }
+}
+
+fn protocol_applied_persisted_state_to_core(
+    state: &protocol::AppliedPersistedState,
+) -> Result<AppliedState, ProtocolConvertError> {
+    let protocol::AppliedPersistedState {
+        id,
+        identifier,
+        attributes,
+    } = state;
+    Ok(AppliedState::from_snapshot_parts(
+        protocol_to_resource_id(id),
+        identifier.clone(),
+        protocol_to_core_persisted_value_map(attributes)?,
+    ))
+}
+
+/// Decode an update outcome. An empty partial-read attribute list normalizes
+/// to core's success variant through [`UpdateOutcome::partial_success`].
+pub fn protocol_update_outcome_to_core(
+    outcome: &protocol::UpdateOutcome,
+) -> Result<UpdateOutcome, ProtocolConvertError> {
+    match outcome {
+        protocol::UpdateOutcome::Success { state } => Ok(UpdateOutcome::success(
+            protocol_applied_persisted_state_to_core(state)?,
+        )),
+        protocol::UpdateOutcome::PartialSuccess { state, diagnostic } => {
+            let protocol::PartialReadDiagnostic {
+                reason,
+                missing_attributes,
+            } = diagnostic;
+            let state = protocol_applied_persisted_state_to_core(state)?;
+            Ok(
+                match crate::provider::NonEmptyMissingAttributes::try_from(
+                    missing_attributes.clone(),
+                ) {
+                    Ok(missing) => UpdateOutcome::partial_success(
+                        state,
+                        crate::provider_text::ProviderDiagnostic::message(reason.clone().into()),
+                        missing,
+                    ),
+                    Err(_) => UpdateOutcome::success(state),
+                },
+            )
+        }
+    }
+}
+
+/// Encode one update patch operation.
+pub fn try_patch_op_to_protocol(
+    operation: &PatchOp,
+) -> Result<protocol::PatchOp, ProtocolConvertError> {
+    match operation {
+        PatchOp::Add { key, value } => Ok(protocol::PatchOp::Add {
+            key: key.clone(),
+            value: try_core_to_protocol_value(&require_known_for_protocol(
+                (value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(protocol_knowledge_error)?,
+            )?)
+            .map_err(|error| error.context(format!("patch add `{key}`")))?,
+        }),
+        PatchOp::Replace { key, value } => Ok(protocol::PatchOp::Replace {
+            key: key.clone(),
+            value: try_core_to_protocol_value(&require_known_for_protocol(
+                (value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(protocol_knowledge_error)?,
+            )?)
+            .map_err(|error| error.context(format!("patch replace `{key}`")))?,
+        }),
+        PatchOp::Reassert { key, value } => Ok(protocol::PatchOp::Reassert {
+            key: key.clone(),
+            value: try_core_to_protocol_value(&require_known_for_protocol(
+                (value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(protocol_knowledge_error)?,
+            )?)
+            .map_err(|error| error.context(format!("patch reassert `{key}`")))?,
+        }),
+        PatchOp::Remove { key } => Ok(protocol::PatchOp::Remove { key: key.clone() }),
+    }
+}
+
+/// Decode one update patch operation.
+pub fn protocol_patch_op_to_core(
+    operation: &protocol::PatchOp,
+) -> Result<PatchOp, ProtocolConvertError> {
+    match operation {
+        protocol::PatchOp::Add { key, value } => Ok(PatchOp::Add {
+            key: key.clone(),
+            value: protocol_to_core_value(value)
+                .map_err(|error| error.context(format!("patch add `{key}`")))?,
+        }),
+        protocol::PatchOp::Replace { key, value } => Ok(PatchOp::Replace {
+            key: key.clone(),
+            value: protocol_to_core_value(value)
+                .map_err(|error| error.context(format!("patch replace `{key}`")))?,
+        }),
+        protocol::PatchOp::Reassert { key, value } => Ok(PatchOp::Reassert {
+            key: key.clone(),
+            value: protocol_to_core_value(value)
+                .map_err(|error| error.context(format!("patch reassert `{key}`")))?,
+        }),
+        protocol::PatchOp::Remove { key } => Ok(PatchOp::Remove { key: key.clone() }),
+    }
+}
+
+/// Encode an update patch without changing operation order.
+pub fn try_update_patch_to_protocol(
+    patch: &UpdatePatch,
+) -> Result<protocol::UpdatePatch, ProtocolConvertError> {
+    let UpdatePatch { ops } = patch;
+    Ok(protocol::UpdatePatch {
+        ops: ops
+            .iter()
+            .map(try_patch_op_to_protocol)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+/// Decode an update patch without changing operation order.
+pub fn protocol_update_patch_to_core(
+    patch: &protocol::UpdatePatch,
+) -> Result<UpdatePatch, ProtocolConvertError> {
+    let protocol::UpdatePatch { ops } = patch;
+    Ok(UpdatePatch {
+        ops: ops
+            .iter()
+            .map(protocol_patch_op_to_core)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::schema::CompiledResourceSchema as ResourceSchema;
+    use crate::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+    };
+
+    #[test]
+    fn provider_text_invalid_provider_schema_child_is_rendered_once() {
+        let child = crate::schema::ProviderSchemaValidationError::DanglingReferenceForm {
+            identity: crate::schema::TypeIdentity::bare("missing\x1b[2J"),
+        };
+        let error = super::SchemaDecodeError::InvalidProviderSchema(child);
+        let rendered = crate::executor::render_error_chain(&error);
+        assert_eq!(
+            rendered.matches("is not declared by this provider").count(),
+            1
+        );
+        assert!(!rendered.contains('\x1b'));
+    }
+
+    #[test]
+    fn decode_rejects_uncompilable_string_patterns() {
+        use carina_provider_protocol::types as protocol;
+        let string = protocol::AttributeType::String {
+            identity_layer: protocol::StringIdentityLayer {
+                identity: None,
+                pattern: Some(protocol::PatternSpec::new(
+                    "(?=x)".to_string(),
+                    protocol::PatternMatch::Full,
+                )),
+                length: None,
+                validate: None,
+                to_dsl: None,
+            },
+            member_layer: Default::default(),
+        };
+        let legacy = protocol::AttributeType::Custom {
+            name: "DomainName".to_string(),
+            base: Box::new(protocol::AttributeType::String {
+                identity_layer: protocol::StringIdentityLayer {
+                    identity: None,
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                },
+                member_layer: Default::default(),
+            }),
+            pattern: Some(protocol::PatternSpec::new(
+                "(?=x)".to_string(),
+                protocol::PatternMatch::Full,
+            )),
+            length: None,
+            validate: None,
+            to_dsl: None,
+        };
+        for wire in [string, legacy] {
+            let error = protocol_to_config_schema(BTreeMap::from([("value".to_string(), wire)]))
+                .expect_err("unsupported patterns must fail at schema admission");
+            let source = std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<ConfigSchemaValidationError>()
+                .expect("the decoder must preserve the whole schema error");
+            let (location, source) = source.pattern_errors().next().unwrap();
+            assert_eq!(
+                location,
+                &SchemaValidationIssueLocation::Attribute("value".into())
+            );
+            assert_eq!(source.as_ref().as_str(), "(?=x)");
+        }
+    }
+
+    fn bad_pattern(pattern: &str) -> protocol::AttributeType {
+        protocol::AttributeType::String {
+            identity_layer: protocol::StringIdentityLayer {
+                identity: None,
+                pattern: Some(protocol::PatternSpec::new(
+                    pattern,
+                    protocol::PatternMatch::Full,
+                )),
+                length: None,
+                validate: None,
+                to_dsl: None,
+            },
+            member_layer: Default::default(),
+        }
+    }
+
+    #[test]
+    fn protocol_admission_collects_patterns_and_refs_with_typed_locations() {
+        let schema = PatternResourceSchema::new("test.Pattern")
+            .attribute(
+                PatternAttributeSchema::optional("foo", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap();
+        let mut wire = resource_schema_to_protocol(&schema).unwrap();
+        wire.defs.insert("Bad".into(), bad_pattern("["));
+        wire.attributes.get_mut("foo").unwrap().attr_type = protocol::AttributeType::List {
+            element_type: Box::new(bad_pattern("(?=x)")),
+            ordered: true,
+            length: None,
+            elements: protocol::ListElements::AllowDuplicates,
+            validate: None,
+        };
+        let mut missing = wire.attributes["foo"].clone();
+        missing.name = "missing".into();
+        missing.attr_type = protocol::AttributeType::Ref {
+            name: "Missing".into(),
+        };
+        wire.attributes.insert(missing.name.clone(), missing);
+
+        let error = protocol_to_resource_schema(&wire).unwrap_err();
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<ResourceSchemaValidationError>()
+            .expect("protocol admission must expose the whole core schema error");
+        assert_eq!(
+            source
+                .located_issues()
+                .map(|(location, _)| location.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                SchemaValidationIssueLocation::Definition("Bad".into()),
+                SchemaValidationIssueLocation::Attribute("foo[]".into()),
+                SchemaValidationIssueLocation::Attribute("missing".into()),
+            ]
+        );
+        assert_eq!(
+            source
+                .pattern_errors()
+                .map(|(location, error)| (location.clone(), error.as_ref().as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (SchemaValidationIssueLocation::Definition("Bad".into()), "["),
+                (
+                    SchemaValidationIssueLocation::Attribute("foo[]".into()),
+                    "(?=x)"
+                ),
+            ]
+        );
+        assert!(source.issues().any(
+            |(path, message)| path == "missing" && message.contains("`Missing` is not defined")
+        ));
+        assert!(
+            matches!(error, SchemaDecodeError::InvalidSchema { schema_issue_location: Some(ref location), .. }
+            if **location == SchemaValidationIssueLocation::Definition("Bad".into()))
+        );
+        assert!(!error.to_string().contains("attribute 'Bad'"), "{error}");
+    }
+
+    #[test]
+    fn protocol_definition_decode_errors_have_definition_locations() {
+        let schema = DraftResourceSchema::new("test.Definition")
+            .validate()
+            .unwrap();
+        let mut wire = resource_schema_to_protocol(&schema).unwrap();
+        let mut bad = bad_pattern("valid");
+        let protocol::AttributeType::String {
+            identity_layer: protocol::StringIdentityLayer { validate, .. },
+            member_layer: _,
+        } = &mut bad
+        else {
+            unreachable!()
+        };
+        *validate = Some(serde_json::json!(true));
+        wire.defs.insert("Bad".to_string(), bad);
+        let error = protocol_to_resource_schema(&wire).unwrap_err();
+        assert!(
+            matches!(error, SchemaDecodeError::InvalidSchema {
+            schema_issue_location: Some(ref location), ref attribute_path, ..
+        } if **location == SchemaValidationIssueLocation::Definition("Bad".into()) && attribute_path.is_empty()),
+            "{error}"
+        );
+        assert!(error.to_string().contains("defs.Bad"), "{error}");
+    }
+
+    #[test]
+    fn protocol_config_admission_collects_patterns_and_refs() {
+        let error = protocol_to_config_schema(BTreeMap::from([
+            (
+                "first".into(),
+                protocol::AttributeType::List {
+                    element_type: Box::new(bad_pattern("(?=x)")),
+                    ordered: true,
+                    length: None,
+                    elements: protocol::ListElements::AllowDuplicates,
+                    validate: None,
+                },
+            ),
+            ("second".into(), bad_pattern("[")),
+            (
+                "missing".into(),
+                protocol::AttributeType::Ref {
+                    name: "Missing".into(),
+                },
+            ),
+        ]))
+        .unwrap_err();
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<ConfigSchemaValidationError>()
+            .expect("config admission must expose the whole core schema error");
+        assert_eq!(
+            source
+                .located_issues()
+                .map(|(location, _)| location.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                SchemaValidationIssueLocation::Attribute("first[]".into()),
+                SchemaValidationIssueLocation::Attribute("missing".into()),
+                SchemaValidationIssueLocation::Attribute("second".into()),
+            ]
+        );
+        assert_eq!(source.pattern_errors().count(), 2);
+    }
+
+    #[test]
+    fn legacy_custom_compiles_only_the_surviving_pattern() {
+        let invalid_string = protocol::AttributeType::String {
+            identity_layer: protocol::StringIdentityLayer {
+                identity: None,
+                pattern: Some(protocol::PatternSpec::new(
+                    "(?=x)",
+                    protocol::PatternMatch::Full,
+                )),
+                length: None,
+                validate: None,
+                to_dsl: None,
+            },
+            member_layer: Default::default(),
+        };
+        let invalid_custom = protocol::AttributeType::Custom {
+            name: "Inner".into(),
+            base: Box::new(invalid_string.clone()),
+            pattern: Some(protocol::PatternSpec::new(
+                "(?=y)",
+                protocol::PatternMatch::Full,
+            )),
+            length: None,
+            validate: None,
+            to_dsl: None,
+        };
+        for base in [invalid_string, invalid_custom] {
+            let wire = protocol::AttributeType::Custom {
+                name: "Outer".into(),
+                base: Box::new(base),
+                pattern: Some(protocol::PatternSpec::new(
+                    "^valid$",
+                    protocol::PatternMatch::Full,
+                )),
+                length: None,
+                validate: None,
+                to_dsl: None,
+            };
+            let decoded =
+                protocol_to_attribute_type(&wire).expect("shadowed patterns must not be compiled");
+            assert!(matches!(
+                decoded.raw_shape(),
+                RawShape::String { identity_layer: crate::schema::StringIdentityParts {
+                    pattern: Some(pattern),
+                    ..
+                }, .. } if pattern == &crate::schema::PatternSpec::new("^valid$", crate::schema::PatternMatch::Full)
+            ));
+            ValidatedConfigSchema::validate(BTreeMap::from([("value".to_string(), decoded)]))
+                .expect("only the surviving pattern may reach admission");
+        }
+    }
+
+    #[test]
+    fn legacy_custom_rejects_incompatible_metadata_before_compiling() {
+        for (base_kind, base) in [
+            (
+                "Int",
+                protocol::AttributeType::Int {
+                    identity_layer: protocol::IntIdentityLayer {
+                        identity: None,
+                        range: None,
+                    },
+                    member_layer: Default::default(),
+                },
+            ),
+            (
+                "Float",
+                protocol::AttributeType::Float {
+                    identity: None,
+                    range: None,
+                },
+            ),
+            (
+                "List",
+                protocol::AttributeType::List {
+                    element_type: Box::new(protocol::AttributeType::Bool),
+                    ordered: true,
+                    length: None,
+                    elements: protocol::ListElements::AllowDuplicates,
+                    validate: None,
+                },
+            ),
+        ] {
+            let wire = protocol::AttributeType::Custom {
+                name: String::new(),
+                base: Box::new(base),
+                pattern: Some(protocol::PatternSpec::new(
+                    "(?=x)",
+                    protocol::PatternMatch::Full,
+                )),
+                length: None,
+                validate: None,
+                to_dsl: None,
+            };
+            let error = protocol_to_attribute_type(&wire).unwrap_err();
+            let source = std::error::Error::source(&error).unwrap();
+            assert!(
+                matches!(source.downcast_ref::<ProtocolConvertError>(), Some(
+                ProtocolConvertError::LegacyCustomUnsupportedMetadata { field: "pattern", base_kind: actual, .. }
+            ) if *actual == base_kind),
+                "{error}: {source}"
+            );
+        }
+    }
+
+    use super::*;
+    use crate::provider::{ProviderDirectiveSchema, ProviderDirectives, UpdatePatch};
+    use crate::resource::{ModuleSource, PreventDestroy, ProviderResource, RedactedSecretHash};
+    use crate::schema::{
+        CompletionValue, ProviderSchemaValidationError, ReferenceForm, ReferenceForms,
+        ReferenceTemplate, ValidatedProviderSchemaWitness, ValidatorType,
+    };
+
+    #[test]
+    fn map_length_round_trip_through_protocol_json() {
+        for length in [Some((Some(0), Some(10))), Some((Some(2), None)), None] {
+            let wire = serde_json::from_value(serde_json::json!({
+                "type": "map", "inner": {"type": "String", "identity_layer": {}, "member_layer": {}},
+                "key": {"type": "String", "identity_layer": {}, "member_layer": {}}, "length": length,
+            }))
+            .unwrap();
+            let schema =
+                protocol_to_config_schema(BTreeMap::from([("value".into(), wire)])).unwrap();
+            let original = &schema.parts()["value"];
+            let wire = attribute_type_to_protocol(original).unwrap();
+            let json = serde_json::to_value(&wire).unwrap();
+            assert_eq!(json["length"], serde_json::to_value(length).unwrap());
+            let decoded_wire = serde_json::from_value(json.clone()).unwrap();
+            let decoded =
+                protocol_to_config_schema(BTreeMap::from([("value".into(), decoded_wire)]))
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(
+                    attribute_type_to_protocol(&decoded.parts()["value"]).unwrap()
+                )
+                .unwrap(),
+                json
+            );
+        }
+    }
+
+    #[test]
+    fn map_length_missing_json_decodes_as_unbounded() {
+        let wire = serde_json::from_value(serde_json::json!({
+            "type": "map", "inner": {"type": "String", "identity_layer": {}, "member_layer": {}}, "key": {"type": "String", "identity_layer": {}, "member_layer": {}},
+        }))
+        .unwrap();
+        let schema = protocol_to_config_schema(BTreeMap::from([("value".into(), wire)])).unwrap();
+        let value: Value = Value::Concrete(ConcreteValue::Map(
+            (0..11)
+                .map(|i| {
+                    (
+                        format!("key_{i}"),
+                        Value::Concrete(ConcreteValue::String("value".into())),
+                    )
+                })
+                .collect(),
+        ));
+        assert!(
+            schema
+                .rootless_type("value")
+                .unwrap()
+                .validate(&value)
+                .is_ok()
+        );
+        assert!(
+            serde_json::to_value(attribute_type_to_protocol(&schema.parts()["value"]).unwrap())
+                .unwrap()
+                .get("length")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn list_elements_refinements_round_trip_through_json() {
+        use crate::schema::ListElements;
+        for elements in [ListElements::AllowDuplicates, ListElements::Unique] {
+            for ordered in [true, false] {
+                let original = AttributeType::refined_list(
+                    AttributeType::string(),
+                    ordered,
+                    Some((Some(1), Some(3))),
+                    elements,
+                );
+                let wire = attribute_type_to_protocol(&original).unwrap();
+                let json = serde_json::to_value(&wire).unwrap();
+                assert_eq!(json["elements"], serde_json::to_value(elements).unwrap());
+                let decoded_wire = serde_json::from_value(json.clone()).unwrap();
+                let decoded_schema = protocol_to_config_schema(BTreeMap::from([(
+                    "value".to_string(),
+                    decoded_wire,
+                )]))
+                .unwrap();
+                let decoded = &decoded_schema.parts()["value"];
+                assert_eq!(
+                    serde_json::to_value(attribute_type_to_protocol(decoded).unwrap()).unwrap(),
+                    json
+                );
+                let RawShape::List {
+                    element_type: _element_type,
+                    ordered: back_ordered,
+                    constraints,
+                } = decoded.raw_shape()
+                else {
+                    panic!("list shape was lost");
+                };
+                assert_eq!(back_ordered, ordered);
+                assert_eq!(constraints.elements(), elements);
+                assert_eq!(constraints.length(), Some((Some(1), Some(3))));
+            }
+        }
+    }
+
+    fn reference_identity(kind: &str) -> TypeIdentity {
+        TypeIdentity::new(Some("aws"), ["lambda", "Function"], kind)
+    }
+
+    fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+        crate::resource::RootScope::new()
+            .resolve(crate::resource::RelativeBindingName::new(binding))
+    }
+
+    fn reference_form() -> ReferenceForm {
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:lambda:{region}:{account}:function:{name}",
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn reference_type_round_trip_and_offline_constraints() {
+        let identity = TypeIdentity::new(Some("test"), ["keys", "Key"], "Reference");
+        let ty = DraftAttributeType::reference(
+            identity.clone(),
+            Some(crate::schema::PatternSpec::new(
+                "^alias/[a-z]+$",
+                crate::schema::PatternMatch::Full,
+            )),
+            Some((Some(8), Some(12))),
+        );
+        let owner = PatternResourceSchema::new("keys.Resource")
+            .attribute(PatternAttributeSchema::optional("key", ty).build())
+            .validate()
+            .unwrap();
+        let wire = attribute_type_to_protocol(&owner.parts().attributes["key"].attr_type).unwrap();
+        let decoded = protocol_to_attribute_type(&wire).unwrap();
+        assert!(
+            matches!(decoded.raw_shape(), RawShape::Reference { identity: actual, pattern: Some(pattern), length: Some((Some(8), Some(12))) } if actual == &identity && pattern == &crate::schema::PatternSpec::new("^alias/[a-z]+$", crate::schema::PatternMatch::Full))
+        );
+        let schema = PatternResourceSchema::new("keys.Resource")
+            .attribute(crate::schema::AttributeSchema::optional("key", decoded).build())
+            .validate()
+            .unwrap();
+        let attribute = schema.effective_attribute("key").unwrap();
+        assert!(
+            attribute
+                .value_type()
+                .validate(&Value::<crate::resource::NoPlaceholder>::Concrete(
+                    ConcreteValue::String("alias/abc".into())
+                ))
+                .is_ok()
+        );
+        for invalid in ["alias/a", "alias/abcdefghijk", "key/abc"] {
+            assert!(
+                attribute
+                    .value_type()
+                    .validate(&Value::<crate::resource::NoPlaceholder>::Concrete(
+                        ConcreteValue::String(invalid.into())
+                    ))
+                    .is_err()
+            );
+        }
+    }
+
+    fn schema_with_identified_type(
+        identity: &TypeIdentity,
+        attribute_type: DraftAttributeType,
+    ) -> ValidatedResourceSchema {
+        PatternResourceSchema::new("aws.lambda.Function")
+            .attribute(PatternAttributeSchema::optional("function", attribute_type).build())
+            .validate()
+            .unwrap_or_else(|error| panic!("fixture for {identity} must validate: {error}"))
+    }
+
+    fn protocol_identity(identity: &TypeIdentity) -> String {
+        identity.to_string()
+    }
+
+    fn envelope_with_form(
+        identity: &TypeIdentity,
+        schema: Option<ValidatedResourceSchema>,
+    ) -> protocol::ProviderSchemaEnvelope {
+        protocol::ProviderSchemaEnvelope {
+            resources: schema
+                .iter()
+                .map(resource_schema_to_protocol)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            reference_forms: vec![protocol::ReferenceFormDeclaration {
+                identity: protocol_identity(identity),
+                form: reference_form(),
+            }],
+            assignability_edges: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn provider_schema_envelope_round_trips_the_aggregate_witness() {
+        let first = reference_identity("Alias");
+        let second = reference_identity("Name");
+        let schema = PatternResourceSchema::new("aws.lambda.Function")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "alias",
+                    PatternAttributeType::refined_string(Some(first.clone()), None, None, None),
+                )
+                .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "name",
+                    PatternAttributeType::refined_string(Some(second.clone()), None, None, None),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let forms = ReferenceForms::from([
+            (second.clone(), reference_form()),
+            (first.clone(), reference_form()),
+        ]);
+        let config = ValidatedConfigSchema::default();
+        let witness =
+            ValidatedProviderSchemaWitness::new(vec![schema], config.clone(), forms, Vec::new())
+                .expect("refined String forms must be admitted");
+
+        let wire = provider_schema_to_protocol(&witness).expect("witness must encode");
+        assert_eq!(
+            wire.reference_forms
+                .iter()
+                .map(|record| record.identity.as_str())
+                .collect::<Vec<_>>(),
+            ["aws.lambda.Function.Alias", "aws.lambda.Function.Name"],
+            "BTreeMap order is the wire order",
+        );
+        let json = serde_json::to_string(&wire).expect("envelope must serialize");
+        let decoded_wire: protocol::ProviderSchemaEnvelope =
+            serde_json::from_str(&json).expect("envelope must deserialize");
+        let decoded = protocol_to_provider_schema_witness(&decoded_wire, config)
+            .expect("envelope must regain its aggregate witness");
+
+        assert_eq!(decoded.resources().len(), 1);
+        assert_eq!(decoded.reference_forms().len(), 2);
+        assert_eq!(
+            decoded.reference_forms().get(&first),
+            Some(&reference_form())
+        );
+        assert_eq!(
+            decoded.reference_forms().get(&second),
+            Some(&reference_form())
+        );
+    }
+
+    #[test]
+    fn provider_schema_envelope_decodes_form_and_attribute_identities_identically() {
+        let identity = TypeIdentity::new(None::<String>, ["shared"], "Name");
+        let schema = schema_with_identified_type(
+            &identity,
+            PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
+        );
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![schema],
+            ValidatedConfigSchema::default(),
+            ReferenceForms::from([(identity.clone(), reference_form())]),
+            Vec::new(),
+        )
+        .expect("the SDK-side aggregate identity is internally consistent");
+
+        let wire = provider_schema_to_protocol(&witness).expect("witness must encode");
+        let decoded = protocol_to_provider_schema_witness(&wire, ValidatedConfigSchema::default())
+            .expect("forms and attributes must take the same lossy dotted identity path");
+        let decoded_identity = TypeIdentity::from_dotted(&identity.to_string());
+
+        assert_eq!(
+            decoded.reference_forms().get(&decoded_identity),
+            Some(&reference_form())
+        );
+    }
+
+    #[test]
+    fn provider_schema_decode_rejects_duplicate_reference_form_identities() {
+        let identity = reference_identity("Name");
+        let schema = schema_with_identified_type(
+            &identity,
+            PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
+        );
+        let mut wire = envelope_with_form(&identity, Some(schema));
+        wire.reference_forms.push(wire.reference_forms[0].clone());
+
+        assert!(matches!(
+            protocol_to_provider_schema_witness(&wire, ValidatedConfigSchema::default()),
+            Err(SchemaDecodeError::DuplicateReferenceForm { identity: actual })
+                if actual == identity
+        ));
+    }
+
+    #[test]
+    fn provider_schema_decode_rejects_dangling_reference_form_identities() {
+        let identity = reference_identity("Name");
+        let wire = envelope_with_form(&identity, None);
+
+        assert!(matches!(
+            protocol_to_provider_schema_witness(&wire, ValidatedConfigSchema::default()),
+            Err(SchemaDecodeError::InvalidProviderSchema(
+                ProviderSchemaValidationError::DanglingReferenceForm { identity: actual }
+            )) if actual == identity
+        ));
+    }
+
+    #[test]
+    fn provider_schema_decode_accepts_a_form_declared_by_provider_config() {
+        let identity = reference_identity("Endpoint");
+        let config = ValidatedConfigSchema::validate(BTreeMap::from([(
+            "endpoint".to_string(),
+            PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
+        )]))
+        .expect("config fixture must validate");
+        let wire = envelope_with_form(&identity, None);
+
+        let decoded = protocol_to_provider_schema_witness(&wire, config)
+            .expect("config identities belong to the same aggregate witness");
+
+        assert_eq!(
+            decoded.reference_forms().get(&identity),
+            Some(&reference_form())
+        );
+    }
+
+    #[test]
+    fn provider_schema_decode_rejects_int_reference_form_identities() {
+        let identity = reference_identity("Count");
+        let schema = schema_with_identified_type(
+            &identity,
+            PatternAttributeType::refined_int(Some(identity.clone()), None),
+        );
+        let wire = envelope_with_form(&identity, Some(schema));
+
+        assert!(matches!(
+            protocol_to_provider_schema_witness(&wire, ValidatedConfigSchema::default()),
+            Err(SchemaDecodeError::InvalidProviderSchema(
+                ProviderSchemaValidationError::NonStringReferenceForm {
+                    identity: actual,
+                    declaration: crate::schema::IdentifiedDeclarationKind::Int,
+                }
+            )) if actual == identity
+        ));
+    }
+
+    #[test]
+    fn provider_schema_decode_rejects_enum_reference_form_identities() {
+        let identity = reference_identity("Mode");
+        let schema = schema_with_identified_type(
+            &identity,
+            PatternAttributeType::enum_(
+                identity.clone(),
+                Some(vec!["enabled".to_string()]),
+                Vec::new(),
+                None,
+                None,
+            ),
+        );
+        let wire = envelope_with_form(&identity, Some(schema));
+
+        assert!(matches!(
+            protocol_to_provider_schema_witness(&wire, ValidatedConfigSchema::default()),
+            Err(SchemaDecodeError::InvalidProviderSchema(
+                ProviderSchemaValidationError::NonStringReferenceForm {
+                    identity: actual,
+                    declaration: crate::schema::IdentifiedDeclarationKind::Enum,
+                }
+            )) if actual == identity
+        ));
+    }
+
+    #[test]
+    fn provider_resource_encodes_identically_to_live_resource() {
+        let mut resource = Resource::with_provider(
+            "test",
+            "test.Widget",
+            ResourceIdentity::from("example"),
+            None,
+        );
+        resource.attributes.insert(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("widget".into())),
+        );
+        resource.directives.force_delete = true;
+        resource.module_source = Some(ModuleSource::Root);
+        let provider_resource = ProviderResource::from(resource.clone());
+        let directives =
+            ProviderDirectives::resolve(&resource.directives, ProviderDirectiveSchema::Unavailable);
+
+        let provider_wire = try_resource_to_protocol(&provider_resource, &directives)
+            .expect("provider resource must encode");
+        let live_wire =
+            try_resource_to_protocol(&resource, &directives).expect("live resource must encode");
+
+        assert_eq!(
+            serde_json::to_value(provider_wire).expect("provider protocol resource must serialize"),
+            serde_json::to_value(live_wire).expect("live protocol resource must serialize")
+        );
+    }
+
+    #[test]
+    fn schema_default_prevent_destroy_is_true_in_provider_protocol_resources() {
+        let schema = ResourceSchema::new("test.Widget").default_prevent_destroy();
+        let resource: Resource = Resource::with_provider(
+            "test",
+            "test.Widget",
+            ResourceIdentity::from("example"),
+            None,
+        );
+        let directives = ProviderDirectives::resolve(
+            &resource.directives,
+            ProviderDirectiveSchema::Available(&schema),
+        );
+
+        let wire = try_resource_to_protocol(&resource, &directives)
+            .expect("schema-resolved resource must encode");
+
+        assert!(wire.directives.prevent_destroy);
+    }
+
+    #[test]
+    fn protocol_effective_false_does_not_become_an_authored_opt_out() {
+        let wire = protocol::Resource {
+            id: protocol::ResourceId {
+                provider: "test".to_string(),
+                resource_type: "test.Widget".to_string(),
+                identity: "example".to_string(),
+            },
+            attributes: BTreeMap::new(),
+            directives: protocol::Directives {
+                force_delete: false,
+                create_before_destroy: false,
+                prevent_destroy: false,
+            },
+        };
+
+        let decoded = protocol_to_resource(&wire).expect("provider resource must decode");
+
+        assert_eq!(
+            decoded.value().directives.prevent_destroy_setting(),
+            PreventDestroy::Unspecified,
+        );
+        assert!(!decoded.directives().prevent_destroy());
+
+        let decoded = protocol_to_data_source(&wire).expect("provider data source must decode");
+        assert_eq!(
+            decoded.value().directives.prevent_destroy_setting(),
+            PreventDestroy::Unspecified,
+        );
+        let (_value, directives) = decoded.into_parts();
+        assert!(!directives.prevent_destroy());
+    }
+
+    #[test]
+    fn persisted_secret_uses_only_the_persisted_conversion_domain() {
+        let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
+        let hash =
+            RedactedSecretHash::from_encoded_digest(&digest).expect("fixture digest must be valid");
+        let value = crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            crate::resource::SnapshotLeaf::RedactedSecret { hash },
+        ));
+
+        let unavailable = value.to_value_at("state.password").unwrap_err();
+        assert_eq!(unavailable.path(), "state.password");
+
+        let encoded = try_core_to_protocol_persisted_value(&value)
+            .expect("persisted positions may carry a redacted secret");
+        assert_eq!(encoded, protocol::PersistedValue::RedactedSecret(digest));
+        assert_eq!(
+            protocol_to_core_persisted_value(&encoded).expect("persisted secret must decode"),
+            value
+        );
+    }
+
+    #[test]
+    fn ordinary_decode_preserves_string_list_but_schema_defaults_normalize_it() {
+        let wire = protocol::Value::StringList(vec!["one".to_string(), "two".to_string()]);
+
+        assert!(matches!(
+            protocol_to_core_value(&wire).unwrap(),
+            Value::Concrete(ConcreteValue::StringList(values)) if values.len() == 2
+        ));
+        assert!(matches!(
+            protocol_schema_default_to_core(&wire).unwrap(),
+            Value::Concrete(ConcreteValue::List(values)) if values.len() == 2
+        ));
+
+        let nested = protocol::Value::Map(BTreeMap::from([(
+            "items".into(),
+            protocol::Value::List(vec![protocol::Value::Float(crate::finite(-0.0))]),
+        )]));
+        let decoded = protocol_schema_default_to_core(&nested).unwrap();
+        assert_eq!(
+            decoded
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map_err(protocol_knowledge_error)
+                .and_then(require_known_for_protocol)
+                .and_then(|known| try_core_to_protocol_value(&known))
+                .unwrap(),
+            nested
+        );
+    }
+
+    #[test]
+    fn protocol_ordered_map_conversion_uses_canonical_key_order() {
+        for iteration in 0..200 {
+            let valid = protocol::Value::Map(BTreeMap::from([
+                ("z_last".to_string(), protocol::Value::Int(2)),
+                ("a_first".to_string(), protocol::Value::Int(1)),
+            ]));
+            let Value::Concrete(ConcreteValue::Map(decoded)) =
+                protocol_to_core_value(&valid).unwrap()
+            else {
+                panic!("expected a map")
+            };
+            assert_eq!(
+                decoded.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["a_first", "z_last"],
+                "iteration {iteration}"
+            );
+        }
+    }
+
+    fn assert_complete_value_path(error: ProtocolConvertError) {
+        assert_eq!(
+            error.value_path(),
+            vec![
+                WirePathSegment::Key("root".into()),
+                WirePathSegment::Index(0),
+                WirePathSegment::Key("leaf".into()),
+            ]
+        );
+        assert!(matches!(
+            error.leaf_error(),
+            ProtocolConvertError::DurationOutOfRange
+        ));
+        let mut messages = Vec::new();
+        let mut current: Option<&dyn std::error::Error> = Some(&error);
+        while let Some(error) = current {
+            messages.push(error.to_string());
+            current = error.source();
+        }
+        assert_eq!(
+            messages,
+            [
+                "map key `root`",
+                "list index 0",
+                "map key `leaf`",
+                "duration in seconds does not fit the provider protocol integer domain",
+            ]
+        );
+    }
+
+    #[test]
+    fn ordinary_value_converters_keep_complete_structured_paths() {
+        let core: HashMap<String, Value> = HashMap::from([(
+            "root".into(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([(
+                    "leaf".into(),
+                    Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                        u64::MAX,
+                    ))),
+                )])),
+            )])),
+        )]);
+        assert_complete_value_path(
+            try_core_to_protocol_value_map(
+                &(core)
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key.clone(),
+                            value
+                                .knowledge(
+                                    &crate::resource::knowledge::KnowledgeContext::validation(),
+                                )
+                                .map(|proof| proof.into_classification())
+                                .unwrap()
+                                .into_known()
+                                .unwrap(),
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap_err(),
+        );
+        assert_complete_value_path(
+            (Value::Concrete(ConcreteValue::Map(core.into_iter().collect())))
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map_err(protocol_knowledge_error)
+                .and_then(require_known_for_protocol)
+                .and_then(|known| try_core_to_protocol_value(&known))
+                .unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn persisted_value_converters_keep_complete_structured_paths() {
+        let core: BTreeMap<String, SnapshotValue> = std::collections::BTreeMap::from([(
+            "root".into(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([(
+                    "leaf".into(),
+                    Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                        u64::MAX,
+                    ))),
+                )])),
+            )])),
+        )]);
+        assert_complete_value_path(try_core_to_protocol_persisted_value_map(&core).unwrap_err());
+        assert_complete_value_path(
+            try_core_to_protocol_persisted_value(&Value::Concrete(ConcreteValue::Map(
+                core.into_iter().collect(),
+            )))
+            .unwrap_err(),
+        );
+        let wire = BTreeMap::from([(
+            "root".into(),
+            protocol::PersistedValue::List(vec![protocol::PersistedValue::Map(BTreeMap::from([
+                (
+                    "leaf".into(),
+                    protocol::PersistedValue::RedactedSecret("invalid-digest".into()),
+                ),
+            ]))]),
+        )]);
+        for error in [
+            protocol_to_core_persisted_value_map(&wire).unwrap_err(),
+            protocol_to_core_persisted_value(&protocol::PersistedValue::Map(wire)).unwrap_err(),
+        ] {
+            assert_eq!(
+                error.value_path(),
+                vec![
+                    WirePathSegment::Key("root".into()),
+                    WirePathSegment::Index(0),
+                    WirePathSegment::Key("leaf".into())
+                ]
+            );
+            assert!(matches!(
+                error.leaf_error(),
+                ProtocolConvertError::InvalidRedactedSecretDigest
+            ));
+            assert!(std::error::Error::source(&error).is_some());
+        }
+    }
+
+    #[test]
+    fn schema_default_projection_rejects_non_wire_values() {
+        assert!(matches!(
+            (Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                u64::MAX
+            ),)))
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .map_err(protocol_knowledge_error)
+            .and_then(require_known_for_protocol)
+            .and_then(|known| try_core_to_protocol_value(&known)),
+            Err(ProtocolConvertError::DurationOutOfRange)
+        ));
+
+        let resolved_function: std::sync::Arc<
+            crate::parser::UserFunction<crate::resource::AbsoluteBindingAddress>,
+        > = std::sync::Arc::new(crate::parser::UserFunction {
+            type_annotations: Vec::new(),
+            name: "fixture".to_string(),
+            params: Vec::new(),
+            return_type: None,
+            return_type_span: None,
+            annotation_source_file: None,
+            local_lets: Vec::new(),
+            body: crate::parser::UserFunctionBody {
+                location: crate::parser::ModuleCallId::test_dummy_in("test.crn")
+                    .declaration_location()
+                    .clone(),
+                value: Value::Concrete(ConcreteValue::Int(1)),
+                source_line: 0,
+                source_file: None,
+            },
+        });
+        let access = crate::resource::apply_postfix_access(
+            Value::Deferred(DeferredValue::Unknown(
+                crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                    binding: absolute_binding("upstream"),
+                },
+            )),
+            crate::resource::PathSegment::Field {
+                name: "field".to_string(),
+            },
+            0,
+            crate::resource::AccessMissPolicy::Defer,
+        )
+        .expect("unknown field access must remain deferred");
+        let non_wire = [
+            Value::Concrete(ConcreteValue::enum_identifier("test.Mode.enabled")),
+            crate::resource::AuthoredValue::resource_ref("source", "value", Vec::new())
+                .resolve_root(&crate::resource::RootScope::new())
+                .into_expanded()
+                .expect("protocol fixture contains no parser placeholder"),
+            Value::Deferred(DeferredValue::BindingRef {
+                binding: absolute_binding("source"),
+            }),
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(Value::Deferred(DeferredValue::Unknown(
+                    crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                        binding: absolute_binding("upstream"),
+                    },
+                ))),
+                default: Box::new(Value::Concrete(ConcreteValue::Int(1))),
+            }),
+            Value::Deferred(DeferredValue::Interpolation(Vec::new())),
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: crate::builtins::BuiltinFunction::upper,
+                args: Vec::new(),
+                source_line: (0).into(),
+            }),
+            Value::Deferred(DeferredValue::Unavailable {
+                name: crate::builtins::BuiltinFunction::upper,
+                args: Vec::new(),
+                reason: crate::resource::UnavailableReason::from_builtin_error(
+                    "fixture failure".to_string(),
+                ),
+                source_line: (0).into(),
+            }),
+            Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                function: resolved_function,
+                functions: std::sync::Arc::new(indexmap::IndexMap::new()),
+                args: Vec::new(),
+                source_line: (0).into(),
+            }),
+            access,
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("secret".into()))).into(),
+            )),
+            Value::Deferred(DeferredValue::Unknown(
+                crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                    binding: absolute_binding("upstream"),
+                },
+            )),
+        ];
+
+        for value in non_wire {
+            assert!(matches!(
+                value
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(protocol_knowledge_error)
+                    .and_then(require_known_for_protocol)
+                    .and_then(|known| try_core_to_protocol_value(&known)),
+                Err(ProtocolConvertError::NonWireValue { variant: _variant })
+            ));
+        }
+    }
+
+    #[test]
+    fn closed_enum_rejects_wire_loss_for_transform_and_non_string_base() {
+        let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
+        let with_transform = AttributeType::enum_(
+            identity.clone(),
+            Some(vec!["api-value".to_string()]),
+            Vec::new(),
+            None,
+            Some(crate::schema::DslTransform::HyphenToUnderscore),
+        );
+        assert!(matches!(
+            attribute_type_to_protocol(&with_transform),
+            Err(ProtocolConvertError::ClosedEnumWithTransform { identity: actual })
+                if actual == identity
+        ));
+
+        let with_int_base = AttributeType::enum_with_base(
+            identity.clone(),
+            AttributeType::int(),
+            Some(vec!["1".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        );
+        assert!(matches!(
+            attribute_type_to_protocol(&with_int_base),
+            Err(ProtocolConvertError::ClosedEnumUnsupportedBase {
+                identity: actual,
+                base_kind,
+            }) if actual == identity && base_kind == "Int"
+        ));
+    }
+
+    #[test]
+    fn protocol_enums_never_inherit_a_scalar_builtin_validator() {
+        let wire = protocol::AttributeType::StringEnum {
+            values: vec!["1".to_string()],
+            name: "PositiveInt".to_string(),
+            namespace: None,
+            dsl_aliases: Vec::new(),
+        };
+        let decoded = protocol_to_attribute_type(&wire).expect("enum must decode");
+        let RawShape::Enum { validate, .. } = decoded.raw_shape() else {
+            panic!("StringEnum must decode as a core enum")
+        };
+        assert!(
+            validate.is_none(),
+            "an Int builtin identity must not attach its callback to an enum"
+        );
+    }
+
+    #[test]
+    fn contextual_errors_display_only_their_context_and_expose_the_source() {
+        let error = ProtocolConvertError::DurationOutOfRange.context("list index 0");
+        assert_eq!(error.to_string(), "list index 0");
+        assert_eq!(
+            std::error::Error::source(&error)
+                .expect("context must expose its source")
+                .to_string(),
+            "duration in seconds does not fit the provider protocol integer domain"
+        );
+
+        let decode = SchemaDecodeError::from_default(error);
+        assert_eq!(decode.to_string(), "schema default value conversion error");
+        assert!(std::error::Error::source(&decode).is_some());
+    }
+
+    #[test]
+    fn schema_validation_issue_is_rendered_once_across_the_error_chain() {
+        fn chain(error: &SchemaDecodeError) -> String {
+            let mut rendered = vec![error.to_string()];
+            let mut source = std::error::Error::source(error);
+            while let Some(current) = source {
+                rendered.push(current.to_string());
+                source = current.source();
+            }
+            rendered.join(" -> ")
+        }
+
+        let config_validation = ValidatedConfigSchema::validate(BTreeMap::from([(
+            "value".to_string(),
+            PatternAttributeType::ref_("Missing"),
+        )]))
+        .expect_err("the fixture must fail schema validation");
+        let config = SchemaDecodeError::config_schema_validation(config_validation);
+        let resource_validation = PatternResourceSchema::new("test.Widget")
+            .attribute(
+                PatternAttributeSchema::optional("value", PatternAttributeType::ref_("Missing"))
+                    .build(),
+            )
+            .validate()
+            .expect_err("the resource fixture must fail schema validation");
+        let resource =
+            SchemaDecodeError::resource_schema_validation("test.Widget", resource_validation);
+
+        for error in [&config, &resource] {
+            let rendered = chain(error);
+            assert_eq!(
+                rendered.matches("Missing").count(),
+                1,
+                "the issue belongs to the source, not both context and source: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn validated_schema_round_trips_through_real_json_projection() {
+        let schema = PatternResourceSchema::new("test.Widget")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "aliases",
+                    PatternAttributeType::list(PatternAttributeType::string()),
+                )
+                .with_default(Value::Concrete(ConcreteValue::StringList(vec![
+                    "one".into(),
+                    "two".into(),
+                ])))
+                .with_completions(vec![CompletionValue::new("one", "first alias")])
+                .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "tags",
+                    PatternAttributeType::map(PatternAttributeType::string()),
+                )
+                .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "settings",
+                    PatternAttributeType::list(PatternAttributeType::struct_(
+                        "Setting",
+                        vec![
+                            PatternStructField::required("key", PatternAttributeType::string())
+                                .build(),
+                            PatternStructField::required("value", PatternAttributeType::string())
+                                .build(),
+                        ],
+                    )),
+                )
+                .keyed_partial_update("key")
+                .build(),
+            )
+            .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
+            .default_prevent_destroy()
+            .with_default_wait_timeout(std::time::Duration::from_secs(30))
+            .with_default_wait_interval(std::time::Duration::from_secs(2))
+            .validate()
+            .expect("portable fixture schema must validate");
+
+        let invalid_tags = HashMap::from([(
+            "tags".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "key".to_string(),
+                    Value::Concrete(ConcreteValue::String("Name".into())),
+                ),
+                (
+                    "value".to_string(),
+                    Value::Concrete(ConcreteValue::String("widget".into())),
+                ),
+            ]))),
+        )]);
+        assert!(
+            schema.validate(&invalid_tags).is_err(),
+            "declared tags validation must execute after direct core construction"
+        );
+
+        let wire = resource_schema_to_protocol(&schema).expect("schema must encode");
+        assert!(wire.default_prevent_destroy);
+        let json = serde_json::to_string(&wire).expect("protocol schema must serialize");
+        let decoded_wire: protocol::ResourceSchema =
+            serde_json::from_str(&json).expect("protocol schema JSON must decode");
+        let decoded = protocol_to_resource_schema(&decoded_wire)
+            .expect("JSON-decoded schema must regain a validation witness");
+        assert!(decoded.parts().default_prevent_destroy);
+
+        let aliases = decoded
+            .parts()
+            .attributes
+            .get("aliases")
+            .expect("aliases attribute");
+        assert!(matches!(
+            aliases.default_value(),
+            Some(Value::Concrete(ConcreteValue::List(values))) if values.len() == 2
+        ));
+        assert!(aliases.completions().is_none());
+        assert_eq!(decoded.parts().default_wait_timeout, None);
+        assert_eq!(decoded.parts().default_wait_interval, None);
+        assert!(matches!(
+            decoded.parts().validation,
+            ResourceValidation::Declared(validators)
+                if validators == &[ValidatorType::TagsKeyValueCheck]
+        ));
+        assert_eq!(
+            decoded
+                .effective_attribute("settings")
+                .expect("settings attribute")
+                .keyed_partial_update()
+                .expect("keyed partial-update metadata")
+                .key_field()
+                .as_str(),
+            "key"
+        );
+
+        assert!(
+            decoded.validate(&invalid_tags).is_err(),
+            "declared tags validation must execute after JSON decode"
+        );
+    }
+
+    #[test]
+    fn protocol_decode_rejects_invalid_keyed_partial_update_through_schema_validation() {
+        let schema = PatternResourceSchema::new("test.Settings")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "settings",
+                    PatternAttributeType::list(PatternAttributeType::struct_(
+                        "Setting",
+                        vec![
+                            PatternStructField::required("key", PatternAttributeType::string())
+                                .build(),
+                        ],
+                    )),
+                )
+                .keyed_partial_update("key")
+                .build(),
+            )
+            .validate()
+            .expect("fixture schema validates");
+        let mut wire = resource_schema_to_protocol(&schema).expect("schema encodes");
+        wire.attributes
+            .get_mut("settings")
+            .expect("settings wire attribute")
+            .keyed_partial_update = Some("missing".to_string());
+
+        let error = protocol_to_resource_schema(&wire)
+            .expect_err("wire key must be checked by whole-schema validation");
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<ResourceSchemaValidationError>())
+            .expect("typed resource-schema validation error remains in the source chain");
+        assert!(source.issues().any(|(path, message)| {
+            path == "settings"
+                && message
+                    == "keyed partial-update key `missing` is not a field of list element struct `Setting`"
+        }));
+    }
+
+    #[test]
+    fn field_groups_round_trip_at_resource_and_struct_scope() {
+        let nested_group = FieldGroup::at_least_one(["left", "right"]).unwrap();
+        let top_group = FieldGroup::at_most_one(["first", "second"]).unwrap();
+        let schema = PatternResourceSchema::new("test.Groups")
+            .attribute(
+                PatternAttributeSchema::optional("first", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("second", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "nested",
+                    PatternAttributeType::struct_with_field_groups(
+                        "Nested",
+                        vec![
+                            PatternStructField::optional("left", PatternAttributeType::string())
+                                .build(),
+                            PatternStructField::optional("right", PatternAttributeType::string())
+                                .build(),
+                        ],
+                        vec![nested_group.clone()],
+                    ),
+                )
+                .build(),
+            )
+            .field_group(top_group.clone())
+            .validate()
+            .unwrap();
+
+        let wire = resource_schema_to_protocol(&schema).unwrap();
+        assert_eq!(wire.field_groups.len(), 1);
+        let protocol::AttributeType::Struct { field_groups, .. } =
+            &wire.attributes["nested"].attr_type
+        else {
+            panic!("nested attribute must remain a struct");
+        };
+        assert_eq!(field_groups.len(), 1);
+
+        let json = serde_json::to_string(&wire).unwrap();
+        let decoded_wire = serde_json::from_str(&json).unwrap();
+        let decoded = protocol_to_resource_schema(&decoded_wire).unwrap();
+        assert_eq!(decoded.parts().field_groups, &[top_group]);
+        let RawShape::Struct { field_groups, .. } =
+            decoded.parts().attributes["nested"].attr_type().raw_shape()
+        else {
+            panic!("decoded nested attribute must remain a struct");
+        };
+        assert_eq!(field_groups, &[nested_group]);
+    }
+
+    #[test]
+    fn protocol_decode_rejects_field_groups_with_fewer_than_two_fields() {
+        let schema = PatternResourceSchema::new("test.Groups")
+            .attribute(
+                PatternAttributeSchema::optional("only", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap();
+        let mut wire = resource_schema_to_protocol(&schema).unwrap();
+        for fields in [vec![], vec!["only".to_string()]] {
+            wire.field_groups = vec![protocol::FieldGroup {
+                kind: protocol::FieldGroupKind::ExactlyOne,
+                fields,
+            }];
+            let error = protocol_to_resource_schema(&wire)
+                .expect_err("invalid wire group must fail schema admission");
+            let source = std::error::Error::source(&error)
+                .expect("field-group construction error must be retained")
+                .to_string();
+            assert!(source.contains("at least two fields"), "{source}");
+        }
+
+        let mut wire = resource_schema_to_protocol(&schema).unwrap();
+        wire.attributes.get_mut("only").unwrap().attr_type = protocol::AttributeType::Struct {
+            input_rules: Vec::new(),
+            name: "Nested".to_string(),
+            fields: vec![protocol::StructField {
+                name: "nested_only".to_string(),
+                field_type: protocol::AttributeType::String {
+                    identity_layer: protocol::StringIdentityLayer {
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                        identity: None,
+                    },
+                    member_layer: Default::default(),
+                },
+                required: false,
+                description: None,
+                block_name: None,
+                provider_name: None,
+                read_only: false,
+                write_only: false,
+                create_only: false,
+                identity: protocol::IdentityMode::None,
+                deferred_populate: false,
+            }],
+            field_groups: vec![protocol::FieldGroup {
+                kind: protocol::FieldGroupKind::AtLeastOne,
+                fields: vec!["nested_only".to_string()],
+            }],
+        };
+        let error = protocol_to_resource_schema(&wire)
+            .expect_err("invalid nested wire group must fail schema admission");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("attribute 'only.field_groups[0]'"),
+            "{rendered}"
+        );
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .to_string()
+                .contains("at least two fields")
+        );
+    }
+
+    #[test]
+    fn identity_modes_round_trip_for_attributes_and_struct_fields() {
+        let required_field = StructField::required("budget_name", AttributeType::string())
+            .create_only()
+            .identity()
+            .build();
+
+        let wire = struct_field_to_protocol(&required_field).unwrap();
+        assert!(wire.create_only);
+        assert_eq!(wire.identity, protocol::IdentityMode::Required);
+
+        let decoded = protocol_to_struct_field(&wire).unwrap();
+        let parts = decoded.parts();
+        assert!(parts.create_only);
+        assert_eq!(parts.identity_mode, IdentityMode::Required);
+
+        let when_present_field = StructField::optional("description", AttributeType::string())
+            .create_only()
+            .identity_when_present()
+            .build();
+        let wire = struct_field_to_protocol(&when_present_field).unwrap();
+        assert_eq!(wire.identity, protocol::IdentityMode::WhenPresent);
+        assert_eq!(
+            protocol_to_struct_field(&wire)
+                .unwrap()
+                .parts()
+                .identity_mode,
+            IdentityMode::WhenPresent,
+        );
+
+        let required_attribute = AttributeSchema::required("name", AttributeType::string())
+            .create_only()
+            .identity()
+            .build();
+        let wire = attribute_schema_to_protocol(&required_attribute).unwrap();
+        assert_eq!(wire.identity, protocol::IdentityMode::Required);
+        assert_eq!(
+            protocol_to_attribute_schema(&wire)
+                .unwrap()
+                .parts()
+                .identity_mode,
+            IdentityMode::Required,
+        );
+
+        let when_present_attribute =
+            AttributeSchema::optional("description", AttributeType::string())
+                .create_only()
+                .identity_when_present()
+                .build();
+        let wire = attribute_schema_to_protocol(&when_present_attribute).unwrap();
+        assert_eq!(wire.identity, protocol::IdentityMode::WhenPresent);
+        assert_eq!(
+            protocol_to_attribute_schema(&wire)
+                .unwrap()
+                .parts()
+                .identity_mode,
+            IdentityMode::WhenPresent,
+        );
+    }
+
+    #[test]
+    fn protocol_decode_rejects_nested_identity_without_create_only() {
+        let wire = protocol::StructField {
+            name: "budget_name".to_string(),
+            field_type: protocol::AttributeType::String {
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: None,
+                },
+                member_layer: Default::default(),
+            },
+            required: false,
+            description: None,
+            block_name: None,
+            provider_name: None,
+            read_only: false,
+            write_only: false,
+            create_only: false,
+            identity: protocol::IdentityMode::Required,
+            deferred_populate: false,
+        };
+
+        let error = protocol_to_struct_field(&wire)
+            .expect_err("identity must be decoded through a create-only builder");
+        assert!(matches!(error, SchemaDecodeError::InvalidSchema { .. }));
+        assert_eq!(
+            error.to_string(),
+            "attribute 'budget_name': identity requires create_only"
+        );
+    }
+
+    #[test]
+    fn protocol_decode_rejects_when_present_identity_without_optional_create_only_input() {
+        let mut attribute = attribute_schema_to_protocol(
+            &AttributeSchema::optional("name", AttributeType::string())
+                .create_only()
+                .identity_when_present()
+                .build(),
+        )
+        .unwrap();
+        attribute.create_only = false;
+        let error = protocol_to_attribute_schema(&attribute)
+            .expect_err("when-present identity must require create_only");
+        assert_eq!(
+            error.to_string(),
+            "attribute 'name': identity requires create_only"
+        );
+
+        let mut required_attribute = attribute_schema_to_protocol(
+            &AttributeSchema::required("name", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .unwrap();
+        required_attribute.identity = protocol::IdentityMode::WhenPresent;
+        let error = protocol_to_attribute_schema(&required_attribute)
+            .expect_err("when-present identity must reject required input");
+        assert!(matches!(&error, SchemaDecodeError::InvalidSchema { .. }));
+        assert_eq!(
+            error.to_string(),
+            "attribute 'name': when-present identity requires optional input"
+        );
+
+        let mut required_field = struct_field_to_protocol(
+            &StructField::required("name", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .unwrap();
+        required_field.identity = protocol::IdentityMode::WhenPresent;
+        let error = protocol_to_struct_field(&required_field)
+            .expect_err("nested when-present identity must reject required input");
+        assert!(matches!(&error, SchemaDecodeError::InvalidSchema { .. }));
+        assert_eq!(
+            error.to_string(),
+            "attribute 'name': when-present identity requires optional input"
+        );
+    }
+
+    #[test]
+    fn protocol_decode_rejects_non_scalar_identity_leaves_directly() {
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional("names", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut wire = resource_schema_to_protocol(&schema).unwrap();
+        let attribute = wire.attributes.get_mut("names").unwrap();
+        attribute.attr_type = protocol::AttributeType::List {
+            elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
+            element_type: Box::new(protocol::AttributeType::String {
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: None,
+                },
+                member_layer: Default::default(),
+            }),
+            ordered: true,
+            length: None,
+            validate: None,
+        };
+
+        let attribute_error = protocol_to_attribute_schema(attribute)
+            .expect_err("protocol attribute identity must be scalar or enum");
+        assert!(matches!(
+            &attribute_error,
+            SchemaDecodeError::InvalidSchema { .. }
+        ));
+        assert_eq!(
+            attribute_error.to_string(),
+            "attribute 'names': identity value must have a scalar or enum type"
+        );
+
+        let field = StructField::optional("names", AttributeType::string())
+            .create_only()
+            .identity()
+            .build();
+        let field_schema = ResourceSchema::new("test.Field")
+            .attribute(
+                AttributeSchema::optional("config", AttributeType::struct_("Config", vec![field]))
+                    .build(),
+            )
+            .validate()
+            .unwrap();
+        let RawShape::Struct { fields, .. } = field_schema
+            .effective_attribute("config")
+            .unwrap()
+            .value_type()
+            .as_type()
+            .raw_shape()
+        else {
+            panic!("field fixture must be a struct")
+        };
+        let mut wire = struct_field_to_protocol(&fields[0]).unwrap();
+        wire.field_type = protocol::AttributeType::List {
+            elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
+            element_type: Box::new(protocol::AttributeType::String {
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: None,
+                },
+                member_layer: Default::default(),
+            }),
+            ordered: true,
+            length: None,
+            validate: None,
+        };
+
+        let field_error = protocol_to_struct_field(&wire)
+            .expect_err("protocol struct-field identity must be scalar or enum");
+        assert!(matches!(
+            &field_error,
+            SchemaDecodeError::InvalidSchema { .. }
+        ));
+        assert_eq!(
+            field_error.to_string(),
+            "attribute 'names': identity value must have a scalar or enum type"
+        );
+    }
+
+    #[test]
+    fn protocol_decode_rejects_create_only_below_union_members() {
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(AttributeSchema::optional("config", AttributeType::string()).build())
+            .validate()
+            .unwrap();
+        let mut wire = resource_schema_to_protocol(&schema).unwrap();
+        wire.attributes.get_mut("config").unwrap().attr_type = protocol::AttributeType::Union {
+            members: vec![protocol::AttributeType::Struct {
+                input_rules: Vec::new(),
+                name: "Config".to_string(),
+                fields: vec![protocol::StructField {
+                    name: "immutable".to_string(),
+                    field_type: protocol::AttributeType::String {
+                        identity_layer: protocol::StringIdentityLayer {
+                            pattern: None,
+                            length: None,
+                            validate: None,
+                            to_dsl: None,
+                            identity: None,
+                        },
+                        member_layer: Default::default(),
+                    },
+                    required: false,
+                    description: None,
+                    block_name: None,
+                    provider_name: None,
+                    read_only: false,
+                    write_only: false,
+                    create_only: true,
+                    identity: protocol::IdentityMode::None,
+                    deferred_populate: false,
+                }],
+                field_groups: vec![],
+            }],
+        };
+
+        let error = protocol_to_resource_schema(&wire)
+            .expect_err("create-only fields below a union must fail wire admission");
+        assert!(matches!(
+            &error,
+            SchemaDecodeError::InvalidSchema {
+                schema_issue_location: Some(_),
+                source: Some(_),
+                ..
+            }
+        ));
+        let source = std::error::Error::source(&error)
+            .expect("schema admission error must retain its typed source")
+            .to_string();
+        assert!(
+            source.contains("union members cannot be create-only-bearing"),
+            "{error}; source: {source}"
+        );
+    }
+
+    #[test]
+    fn protocol_decode_rejects_identity_inside_list_map_and_union_elements() {
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        let identity_struct = || protocol::AttributeType::Struct {
+            input_rules: Vec::new(),
+            name: "Element".to_string(),
+            fields: vec![protocol::StructField {
+                name: "key".to_string(),
+                field_type: protocol::AttributeType::String {
+                    identity_layer: protocol::StringIdentityLayer {
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                        identity: None,
+                    },
+                    member_layer: Default::default(),
+                },
+                required: true,
+                description: None,
+                block_name: None,
+                provider_name: None,
+                read_only: false,
+                write_only: false,
+                create_only: true,
+                identity: protocol::IdentityMode::Required,
+                deferred_populate: false,
+            }],
+            field_groups: vec![],
+        };
+        let cases = [
+            (
+                "list",
+                protocol::AttributeType::List {
+                    elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
+                    element_type: Box::new(identity_struct()),
+                    ordered: true,
+                    length: None,
+                    validate: None,
+                },
+            ),
+            (
+                "map",
+                protocol::AttributeType::Map {
+                    length: None,
+                    inner: Box::new(identity_struct()),
+                    key: Box::new(protocol::AttributeType::String {
+                        identity_layer: protocol::StringIdentityLayer {
+                            pattern: None,
+                            length: None,
+                            validate: None,
+                            to_dsl: None,
+                            identity: None,
+                        },
+                        member_layer: Default::default(),
+                    }),
+                },
+            ),
+            (
+                "union",
+                protocol::AttributeType::Union {
+                    members: vec![identity_struct()],
+                },
+            ),
+        ];
+
+        for (shape, attr_type) in cases {
+            let schema = ResourceSchema::new(format!("test.Invalid{shape}"))
+                .attribute(AttributeSchema::required("container", AttributeType::string()).build())
+                .validate()
+                .unwrap();
+            let mut wire = resource_schema_to_protocol(&schema).unwrap();
+            wire.attributes.get_mut("container").unwrap().attr_type = attr_type;
+
+            let error = protocol_to_resource_schema(&wire)
+                .expect_err("non-singular identity path must fail wire admission");
+            assert!(matches!(
+                &error,
+                SchemaDecodeError::InvalidSchema {
+                    schema_issue_location: Some(_),
+                    source: Some(_),
+                    ..
+                }
+            ));
+            let source = std::error::Error::source(&error)
+                .expect("schema admission error must retain its typed source")
+                .to_string();
+            assert!(
+                source.contains("identity cannot be declared inside a list, map, or union element"),
+                "{shape}: {error}; source: {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn json_decode_reconstructs_every_registered_builtin_validator() {
+        let positive_int = TypeIdentity::bare("PositiveInt");
+        #[allow(clippy::iter_over_hash_type)]
+        // commutative: validator round-trip assertions are independent per identity
+        for (kind, identity) in crate::schema::builtin_validator_registry().keys() {
+            let wire = match kind {
+                crate::schema::RefinedScalarKind::String => protocol::AttributeType::String {
+                    identity_layer: protocol::StringIdentityLayer {
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                        identity: Some(identity.to_string()),
+                    },
+                    member_layer: Default::default(),
+                },
+                crate::schema::RefinedScalarKind::Int => protocol::AttributeType::Int {
+                    identity_layer: protocol::IntIdentityLayer {
+                        range: None,
+                        identity: Some(identity.to_string()),
+                    },
+                    member_layer: Default::default(),
+                },
+                crate::schema::RefinedScalarKind::Float => protocol::AttributeType::Float {
+                    range: None,
+                    identity: Some(identity.to_string()),
+                },
+            };
+            let json = serde_json::to_string(&wire).unwrap();
+            let decoded_wire: protocol::AttributeType = serde_json::from_str(&json).unwrap();
+            let decoded = protocol_to_attribute_type(&decoded_wire).unwrap();
+            let (decoded_identity, has_callback) = match decoded.raw_shape() {
+                RawShape::UnloadedSchemaType(_) => {
+                    panic!("builtin wire type must have a loaded declaration")
+                }
+                RawShape::Reference {
+                    identity,
+                    pattern: _pattern,
+                    length: _length,
+                } => (Some(identity), false),
+                RawShape::String {
+                    identity_layer:
+                        crate::schema::StringIdentityParts {
+                            identity,
+                            pattern: _pattern,
+                            length: _length,
+                            validate,
+                            to_dsl: _to_dsl,
+                        },
+                    member_layer: _,
+                } => (identity, validate.is_some()),
+                RawShape::Int {
+                    identity_layer:
+                        crate::schema::IntIdentityParts {
+                            identity,
+                            range: _range,
+                            validate,
+                        },
+                    member_layer: _,
+                } => (identity, validate.is_some()),
+                RawShape::Float {
+                    identity,
+                    range: _range,
+                    validate,
+                } => (identity, validate.is_some()),
+                RawShape::Bool => panic!("unexpected Bool builtin wire shape for {identity}"),
+                RawShape::Duration => {
+                    panic!("unexpected Duration builtin wire shape for {identity}")
+                }
+                RawShape::Enum {
+                    identity: _enum_identity,
+                    base: _base,
+                    values: _values,
+                    dsl_aliases: _dsl_aliases,
+                    validate: _validate,
+                    to_dsl: _to_dsl,
+                } => panic!("unexpected Enum builtin wire shape for {identity}"),
+                RawShape::List {
+                    element_type: _element_type,
+                    ordered: _ordered,
+                    constraints: _constraints,
+                } => panic!("unexpected List builtin wire shape for {identity}"),
+                RawShape::Map {
+                    key: _key,
+                    value: _value,
+                    constraints: _constraints,
+                } => panic!("unexpected Map builtin wire shape for {identity}"),
+                RawShape::Struct {
+                    name: _name,
+                    fields: _fields,
+                    field_groups: _field_groups,
+                    input_rules: _input_rules,
+                } => panic!("unexpected Struct builtin wire shape for {identity}"),
+                RawShape::Union(_members) => {
+                    panic!("unexpected Union builtin wire shape for {identity}")
+                }
+                RawShape::Ref(_name) => {
+                    panic!("unexpected Ref builtin wire shape for {identity}")
+                }
+            };
+            assert_eq!(decoded_identity, Some(identity));
+            assert!(
+                has_callback,
+                "builtin callback was not restored for {identity}"
+            );
+        }
+
+        let wire_schema = protocol::ResourceSchema {
+            resource_type: "test.Counter".to_string(),
+            attributes: BTreeMap::from([(
+                "count".to_string(),
+                protocol::AttributeSchema {
+                    name: "count".to_string(),
+                    attr_type: protocol::AttributeType::Int {
+                        identity_layer: protocol::IntIdentityLayer {
+                            range: None,
+                            identity: Some(positive_int.to_string()),
+                        },
+                        member_layer: Default::default(),
+                    },
+                    required: false,
+                    keyed_partial_update: None,
+                    default: None,
+                    description: None,
+                    create_only: false,
+                    read_only: false,
+                    write_only: false,
+                    block_name: None,
+                    provider_name: None,
+                    removable: None,
+                    identity: protocol::IdentityMode::None,
+                    deferred_populate: false,
+                },
+            )]),
+            description: None,
+            kind: protocol::SchemaKind::Managed,
+            unique_name: protocol::UniqueNameSpec::Conflicting,
+            operation_config: None,
+            validators: Vec::new(),
+            field_groups: Vec::new(),
+            input_rules: Vec::new(),
+            default_prevent_destroy: false,
+            defs: Default::default(),
+        };
+        let json = serde_json::to_string(&wire_schema).unwrap();
+        let decoded_wire: protocol::ResourceSchema = serde_json::from_str(&json).unwrap();
+        let decoded = protocol_to_resource_schema(&decoded_wire).unwrap();
+        let attributes = |count| {
+            HashMap::from([(
+                "count".to_string(),
+                Value::Concrete(ConcreteValue::Int(count)),
+            )])
+        };
+        assert!(decoded.validate(&attributes(1)).is_ok());
+        assert!(decoded.validate(&attributes(0)).is_err());
+    }
+
+    #[test]
+    fn v16_json_decode_rejects_an_empty_custom_enum_namespace() {
+        let wire = protocol::AttributeType::CustomEnum {
+            name: "Mode".to_string(),
+            base: Box::new(protocol::AttributeType::String {
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: None,
+                },
+                member_layer: Default::default(),
+            }),
+            namespace: String::new(),
+            dsl_transform: None,
+        };
+        let json = serde_json::to_string(&wire).expect("v16 CustomEnum must serialize");
+        let decoded_wire: protocol::AttributeType =
+            serde_json::from_str(&json).expect("v16 CustomEnum JSON must decode");
+
+        let error = protocol_to_attribute_type(&decoded_wire)
+            .expect_err("an empty namespace cannot identify a provider custom enum");
+        let source = std::error::Error::source(&error).expect("typed decode cause");
+        assert!(matches!(
+            source.downcast_ref::<ProtocolConvertError>(),
+            Some(ProtocolConvertError::EmptyCustomEnumNamespace { name }) if name == "Mode"
+        ));
+        assert!(error.to_string().contains("namespace"), "{error}");
+    }
+
+    #[test]
+    fn legacy_custom_string_preserves_base_constraints() {
+        let wire = protocol::AttributeType::Custom {
+            name: "test.StringId".to_string(),
+            base: Box::new(protocol::AttributeType::String {
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: Some(protocol::PatternSpec::new(
+                        "^base-[a-z]+$".to_string(),
+                        protocol::PatternMatch::Full,
+                    )),
+                    length: Some((Some(5), Some(32))),
+                    validate: None,
+                    to_dsl: Some(protocol::DslTransform::HyphenToUnderscore),
+                    identity: None,
+                },
+                member_layer: Default::default(),
+            }),
+            pattern: None,
+            length: None,
+            validate: None,
+            to_dsl: None,
+        };
+
+        let decoded = protocol_to_attribute_type(&wire).expect("base metadata is representable");
+        assert!(matches!(
+            decoded.raw_shape(),
+            RawShape::String { identity_layer: crate::schema::StringIdentityParts {
+                identity: Some(identity),
+                pattern: Some(pattern),
+                length: Some((Some(5), Some(32))),
+                validate: None,
+                to_dsl: Some(protocol::DslTransform::HyphenToUnderscore),
+            }, member_layer: _ } if identity == &TypeIdentity::from_dotted("test.StringId")
+                && pattern == &crate::schema::PatternSpec::new("^base-[a-z]+$", crate::schema::PatternMatch::Full)
+        ));
+    }
+
+    #[test]
+    fn anonymous_legacy_custom_string_does_not_inherit_its_base_identity() {
+        let wire = protocol::AttributeType::Custom {
+            name: String::new(),
+            base: Box::new(protocol::AttributeType::String {
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: Some("base.Identity".to_string()),
+                },
+                member_layer: Default::default(),
+            }),
+            pattern: None,
+            length: None,
+            validate: None,
+            to_dsl: None,
+        };
+
+        let decoded = protocol_to_attribute_type(&wire)
+            .expect("an anonymous legacy Custom string remains representable");
+        assert!(matches!(
+            decoded.raw_shape(),
+            RawShape::String {
+                identity_layer: crate::schema::StringIdentityParts { identity: None, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn anonymous_legacy_custom_does_not_inherit_a_nested_custom_identity() {
+        let wire = protocol::AttributeType::Custom {
+            name: String::new(),
+            base: Box::new(protocol::AttributeType::Custom {
+                name: "nested.Identity".to_string(),
+                base: Box::new(protocol::AttributeType::String {
+                    identity_layer: protocol::StringIdentityLayer {
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                        identity: None,
+                    },
+                    member_layer: Default::default(),
+                }),
+                pattern: None,
+                length: None,
+                validate: None,
+                to_dsl: None,
+            }),
+            pattern: None,
+            length: None,
+            validate: None,
+            to_dsl: None,
+        };
+
+        let decoded = protocol_to_attribute_type(&wire)
+            .expect("a nested reusable Custom does not supply the outer identity");
+        assert!(matches!(
+            decoded.raw_shape(),
+            RawShape::String {
+                identity_layer: crate::schema::StringIdentityParts { identity: None, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn anonymous_legacy_custom_list_remains_a_refined_list() {
+        let wire = protocol::AttributeType::Custom {
+            name: String::new(),
+            base: Box::new(protocol::AttributeType::List {
+                elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
+                element_type: Box::new(protocol::AttributeType::String {
+                    identity_layer: protocol::StringIdentityLayer {
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                        identity: None,
+                    },
+                    member_layer: Default::default(),
+                }),
+                ordered: false,
+                length: Some((Some(2), Some(4))),
+                validate: None,
+            }),
+            pattern: None,
+            length: Some((Some(1), Some(5))),
+            validate: None,
+            to_dsl: None,
+        };
+
+        let decoded = protocol_to_attribute_type(&wire)
+            .expect("an anonymous legacy Custom list has no lost identity");
+        assert!(matches!(
+            decoded.raw_shape(),
+            RawShape::List {
+                ordered: false,
+                constraints,
+                element_type: _element_type,
+            } if constraints.length() == Some((Some(1), Some(5)))
+        ));
+    }
+
+    #[test]
+    fn legacy_custom_numeric_types_preserve_base_ranges() {
+        let int_wire = protocol::AttributeType::Custom {
+            name: "test.Port".to_string(),
+            base: Box::new(protocol::AttributeType::Int {
+                identity_layer: protocol::IntIdentityLayer {
+                    range: Some((Some(1), Some(65_535))),
+                    identity: None,
+                },
+                member_layer: Default::default(),
+            }),
+            pattern: None,
+            length: None,
+            validate: None,
+            to_dsl: None,
+        };
+        let float_wire = protocol::AttributeType::Custom {
+            name: "test.Ratio".to_string(),
+            base: Box::new(protocol::AttributeType::Float {
+                range: Some((Some(crate::finite(0.0)), Some(crate::finite(1.0)))),
+                identity: None,
+            }),
+            pattern: None,
+            length: None,
+            validate: None,
+            to_dsl: None,
+        };
+
+        let int_decoded =
+            protocol_to_attribute_type(&int_wire).expect("integer range is representable");
+        assert!(matches!(
+            int_decoded.raw_shape(),
+            RawShape::Int {
+                identity_layer: crate::schema::IntIdentityParts {
+                    range: Some((Some(1), Some(65_535))),
+                    ..
+                },
+                ..
+            }
+        ));
+        let float_decoded =
+            protocol_to_attribute_type(&float_wire).expect("float range is representable");
+        assert!(matches!(
+            float_decoded.raw_shape(),
+            RawShape::Float {
+                range: Some((Some(min), Some(max))),
+                ..
+            } if min.get() == 0.0 && max.get() == 1.0
+        ));
+    }
+
+    #[test]
+    fn named_legacy_custom_list_rejects_unrepresentable_identity_and_prefers_outer_constraint() {
+        let list_wire = protocol::AttributeType::Custom {
+            name: "test.IdentifiedList".to_string(),
+            base: Box::new(protocol::AttributeType::List {
+                elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
+                element_type: Box::new(protocol::AttributeType::String {
+                    identity_layer: protocol::StringIdentityLayer {
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                        identity: None,
+                    },
+                    member_layer: Default::default(),
+                }),
+                ordered: true,
+                length: None,
+                validate: None,
+            }),
+            pattern: None,
+            length: None,
+            validate: None,
+            to_dsl: None,
+        };
+        let duplicate_wire = protocol::AttributeType::Custom {
+            name: "test.ConflictingString".to_string(),
+            base: Box::new(protocol::AttributeType::String {
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: Some(protocol::PatternSpec::new(
+                        "^base$".to_string(),
+                        protocol::PatternMatch::Full,
+                    )),
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: None,
+                },
+                member_layer: Default::default(),
+            }),
+            pattern: Some(protocol::PatternSpec::new(
+                "^outer$".to_string(),
+                protocol::PatternMatch::Full,
+            )),
+            length: None,
+            validate: None,
+            to_dsl: None,
+        };
+
+        let list_error = protocol_to_attribute_type(&list_wire)
+            .expect_err("core has no identified-list representation");
+        assert!(matches!(
+            std::error::Error::source(&list_error)
+                .and_then(|source| source.downcast_ref::<ProtocolConvertError>()),
+            Some(ProtocolConvertError::LegacyCustomUnsupportedBase {
+                identity,
+                base_kind: "List",
+            }) if identity == "test.IdentifiedList"
+        ));
+        let decoded = protocol_to_attribute_type(&duplicate_wire)
+            .expect("v16 defines the enclosing Custom refinement as authoritative");
+        assert!(matches!(
+            decoded.raw_shape(),
+            RawShape::String { identity_layer: crate::schema::StringIdentityParts {
+                pattern: Some(pattern),
+                ..
+            }, .. } if pattern == &crate::schema::PatternSpec::new("^outer$", crate::schema::PatternMatch::Full)
+        ));
+    }
+
+    #[test]
+    fn update_patch_round_trip_preserves_order_and_kinds() {
+        let patch = UpdatePatch {
+            ops: vec![
+                PatchOp::Add {
+                    key: "first".to_string(),
+                    value: Value::Concrete(ConcreteValue::Int(1)),
+                },
+                PatchOp::Reassert {
+                    key: "secret".to_string(),
+                    value: Value::Concrete(ConcreteValue::String("value".into())),
+                },
+                PatchOp::Remove {
+                    key: "old".to_string(),
+                },
+            ],
+        };
+
+        let wire = try_update_patch_to_protocol(&patch).expect("patch must encode");
+        let decoded = protocol_update_patch_to_core(&wire).expect("patch must decode");
+        assert_eq!(decoded.ops, patch.ops);
+    }
+}
+
+#[cfg(test)]
+mod explicit_pattern_mode_tests {
+    use super::*;
+    use crate::schema::{PatternMatch, PatternReason, PatternSpec};
+
+    #[test]
+    fn round12_legacy_custom_rejects_nonempty_base_members() {
+        let pattern = protocol::PatternSpec::new("inner", protocol::PatternMatch::Full);
+        let bases = [
+            protocol::AttributeType::String {
+                identity_layer: protocol::StringIdentityLayer {
+                    identity: None,
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                },
+                member_layer: protocol::StringMemberConstraints {
+                    pattern: Some(pattern.clone()),
+                    length: None,
+                },
+            },
+            protocol::AttributeType::String {
+                identity_layer: protocol::StringIdentityLayer {
+                    identity: None,
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                },
+                member_layer: protocol::StringMemberConstraints {
+                    pattern: None,
+                    length: Some((Some(1), Some(8))),
+                },
+            },
+            protocol::AttributeType::Int {
+                identity_layer: protocol::IntIdentityLayer {
+                    identity: None,
+                    range: None,
+                },
+                member_layer: protocol::IntMemberConstraints {
+                    range: Some((Some(1), Some(8))),
+                },
+            },
+        ];
+        for base in bases {
+            let kind = if matches!(base, protocol::AttributeType::Int { .. }) {
+                "Int"
+            } else {
+                "String"
+            };
+            for outer_present in [false, true] {
+                for name in ["", "test.X"] {
+                    let wire = protocol::AttributeType::Custom {
+                        name: name.into(),
+                        base: Box::new(base.clone()),
+                        pattern: (outer_present && kind == "String").then(|| pattern.clone()),
+                        length: outer_present.then_some((Some(1), Some(32))),
+                        validate: None,
+                        to_dsl: None,
+                    };
+                    let error = protocol_to_attribute_type(&wire)
+                        .expect_err("legacy Custom cannot carry member metadata through its base");
+                    assert!(
+                        matches!(std::error::Error::source(&error).and_then(|cause| cause.downcast_ref::<ProtocolConvertError>()), Some(ProtocolConvertError::LegacyCustomUnsupportedMetadata { field: "member_layer", base_kind, .. }) if *base_kind == kind),
+                        "{error:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_custom_precedence_selects_the_entire_pattern_spec() {
+        let inner = protocol::PatternSpec::new(
+            "abc",
+            protocol::PatternMatch::Substring {
+                reason: protocol::PatternReason::new("Inner contract permits a substring").unwrap(),
+            },
+        );
+        let outer = protocol::PatternSpec::new("abc", protocol::PatternMatch::Full);
+        let base = protocol::AttributeType::String {
+            identity_layer: protocol::StringIdentityLayer {
+                pattern: Some(inner.clone()),
+                length: None,
+                validate: None,
+                to_dsl: None,
+                identity: None,
+            },
+            member_layer: Default::default(),
+        };
+        for (outer_pattern, expected) in [
+            (Some(outer), PatternSpec::new("abc", PatternMatch::Full)),
+            (
+                None,
+                PatternSpec::new(
+                    "abc",
+                    PatternMatch::Substring {
+                        reason: PatternReason::new("Inner contract permits a substring").unwrap(),
+                    },
+                ),
+            ),
+        ] {
+            let wire = protocol::AttributeType::Custom {
+                name: "test.Pattern".into(),
+                base: Box::new(base.clone()),
+                pattern: outer_pattern,
+                length: None,
+                validate: None,
+                to_dsl: None,
+            };
+            let decoded = protocol_to_attribute_type(&wire).unwrap();
+            let RawShape::String {
+                identity_layer:
+                    crate::schema::StringIdentityParts {
+                        identity: _identity,
+                        pattern,
+                        length: _length,
+                        validate: _validate,
+                        to_dsl: _to_dsl,
+                    },
+                member_layer: _,
+            } = decoded.raw_shape()
+            else {
+                panic!("String refinement");
+            };
+            assert_eq!(pattern, Some(&expected));
+        }
+    }
+}

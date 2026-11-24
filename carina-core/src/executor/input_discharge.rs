@@ -1,4 +1,5 @@
 //! Linear preparation of exact provider requests and replacement delete permits.
+use std::collections::BTreeSet;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -12,7 +13,8 @@ use crate::{
     effect::{DeletedInstanceKey, Effect, EffectGeneration},
     input_rules::{PendingInputObligation, executor_write_site},
     provider::{
-        AppliedIdentifier, CreateRequest, HostProvider, ProviderReadyResource, UpdateRequest,
+        AppliedIdentifier, CreateRequest, HostProvider, ProviderReadyResource, SentAttributes,
+        UpdateRequest,
     },
     resource::{Directives, ResourceId, SnapshotState},
     schema::SchemaRegistry,
@@ -69,6 +71,25 @@ pub struct PreparedWrite<R> {
     resource_id: ResourceId,
     writeback: SecretPreservingAttributes,
     receipt: Arc<PreparationReceipt>,
+}
+
+/// Host writeback values and request membership from one prepared create.
+/// Only [`PreparedWrite`] can construct this pairing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedCreateWriteback {
+    attributes: SecretPreservingAttributes,
+    sent_attributes: SentAttributes,
+}
+
+impl PreparedCreateWriteback {
+    pub(crate) fn attributes(&self) -> &SecretPreservingAttributes {
+        &self.attributes
+    }
+
+    /// Attributes carried by the normalized create request.
+    pub fn sent_attributes(&self) -> &SentAttributes {
+        &self.sent_attributes
+    }
 }
 
 // A receipt is shared by the prepared request and every permit it authorizes.
@@ -404,20 +425,11 @@ impl<R> PreparedWrite<R> {
     pub fn request(&self) -> &R {
         &self.request
     }
-    pub(super) fn writeback(&self) -> &SecretPreservingAttributes {
+    pub(crate) fn writeback(&self) -> &SecretPreservingAttributes {
         &self.writeback
     }
     pub(super) fn resource_id(&self) -> &ResourceId {
         &self.resource_id
-    }
-    pub(super) fn into_parts(self) -> (R, SecretPreservingAttributes)
-    where
-        R: Clone,
-    {
-        let Self {
-            request, writeback, ..
-        } = self;
-        (Arc::unwrap_or_clone(request), writeback)
     }
     pub(super) fn delete_receipts(&self) -> Vec<DeleteDischargeReceipt> {
         self.receipt
@@ -428,6 +440,23 @@ impl<R> PreparedWrite<R> {
                 prepared: Arc::clone(&self.receipt),
             })
             .collect()
+    }
+}
+
+impl PreparedWrite<CreateRequest> {
+    pub(crate) fn create_writeback(&self) -> PreparedCreateWriteback {
+        PreparedCreateWriteback {
+            attributes: self.writeback.clone(),
+            sent_attributes: self.request.sent_attributes(),
+        }
+    }
+
+    pub(super) fn into_parts(self) -> (CreateRequest, PreparedCreateWriteback) {
+        let writeback = PreparedCreateWriteback {
+            sent_attributes: self.request.sent_attributes(),
+            attributes: self.writeback,
+        };
+        (Arc::unwrap_or_clone(self.request), writeback)
     }
 }
 
@@ -456,9 +485,9 @@ pub(super) struct ExecutionInputChecks {
     run: Arc<()>,
     pub(super) checks: HashMap<usize, PendingInputObligation>,
     pub(super) paired: HashMap<usize, Vec<usize>>,
-    pub(super) absorbed: HashMap<usize, HashSet<usize>>,
+    pub(super) absorbed: HashMap<usize, BTreeSet<usize>>,
     cohorts: HashSet<usize>,
-    required_deletes: HashMap<usize, HashSet<usize>>,
+    required_deletes: HashMap<usize, BTreeSet<usize>>,
     receipts: HashMap<(usize, usize), DeleteDischargeReceipt>,
     consumed: HashSet<usize>,
     delete_targets: HashMap<usize, DeleteTarget>,
@@ -575,7 +604,7 @@ impl ExecutionInputChecks {
                 }
                 if result
                     .required_deletes
-                    .insert(delete_idx, HashSet::from([write]))
+                    .insert(delete_idx, BTreeSet::from([write]))
                     .is_some()
                 {
                     return Err(InputCheckConstructionError::DuplicateDelete { index: delete_idx });
@@ -1385,7 +1414,7 @@ mod tests {
             id: resource.resolved_id(),
             identifier: AppliedIdentifier::new("old").unwrap(),
             generation: EffectGeneration::Current,
-            previous_attributes: HashMap::new(),
+            previous_attributes: std::collections::BTreeMap::new(),
             directives: Default::default(),
             binding: None,
             dependencies: Default::default(),
@@ -1546,7 +1575,7 @@ mod tests {
                                     .attributes
                                     .clone()
                                     .into_iter()
-                                    .collect();
+                                    .collect::<std::collections::BTreeMap<_, _>>();
                                 let writeback = SecretPreservingAttributes::from_provider_values(
                                     &attributes,
                                     &attributes,
@@ -1598,7 +1627,7 @@ mod tests {
         // effect slot even if their resource and generation were identical.
         checks
             .required_deletes
-            .extend([(1, HashSet::from([0])), (2, HashSet::from([3]))]);
+            .extend([(1, BTreeSet::from([0])), (2, BTreeSet::from([3]))]);
         let target = DeleteTarget {
             id: ResourceId::with_identity("test", "same-instance"),
             identifier: AppliedIdentifier::new("old-id").unwrap(),
@@ -1631,7 +1660,7 @@ mod tests {
         let cohort = first.take_write(0).unwrap();
         let permit = cohort.cohort_receipts::<CreateRequest>(&[]).pop().unwrap();
         let mut second = ExecutionInputChecks::new(Vec::new(), &effects, &[]).unwrap();
-        second.required_deletes.insert(1, HashSet::from([0]));
+        second.required_deletes.insert(1, BTreeSet::from([0]));
         // Deliberately corrupt the private store to exercise its final check.
         second.receipts.insert((1, 0), permit);
         let ready = super::super::scheduler::ReadyDelete::for_test(DeletedInstanceKey::new(

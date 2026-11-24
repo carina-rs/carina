@@ -32,6 +32,7 @@ pub use carina_provider_protocol::types::{
 
 use crate::binding_index::SecretPreservingAttributes;
 use crate::effect::PlanOp;
+use crate::executor::PreparedCreateWriteback;
 use crate::parser::{ProviderConfig, StateBlockAddress};
 #[cfg(test)]
 use crate::provider_text::OpaqueFixtureDisplay as _;
@@ -43,16 +44,16 @@ use crate::provider_text::{
 pub use crate::resource::ProviderDirectiveSchema;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, Directives, PartialReadMarker, PendingReRead,
-    PreventDestroyResolution, PreventDestroySource, ProviderResource, Resource, ResourceId,
-    SnapshotState, SnapshotValue, State, StateValueLeaf, UnavailableSecretError, Value,
+    PreventDestroyResolution, PreventDestroySource, ProviderResource, ResolvedResourceId, Resource,
+    ResourceId, SnapshotState, SnapshotValue, State, StateValueLeaf, UnavailableSecretError, Value,
     ValueString,
 };
 #[cfg(test)]
 use crate::resource::{DataSource, RedactedSecretHash};
 use crate::schema::{
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema, LeafPath,
-    RawShape, RefinedScalarKind, SchemaRegistry, Shape, TypeIdentity, ValidatedConfigSchema,
-    ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    LeafPathSegment, RawShape, RefinedScalarKind, SchemaRegistry, Shape, TypeIdentity,
+    ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
 use crate::value::{
     PersistedListView, PersistedValue, PersistedValueDecodeError, PersistedView, SerializationError,
@@ -95,15 +96,20 @@ pub type HostUpdateOutcomeKind = UpdateOutcomeKind<Bound>;
 pub type HostPartialReadDiagnostic = PartialReadDiagnostic<Bound>;
 pub type HostCreateObservation = CreateObservation<Bound>;
 pub type HostUnobservedReason = UnobservedReason<Bound>;
-pub type HostIdentifiedCreate = IdentifiedCreate<Bound>;
-pub type HostCreateFailure = CreateFailure<Bound>;
-pub type HostCreateFailureKind = CreateFailureKind<Bound>;
-pub type HostResumeOutcome = ResumeOutcome<Bound>;
-pub type HostResumeOutcomeKind = ResumeOutcomeKind<Bound>;
-pub type HostCompletedResume = CompletedResume<Bound>;
-pub type HostPartialResume = PartialResume<Bound>;
-pub type HostResumeFailure = ResumeFailure<Bound>;
-pub type HostResumeFailureKind = ResumeFailureKind<Bound>;
+pub type HostIdentifiedCreate = IdentifiedCreate<Bound, PreparedCreateWriteback>;
+pub type HostCreateFailure = CreateFailure<Bound, PreparedCreateWriteback>;
+pub type HostCreateFailureKind = CreateFailureKind<Bound, PreparedCreateWriteback>;
+pub type HostResumeOutcome<W = PreparedCreateWriteback> = ResumeOutcome<Bound, W>;
+pub type HostResumeOutcomeKind<W = PreparedCreateWriteback> = ResumeOutcomeKind<Bound, W>;
+pub type HostCompletedResume = CompletedResume<Bound, PreparedCreateWriteback>;
+pub type HostPartialResume = PartialResume<Bound, PreparedCreateWriteback>;
+pub type HostResumeFailure<W = PreparedCreateWriteback> = ResumeFailure<Bound, W>;
+pub type HostResumeFailureKind<W = PreparedCreateWriteback> = ResumeFailureKind<Bound, W>;
+
+/// Provider-produced records have no desired values. Only dispatch can turn
+/// this stage into a host writeback record, supplying secret-preserving values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCreateRecord;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("provider reported a missing attribute absent from the resource schema")]
@@ -975,8 +981,6 @@ pub type HostResult<T> = ProviderResult<T, Bound>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentAttributes {
     attributes: BTreeSet<String>,
-    #[cfg(any(test, feature = "test-utils"))]
-    all_for_test: bool,
 }
 
 impl SentAttributes {
@@ -992,53 +996,24 @@ impl SentAttributes {
     }
 
     pub(crate) fn only(attributes: BTreeSet<String>) -> Self {
-        Self {
-            attributes,
-            #[cfg(any(test, feature = "test-utils"))]
-            all_for_test: false,
-        }
+        Self { attributes }
     }
 
-    #[cfg(any(test, feature = "test-utils"))]
-    pub(crate) fn all_for_test() -> Self {
-        Self {
-            attributes: BTreeSet::new(),
-            all_for_test: true,
-        }
-    }
-
-    fn from_update_patch(patch: &UpdatePatch) -> Self {
-        Self::only(
-            patch
-                .ops
-                .iter()
-                .filter_map(|op| op.sent_value().map(|_| op.key().to_string()))
-                .collect(),
-        )
-    }
-
-    fn from_create_sent<S, D>(
-        sent: &Sent,
-        resource: &Resource<
-            S,
-            crate::resource::NoPlaceholder,
-            crate::resource::AbsoluteBindingAddress,
-            D,
-        >,
-    ) -> Self {
+    fn from_create_sent(sent: &Sent, request_attributes: &Self) -> Self {
         match sent {
-            Sent::AllRequestAttributes => Self::from_resource(resource),
+            Sent::AllRequestAttributes => request_attributes.clone(),
             Sent::Only(attributes) => Self::only(attributes.clone()),
         }
     }
 
     /// Whether this operation sent `attribute` with a desired value.
     pub fn contains(&self, attribute: &str) -> bool {
-        #[cfg(any(test, feature = "test-utils"))]
-        if self.all_for_test {
-            return true;
-        }
         self.attributes.contains(attribute)
+    }
+
+    /// Attribute names proven to have been sent by this operation.
+    pub fn as_set(&self) -> &BTreeSet<String> {
+        &self.attributes
     }
 }
 
@@ -1220,7 +1195,7 @@ pub struct UpdateRequest {
     from: SnapshotState,
     /// Structured description of the user's intended change and any write-only
     /// values reasserted alongside it.
-    patch: crate::validation::admission::final_input::FinalInput<WireReady<UpdatePatch>>,
+    patch: AdmittedUpdatePatch,
     /// Effective directives resolved from the managed resource schema.
     directives: ProviderDirectives,
     input: Arc<ProtectedUpdateInput>,
@@ -1241,6 +1216,7 @@ impl UpdateRequest {
         let annotate_patch =
             |annotate: fn(&ProviderReadyResource, &str, &Value) -> Value| UpdatePatch {
                 ops: patch
+                    .patch
                     .payload()
                     .as_inner()
                     .ops
@@ -1294,7 +1270,11 @@ impl UpdateRequest {
 
     /// Patch derived from the checked desired resource.
     pub fn patch(&self) -> &UpdatePatch {
-        self.patch.payload().as_inner()
+        self.patch.patch.payload().as_inner()
+    }
+
+    pub(crate) fn planned_ops(&self) -> &[PlannedPatchOp] {
+        &self.patch.planned.ops
     }
 
     pub(crate) fn diagnostic_values(&self) -> impl Iterator<Item = &Value> {
@@ -1313,7 +1293,7 @@ impl UpdateRequest {
 
     /// The checked projection consumed by provider transport adapters.
     pub fn wire_patch(&self) -> &[WirePatchOp] {
-        self.patch.payload().wire()
+        self.patch.patch.payload().wire()
     }
 
     /// Effective directives resolved while the desired resource crossed the
@@ -1561,14 +1541,108 @@ impl PatchOp {
     }
 }
 
-impl UpdatePatch {
-    pub(crate) fn sent_attributes(&self) -> SentAttributes {
-        SentAttributes::from_update_patch(self)
+/// Host-only update operations, each owning its observed leaf grafts.
+#[derive(Debug, Clone)]
+pub struct PlannedUpdatePatch {
+    ops: Vec<PlannedPatchOp>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PlannedPatchOp {
+    Add(PlannedSentOp),
+    Replace(PlannedSentOp),
+    Reassert(PlannedSentOp),
+    Remove { key: String },
+}
+
+#[derive(Clone)]
+pub(crate) struct PlannedSentOp {
+    key: String,
+    value: Value,
+    grafted_leaves: Vec<LeafPath>,
+}
+
+impl fmt::Debug for PlannedSentOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PlannedSentOp")
+            .field("key", &self.key)
+            .field("grafted_leaves", &self.grafted_leaves)
+            .finish()
     }
 }
 
-/// Build an [`UpdatePatch`] from a list of changed attribute names plus
-/// the desired (`to`) and current (`from`) views.
+impl PlannedSentOp {
+    pub(crate) fn sent_parts(&self) -> (&str, &[LeafPath]) {
+        (&self.key, &self.grafted_leaves)
+    }
+}
+
+impl PlannedPatchOp {
+    fn key(&self) -> &str {
+        match self {
+            Self::Add(sent) | Self::Replace(sent) | Self::Reassert(sent) => &sent.key,
+            Self::Remove { key } => key,
+        }
+    }
+
+    fn to_patch_op(&self) -> PatchOp {
+        match self {
+            Self::Add(PlannedSentOp { key, value, .. }) => PatchOp::Add {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            Self::Replace(PlannedSentOp { key, value, .. }) => PatchOp::Replace {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            Self::Reassert(PlannedSentOp { key, value, .. }) => PatchOp::Reassert {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            Self::Remove { key } => PatchOp::Remove { key: key.clone() },
+        }
+    }
+}
+
+/// A planned update and the immutable projection admitted from those exact ops.
+#[derive(Debug, Clone)]
+pub(crate) struct AdmittedUpdatePatch {
+    planned: PlannedUpdatePatch,
+    patch: crate::validation::admission::final_input::FinalInput<WireReady<UpdatePatch>>,
+}
+
+impl PlannedUpdatePatch {
+    /// Project the provider payload without host-only graft provenance.
+    pub fn to_patch(&self) -> UpdatePatch {
+        UpdatePatch {
+            ops: self.ops.iter().map(PlannedPatchOp::to_patch_op).collect(),
+        }
+    }
+
+    pub(crate) fn admit(
+        self,
+        resource: &ProviderReadyResource,
+        schema: crate::schema::OwnerBoundResourceSchema<'_>,
+        bindings: &crate::binding_index::ResolvedBindings,
+        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Result<AdmittedUpdatePatch, crate::executor::ProviderPreparationError> {
+        let patch = crate::validation::admission::final_input::admit_update_patch(
+            self.to_patch(),
+            resource,
+            schema,
+            bindings,
+            session,
+        )?;
+        Ok(AdmittedUpdatePatch {
+            planned: self,
+            patch,
+        })
+    }
+}
+
+/// Plan update operations from changed attribute names and the desired (`to`)
+/// and current (`from`) views. [`PlannedUpdatePatch::to_patch`] projects the
+/// provider's [`UpdatePatch`].
 ///
 /// For each `key` in `changed_attributes`:
 /// - present in `to` but missing in `from` → [`PatchOp::Add`]
@@ -1596,7 +1670,7 @@ pub fn build_update_patch<P: StateValueLeaf>(
     to: &ProviderReadyResource,
     from: &State<P>,
     schema: &ResourceSchema,
-) -> Result<UpdatePatch, UpdatePatchError> {
+) -> Result<PlannedUpdatePatch, UpdatePatchError> {
     plan_update_patch(changed_attributes, to.as_inner(), from, schema)
 }
 
@@ -1608,7 +1682,7 @@ pub(crate) fn plan_update_patch<S, P: StateValueLeaf>(
     to: &crate::resource::ResolvedResource<S>,
     from: &State<P>,
     schema: &ResourceSchema,
-) -> Result<UpdatePatch, UpdatePatchError> {
+) -> Result<PlannedUpdatePatch, UpdatePatchError> {
     let ignore_changes = to.ignore_changes();
     let to = to.as_resource();
     let mut patched_keys = HashSet::new();
@@ -1636,29 +1710,28 @@ pub(crate) fn plan_update_patch<S, P: StateValueLeaf>(
             .attributes
             .get(key)
             .map(crate::resource::state_value_snapshot);
-        let sent_value = value
-            .map(|value| {
-                ignore_changes
-                    .with_observed_readable_leaves(key, value, observed.as_ref())
-                    .to_value_at(format!("{}.{}", to.id, key))
-            })
-            .transpose()?;
-        match (sent_value, in_from) {
-            (Some(value), false) => ops.push(PatchOp::Add {
-                key: key.clone(),
-                value,
-            }),
-            (Some(value), true) => ops.push(PatchOp::Replace {
-                key: key.clone(),
-                value,
-            }),
-            (None, true) => ops.push(PatchOp::Remove { key: key.clone() }),
-            (None, false) => {}
-        }
+        let op = match value {
+            Some(value) => {
+                let (value, leaves) =
+                    ignore_changes.with_observed_readable_leaves(key, value, observed.as_ref());
+                let sent = PlannedSentOp {
+                    key: key.clone(),
+                    value: value.to_value_at(format!("{}.{}", to.id, key))?,
+                    grafted_leaves: leaves,
+                };
+                if in_from {
+                    PlannedPatchOp::Replace(sent)
+                } else {
+                    PlannedPatchOp::Add(sent)
+                }
+            }
+            None => PlannedPatchOp::Remove { key: key.clone() },
+        };
+        ops.push(op);
     }
 
     if ops.is_empty() {
-        return Ok(UpdatePatch { ops });
+        return Ok(PlannedUpdatePatch { ops });
     }
 
     let mut reasserts = Vec::new();
@@ -1693,23 +1766,23 @@ pub(crate) fn plan_update_patch<S, P: StateValueLeaf>(
             }
             return Err(ignored_write_only_error(&to.id, key, ignored_write_only[0]).into());
         }
-        reasserts.push(PatchOp::Reassert {
+        let (value, leaves) = ignore_changes.with_observed_readable_leaves(
+            key,
+            value,
+            from.attributes
+                .get(key)
+                .map(crate::resource::state_value_snapshot)
+                .as_ref(),
+        );
+        reasserts.push(PlannedPatchOp::Reassert(PlannedSentOp {
             key: key.clone(),
-            value: ignore_changes
-                .with_observed_readable_leaves(
-                    key,
-                    value,
-                    from.attributes
-                        .get(key)
-                        .map(crate::resource::state_value_snapshot)
-                        .as_ref(),
-                )
-                .to_value_at(format!("{}.{}", to.id, key))?,
-        });
+            value: value.to_value_at(format!("{}.{}", to.id, key))?,
+            grafted_leaves: leaves,
+        }));
     }
     reasserts.sort_by(|left, right| left.key().cmp(right.key()));
     ops.extend(reasserts);
-    Ok(UpdatePatch { ops })
+    Ok(PlannedUpdatePatch { ops })
 }
 
 fn ignored_write_only_error(
@@ -1745,22 +1818,26 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ///
 /// Nor can callers add an arbitrary desired map after construction:
 ///
-/// ```compile_fail
-/// use std::collections::HashMap;
+/// ```compile_fail,E0599
+/// use std::collections::BTreeMap;
 /// use carina_core::provider::SavedAttrs;
+/// use carina_core::resource::{ResourceId, SnapshotValue};
 ///
 /// let mut saved = SavedAttrs::new();
-/// saved.insert(todo!("resource id"), HashMap::new());
+/// saved.insert(ResourceId::with_identity("test.Resource", "example"), BTreeMap::<String, SnapshotValue>::new());
 /// ```
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct SavedAttrs(HashMap<ResourceId, HashMap<String, crate::resource::SnapshotValue>>);
+pub struct SavedAttrs(HashMap<ResourceId, BTreeMap<String, crate::resource::SnapshotValue>>);
 
 impl SavedAttrs {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, crate::resource::SnapshotValue>> {
+    pub fn get(
+        &self,
+        id: &ResourceId,
+    ) -> Option<&BTreeMap<String, crate::resource::SnapshotValue>> {
         self.0.get(id)
     }
 
@@ -1769,7 +1846,7 @@ impl SavedAttrs {
     ) -> impl Iterator<
         Item = (
             &ResourceId,
-            &HashMap<String, crate::resource::SnapshotValue>,
+            &BTreeMap<String, crate::resource::SnapshotValue>,
         ),
     > {
         self.0.iter()
@@ -1779,12 +1856,12 @@ impl SavedAttrs {
 impl<'a> IntoIterator for &'a SavedAttrs {
     type Item = (
         &'a ResourceId,
-        &'a HashMap<String, crate::resource::SnapshotValue>,
+        &'a BTreeMap<String, crate::resource::SnapshotValue>,
     );
     type IntoIter = std::collections::hash_map::Iter<
         'a,
         ResourceId,
-        HashMap<String, crate::resource::SnapshotValue>,
+        BTreeMap<String, crate::resource::SnapshotValue>,
     >;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -1801,7 +1878,7 @@ impl<'a> IntoIterator for &'a SavedAttrs {
 /// `RedactedSecret` values. Persisted strings always remain strings.
 ///
 /// Raw JSON cannot be inserted after construction. State loaders call
-/// [`Self::from_encoded`] after versioned migrations rewrite legacy encodings;
+/// [`Self::from_encoded`] to validate current structural encodings;
 /// callers that already hold validated values use [`Self::from_persisted_values`].
 ///
 /// ```compile_fail
@@ -1820,7 +1897,7 @@ impl<'a> IntoIterator for &'a SavedAttrs {
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PersistedAttributes {
-    encoded: HashMap<String, PersistedValue>,
+    encoded: BTreeMap<String, PersistedValue>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1902,16 +1979,6 @@ impl Serialize for PersistedAttributes {
     }
 }
 
-/// Which existing state hashes may classify provider plaintext as secret.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreviousSecretHashAuthority<'a> {
-    None,
-    /// Protect every key that already contains a stored secret hash.
-    AllPreviouslyHashedKeys(&'a PersistedAttributes),
-    /// Protect stored hashes only for keys absent from the desired resource.
-    OnlyKeysAbsentFromDesired(&'a PersistedAttributes),
-}
-
 /// Select the saved-plan hash for an attribute, falling back to the current
 /// state's hash when the plan did not capture one.
 pub fn previous_hash<'a>(
@@ -1943,12 +2010,12 @@ impl PersistedAttributes {
     /// transport. Redacted secrets arrive as `RedactedSecret`; strings are
     /// always encoded as strings without content inspection.
     pub fn from_typed_persisted_wire_values(
-        values: HashMap<String, crate::resource::SnapshotValue>,
+        values: impl IntoIterator<Item = (String, crate::resource::SnapshotValue)>,
     ) -> Result<Self, PersistedAttributesError> {
         let mut values: Vec<_> = values.into_iter().collect();
         values.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-        let mut encoded = HashMap::with_capacity(values.len());
+        let mut encoded = BTreeMap::new();
         for (attribute_key, value) in values {
             let value = PersistedValue::encode_provider_value(&value, None).map_err(|error| {
                 PersistedAttributesError::InvalidWireValue(PersistedWireValueError {
@@ -1964,17 +2031,20 @@ impl PersistedAttributes {
     /// Construct a persisted attribute map from complete values produced by
     /// the core persisted encoder.
     pub fn from_persisted_values(
-        encoded: HashMap<String, PersistedValue>,
+        encoded: impl IntoIterator<Item = (String, PersistedValue)>,
     ) -> Result<Self, PersistedAttributesError> {
-        Ok(Self { encoded })
+        Ok(Self {
+            encoded: encoded.into_iter().collect(),
+        })
     }
 
-    /// Validate JSON entering through the state-row load seam after versioned
-    /// migrations have rewritten legacy encodings.
+    /// Validate current persisted JSON entering through the state-row load seam.
     pub fn from_encoded(
-        encoded: HashMap<String, serde_json::Value>,
+        encoded: impl IntoIterator<Item = (String, serde_json::Value)>,
     ) -> Result<Self, PersistedAttributesError> {
         let encoded = encoded
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
             .into_iter()
             .map(|(attribute_key, value)| {
                 PersistedValue::from_serialized_json(value)
@@ -2001,7 +2071,7 @@ impl PersistedAttributes {
     pub fn rendered_comparison_attributes(
         &self,
         schema: &ResourceSchema,
-    ) -> HashMap<String, crate::value::RenderedValue> {
+    ) -> BTreeMap<String, crate::value::RenderedValue> {
         let values =
             crate::resource::CanonicalComparisonAttributes::canonicalize(self.to_values(), schema);
         values
@@ -2016,7 +2086,7 @@ impl PersistedAttributes {
     }
 
     /// Decode every non-null stored attribute with structural persisted-secret semantics.
-    pub fn to_values(&self) -> HashMap<String, crate::resource::SnapshotValue> {
+    pub fn to_values(&self) -> BTreeMap<String, crate::resource::SnapshotValue> {
         self.encoded
             .iter()
             .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
@@ -2024,7 +2094,7 @@ impl PersistedAttributes {
     }
 
     /// Decode every stored value into ordinary JSON for display surfaces.
-    pub fn to_decoded_json(&self) -> HashMap<String, serde_json::Value> {
+    pub fn to_decoded_json(&self) -> BTreeMap<String, serde_json::Value> {
         self.encoded
             .iter()
             .map(|(key, value)| (key.clone(), value.decoded_json()))
@@ -2066,7 +2136,7 @@ impl PersistedAttributes {
 
     /// Return ordinary persisted string attributes for identity-prefix
     /// reconciliation. Typed secret hashes are deliberately excluded.
-    pub fn plain_string_values(&self) -> HashMap<String, String> {
+    pub fn plain_string_values(&self) -> BTreeMap<String, String> {
         self.encoded
             .keys()
             .filter_map(|key| match self.get(key) {
@@ -2079,7 +2149,7 @@ impl PersistedAttributes {
     }
 
     #[cfg(test)]
-    pub(crate) fn encoded(&self) -> &HashMap<String, PersistedValue> {
+    pub(crate) fn encoded(&self) -> &BTreeMap<String, PersistedValue> {
         &self.encoded
     }
 
@@ -2189,10 +2259,59 @@ fn contains_secret_hash_view(value: PersistedView<'_>) -> bool {
     secret_hash_shape_view(value) != SecretHashShape::None
 }
 
+/// Restrict previous hash protection to grafted subtrees. Public siblings remain
+/// available as alignment evidence inside any selected list. Opaque ancestors
+/// keep their whole protection because their hashed leaves cannot be separated.
+pub fn restrict_previous_secret_hashes_to_leaves(
+    previous: &PersistedValue,
+    leaves: &[LeafPath],
+) -> Result<PersistedValue, SerializationError> {
+    fn restrict(value: &mut SnapshotValue, paths: &[&[LeafPathSegment]]) {
+        if paths.iter().any(|path| {
+            path.is_empty() || matches!(path.first(), Some(LeafPathSegment::ListIndex(_)))
+        }) {
+            return;
+        }
+        let Value::Concrete(ConcreteValue::Map(children)) = value else {
+            return;
+        };
+        children.retain(|name, child| {
+            if !crate::value::contains_redacted_secret(child) {
+                return true;
+            }
+            let child_paths = paths
+                .iter()
+                .filter_map(|path| {
+                    let (segment, rest) = path.split_first()?;
+                    let matches = match segment {
+                        LeafPathSegment::StructField(field) => field == name,
+                        LeafPathSegment::MapKey(key) => key.expose_plaintext() == name.as_str(),
+                        LeafPathSegment::ListIndex(_) => false,
+                    };
+                    matches.then_some(rest)
+                })
+                .collect::<Vec<_>>();
+            if child_paths.is_empty() {
+                return false;
+            }
+            restrict(child, &child_paths);
+            true
+        });
+    }
+    let Some(mut value) = previous.decode() else {
+        return Ok(previous.clone());
+    };
+    restrict(
+        &mut value,
+        &leaves.iter().map(LeafPath::segments).collect::<Vec<_>>(),
+    );
+    PersistedValue::encode_provider_value(&value, None)
+}
+
 /// Preserve secret hashes from a previous persisted value while retaining
 /// provider material at every unprotected path. Returns `None` when the
-/// previous value contains no secret hash. Unavailable provider plaintext
-/// returns its typed serialization error rather than retaining stale evidence.
+/// previous value contains no secret hash. An opaque previous hash is kept when
+/// the provider subtree contains nested hashes and cannot be re-hashed.
 pub fn merge_previous_secret_hashes_into_provider_value(
     previous_value: &PersistedValue,
     provider_value: Option<&PersistedValue>,
@@ -2203,6 +2322,11 @@ pub fn merge_previous_secret_hashes_into_provider_value(
             if secret_hash_shape(provider_value) == SecretHashShape::TopLevel =>
         {
             Some(provider_value.clone())
+        }
+        (SecretHashShape::TopLevel, Some(provider_value))
+            if secret_hash_shape(provider_value) == SecretHashShape::Nested =>
+        {
+            Some(previous_value.clone())
         }
         (SecretHashShape::TopLevel, Some(provider_value)) if !provider_value.view().is_null() => {
             Some(hash_provider_json_as_secret(
@@ -2237,8 +2361,10 @@ fn merge_previous_secret_hashes_into_provider_json_inner(
         let Some(provider_value) = provider_value.filter(|value| !value.is_null()) else {
             return Ok(previous_value.to_owned_json());
         };
-        if secret_hash_shape_view(provider_value) == SecretHashShape::TopLevel {
-            return Ok(provider_value.to_owned_json());
+        match secret_hash_shape_view(provider_value) {
+            SecretHashShape::TopLevel => return Ok(provider_value.to_owned_json()),
+            SecretHashShape::Nested => return Ok(previous_value.to_owned_json()),
+            SecretHashShape::None => {}
         }
         return hash_provider_view_as_secret(provider_value, Some(previous_value));
     }
@@ -2269,6 +2395,12 @@ fn merge_previous_secret_hashes_into_provider_json_inner(
             return Ok(previous_value.to_owned_json());
         };
         if !previous_secret_hash_array_alignment_is_trusted(previous_items, provider_items) {
+            // With untrusted alignment, fall back to the masked provider value
+            // as on main. Remaining leaf leaks inside reordered/resized lists
+            // are tracked in carina-rs/carina#4592.
+            if secret_hash_shape_view(provider_value) == SecretHashShape::Nested {
+                return Ok(provider_value.to_owned_json());
+            }
             return hash_provider_view_as_secret(provider_value, Some(previous_value));
         }
         let replacements = previous_items
@@ -2390,7 +2522,7 @@ impl RawSavedAttrs {
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn from_decoded_values_for_test(
-        saved_attrs: HashMap<ResourceId, HashMap<String, crate::resource::SnapshotValue>>,
+        saved_attrs: HashMap<ResourceId, BTreeMap<String, crate::resource::SnapshotValue>>,
     ) -> Self {
         Self {
             attributes: SavedAttrs(saved_attrs),
@@ -2412,7 +2544,10 @@ impl RawSavedAttrs {
     }
 
     /// Read a raw resource entry without changing its typestate.
-    pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, crate::resource::SnapshotValue>> {
+    pub fn get(
+        &self,
+        id: &ResourceId,
+    ) -> Option<&BTreeMap<String, crate::resource::SnapshotValue>> {
         self.attributes.get(id)
     }
 }
@@ -2445,7 +2580,10 @@ impl LiftedSavedAttrs {
     }
 
     /// Read saved attributes for one resource.
-    pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, crate::resource::SnapshotValue>> {
+    pub fn get(
+        &self,
+        id: &ResourceId,
+    ) -> Option<&BTreeMap<String, crate::resource::SnapshotValue>> {
         self.attributes.get(id)
     }
 
@@ -2480,14 +2618,14 @@ impl LiftedSavedAttrs {
 pub struct AppliedState {
     pub(crate) id: ResourceId,
     pub(crate) identifier: AppliedIdentifier,
-    pub(crate) attributes: HashMap<String, crate::resource::SnapshotValue>,
+    pub(crate) attributes: BTreeMap<String, crate::resource::SnapshotValue>,
 }
 
 impl AppliedState {
     pub fn new(
         id: ResourceId,
         identifier: impl Into<String>,
-        attributes: HashMap<String, Value>,
+        attributes: impl IntoIterator<Item = (String, Value)>,
     ) -> Result<Self, EmptyAppliedIdentifier> {
         Ok(Self {
             id,
@@ -2502,7 +2640,7 @@ impl AppliedState {
     pub fn from_identifier(
         id: ResourceId,
         identifier: AppliedIdentifier,
-        attributes: HashMap<String, Value>,
+        attributes: impl IntoIterator<Item = (String, Value)>,
     ) -> Self {
         Self {
             id,
@@ -2517,12 +2655,12 @@ impl AppliedState {
     pub fn from_snapshot_parts(
         id: ResourceId,
         identifier: AppliedIdentifier,
-        attributes: HashMap<String, crate::resource::SnapshotValue>,
+        attributes: impl IntoIterator<Item = (String, crate::resource::SnapshotValue)>,
     ) -> Self {
         Self {
             id,
             identifier,
-            attributes,
+            attributes: attributes.into_iter().collect(),
         }
     }
 
@@ -2534,7 +2672,7 @@ impl AppliedState {
         &self.identifier
     }
 
-    pub fn attributes(&self) -> &HashMap<String, crate::resource::SnapshotValue> {
+    pub fn attributes(&self) -> &BTreeMap<String, crate::resource::SnapshotValue> {
         &self.attributes
     }
 
@@ -2543,7 +2681,7 @@ impl AppliedState {
     ) -> (
         ResourceId,
         AppliedIdentifier,
-        HashMap<String, crate::resource::SnapshotValue>,
+        BTreeMap<String, crate::resource::SnapshotValue>,
     ) {
         (self.id, self.identifier, self.attributes)
     }
@@ -2802,9 +2940,12 @@ pub struct PendingCreate {
 
 /// Read-only record retained after a provider returns a fresh pending create.
 /// Unlike [`PendingCreate`], this is storage, not transition authority.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FreshPendingCreate {
+/// The provider stage carries [`ProviderCreateRecord`]; only the host stage
+/// carries [`PreparedCreateWriteback`] and can reach state writers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreshPendingCreate<W = PreparedCreateWriteback> {
     id: ResourceId,
+    writeback: Box<W>,
     token: PendingToken,
     progress: CreateProgress,
     sent: Sent,
@@ -2812,10 +2953,11 @@ pub struct FreshPendingCreate {
     started_at: Timestamp,
 }
 
-impl From<PendingCreate> for FreshPendingCreate {
+impl From<PendingCreate> for FreshPendingCreate<ProviderCreateRecord> {
     fn from(pending: PendingCreate) -> Self {
         Self {
             id: pending.id,
+            writeback: Box::new(ProviderCreateRecord),
             token: pending.token,
             progress: pending.progress,
             sent: pending.sent,
@@ -2826,6 +2968,26 @@ impl From<PendingCreate> for FreshPendingCreate {
 }
 
 impl FreshPendingCreate {
+    /// Values and request membership retained from the same prepared create.
+    pub fn writeback(&self) -> &PreparedCreateWriteback {
+        &self.writeback
+    }
+
+    /// Desired values retained by this continuation, with send membership
+    /// expanded from the same prepared create's request attributes.
+    pub fn sent_desired_attributes(&self) -> SentDesiredAttributes<'_> {
+        SentDesiredAttributes::new(
+            self.writeback.attributes().values().iter(),
+            SentAttributes::from_create_sent(&self.sent, self.writeback.sent_attributes()),
+        )
+    }
+
+    pub fn resolved_desired_attributes(&self) -> &SecretPreservingAttributes {
+        self.writeback.attributes()
+    }
+}
+
+impl<W> FreshPendingCreate<W> {
     pub fn token(&self) -> &PendingToken {
         &self.token
     }
@@ -2836,22 +2998,6 @@ impl FreshPendingCreate {
 
     pub fn sent(&self) -> &Sent {
         &self.sent
-    }
-
-    /// Desired values and send evidence retained by this fresh continuation.
-    pub fn sent_desired_attributes_for<'a, S, D>(
-        &self,
-        resource: &'a Resource<
-            S,
-            crate::resource::NoPlaceholder,
-            crate::resource::AbsoluteBindingAddress,
-            D,
-        >,
-    ) -> SentDesiredAttributes<'a> {
-        SentDesiredAttributes::new(
-            resource.attributes.iter(),
-            SentAttributes::from_create_sent(&self.sent, resource),
-        )
     }
 
     pub fn poll_after_secs(&self) -> u32 {
@@ -2884,6 +3030,7 @@ impl FreshPendingCreate {
                 secrets,
             )),
             started_at: self.started_at.clone(),
+            dependency_bindings: Default::default(),
         }
     }
 
@@ -2978,6 +3125,7 @@ impl PendingCreate {
                 secrets,
             )),
             started_at: self.started_at.clone(),
+            dependency_bindings: Default::default(),
         }
     }
 
@@ -3160,26 +3308,6 @@ pub enum SentRecord {
     Persisted(PendingEnvelope),
 }
 
-impl SentRecord {
-    /// Recover attribute send evidence while it is still retained in request
-    /// form. Persisted continuations intentionally omit ordinary observable
-    /// attribute names, so they cannot claim a sent desired basis.
-    fn sent_attributes_for<S, D>(
-        &self,
-        resource: &Resource<
-            S,
-            crate::resource::NoPlaceholder,
-            crate::resource::AbsoluteBindingAddress,
-            D,
-        >,
-    ) -> Option<SentAttributes> {
-        match self {
-            Self::Request(sent) => Some(SentAttributes::from_create_sent(sent, resource)),
-            Self::Persisted(_envelope) => None,
-        }
-    }
-}
-
 /// What carina-core knows about a create for which the provider reported an
 /// identifier.
 #[derive(Debug)]
@@ -3209,17 +3337,40 @@ impl std::fmt::Display for UnobservedReason<Bound> {
 }
 
 /// A provider-reported identifier, its observation, and the accepted create's sent values.
+/// Provider records acquire the required [`PreparedCreateWriteback`] when
+/// dispatch converts them into [`HostIdentifiedCreate`] records.
+///
+/// Callers outside core cannot attach writeback to a provider-stage record.
+///
+/// ```compile_fail,E0624
+/// use carina_core::{
+///     executor::PreparedCreateWriteback,
+///     provider::{IdentifiedCreate, ProviderCreateRecord},
+///     provider_text::Unbound,
+/// };
+///
+/// fn forge(record: IdentifiedCreate<Unbound, ProviderCreateRecord>, writeback: PreparedCreateWriteback) {
+///     let _ = record.into_writeback(writeback);
+/// }
+/// ```
 #[derive(Debug)]
-pub struct IdentifiedCreate<S: TextState = Unbound> {
+pub struct IdentifiedCreate<S: TextState = Unbound, W = ProviderCreateRecord> {
     id: ResourceId,
     identifier: AppliedIdentifier,
     observation: CreateObservation<S>,
     sent: SentRecord,
     partial_read: Option<Box<PartialReadDiagnostic<S>>>,
-    resolved_desired_attributes: Option<SecretPreservingAttributes>,
+    writeback: W,
 }
 
 impl<S: TextState> IdentifiedCreate<S> {
+    pub(crate) fn into_writeback(
+        self,
+        attributes: PreparedCreateWriteback,
+    ) -> IdentifiedCreate<S, PreparedCreateWriteback> {
+        self.map_writeback(|ProviderCreateRecord| attributes)
+    }
+
     fn new(
         id: ResourceId,
         identifier: AppliedIdentifier,
@@ -3250,20 +3401,46 @@ impl<S: TextState> IdentifiedCreate<S> {
             observation,
             sent,
             partial_read: None,
-            resolved_desired_attributes: None,
+            writeback: ProviderCreateRecord,
         }
     }
+}
 
-    /// Construct the observation produced by a resumed in-flight create in
-    /// cross-crate tests.
-    #[cfg(feature = "test-utils")]
-    #[doc(hidden)]
-    pub fn from_in_flight_for_test(
-        pending: InFlightCreate,
-        identifier: AppliedIdentifier,
-        observation: CreateObservation<S>,
-    ) -> Self {
-        identified_from_resume(pending, identifier, observation)
+impl<S: TextState> IdentifiedCreate<S, PreparedCreateWriteback> {
+    /// Values and request membership retained from the same prepared create.
+    pub fn writeback(&self) -> &PreparedCreateWriteback {
+        &self.writeback
+    }
+
+    /// Resolved desired values and send evidence retained by the accepted
+    /// create observation. Membership is expanded from the same prepared
+    /// create's request attributes. Persisted continuations omit observable keys
+    /// and therefore cannot claim a sent desired basis.
+    pub fn sent_desired_attributes(&self) -> Option<SentDesiredAttributes<'_>> {
+        let SentRecord::Request(sent) = &self.sent else {
+            return None;
+        };
+        Some(SentDesiredAttributes::new(
+            self.writeback.attributes().values().iter(),
+            SentAttributes::from_create_sent(sent, self.writeback.sent_attributes()),
+        ))
+    }
+
+    pub fn resolved_desired_attributes(&self) -> &SecretPreservingAttributes {
+        self.writeback.attributes()
+    }
+}
+
+impl<S: TextState, W> IdentifiedCreate<S, W> {
+    fn map_writeback<T>(self, map: impl FnOnce(W) -> T) -> IdentifiedCreate<S, T> {
+        IdentifiedCreate {
+            id: self.id,
+            identifier: self.identifier,
+            observation: self.observation,
+            sent: self.sent,
+            partial_read: self.partial_read,
+            writeback: map(self.writeback),
+        }
     }
 
     pub fn id(&self) -> &ResourceId {
@@ -3286,32 +3463,6 @@ impl<S: TextState> IdentifiedCreate<S> {
         self.partial_read.as_deref()
     }
 
-    /// Resolved desired values and send evidence retained by the accepted
-    /// create observation.
-    pub fn sent_desired_attributes_for<'a, M, D>(
-        &'a self,
-        fallback_resource: &'a Resource<
-            M,
-            crate::resource::NoPlaceholder,
-            crate::resource::AbsoluteBindingAddress,
-            D,
-        >,
-    ) -> Option<SentDesiredAttributes<'a>> {
-        let sent = self.sent.sent_attributes_for(fallback_resource)?;
-        Some(match self.resolved_desired_attributes.as_ref() {
-            Some(attributes) => SentDesiredAttributes::new(attributes.values().iter(), sent),
-            None => SentDesiredAttributes::new(fallback_resource.attributes.iter(), sent),
-        })
-    }
-
-    pub(crate) fn with_resolved_desired_attributes(
-        mut self,
-        attributes: SecretPreservingAttributes,
-    ) -> Self {
-        self.resolved_desired_attributes = Some(attributes);
-        self
-    }
-
     fn with_partial_read(mut self, diagnostic: PartialReadDiagnostic<S>) -> Self {
         self.partial_read = Some(Box::new(diagnostic));
         self
@@ -3322,10 +3473,6 @@ impl<S: TextState> IdentifiedCreate<S> {
     #[doc(hidden)]
     pub fn with_partial_read_for_test(self, diagnostic: PartialReadDiagnostic<S>) -> Self {
         self.with_partial_read(diagnostic)
-    }
-
-    pub fn resolved_desired_attributes(&self) -> Option<&SecretPreservingAttributes> {
-        self.resolved_desired_attributes.as_ref()
     }
 
     pub fn into_parts(
@@ -3372,13 +3519,13 @@ impl<S: TextState> IdentifiedCreate<S> {
     }
 }
 
-impl IdentifiedCreate<Bound> {
+impl<W> IdentifiedCreate<Bound, W> {
     /// Materialize only the provider observation for runtime publication.
     /// Sent desired values are intentionally excluded.
     pub fn observed_state(&self) -> SnapshotState {
         let attributes = match &self.observation {
             CreateObservation::Observed(state) => state.attributes().clone(),
-            CreateObservation::Unobserved(_reason) => HashMap::new(),
+            CreateObservation::Unobserved(_reason) => BTreeMap::new(),
         };
         let state = State::existing(self.id.clone(), attributes)
             .with_identifier(self.identifier.as_str().to_string());
@@ -3391,24 +3538,25 @@ impl IdentifiedCreate<Bound> {
 
 pub type Observation<S = Unbound> = protocol_types::Observation<ReadOutcome, ProviderFailure<S>>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PendingRecord {
-    Fresh(FreshPendingCreate),
+#[derive(Debug, Clone, PartialEq)]
+enum PendingRecord<W> {
+    Fresh(FreshPendingCreate<W>),
     Persisted(PendingEnvelope),
 }
 
 /// Exhaustive borrowed view of how an in-flight create entered this process.
-pub enum InFlightPersistence<'a> {
+pub enum InFlightPersistence<'a, W = PreparedCreateWriteback> {
     /// Produced by a provider call in this process and not encoded yet.
-    Fresh(&'a FreshPendingCreate),
+    Fresh(&'a FreshPendingCreate<W>),
     /// Loaded from a validated persisted-state row.
     Persisted,
 }
 
 /// A create continuation bound to the exact resource route it was issued for.
 ///
-/// Persisted continuations are produced only by decoding their complete state
-/// row, so no API can bind an already-decoded envelope to an arbitrary route.
+/// State loaders must decode the complete row. Core's typed state-row
+/// projection also restores an in-memory payload's binding from its containing
+/// row; standalone payload binding is crate-private.
 ///
 /// ```compile_fail
 /// use carina_core::provider::{InFlightCreate, PendingEnvelope, Timestamp};
@@ -3432,14 +3580,39 @@ pub enum InFlightPersistence<'a> {
 ///     let _ = pending.repend(token);
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InFlightCreate {
+#[derive(Debug, Clone, PartialEq)]
+pub struct InFlightCreate<W = PreparedCreateWriteback> {
     id: ResourceId,
-    pending: PendingRecord,
+    pending: PendingRecord<W>,
     started_at: Timestamp,
+    // Host-owned destroy metadata; the containing state row persists it.
+    pub(crate) dependency_bindings: Box<crate::resource::PersistedDestroyDependencies>,
 }
 
-impl Serialize for InFlightCreate {
+// Provider fixtures compare all continuation metadata across provider and host
+// stages. Only the host stage carries desired values.
+#[cfg(any(test, feature = "test-utils"))]
+impl PartialEq<InFlightCreate> for InFlightCreate<ProviderCreateRecord> {
+    fn eq(&self, other: &InFlightCreate) -> bool {
+        self.id == other.id
+            && self.started_at == other.started_at
+            && self.dependency_bindings == other.dependency_bindings
+            && match (&self.pending, &other.pending) {
+                (PendingRecord::Fresh(left), PendingRecord::Fresh(right)) => {
+                    left.id == right.id
+                        && left.token == right.token
+                        && left.progress == right.progress
+                        && left.sent == right.sent
+                        && left.poll_after_secs == right.poll_after_secs
+                        && left.started_at == right.started_at
+                }
+                (PendingRecord::Persisted(left), PendingRecord::Persisted(right)) => left == right,
+                _ => false,
+            }
+    }
+}
+
+impl<W> Serialize for InFlightCreate<W> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         struct Encoded<'a> {
@@ -3460,9 +3633,14 @@ impl Serialize for InFlightCreate {
     }
 }
 
-/// Loader-produced binding of an ID-less persisted envelope to its containing
-/// state row. The tuple field is private, and [`InFlightCreate`] itself does
-/// not implement `Deserialize`; state loaders must decode the complete row.
+/// Binding of an ID-less persisted envelope to its containing state row.
+/// Complete-row decoding and the
+/// [`current_from_state_row`](crate::state_document::current_from_state_row)
+/// projection produce this binding. That projection is public and trusts its
+/// caller to pass the row's own address; tying the address to the row by type
+/// is tracked in carina#4519. The tuple field is private, and
+/// [`InFlightCreate`] itself does not implement `Deserialize`; state loaders
+/// must decode the complete row.
 ///
 /// ```compile_fail
 /// use carina_core::provider::{InFlightCreate, StateRowInFlightCreate};
@@ -3471,21 +3649,56 @@ impl Serialize for InFlightCreate {
 ///     StateRowInFlightCreate(pending)
 /// }
 /// ```
+///
+/// ```compile_fail,E0624
+/// use carina_core::provider::{InFlightCreate, StateRowInFlightCreate};
+/// use carina_core::resource::ResolvedResourceId;
+/// fn bypass(id: &ResolvedResourceId, pending: InFlightCreate) -> StateRowInFlightCreate {
+///     StateRowInFlightCreate::bind(id, pending)
+/// }
+/// ```
 #[derive(Debug)]
 pub struct StateRowInFlightCreate(InFlightCreate);
 
 impl StateRowInFlightCreate {
+    /// Bind an in-memory continuation to its persisted row address, including
+    /// the provider instance that the row would supply during decoding.
+    pub(crate) fn bind(id: &ResolvedResourceId, mut pending: InFlightCreate) -> Self {
+        pending.id = id.as_inner().clone();
+        if let PendingRecord::Fresh(fresh) = &mut pending.pending {
+            fresh.id = id.as_inner().clone();
+        }
+        Self(pending)
+    }
+
     pub fn into_inner(self) -> InFlightCreate {
         self.0
     }
 }
 
-/// Loader-produced binding of an outcome-unknown timestamp to its containing
-/// state-row address.
+/// Binding of an outcome-unknown timestamp to its containing state-row address.
+/// Complete-row decoding and the
+/// [`current_from_state_row`](crate::state_document::current_from_state_row)
+/// projection produce this binding (see [`StateRowInFlightCreate`] for the
+/// caller-trust caveat); state loaders must decode the complete row.
+///
+/// ```compile_fail,E0624
+/// use carina_core::provider::{StateRowUnknownCreateOutcome, UnknownCreateOutcome};
+/// use carina_core::resource::ResolvedResourceId;
+/// fn bypass(id: &ResolvedResourceId, unknown: UnknownCreateOutcome) -> StateRowUnknownCreateOutcome {
+///     StateRowUnknownCreateOutcome::bind(id, unknown)
+/// }
+/// ```
 #[derive(Debug)]
 pub struct StateRowUnknownCreateOutcome(UnknownCreateOutcome);
 
 impl StateRowUnknownCreateOutcome {
+    /// Bind an in-memory unknown outcome to the address supplied by its row.
+    pub(crate) fn bind(id: &ResolvedResourceId, mut unknown: UnknownCreateOutcome) -> Self {
+        unknown.id = id.as_inner().clone();
+        Self(unknown)
+    }
+
     pub fn into_inner(self) -> UnknownCreateOutcome {
         self.0
     }
@@ -3540,11 +3753,12 @@ impl<'de> Deserialize<'de> for StateRowInFlightCreate {
                 secrets,
             )),
             started_at,
+            dependency_bindings: Default::default(),
         }))
     }
 }
 
-impl InFlightCreate {
+impl InFlightCreate<ProviderCreateRecord> {
     pub(crate) fn from_pending(pending: PendingCreate) -> Self {
         let id = pending.id.clone();
         let started_at = pending.started_at.clone();
@@ -3552,7 +3766,39 @@ impl InFlightCreate {
             id,
             pending: PendingRecord::Fresh(pending.into()),
             started_at,
+            dependency_bindings: Default::default(),
         }
+    }
+
+    pub(crate) fn into_writeback(self, attributes: PreparedCreateWriteback) -> InFlightCreate {
+        self.map_writeback(|ProviderCreateRecord| attributes)
+    }
+}
+
+impl<W> InFlightCreate<W> {
+    fn map_writeback<T>(self, map: impl FnOnce(W) -> T) -> InFlightCreate<T> {
+        let pending = match self.pending {
+            PendingRecord::Fresh(fresh) => PendingRecord::Fresh(FreshPendingCreate {
+                id: fresh.id,
+                writeback: Box::new(map(*fresh.writeback)),
+                token: fresh.token,
+                progress: fresh.progress,
+                sent: fresh.sent,
+                poll_after_secs: fresh.poll_after_secs,
+                started_at: fresh.started_at,
+            }),
+            PendingRecord::Persisted(envelope) => PendingRecord::Persisted(envelope),
+        };
+        InFlightCreate {
+            id: self.id,
+            pending,
+            started_at: self.started_at,
+            dependency_bindings: self.dependency_bindings,
+        }
+    }
+
+    fn into_provider_record(self) -> InFlightCreate<ProviderCreateRecord> {
+        self.map_writeback(|_| ProviderCreateRecord)
     }
 
     /// Convert a continuation produced by a native provider or host adapter
@@ -3560,7 +3806,7 @@ impl InFlightCreate {
     pub(crate) fn into_create_failure<S: TextState>(
         self,
         error: ProviderFailure<S>,
-    ) -> CreateFailure<S> {
+    ) -> CreateFailure<S, W> {
         CreateFailure::from_kind(CreateFailureKind::InFlight {
             pending: self,
             error,
@@ -3571,7 +3817,7 @@ impl InFlightCreate {
     pub(crate) fn into_resume_failure<S: TextState>(
         self,
         error: ProviderFailure<S>,
-    ) -> ResumeFailure<S> {
+    ) -> ResumeFailure<S, W> {
         ResumeFailure::from_kind(ResumeFailureKind::InFlight {
             pending: self,
             error,
@@ -3607,7 +3853,7 @@ impl InFlightCreate {
         &self.started_at
     }
 
-    pub fn persistence(&self) -> InFlightPersistence<'_> {
+    pub fn persistence(&self) -> InFlightPersistence<'_, W> {
         match &self.pending {
             PendingRecord::Fresh(pending) => InFlightPersistence::Fresh(pending),
             PendingRecord::Persisted(_envelope) => InFlightPersistence::Persisted,
@@ -3623,6 +3869,7 @@ impl InFlightCreate {
                 id: self.id,
                 pending: PendingRecord::Persisted(envelope),
                 started_at: self.started_at,
+                dependency_bindings: self.dependency_bindings,
             })),
         }
     }
@@ -3631,6 +3878,7 @@ impl InFlightCreate {
         let pending = match self.pending {
             PendingRecord::Fresh(FreshPendingCreate {
                 id,
+                writeback,
                 token: _old_token,
                 progress,
                 sent,
@@ -3638,6 +3886,7 @@ impl InFlightCreate {
                 started_at,
             }) => PendingRecord::Fresh(FreshPendingCreate {
                 id,
+                writeback,
                 token,
                 progress,
                 sent,
@@ -3653,6 +3902,7 @@ impl InFlightCreate {
             id: self.id,
             pending,
             started_at: self.started_at,
+            dependency_bindings: self.dependency_bindings,
         }
     }
 
@@ -3660,6 +3910,7 @@ impl InFlightCreate {
         let pending = match self.pending {
             PendingRecord::Fresh(FreshPendingCreate {
                 id,
+                writeback,
                 token,
                 progress,
                 sent,
@@ -3667,6 +3918,7 @@ impl InFlightCreate {
                 started_at,
             }) => PendingRecord::Fresh(FreshPendingCreate {
                 id,
+                writeback,
                 token,
                 progress: match progress {
                     CreateProgress::Operating { .. } => CreateProgress::Operating {
@@ -3689,6 +3941,7 @@ impl InFlightCreate {
             id: self.id,
             pending,
             started_at: self.started_at,
+            dependency_bindings: self.dependency_bindings,
         }
     }
 
@@ -3870,6 +4123,8 @@ impl Drop for PendingCallEgress {
 pub struct UnknownCreateOutcome {
     id: ResourceId,
     started_at: Timestamp,
+    // Host-owned destroy metadata; the containing state row persists it.
+    pub(crate) dependency_bindings: Box<crate::resource::PersistedDestroyDependencies>,
 }
 
 impl Serialize for UnknownCreateOutcome {
@@ -3888,7 +4143,11 @@ impl Serialize for UnknownCreateOutcome {
 
 impl UnknownCreateOutcome {
     fn new(id: ResourceId, started_at: Timestamp) -> Self {
-        Self { id, started_at }
+        Self {
+            id,
+            started_at,
+            dependency_bindings: Default::default(),
+        }
     }
 
     pub fn id(&self) -> &ResourceId {
@@ -4096,7 +4355,7 @@ fn report_cancelled_guest_create(attempt: CreateAttempt, may_have_dispatched: bo
 
 /// Inspectable classification carried by an opaque [`CreateFailure`].
 #[derive(Debug)]
-pub enum CreateFailureKind<S: TextState = Unbound> {
+pub enum CreateFailureKind<S: TextState = Unbound, W = ProviderCreateRecord> {
     /// No cloud resource remains. A `not-created` verdict means nothing was
     /// created: no request left the provider, or the cloud rejected it without
     /// creating anything.
@@ -4108,12 +4367,12 @@ pub enum CreateFailureKind<S: TextState = Unbound> {
     },
     /// The provider reported an identifier; resource existence may be unobserved.
     IdentifierReported {
-        identified: IdentifiedCreate<S>,
+        identified: IdentifiedCreate<S, W>,
         error: ProviderFailure<S>,
     },
     /// A resumable continuation is available, with an optional cloud identifier.
     InFlight {
-        pending: InFlightCreate,
+        pending: InFlightCreate<W>,
         error: ProviderFailure<S>,
     },
 }
@@ -4131,9 +4390,11 @@ pub enum CreateFailureKind<S: TextState = Unbound> {
 /// let _failure = CreateFailure(kind);
 /// ```
 #[derive(Debug)]
-pub struct CreateFailure<S: TextState = Unbound>(Box<CreateFailureKind<S>>);
+pub struct CreateFailure<S: TextState = Unbound, W = ProviderCreateRecord>(
+    Box<CreateFailureKind<S, W>>,
+);
 
-impl<S: TextState> std::fmt::Display for CreateFailure<S> {
+impl<S: TextState, W> std::fmt::Display for CreateFailure<S, W> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.kind() {
             CreateFailureKind::NoResource(_error) => {
@@ -4155,7 +4416,7 @@ impl<S: TextState> std::fmt::Display for CreateFailure<S> {
     }
 }
 
-impl std::error::Error for CreateFailure<Bound> {
+impl<W: std::fmt::Debug> std::error::Error for CreateFailure<Bound, W> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self.kind() {
             CreateFailureKind::NoResource(error) => Some(error),
@@ -4175,16 +4436,16 @@ impl std::error::Error for CreateFailure<Bound> {
     }
 }
 
-impl<S: TextState> CreateFailure<S> {
-    fn from_kind(kind: CreateFailureKind<S>) -> Self {
+impl<S: TextState, W> CreateFailure<S, W> {
+    fn from_kind(kind: CreateFailureKind<S, W>) -> Self {
         Self(Box::new(kind))
     }
 
-    pub fn kind(&self) -> &CreateFailureKind<S> {
+    pub fn kind(&self) -> &CreateFailureKind<S, W> {
         self.0.as_ref()
     }
 
-    pub fn into_kind(self) -> CreateFailureKind<S> {
+    pub fn into_kind(self) -> CreateFailureKind<S, W> {
         *self.0
     }
 
@@ -4207,13 +4468,13 @@ impl<S: TextState> CreateFailure<S> {
     }
 
     pub(crate) fn identifier_reported(
-        identified: IdentifiedCreate<S>,
+        identified: IdentifiedCreate<S, W>,
         error: ProviderFailure<S>,
     ) -> Self {
         Self::from_kind(CreateFailureKind::IdentifierReported { identified, error })
     }
 
-    pub(crate) fn in_flight(pending: InFlightCreate, error: ProviderFailure<S>) -> Self {
+    pub(crate) fn in_flight(pending: InFlightCreate<W>, error: ProviderFailure<S>) -> Self {
         Self::from_kind(CreateFailureKind::InFlight { pending, error })
     }
 
@@ -4242,8 +4503,8 @@ impl<S: TextState> CreateFailure<S> {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct ResumeOutcome<S: TextState = Unbound> {
-    kind: ResumeOutcomeKind<S>,
+pub struct ResumeOutcome<S: TextState = Unbound, W = ProviderCreateRecord> {
+    kind: ResumeOutcomeKind<S, W>,
 }
 
 /// A resumed create that completed with an applied state.
@@ -4259,10 +4520,16 @@ pub struct ResumeOutcome<S: TextState = Unbound> {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct CompletedResume<S: TextState = Unbound>(IdentifiedCreate<S>);
+pub struct CompletedResume<S: TextState = Unbound, W = ProviderCreateRecord>(
+    IdentifiedCreate<S, W>,
+);
 
 impl<S: TextState> CompletedResume<S> {
-    fn new(pending: InFlightCreate, identifier: AppliedIdentifier, state: AppliedState) -> Self {
+    fn new(
+        pending: InFlightCreate<ProviderCreateRecord>,
+        identifier: AppliedIdentifier,
+        state: AppliedState,
+    ) -> Self {
         let (_state_id, _observed_identifier, attributes) = state.into_parts();
         let state =
             AppliedState::from_snapshot_parts(pending.id().clone(), identifier.clone(), attributes);
@@ -4272,7 +4539,9 @@ impl<S: TextState> CompletedResume<S> {
             CreateObservation::Observed(state),
         ))
     }
+}
 
+impl<S: TextState, W> CompletedResume<S, W> {
     fn id(&self) -> &ResourceId {
         self.0.id()
     }
@@ -4281,19 +4550,12 @@ impl<S: TextState> CompletedResume<S> {
         self.0.identifier()
     }
 
-    pub(crate) fn with_resolved_desired_attributes(
-        self,
-        attributes: SecretPreservingAttributes,
-    ) -> Self {
-        Self(self.0.with_resolved_desired_attributes(attributes))
-    }
-
-    pub(crate) fn into_identified_create(self) -> IdentifiedCreate<S> {
+    pub(crate) fn into_identified_create(self) -> IdentifiedCreate<S, W> {
         self.0
     }
 }
 
-impl CompletedResume<Bound> {
+impl<W> CompletedResume<Bound, W> {
     pub fn observed_state(&self) -> SnapshotState {
         self.0.observed_state()
     }
@@ -4304,15 +4566,15 @@ impl CompletedResume<Bound> {
 /// The completed observation retains the persisted continuation's sent-value
 /// authority; unlike a resent create, this type never invents a new `Sent`.
 #[derive(Debug)]
-pub struct PartialResume<S: TextState = Unbound> {
-    completed: CompletedResume<S>,
+pub struct PartialResume<S: TextState = Unbound, W = ProviderCreateRecord> {
+    completed: CompletedResume<S, W>,
     diagnostic: PartialReadDiagnostic<S>,
     read_back_end: ReadBackEnd,
 }
 
 impl<S: TextState> PartialResume<S> {
     fn new(
-        pending: InFlightCreate,
+        pending: InFlightCreate<ProviderCreateRecord>,
         identifier: AppliedIdentifier,
         attributes: HashMap<String, Value>,
         diagnostic: PartialReadDiagnostic<S>,
@@ -4325,7 +4587,9 @@ impl<S: TextState> PartialResume<S> {
             read_back_end: ReadBackEnd::ProviderReported,
         }
     }
+}
 
+impl<S: TextState, W> PartialResume<S, W> {
     fn id(&self) -> &ResourceId {
         self.completed.id()
     }
@@ -4337,20 +4601,9 @@ impl<S: TextState> PartialResume<S> {
     pub fn diagnostic(&self) -> &PartialReadDiagnostic<S> {
         &self.diagnostic
     }
-
-    pub(crate) fn with_resolved_desired_attributes(
-        self,
-        attributes: SecretPreservingAttributes,
-    ) -> Self {
-        Self {
-            completed: self.completed.with_resolved_desired_attributes(attributes),
-            diagnostic: self.diagnostic,
-            read_back_end: self.read_back_end,
-        }
-    }
 }
 
-impl PartialResume<Bound> {
+impl PartialResume<Bound, PreparedCreateWriteback> {
     pub fn observed_state(&self) -> SnapshotState {
         self.diagnostic
             .clone()
@@ -4380,17 +4633,17 @@ impl PartialResume<Bound> {
 
 /// Read-only classification exposed by an opaque [`ResumeOutcome`].
 #[derive(Debug)]
-pub enum ResumeOutcomeKind<S: TextState = Unbound> {
-    Resumed(Box<CompletedResume<S>>),
+pub enum ResumeOutcomeKind<S: TextState = Unbound, W = ProviderCreateRecord> {
+    Resumed(Box<CompletedResume<S, W>>),
     /// The persisted create completed, but its read-back remains incomplete.
     /// This is distinct from `Resent`: no new create request or `sent` value
     /// was fabricated to finish the resumed continuation.
-    PartialSuccess(Box<PartialResume<S>>),
+    PartialSuccess(Box<PartialResume<S, W>>),
     Resent(Box<CreateOutcome<S>>),
 }
 
-impl<S: TextState> ResumeOutcome<S> {
-    fn resumed(completed: CompletedResume<S>) -> Self {
+impl<S: TextState, W> ResumeOutcome<S, W> {
+    fn resumed(completed: CompletedResume<S, W>) -> Self {
         Self {
             kind: ResumeOutcomeKind::Resumed(Box::new(completed)),
         }
@@ -4402,7 +4655,7 @@ impl<S: TextState> ResumeOutcome<S> {
         }
     }
 
-    fn partial(outcome: PartialResume<S>) -> Self {
+    fn partial(outcome: PartialResume<S, W>) -> Self {
         Self {
             kind: ResumeOutcomeKind::PartialSuccess(Box::new(outcome)),
         }
@@ -4423,11 +4676,11 @@ impl<S: TextState> ResumeOutcome<S> {
         outcome
     }
 
-    pub fn kind(&self) -> &ResumeOutcomeKind<S> {
+    pub fn kind(&self) -> &ResumeOutcomeKind<S, W> {
         &self.kind
     }
 
-    pub fn into_kind(self) -> ResumeOutcomeKind<S> {
+    pub fn into_kind(self) -> ResumeOutcomeKind<S, W> {
         self.kind
     }
 
@@ -4440,21 +4693,41 @@ impl<S: TextState> ResumeOutcome<S> {
     }
 }
 
+impl ResumeOutcome<Bound> {
+    pub(crate) fn into_writeback(self, attributes: PreparedCreateWriteback) -> HostResumeOutcome {
+        ResumeOutcome {
+            kind: match self.kind {
+                ResumeOutcomeKind::Resumed(completed) => ResumeOutcomeKind::Resumed(Box::new(
+                    CompletedResume(completed.0.into_writeback(attributes)),
+                )),
+                ResumeOutcomeKind::PartialSuccess(partial) => {
+                    ResumeOutcomeKind::PartialSuccess(Box::new(PartialResume {
+                        completed: CompletedResume(partial.completed.0.into_writeback(attributes)),
+                        diagnostic: partial.diagnostic,
+                        read_back_end: partial.read_back_end,
+                    }))
+                }
+                ResumeOutcomeKind::Resent(outcome) => ResumeOutcomeKind::Resent(outcome),
+            },
+        }
+    }
+}
+
 /// Inspectable classification carried by an opaque [`ResumeFailure`].
 #[derive(Debug)]
-pub enum ResumeFailureKind<S: TextState = Unbound> {
+pub enum ResumeFailureKind<S: TextState = Unbound, W = ProviderCreateRecord> {
     /// No cloud resource remains. A `not-created` verdict means nothing was
     /// created: no request left the provider, or the cloud rejected it without
     /// creating anything.
     NoResource(ProviderFailure<S>),
     /// The provider reported an identifier; resource existence may be unobserved.
     IdentifierReported {
-        identified: IdentifiedCreate<S>,
+        identified: IdentifiedCreate<S, W>,
         error: ProviderFailure<S>,
     },
     /// A resumable continuation is available, with an optional cloud identifier.
     InFlight {
-        pending: InFlightCreate,
+        pending: InFlightCreate<W>,
         error: ProviderFailure<S>,
     },
 }
@@ -4471,9 +4744,11 @@ pub enum ResumeFailureKind<S: TextState = Unbound> {
 /// let _failure = ResumeFailure(kind);
 /// ```
 #[derive(Debug)]
-pub struct ResumeFailure<S: TextState = Unbound>(Box<ResumeFailureKind<S>>);
+pub struct ResumeFailure<S: TextState = Unbound, W = ProviderCreateRecord>(
+    Box<ResumeFailureKind<S, W>>,
+);
 
-impl<S: TextState> std::fmt::Display for ResumeFailure<S> {
+impl<S: TextState, W> std::fmt::Display for ResumeFailure<S, W> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.kind() {
             ResumeFailureKind::NoResource(_error) => f.write_str("resumed create left no resource"),
@@ -4491,7 +4766,7 @@ impl<S: TextState> std::fmt::Display for ResumeFailure<S> {
     }
 }
 
-impl std::error::Error for ResumeFailure<Bound> {
+impl<W: std::fmt::Debug> std::error::Error for ResumeFailure<Bound, W> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self.kind() {
             ResumeFailureKind::NoResource(error) => Some(error),
@@ -4507,16 +4782,16 @@ impl std::error::Error for ResumeFailure<Bound> {
     }
 }
 
-impl<S: TextState> ResumeFailure<S> {
-    fn from_kind(kind: ResumeFailureKind<S>) -> Self {
+impl<S: TextState, W> ResumeFailure<S, W> {
+    fn from_kind(kind: ResumeFailureKind<S, W>) -> Self {
         Self(Box::new(kind))
     }
 
-    pub fn kind(&self) -> &ResumeFailureKind<S> {
+    pub fn kind(&self) -> &ResumeFailureKind<S, W> {
         self.0.as_ref()
     }
 
-    pub fn into_kind(self) -> ResumeFailureKind<S> {
+    pub fn into_kind(self) -> ResumeFailureKind<S, W> {
         *self.0
     }
 
@@ -4539,13 +4814,13 @@ impl<S: TextState> ResumeFailure<S> {
     }
 
     pub(crate) fn identifier_reported(
-        identified: IdentifiedCreate<S>,
+        identified: IdentifiedCreate<S, W>,
         error: ProviderFailure<S>,
     ) -> Self {
         Self::from_kind(ResumeFailureKind::IdentifierReported { identified, error })
     }
 
-    pub(crate) fn in_flight(pending: InFlightCreate, error: ProviderFailure<S>) -> Self {
+    pub(crate) fn in_flight(pending: InFlightCreate<W>, error: ProviderFailure<S>) -> Self {
         Self::from_kind(ResumeFailureKind::InFlight { pending, error })
     }
 }
@@ -4884,8 +5159,9 @@ pub struct ResumeRoutingMismatch {
 /// ```
 #[derive(Debug)]
 pub struct ResumeCreateRequest {
-    pending: InFlightCreate,
+    pending: InFlightCreate<ProviderCreateRecord>,
     request: CreateRequest,
+    writeback: PreparedCreateWriteback,
     authorization: ResumeAuthorization,
 }
 
@@ -4909,11 +5185,15 @@ enum ResumeAuthorization {
 pub struct PollCreateRequest {
     resumed: ResumedCreate,
     request: CreateRequest,
+    writeback: PreparedCreateWriteback,
 }
 
 impl PollCreateRequest {
-    pub(crate) fn new(pending: InFlightCreate, request: CreateRequest) -> Result<Self, HostError> {
-        if pending.id() != &request.resource().id {
+    pub(crate) fn new(
+        pending: InFlightCreate,
+        write: crate::executor::PreparedWrite<CreateRequest>,
+    ) -> Result<Self, HostError> {
+        if pending.id() != &write.request().resource().id {
             return Err(
                 HostError::internal("poll request belongs to another resource")
                     .for_resource(pending.id().clone()),
@@ -4927,10 +5207,11 @@ impl PollCreateRequest {
         };
         Ok(Self {
             resumed: ResumedCreate {
-                pending,
+                pending: pending.into_provider_record(),
                 identifier,
             },
-            request,
+            request: write.request().clone(),
+            writeback: write.create_writeback(),
         })
     }
 
@@ -4942,6 +5223,7 @@ impl PollCreateRequest {
         ResumeCreateRequest {
             pending: self.resumed.pending,
             request: self.request,
+            writeback: self.writeback,
             authorization: ResumeAuthorization::Poll(self.resumed.identifier),
         }
     }
@@ -5007,7 +5289,7 @@ impl Resume {
 /// ```
 #[derive(Debug)]
 pub struct ResumeAttempt {
-    pending: InFlightCreate,
+    pending: InFlightCreate<ProviderCreateRecord>,
     permit: crate::replacement::CreatePermit,
 }
 
@@ -5073,7 +5355,7 @@ impl ResumeAttempt {
 /// ```
 #[derive(Debug)]
 pub struct ResumedCreate {
-    pending: InFlightCreate,
+    pending: InFlightCreate<ProviderCreateRecord>,
     identifier: AppliedIdentifier,
 }
 
@@ -5147,7 +5429,7 @@ impl ResumedCreate {
 /// Canonicalized resumed-create witness. It intentionally cannot re-pend.
 #[derive(Debug)]
 pub struct FinishingResume {
-    pending: InFlightCreate,
+    pending: InFlightCreate<ProviderCreateRecord>,
     identifier: AppliedIdentifier,
 }
 
@@ -5187,7 +5469,7 @@ impl FinishingResume {
 }
 
 fn identified_from_resume<S: TextState>(
-    pending: InFlightCreate,
+    pending: InFlightCreate<ProviderCreateRecord>,
     identifier: AppliedIdentifier,
     observation: CreateObservation<S>,
 ) -> IdentifiedCreate<S> {
@@ -5221,8 +5503,9 @@ impl ResumeCreateRequest {
             });
         }
         Ok(Self {
-            pending,
+            pending: pending.into_provider_record(),
             request,
+            writeback: permit.prepared_write().create_writeback(),
             authorization: ResumeAuthorization::Resend(permit),
         })
     }
@@ -5246,7 +5529,11 @@ impl ResumeCreateRequest {
         &self.request
     }
 
-    pub(crate) fn pending_for_dispatch(&self) -> InFlightCreate {
+    pub(crate) fn writeback(&self) -> &PreparedCreateWriteback {
+        &self.writeback
+    }
+
+    pub(crate) fn pending_for_dispatch(&self) -> InFlightCreate<ProviderCreateRecord> {
         self.pending.clone()
     }
 
@@ -5270,7 +5557,7 @@ impl ResumeCreateRequest {
         (resume, self.request)
     }
 
-    pub(crate) fn into_in_flight(self) -> InFlightCreate {
+    pub(crate) fn into_in_flight(self) -> InFlightCreate<ProviderCreateRecord> {
         self.pending
     }
 }
@@ -5278,7 +5565,7 @@ impl ResumeCreateRequest {
 /// Linear attempt for a create explicitly re-sent by an unissued resume.
 #[derive(Debug)]
 pub struct ResentCreateAttempt {
-    previous: InFlightCreate,
+    previous: InFlightCreate<ProviderCreateRecord>,
     _permit: crate::replacement::CreatePermit,
 }
 
@@ -5887,7 +6174,7 @@ impl PartialReadDiagnostic<Unbound> {
         }
     }
 }
-impl IdentifiedCreate<Unbound> {
+impl<W> IdentifiedCreate<Unbound, W> {
     fn admit(&mut self, schemas: &SchemaRegistry) -> ProviderResult<()> {
         if let Some(diagnostic) = self.partial_read.take() {
             diagnostic.validate(&self.id, schemas)?;
@@ -5897,16 +6184,16 @@ impl IdentifiedCreate<Unbound> {
     }
 
     #[cfg(feature = "test-utils")]
-    pub fn failure_for_test(self) -> CreateFailure {
+    pub fn failure_for_test(self) -> CreateFailure<Unbound, W> {
         CreateFailure::identifier_reported(self, ProviderError::internal("fixture"))
     }
 
-    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostIdentifiedCreate {
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> IdentifiedCreate<Bound, W> {
         IdentifiedCreate {
             id: self.id,
             identifier: self.identifier,
             sent: self.sent,
-            resolved_desired_attributes: self.resolved_desired_attributes,
+            writeback: self.writeback,
             partial_read: self
                 .partial_read
                 .map(|diagnostic| Box::new(diagnostic.with_secrets(secrets))),
@@ -5979,7 +6266,7 @@ impl UpdateOutcome<Unbound> {
         }
     }
 }
-impl CreateFailure<Unbound> {
+impl<W> CreateFailure<Unbound, W> {
     pub(crate) fn admit(mut self, schemas: &SchemaRegistry) -> Self {
         if let CreateFailureKind::IdentifierReported { identified, error } = self.0.as_mut()
             && let Err(rejected) = identified.admit(schemas)
@@ -5989,8 +6276,8 @@ impl CreateFailure<Unbound> {
         self
     }
 
-    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostCreateFailure {
-        HostCreateFailure::from_kind(match self.into_kind() {
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> CreateFailure<Bound, W> {
+        CreateFailure::from_kind(match self.into_kind() {
             CreateFailureKind::NoResource(error) => {
                 CreateFailureKind::NoResource(error.with_secrets(secrets))
             }
@@ -6013,7 +6300,7 @@ impl CreateFailure<Unbound> {
         })
     }
 }
-impl ResumeFailure<Unbound> {
+impl<W> ResumeFailure<Unbound, W> {
     pub(crate) fn admit(mut self, schemas: &SchemaRegistry) -> Self {
         if let ResumeFailureKind::IdentifierReported { identified, error } = self.0.as_mut()
             && let Err(rejected) = identified.admit(schemas)
@@ -6023,8 +6310,8 @@ impl ResumeFailure<Unbound> {
         self
     }
 
-    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostResumeFailure {
-        HostResumeFailure::from_kind(match self.into_kind() {
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> ResumeFailure<Bound, W> {
+        ResumeFailure::from_kind(match self.into_kind() {
             ResumeFailureKind::NoResource(error) => {
                 ResumeFailureKind::NoResource(error.with_secrets(secrets))
             }
@@ -6085,9 +6372,11 @@ impl ResumeOutcome<Unbound> {
         }
         Ok(self)
     }
+}
 
-    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostResumeOutcome {
-        HostResumeOutcome {
+impl<W> ResumeOutcome<Unbound, W> {
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> ResumeOutcome<Bound, W> {
+        ResumeOutcome {
             kind: match self.kind {
                 ResumeOutcomeKind::Resumed(completed) => ResumeOutcomeKind::Resumed(Box::new(
                     CompletedResume(completed.0.with_secrets(secrets)),
@@ -6132,13 +6421,13 @@ impl PartialReadDiagnostic<Unbound> {
     }
 }
 #[cfg(test)]
-impl IdentifiedCreate<Unbound> {
+impl<W> IdentifiedCreate<Unbound, W> {
     #[doc(hidden)]
-    pub fn into_host_for_test(self) -> HostIdentifiedCreate {
+    pub fn into_host_for_test(self) -> IdentifiedCreate<Bound, W> {
         self.with_secrets(&RedactionSet::for_test(&[]))
     }
     #[doc(hidden)]
-    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostIdentifiedCreate {
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> IdentifiedCreate<Bound, W> {
         self.with_secrets(secrets)
     }
 }
@@ -6165,35 +6454,35 @@ impl UpdateOutcome<Unbound> {
     }
 }
 #[cfg(test)]
-impl CreateFailure<Unbound> {
+impl<W> CreateFailure<Unbound, W> {
     #[doc(hidden)]
-    pub fn into_host_for_test(self) -> HostCreateFailure {
+    pub fn into_host_for_test(self) -> CreateFailure<Bound, W> {
         self.with_secrets(&RedactionSet::for_test(&[]))
     }
     #[doc(hidden)]
-    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostCreateFailure {
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> CreateFailure<Bound, W> {
         self.with_secrets(secrets)
     }
 }
 #[cfg(test)]
-impl ResumeFailure<Unbound> {
+impl<W> ResumeFailure<Unbound, W> {
     #[doc(hidden)]
-    pub fn into_host_for_test(self) -> HostResumeFailure {
+    pub fn into_host_for_test(self) -> ResumeFailure<Bound, W> {
         self.with_secrets(&RedactionSet::for_test(&[]))
     }
     #[doc(hidden)]
-    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostResumeFailure {
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> ResumeFailure<Bound, W> {
         self.with_secrets(secrets)
     }
 }
 #[cfg(test)]
-impl ResumeOutcome<Unbound> {
+impl<W> ResumeOutcome<Unbound, W> {
     #[doc(hidden)]
-    pub fn into_host_for_test(self) -> HostResumeOutcome {
+    pub fn into_host_for_test(self) -> ResumeOutcome<Bound, W> {
         self.with_secrets(&RedactionSet::for_test(&[]))
     }
     #[doc(hidden)]
-    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostResumeOutcome {
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> ResumeOutcome<Bound, W> {
         self.with_secrets(secrets)
     }
 }
@@ -8076,11 +8365,11 @@ impl Provider<Bound> for ProviderRouter {
         id: &ResourceId,
         request: CreateRequest,
         attempt: CreateAttempt,
-    ) -> BoxFuture<'_, Result<HostCreateOutcome, HostCreateFailure>> {
+    ) -> BoxFuture<'_, Result<HostCreateOutcome, CreateFailure<Bound>>> {
         match self.get_provider_or_error(id) {
             Ok(provider) => provider.create(id, request, attempt),
             Err(error) => {
-                Box::pin(async move { Err(HostCreateFailure::not_created_at_dispatch(error)) })
+                Box::pin(async move { Err(CreateFailure::not_created_at_dispatch(error)) })
             }
         }
     }
@@ -8088,12 +8377,12 @@ impl Provider<Bound> for ProviderRouter {
     fn resume_create(
         &self,
         request: ResumeCreateRequest,
-    ) -> BoxFuture<'_, Result<HostResumeOutcome, HostResumeFailure>> {
+    ) -> BoxFuture<'_, Result<ResumeOutcome<Bound>, ResumeFailure<Bound>>> {
         match self.get_provider_or_error(request.id()) {
             Ok(provider) => provider.resume_create(request),
             Err(error) => {
                 let pending = request.into_in_flight();
-                Box::pin(async move { Err(HostResumeFailure::in_flight(pending, error)) })
+                Box::pin(async move { Err(ResumeFailure::in_flight(pending, error)) })
             }
         }
     }
@@ -11722,7 +12011,7 @@ mod tests {
             Timestamp::try_from("2026-10-23T08:00:00Z").expect("fixture timestamp is valid");
         let identifier = AppliedIdentifier::new("persisted-id").expect("valid identifier");
         let pending = PendingCreate::new(
-            id,
+            id.clone(),
             PendingToken::new("persisted-token"),
             CreateProgress::ReadingBack {
                 identifier: identifier.clone(),
@@ -11745,7 +12034,7 @@ mod tests {
         );
 
         let outcome = ResumedCreate {
-            pending,
+            pending: pending.into_provider_record(),
             identifier: identifier.clone(),
         }
         .partial(
@@ -11756,7 +12045,15 @@ mod tests {
             diagnostic.clone(),
         );
         let diagnostic = diagnostic.into_host_for_test();
-        let outcome = outcome.into_host_for_test();
+        let permit = crate::test_utils::prepared_write::create_permit(
+            &Resource::from_id(id).with_value_attributes(HashMap::from([(
+                "arn".to_string(),
+                Value::Concrete(ConcreteValue::String("known-arn".into())),
+            )])),
+        );
+        let outcome = outcome
+            .into_host_for_test()
+            .into_writeback(permit.prepared_write().create_writeback());
         let ResumeOutcomeKind::PartialSuccess(partial) = outcome.into_kind() else {
             panic!("resumed partial read-back must remain distinct from a resent create")
         };
@@ -11815,7 +12112,7 @@ mod tests {
             .await
             .classify();
 
-        let HostCreateFailureKind::OutcomeUnknown { unknown, error } =
+        let CreateFailureKind::OutcomeUnknown { unknown, error } =
             failure.into_host_for_test().into_kind()
         else {
             panic!("a sent guest call must not be classified as not_created")
@@ -11835,8 +12132,7 @@ mod tests {
             .await
             .classify();
 
-        let HostCreateFailureKind::NoResource(error) = failure.into_host_for_test().into_kind()
-        else {
+        let CreateFailureKind::NoResource(error) = failure.into_host_for_test().into_kind() else {
             panic!("a guest call with no dispatched request must remain not_created")
         };
         assert_eq!(error.to_string(), "guest trapped");
@@ -11865,8 +12161,7 @@ mod tests {
         drop(pending);
 
         let failure = classification.await.expect("classification task");
-        let HostCreateFailureKind::NoResource(error) = failure.into_host_for_test().into_kind()
-        else {
+        let CreateFailureKind::NoResource(error) = failure.into_host_for_test().into_kind() else {
             panic!("a host-denied pending request must not count as egress")
         };
         assert_eq!(error.to_string(), "malformed guest result");
@@ -11880,7 +12175,7 @@ mod tests {
             ProviderError::internal("returned value could not be decoded"),
         );
 
-        let HostCreateFailureKind::OutcomeUnknown { unknown, error } =
+        let CreateFailureKind::OutcomeUnknown { unknown, error } =
             failure.into_host_for_test().into_kind()
         else {
             panic!("the egress witness must mint an outcome-unknown failure")
@@ -11927,7 +12222,7 @@ mod tests {
     fn classified_resume_failure_display_is_context_only() {
         use std::error::Error as _;
 
-        let failure = ResumeFailure::no_resource_from_verdict(
+        let failure: ResumeFailure<Bound> = ResumeFailure::no_resource_from_verdict(
             ProviderError::not_found("leaf resume failure")
                 .with_secrets(&crate::provider_text::RedactionSet::for_test(&[])),
         );
@@ -11958,7 +12253,7 @@ mod tests {
     #[test]
     fn create_identified_post_error_note_indents_multiline_reason() {
         let id = ResourceId::with_provider_identity("test", "widget", "example", None);
-        let identified: HostIdentifiedCreate = IdentifiedCreate::from_create_observation(
+        let identified: IdentifiedCreate<Bound> = IdentifiedCreate::from_create_observation(
             id,
             AppliedIdentifier::new("widget-id").expect("fixture identifier is non-empty"),
             CreateObservation::Unobserved(UnobservedReason::ReadFailed(
@@ -12014,14 +12309,16 @@ mod tests {
         let marker = format!("_secret:argon2:{}", "ab".repeat(32));
         let encoded = serde_json::json!({ "token": marker });
         let persisted = PersistedAttributes::from_encoded(
-            serde_json::from_value(encoded.clone()).expect("attribute object"),
+            serde_json::from_value::<BTreeMap<String, serde_json::Value>>(encoded.clone())
+                .expect("attribute object"),
         )
         .expect("marker-shaped strings are ordinary persisted values");
         let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
         assert_eq!(persisted.get("token"), Some((plain.clone()).to_snapshot()));
 
         let persisted = PersistedAttributes::from_encoded(
-            serde_json::from_value(encoded).expect("attribute object"),
+            serde_json::from_value::<BTreeMap<String, serde_json::Value>>(encoded)
+                .expect("attribute object"),
         )
         .expect("state row decode");
         assert_eq!(persisted.get("token"), Some((plain).to_snapshot()));
@@ -12181,53 +12478,20 @@ mod tests {
         argon2::Argon2::default()
             .hash_password_into(material, b"carina-secret-v1", &mut output)
             .expect("hash pre-v12 fallback-salt fixture");
-        let encoded =
-            crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
-                serde_json::json!(format!("_secret:argon2:{}", hex::encode(output))),
-                "mock.test.resource",
-                "old",
-                "password",
-            )
-            .expect("migrate row-bound legacy digest");
+        let encoded = serde_json::json!({"$secret": format!(
+            "argon2-legacy:{}:{}", hex::encode(b"carina:mock.test.resource:old:password"), hex::encode(output)
+        )});
         let persisted =
-            PersistedValue::from_serialized_json(encoded).expect("migrated structural secret");
+            PersistedValue::from_serialized_json(encoded).expect("structural legacy secret");
         let crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
             crate::resource::SnapshotLeaf::RedactedSecret { hash },
-        )) = persisted.decode().expect("typed migrated secret")
+        )) = persisted.decode().expect("typed legacy secret")
         else {
-            panic!("migration must produce a typed redacted secret")
+            panic!("structural secret must decode as a typed redacted secret")
         };
 
         assert!(hash.verify(material));
         assert!(hash.encoded_digest().starts_with("argon2-legacy:"));
-    }
-
-    #[test]
-    fn state_row_upgrade_rejects_legacy_salt_too_long_for_its_digest_format() {
-        let error =
-            crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
-                serde_json::json!(format!("_secret:argon2:{}", "ab".repeat(32))),
-                "mock.test.resource",
-                &"x".repeat(5000),
-                "token",
-            )
-            .expect_err("an upgraded legacy digest must never exceed the parser's salt bound");
-        match error {
-            crate::resource::legacy_secret_migration::LegacySecretMigrationError::StateAttribute {
-                key,
-                source,
-            } => {
-                assert_eq!(key, "token");
-                assert!(matches!(
-                    *source,
-                    crate::resource::legacy_secret_migration::LegacySecretMigrationError::LegacySaltTooLong {
-                        actual,
-                        maximum: 4096,
-                    } if actual > 4096
-                ));
-            }
-            other => panic!("unexpected migration error: {other:?}"),
-        }
     }
 
     #[test]
@@ -12293,7 +12557,208 @@ mod tests {
     }
 
     #[test]
-    fn persistence_merges_propagate_typed_unavailable_secret() {
+    fn merge_previous_secret_hashes_keeps_opaque_ancestors_above_masked_subtrees() {
+        let secret = |text: &str| {
+            PersistedValue::encode_desired_value(
+                &Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(text.into()))).into(),
+                )),
+                None,
+            )
+            .unwrap()
+        };
+        let previous = secret("previous");
+        let masked = secret("current");
+        let map = |value: &PersistedValue, sibling: &str| {
+            PersistedValue::from_serialized_json(serde_json::json!({
+                "protected": value.as_json(), "sibling": sibling,
+            }))
+            .unwrap()
+        };
+        let list = |value: &PersistedValue| {
+            PersistedValue::from_serialized_json(serde_json::json!([
+                {"anchor": "stable", "protected": value.as_json()}
+            ]))
+            .unwrap()
+        };
+        for provider_json in [
+            serde_json::json!({"other": masked.as_json(), "changing": "after"}),
+            serde_json::json!([masked.as_json(), "after"]),
+        ] {
+            let provider = PersistedValue::from_serialized_json(provider_json).unwrap();
+            for (previous, provider, expected) in [
+                (previous.clone(), provider.clone(), previous.clone()),
+                (
+                    map(&previous, "before"),
+                    map(&provider, "after"),
+                    map(&previous, "after"),
+                ),
+                (list(&previous), list(&provider), list(&previous)),
+            ] {
+                let merged =
+                    merge_previous_secret_hashes_into_provider_value(&previous, Some(&provider))
+                        .expect("masked descendants cannot prevent whole-hash protection")
+                        .expect("the previous value contains a secret hash");
+                assert!(
+                    merged == expected,
+                    "opaque ancestors must retain their whole hash while public siblings update"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_previous_secret_hashes_keeps_provider_unaligned_masked_lists() {
+        let secret = |text: &str| {
+            PersistedValue::encode_desired_value(
+                &Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(text.into()))).into(),
+                )),
+                None,
+            )
+            .unwrap()
+        };
+        let previous_token = secret("fixture-secret-4570-previous");
+        let provider_token = secret("fixture-secret-4570-provider");
+        let previous = PersistedValue::from_serialized_json(serde_json::json!([
+            {"port": 80, "token": previous_token.as_json()},
+            {"port": 443, "token": previous_token.as_json()}
+        ]))
+        .unwrap();
+        for provider_json in [
+            serde_json::json!([
+                {"port": 443, "token": provider_token.as_json()},
+                {"port": 80, "token": provider_token.as_json()}
+            ]),
+            serde_json::json!([{"port": 80, "token": provider_token.as_json()}]),
+        ] {
+            let provider = PersistedValue::from_serialized_json(provider_json).unwrap();
+            let merged =
+                merge_previous_secret_hashes_into_provider_value(&previous, Some(&provider))
+                    .expect("an unaligned masked list must fall back to the provider value")
+                    .expect("the previous list contains secret hashes");
+            assert!(merged == provider, "the masked provider list must be kept");
+            assert!(
+                !merged.as_json().to_string().contains("fixture-secret-4570"),
+                "the masked provider list must contain no secret plaintext"
+            );
+
+            let mut plaintext_json = provider.as_json().clone();
+            for item in plaintext_json.as_array_mut().unwrap() {
+                item["token"] = serde_json::json!("fixture-secret-4570-provider");
+            }
+            let material = serde_json::to_vec(&plaintext_json).unwrap();
+            let plaintext = PersistedValue::from_serialized_json(plaintext_json).unwrap();
+            let merged =
+                merge_previous_secret_hashes_into_provider_value(&previous, Some(&plaintext))
+                    .expect("an unaligned plaintext list can still be hashed whole")
+                    .unwrap();
+            let hash = merged.as_json()[crate::value::PERSISTED_SECRET_KEY]
+                .as_str()
+                .and_then(RedactedSecretHash::from_encoded_digest)
+                .expect("the plaintext provider list must become one opaque hash");
+            assert!(
+                hash.verify(&material),
+                "the hash must cover the provider list"
+            );
+            assert!(
+                !merged.as_json().to_string().contains("fixture-secret-4570"),
+                "the provider list must contain no secret plaintext"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_previous_secret_hashes_keeps_newly_masked_struct_list_fields() {
+        let secret = |text: &str| {
+            PersistedValue::encode_desired_value(
+                &Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(text.into()))).into(),
+                )),
+                None,
+            )
+            .unwrap()
+        };
+        let token = secret("fixture-secret-4570-token");
+        let note = secret("n");
+        let previous = PersistedValue::from_serialized_json(serde_json::json!([
+            {"port": 80, "note": "n", "token": token.as_json()}
+        ]))
+        .unwrap();
+        let provider = PersistedValue::from_serialized_json(serde_json::json!([
+            {"port": 80, "note": note.as_json(), "token": token.as_json()}
+        ]))
+        .unwrap();
+
+        let merged = merge_previous_secret_hashes_into_provider_value(&previous, Some(&provider))
+            .expect("a newly masked field must fall back to the provider list")
+            .expect("the previous list contains a secret hash");
+        assert!(merged == provider, "the masked provider list must be kept");
+        assert!(
+            merged.as_json()[0]["note"][crate::value::PERSISTED_SECRET_KEY].is_string(),
+            "the newly secret note must remain hashed"
+        );
+        assert!(
+            !merged.as_json().to_string().contains("fixture-secret-4570"),
+            "the merged list must contain no secret plaintext"
+        );
+    }
+
+    #[test]
+    fn merge_previous_secret_hashes_rehashes_plaintext_and_keeps_provider_hashes() {
+        let previous = PersistedValue::encode_desired_value(
+            &Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("before".into()))).into(),
+            )),
+            None,
+        )
+        .unwrap();
+        let provider =
+            PersistedValue::from_serialized_json(serde_json::json!({"changing": "after"})).unwrap();
+        let expected = hash_provider_json_as_secret(&provider, Some(&previous)).unwrap();
+        let material = serde_json::to_vec(&serde_json::json!({"changing": "after"})).unwrap();
+        let map = |value: &PersistedValue| {
+            PersistedValue::from_serialized_json(serde_json::json!({"protected": value.as_json()}))
+                .unwrap()
+        };
+        let list = |value: &PersistedValue| {
+            PersistedValue::from_serialized_json(serde_json::json!([
+                {"anchor": "stable", "protected": value.as_json()}
+            ]))
+            .unwrap()
+        };
+        for (provider, already_hashed) in [(provider, false), (expected.clone(), true)] {
+            for (previous, provider, expected) in [
+                (previous.clone(), provider.clone(), expected.clone()),
+                (map(&previous), map(&provider), map(&expected)),
+                (list(&previous), list(&provider), list(&expected)),
+            ] {
+                let merged =
+                    merge_previous_secret_hashes_into_provider_value(&previous, Some(&provider))
+                        .expect("available material can be merged")
+                        .unwrap();
+                if already_hashed {
+                    assert!(merged == expected, "an existing provider hash must win");
+                }
+                let json = merged.as_json();
+                let protected = json
+                    .get("protected")
+                    .or_else(|| json.pointer("/0/protected"))
+                    .unwrap_or(json);
+                let hash = protected[crate::value::PERSISTED_SECRET_KEY]
+                    .as_str()
+                    .and_then(RedactedSecretHash::from_encoded_digest)
+                    .expect("the protected node must remain a whole hash");
+                assert!(
+                    hash.verify(&material),
+                    "the whole hash must verify the current provider plaintext"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_secret_hashing_propagates_typed_unavailable_secret() {
         let secret = Value::Deferred(DeferredValue::Secret(
             Box::new(Value::Concrete(ConcreteValue::String(
                 "previous secret".into(),
@@ -12316,29 +12781,6 @@ mod tests {
         );
         for rendered in [error.to_string(), format!("{error:?}")] {
             assert!(!rendered.contains("token"), "{rendered}");
-        }
-        let map = |value: &PersistedValue| {
-            PersistedValue::from_serialized_json(serde_json::json!({"protected": value.as_json()}))
-                .unwrap()
-        };
-        let list = |value: &PersistedValue| {
-            PersistedValue::from_serialized_json(serde_json::json!([value.as_json()])).unwrap()
-        };
-        for (previous, provider) in [
-            (previous.clone(), provider.clone()),
-            (map(&previous), map(&provider)),
-            (list(&previous), list(&provider)),
-        ] {
-            let error =
-                merge_previous_secret_hashes_into_provider_value(&previous, Some(&provider))
-                    .expect_err("an unavailable provider secret must not retain stale evidence");
-            assert!(
-                matches!(error, SerializationError::UnavailableSecret(ref error)
-                if error.path() == "(secret)")
-            );
-            for rendered in [error.to_string(), format!("{error:?}")] {
-                assert!(!rendered.contains("token"), "{rendered}");
-            }
         }
     }
 
@@ -12958,8 +13400,9 @@ mod tests {
         )]));
 
         let once = raw.lift(&registry);
-        let twice = crate::test_support::raw_saved_attrs(once.attributes.0.clone()).lift(&registry);
-        let sorted_pairs = |attrs: &HashMap<String, crate::resource::SnapshotValue>| {
+        let twice =
+            RawSavedAttrs::from_decoded_values_for_test(once.attributes.0.clone()).lift(&registry);
+        let sorted_pairs = |attrs: &BTreeMap<String, crate::resource::SnapshotValue>| {
             let mut pairs: Vec<_> = attrs
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
@@ -13583,7 +14026,7 @@ mod tests {
         let id = ResourceId::with_identity("test", "example");
         let state = AppliedState::new(id.clone(), "mock-id", HashMap::new())
             .expect("fixture identifier is non-empty");
-        let expected = State::existing(id, HashMap::new()).with_identifier("mock-id");
+        let expected = State::existing(id, BTreeMap::new()).with_identifier("mock-id");
         let diagnostic: PartialReadDiagnostic = PartialReadDiagnostic::new(
             crate::provider_text::ProviderDiagnostic::message("mock partial create".into()),
             (vec!["dns_name".to_string()])
@@ -14923,7 +15366,9 @@ mod tests {
         let to = resolved_for_test(to);
         let schema = ResourceSchema::new("test");
         let changed = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let patch = build_update_patch(&changed, &to, &from, &schema).expect("valid patch");
+        let patch = build_update_patch(&changed, &to, &from, &schema)
+            .expect("valid patch")
+            .to_patch();
         assert_eq!(patch.ops.len(), 3);
 
         let by_key: HashMap<&str, &PatchOp> = patch.ops.iter().map(|op| (op.key(), op)).collect();
@@ -14946,6 +15391,19 @@ mod tests {
         let c = by_key["c"];
         assert!(matches!(c, PatchOp::Remove { .. }));
         assert_eq!(c.sent_value(), None);
+    }
+
+    #[test]
+    fn plan_update_patch_debug_omits_sent_values() {
+        let to = resolved_for_test(
+            Resource::new("test", "example")
+                .with_attribute("token", patch_test_value("fixture-secret-4570")),
+        );
+        let from: State = State::existing(to.id.clone(), HashMap::new());
+        let planned =
+            build_update_patch(&["token".into()], &to, &from, &ResourceSchema::new("test"))
+                .expect("fixture patch must be valid");
+        assert!(!format!("{planned:?}").contains("fixture-secret-4570"));
     }
 
     fn patch_test_value(value: &str) -> Value {
@@ -15135,7 +15593,8 @@ mod tests {
 
         let patch =
             build_update_patch(&["description".to_string()], &to, &from, schema.as_schema())
-                .expect("fully ignored write-only leaves need no reassertion");
+                .expect("fully ignored write-only leaves need no reassertion")
+                .to_patch();
 
         assert!(matches!(
             &patch.ops[..],
@@ -15172,9 +15631,11 @@ mod tests {
         let changed = ["description".to_string()];
 
         let planned = plan_update_patch(&changed, to.as_inner(), &from, schema.as_schema())
-            .expect("planning must accept the patch");
+            .expect("planning must accept the patch")
+            .to_patch();
         let applied = build_update_patch(&changed, &to, &from, schema.as_schema())
-            .expect("apply must accept the same patch");
+            .expect("apply must accept the same patch")
+            .to_patch();
 
         assert_eq!(planned.ops, applied.ops);
     }
@@ -15219,8 +15680,16 @@ mod tests {
             ignored_path(&["config", "version"]),
         );
 
-        let patch = build_update_patch(&["config".to_string()], &to, &from, schema.as_schema())
+        let planned = build_update_patch(&["config".to_string()], &to, &from, schema.as_schema())
             .expect("readable ignored leaf can be filled from the read");
+        let expected = vec![LeafPath::from_segments([LeafPathSegment::StructField(
+            "version".into(),
+        )])];
+        let [PlannedPatchOp::Replace(sent)] = planned.ops.as_slice() else {
+            panic!("expected one planned config replacement");
+        };
+        assert_eq!(sent.sent_parts(), ("config", expected.as_slice()));
+        let patch = planned.to_patch();
         let PatchOp::Replace { value, .. } = &patch.ops[0] else {
             panic!("expected config replacement: {:?}", patch.ops);
         };
@@ -15229,6 +15698,20 @@ mod tests {
         };
         assert_eq!(config["version"], patch_test_value("external"));
         assert_eq!(config["memory"], Value::Concrete(ConcreteValue::Int(256)));
+
+        let absent: State = State::existing(from.id.clone(), HashMap::new());
+        let added = build_update_patch(&["config".into()], &to, &absent, schema.as_schema())
+            .expect("an absent observation removes the ignored input leaf");
+        let [PlannedPatchOp::Add(sent)] = added.ops.as_slice() else {
+            panic!("expected one planned config addition");
+        };
+        assert_eq!(sent.sent_parts(), ("config", expected.as_slice()));
+        let added = added.to_patch();
+        assert!(matches!(&added.ops[0], PatchOp::Add { .. }));
+        let Some(Value::Concrete(ConcreteValue::Map(config))) = added.ops[0].sent_value() else {
+            panic!("expected added config map");
+        };
+        assert!(!config.contains_key("version"));
     }
 
     #[test]
@@ -15353,7 +15836,8 @@ mod tests {
 
         let patch =
             build_update_patch(&["description".to_string()], &to, &from, schema.as_schema())
-                .expect("valid reassert patch");
+                .expect("valid reassert patch")
+                .to_patch();
 
         assert!(matches!(
             &patch.ops[..],
@@ -15416,7 +15900,8 @@ mod tests {
             );
 
         let patch = build_update_patch(&["description".to_string()], &to, &from, &schema)
-            .expect("valid write-only patch");
+            .expect("valid write-only patch")
+            .to_patch();
 
         assert!(matches!(
             &patch.ops[0],
@@ -15480,7 +15965,8 @@ mod tests {
             &from,
             &schema,
         )
-        .expect("valid changed write-only patch");
+        .expect("valid changed write-only patch")
+        .to_patch();
 
         assert!(matches!(
             &patch.ops[0],
@@ -15521,12 +16007,14 @@ mod tests {
         assert!(
             build_update_patch(&[], &to, &from, &schema)
                 .expect("empty patch is valid")
+                .to_patch()
                 .ops
                 .is_empty()
         );
         assert!(
             build_update_patch(&["absent".to_string()], &to, &from, &schema)
                 .expect("absent patch is valid")
+                .to_patch()
                 .ops
                 .is_empty(),
             "a changed key absent from both sides must be dropped and cannot trigger reassertion"
@@ -15543,6 +16031,7 @@ mod tests {
         assert!(
             build_update_patch(&[], &to, &from, schema.as_schema())
                 .expect("empty nested patch is valid")
+                .to_patch()
                 .ops
                 .is_empty(),
             "a write-only-bearing attribute cannot create a reassert-only patch"
@@ -15596,7 +16085,8 @@ mod tests {
                             let from = State::existing(id, from_attributes);
                             let desired = resolved_for_test(desired);
                             let patch = build_update_patch(&changed, &desired, &from, &schema)
-                                .expect("generated fixture has no ignored paths");
+                                .expect("generated fixture has no ignored paths")
+                                .to_patch();
                             let patch_keys: Vec<&str> =
                                 patch.ops.iter().map(PatchOp::key).collect();
                             let unique: std::collections::HashSet<_> =
@@ -16336,8 +16826,6 @@ mod tests {
                 Box::pin(async move {
                     for (id, saved_attrs) in saved {
                         if let Some(state) = states.get_mut(id) {
-                            #[allow(clippy::iter_over_hash_type)]
-                            // keyed rebuild: test hydration fills distinct missing saved attribute keys
                             for (key, value) in saved_attrs {
                                 state
                                     .attributes
@@ -16721,7 +17209,7 @@ mod provider_text_route_tests {
         let saved = SavedAttrs(
             desired
                 .iter()
-                .map(|r| (r.id.clone(), HashMap::new()))
+                .map(|r| (r.id.clone(), BTreeMap::new()))
                 .collect(),
         );
         router.normalize_state(&mut states).await.unwrap();
@@ -16790,7 +17278,7 @@ mod composition_partial_tests {
             .pending(PendingToken::new("read-back"), 0)
             .persist(Default::default(), Default::default());
         let outcome = ResumedCreate {
-            pending,
+            pending: pending.into_provider_record(),
             identifier,
         }
         .partial(HashMap::new(), reason());

@@ -21,7 +21,7 @@ fn generated_prefix_names_retain_authored_provenance() {
             .validate()
             .unwrap(),
     );
-    crate::identifier::resolve_attr_prefixes(&mut parsed.resources, &schemas).unwrap();
+    crate::identifier::resolve_attr_prefixes(&mut parsed, &schemas).unwrap();
     let tree = AnalysisTree::try_from_file(&parsed).unwrap();
     let resource = tree.resources().next().unwrap();
     assert_eq!(

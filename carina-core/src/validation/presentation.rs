@@ -64,6 +64,61 @@ impl<E: ValidationClientError> std::fmt::Display for OrdinaryFinding<E> {
 pub enum PresentedFinding<E: ValidationClientError = std::convert::Infallible> {
     Ordinary(OrdinaryFinding<E>),
     Conversion(PresentedConversion),
+    FunctionPromise(crate::parser::Located<crate::parser::retained::FunctionTypePromise>),
+}
+
+/// Insert source-ordered promise diagnostics without reordering existing findings.
+/// Clients supply their rendered file and start position, including UTF-16 editor
+/// positions. A file-only finding still counts as that file's last diagnostic;
+/// findings without a file are appended at the end.
+pub fn merge_function_promise_diagnostics<T, F: Ord, P: Ord>(
+    ordinary: Vec<T>,
+    promises: Vec<T>,
+    position: impl Fn(&T) -> Option<(F, Option<P>)>,
+) -> Vec<T> {
+    if promises.is_empty() {
+        return ordinary;
+    }
+    let positions: Vec<_> = ordinary.iter().map(&position).collect();
+    let mut promises: Vec<_> = promises
+        .into_iter()
+        .map(|finding| (position(&finding), finding))
+        .collect();
+    promises.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut merged = Vec::with_capacity(ordinary.len() + promises.len());
+    let mut before: Vec<Vec<T>> = (0..=ordinary.len()).map(|_| Vec::new()).collect();
+    for (location, finding) in promises {
+        let index = location
+            .and_then(|(file, start)| {
+                positions
+                    .iter()
+                    .position(|other| {
+                        other.as_ref().is_some_and(|(path, point)| {
+                            *path == file
+                                && point
+                                    .as_ref()
+                                    .zip(start.as_ref())
+                                    .is_some_and(|(point, start)| point > start)
+                        })
+                    })
+                    .or_else(|| {
+                        positions
+                            .iter()
+                            .rposition(|other| {
+                                other.as_ref().is_some_and(|(path, _)| *path == file)
+                            })
+                            .map(|last| last + 1)
+                    })
+            })
+            .unwrap_or(ordinary.len());
+        before[index].push(finding);
+    }
+    for (index, finding) in ordinary.into_iter().enumerate() {
+        merged.append(&mut before[index]);
+        merged.push(finding);
+    }
+    merged.append(before.last_mut().expect("the final insertion bucket"));
+    merged
 }
 
 /// A conversion after the validation report's consuming exit.
@@ -115,7 +170,9 @@ impl<E: ValidationClientError> PresentedFinding<E> {
     pub fn resource_id(&self) -> Option<&crate::resource::ResourceId> {
         match self {
             Self::Ordinary(OrdinaryFinding::Resource(finding)) => finding.resource_id(),
-            Self::Ordinary(OrdinaryFinding::Client(_)) | Self::Conversion(_) => None,
+            Self::Ordinary(OrdinaryFinding::Client(_))
+            | Self::Conversion(_)
+            | Self::FunctionPromise(_) => None,
         }
     }
     pub fn location(&self) -> Option<&crate::parser::DeclarationLocation> {
@@ -123,6 +180,7 @@ impl<E: ValidationClientError> PresentedFinding<E> {
             Self::Ordinary(OrdinaryFinding::Resource(finding)) => finding.location(),
             Self::Ordinary(OrdinaryFinding::Client(_)) => None,
             Self::Conversion(finding) => Some(finding.location()),
+            Self::FunctionPromise(finding) => Some(finding.location()),
         }
     }
     pub fn message(&self) -> String {
@@ -130,6 +188,7 @@ impl<E: ValidationClientError> PresentedFinding<E> {
             Self::Ordinary(OrdinaryFinding::Resource(finding)) => finding.message(),
             Self::Ordinary(OrdinaryFinding::Client(finding)) => finding.to_string(),
             Self::Conversion(finding) => finding.message().to_owned(),
+            Self::FunctionPromise(finding) => finding.detail().to_string(),
         }
     }
 }
@@ -139,6 +198,7 @@ impl<E: ValidationClientError> std::fmt::Display for PresentedFinding<E> {
         match self {
             Self::Ordinary(finding) => write!(f, "{finding}"),
             Self::Conversion(finding) => write!(f, "{finding}"),
+            Self::FunctionPromise(finding) => write!(f, "{finding}"),
         }
     }
 }
@@ -189,6 +249,7 @@ impl<E: ValidationClientError> IntoIterator for PresentedFindings<E> {
 pub struct ResourceValidationReport<E: ValidationClientError = std::convert::Infallible> {
     ordinary: Vec<(FindingSubject, OrdinaryFinding<E>)>,
     conversions: crate::ConversionFindings,
+    promises: Vec<crate::parser::Located<crate::parser::retained::FunctionTypePromise>>,
 }
 
 impl<E: ValidationClientError> std::fmt::Debug for ResourceValidationReport<E> {
@@ -224,6 +285,11 @@ impl<E: ValidationClientError> ResourceValidationReport<E> {
                 .into_iter()
                 .map(|error| PresentedFinding::Conversion(PresentedConversion::new(error))),
         );
+        findings.extend(
+            self.promises
+                .into_iter()
+                .map(PresentedFinding::FunctionPromise),
+        );
         PresentedFindings(findings)
     }
 }
@@ -241,7 +307,7 @@ pub(super) enum AdmissionBoundary {
 type ResourceAdmissionParts<'file, E, D, B> = (
     CanonicalResource<'file, E, D, B>,
     Result<
-        Option<crate::schema::ResourceValueValidation>,
+        Option<crate::identifier::PrefixAdmitted<crate::schema::ResourceValueValidation>>,
         crate::parser::retained::MissingEvidence,
     >,
 );
@@ -255,7 +321,7 @@ where
 {
     resource: CanonicalResource<'file, E, D, B>,
     values: Result<
-        Option<crate::schema::ResourceValueValidation>,
+        Option<crate::identifier::PrefixAdmitted<crate::schema::ResourceValueValidation>>,
         crate::parser::retained::MissingEvidence,
     >,
 }
@@ -318,6 +384,7 @@ pub struct ConversionValidation<E: ValidationClientError = std::convert::Infalli
     conversions: crate::ConversionFindings,
     coverage: crate::schema::value_validation::WalkCoverage,
     ordinary: Vec<(FindingSubject, OrdinaryFinding<E>)>,
+    promises: Vec<crate::parser::Located<crate::parser::retained::FunctionTypePromise>>,
     // Work memo: NodeId diagnostic dedup cannot undo repeated provider callbacks.
     admitted_uses: std::collections::HashMap<
         AdmissionUse,
@@ -331,6 +398,7 @@ impl<E: ValidationClientError> ConversionValidation<E> {
             conversions: Default::default(),
             coverage: Default::default(),
             ordinary: Vec::new(),
+            promises: Vec::new(),
             admitted_uses: Default::default(),
         }
     }
@@ -343,11 +411,29 @@ impl<E: ValidationClientError> Extend<E> for ConversionValidation<E> {
     }
 }
 impl<E: ValidationClientError> ConversionValidation<E> {
+    /// These findings are presented at completion and cannot stop admission.
+    pub fn include_function_promises(
+        &mut self,
+        findings: impl IntoIterator<
+            Item = crate::parser::Located<crate::parser::retained::FunctionTypePromise>,
+        >,
+    ) {
+        self.promises.extend(findings);
+    }
+
     pub fn push(&mut self, error: E) {
         self.ordinary.push((
             FindingSubject::Root,
             OrdinaryFinding::Client(Box::new(error)),
         ));
+    }
+    pub fn client_findings(&self) -> impl Iterator<Item = &E> {
+        self.ordinary
+            .iter()
+            .filter_map(|(_, finding)| match finding {
+                OrdinaryFinding::Client(error) => Some(error.as_ref()),
+                OrdinaryFinding::Resource(_) => None,
+            })
     }
     pub fn fail(&mut self, error: E) -> OrdinaryFailure
     where
@@ -673,6 +759,7 @@ impl<E: ValidationClientError> ConversionValidation<E> {
         ResourceValidationReport {
             ordinary: self.ordinary,
             conversions: self.conversions,
+            promises: self.promises,
         }
     }
 }

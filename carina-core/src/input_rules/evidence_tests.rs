@@ -278,7 +278,8 @@ mod secret_predicate_tests {
             &previous,
             schemas.get_for(&desired).unwrap().schema().as_schema(),
         )
-        .unwrap();
+        .unwrap()
+        .to_patch();
         assert_eq!(patch.ops.len(), 1);
         assert_eq!(patch.ops[0].key(), "type");
         let mut plan = Plan::new();
@@ -353,7 +354,8 @@ mod secret_predicate_tests {
                 &previous,
                 schemas.get_for(&desired).unwrap().schema().as_schema(),
             )
-            .unwrap();
+            .unwrap()
+            .to_patch();
             assert_eq!(patch.ops.len(), 2);
             assert!(
                 matches!(&patch.ops[1], crate::provider::PatchOp::Reassert { key, value: reasserted } if key == "value" && reasserted == &value)
@@ -1154,7 +1156,7 @@ fn deferred_template_retains_literal_guard_evidence() {
                     id: old.resolved_id(),
                     identifier: crate::provider::AppliedIdentifier::new("existing").unwrap(),
                     generation: crate::effect::EffectGeneration::Current,
-                    previous_attributes: HashMap::new(),
+                    previous_attributes: std::collections::BTreeMap::new(),
                     directives: Default::default(),
                     binding: None,
                     dependencies: Default::default(),

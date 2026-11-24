@@ -1,0 +1,149 @@
+{
+  "text": "Validating...\nError: mock.test.resource.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.first', which is not resolved when names are generated\nError: mock.test.resource.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.second', which is not resolved when names are generated\nError: mock.test.resource.<pending>: Unknown attribute 'bogus'\nError: mock.test.resource.<pending>: Unknown attribute 'bogus'\n",
+  "text_exit": 1,
+  "json": {
+    "errors": [
+      {
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "end": {
+              "column": 45,
+              "line": 3
+            },
+            "start": {
+              "column": 22,
+              "line": 3
+            }
+          }
+        },
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.first', which is not resolved when names are generated",
+        "severity": "error"
+      },
+      {
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "end": {
+              "column": 46,
+              "line": 4
+            },
+            "start": {
+              "column": 22,
+              "line": 4
+            }
+          }
+        },
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.second', which is not resolved when names are generated",
+        "severity": "error"
+      },
+      {
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "end": {
+              "column": 59,
+              "line": 3
+            },
+            "start": {
+              "column": 46,
+              "line": 3
+            }
+          }
+        },
+        "message": "Unknown attribute 'bogus'",
+        "severity": "error"
+      },
+      {
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "end": {
+              "column": 60,
+              "line": 4
+            },
+            "start": {
+              "column": 47,
+              "line": 4
+            }
+          }
+        },
+        "message": "Unknown attribute 'bogus'",
+        "severity": "error"
+      }
+    ],
+    "resource_count": 0,
+    "resources": [],
+    "status": "error"
+  },
+  "json_exit": 1,
+  "json_stderr": "",
+  "lsp": {
+    "backend.crn": [],
+    "child/main.crn": [],
+    "lets.crn": [],
+    "main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.first', which is not resolved when names are generated",
+        "range": {
+          "end": {
+            "character": 44,
+            "line": 2
+          },
+          "start": {
+            "character": 21,
+            "line": 2
+          }
+        },
+        "severity": 1
+      },
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.second', which is not resolved when names are generated",
+        "range": {
+          "end": {
+            "character": 45,
+            "line": 3
+          },
+          "start": {
+            "character": 21,
+            "line": 3
+          }
+        },
+        "severity": 1
+      },
+      {
+        "message": "Unknown attribute 'bogus'",
+        "severity": 1,
+        "range": {
+          "start": {
+            "line": 2,
+            "character": 45
+          },
+          "end": {
+            "line": 2,
+            "character": 58
+          }
+        }
+      },
+      {
+        "message": "Unknown attribute 'bogus'",
+        "severity": 1,
+        "range": {
+          "start": {
+            "line": 3,
+            "character": 46
+          },
+          "end": {
+            "line": 3,
+            "character": 59
+          }
+        }
+      }
+    ],
+    "providers.crn": []
+  }
+}

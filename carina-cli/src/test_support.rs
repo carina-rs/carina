@@ -36,7 +36,7 @@ impl carina_state::StateBackend for UnavailableStorageBackend {
         carina_core::shutdown::CleanupBudget::TWO_SECOND
     }
 
-    async fn read_state(&self) -> carina_state::BackendResult<Option<carina_state::LoadedState>> {
+    async fn read_state(&self) -> carina_state::BackendResult<Option<carina_state::StateFile>> {
         panic!("unavailable storage must not be read")
     }
 
@@ -533,6 +533,8 @@ mod graph_fixtures {
 }
 
 #[cfg(test)]
+mod ordering;
+#[cfg(test)]
 mod removed_refresh;
 
 #[cfg(test)]
@@ -541,7 +543,10 @@ pub(crate) fn refresh_current(
 ) -> carina_state::RefreshableCurrent {
     let id = current.id().clone();
     carina_state::PreparedRows::from_snapshots(
-        [(id.clone(), current)],
+        [(
+            carina_core::resource::ResolvedResourceId::new(id.clone()),
+            current,
+        )],
         &carina_state::ResolvedRemovedClaims::resolve(&[], None),
     )
     .refreshable

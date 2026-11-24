@@ -180,8 +180,9 @@ let stack = outer {
         std::fs::write(
             caller.join("mock-provider-state.json"),
             r#"{
-  "version": 2,
-  "states": {
+  "version": 3,
+  "states": {},
+  "data_sources": {
     "iam.Roles.stack.roles": {
       "name_regex": "base",
       "names": ["from-data"]
@@ -629,7 +630,10 @@ fn plan_json_preserves_if_free_two_level_module_dependency_edges() {
             "stack.nested_call.nested".to_string(),
             vec!["source".to_string()],
         ),
-        ("stack.generated[0]".to_string(), vec!["source".to_string()]),
+        (
+            "stack.generated.caller".to_string(),
+            vec!["source".to_string()],
+        ),
         (
             "stack.data_consumer".to_string(),
             vec!["stack.roles".to_string()],
@@ -646,7 +650,10 @@ fn plan_json_preserves_if_free_two_level_module_dependency_edges() {
                 "stack.nested_call.nested".to_string(),
                 vec!["source".to_string()],
             ),
-            ("stack.generated[0]".to_string(), vec!["source".to_string()],),
+            (
+                "stack.generated.caller".to_string(),
+                vec!["source".to_string()],
+            ),
             (
                 "stack.data_consumer".to_string(),
                 vec!["stack.base".to_string()],

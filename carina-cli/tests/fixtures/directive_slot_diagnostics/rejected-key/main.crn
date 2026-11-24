@@ -1,0 +1,5 @@
+
+mock.test.resource {
+  name = 'sink'
+  "k${'repo' as mock.actions.OidcSubject.ClaimKey}" = (y as mock.actions.OidcSubject.ClaimKey)
+}

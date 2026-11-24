@@ -105,7 +105,7 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
         for resource in tree.resources() {
             let inputs =
                 ResourceAttributeInputs::for_resource_for_test(resource, judged.report()).unwrap();
-            let mut report = validation
+            let (mut report, _prefixes_for_test) = validation
                 .admit_resource(
                     crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(
                         resource,
@@ -119,7 +119,8 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
                         &schemas,
                     ),
                 )
-                .values;
+                .values
+                .into_parts();
             assert_eq!(report.errors().count(), 0, "conversion leaked into errors");
             assert_eq!(
                 report.symbolic_errors().count(),
@@ -461,7 +462,7 @@ fn r16_report_only_slot_reads_recorded_destination_then_checks_the_source() {
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
             let mut validation: crate::validation::ConversionValidation =
                 crate::validation::ConversionValidation::new(judged.report());
-            let report = validation
+            let (report, _prefixes_for_test) = validation
                 .admit_resource(
                     crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(
                         resource,
@@ -475,7 +476,8 @@ fn r16_report_only_slot_reads_recorded_destination_then_checks_the_source() {
                         &schemas,
                     ),
                 )
-                .values;
+                .values
+                .into_parts();
             assert_eq!(report.errors().count(), 0, "{report:?}");
             assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
             crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
@@ -546,9 +548,9 @@ fn r11_stale_projection_can_only_reuse_an_already_recorded_static_verdict() {
             let mut run: crate::validation::ConversionValidation =
                 crate::validation::ConversionValidation::new(judged.report());
             crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-                let findings = run.admit_resource(
+                let (findings, _prefixes_for_test) = run.admit_resource(
                     crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(resource, &changed, resource.schema(&schemas).unwrap(), resource.quoted_string_attrs(), inputs, crate::validation::admission::attributes::ValidationEvaluation::None, &bindings, session, &schemas),
-                ).values;
+                ).values.into_parts();
                 assert_eq!(
                     findings.errors().count(),
                     usize::from(!converted),
@@ -673,9 +675,9 @@ fn round5_unresolved_or_reshaped_containers_require_conversion_descent() {
                 let mut run: crate::validation::ConversionValidation =
                     crate::validation::ConversionValidation::new(judged.report());
                 crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-                    let findings = run.admit_resource(
+                    let (findings, _prefixes_for_test) = run.admit_resource(
                         crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(resource, judged.file(), resource.schema(&schemas).unwrap(), resource.quoted_string_attrs(), inputs, crate::validation::admission::attributes::ValidationEvaluation::None, &bindings, session, &schemas),
-                    ).values;
+                    ).values.into_parts();
                     assert_eq!(
                         findings.errors().count(),
                         usize::from(!matches!(projection, Projection::Pending)),
@@ -786,7 +788,7 @@ fn r9_syntax_with_values(
     let mut run: crate::validation::ConversionValidation =
         crate::validation::ConversionValidation::new(judged.report());
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        let findings = run
+        let (findings, _prefixes_for_test) = run
             .admit_resource(
                 crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(
                     resource,
@@ -800,7 +802,8 @@ fn r9_syntax_with_values(
                     &schemas,
                 ),
             )
-            .values;
+            .values
+            .into_parts();
         assert_eq!(findings.errors().count(), 0, "{findings:?}");
     });
     run.complete().into_presented()
@@ -1003,7 +1006,7 @@ fn r5b_pending_transport_requires_a_shape_compatible_destination() {
         let mut run: crate::validation::ConversionValidation =
             crate::validation::ConversionValidation::new(judged.report());
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-            let findings = run
+            let (findings, _prefixes_for_test) = run
                 .admit_resource(
                     crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(
                         resource,
@@ -1017,7 +1020,8 @@ fn r5b_pending_transport_requires_a_shape_compatible_destination() {
                         &schemas,
                     ),
                 )
-                .values;
+                .values
+                .into_parts();
             assert_eq!(
                 findings.errors().count(),
                 0,
@@ -1377,9 +1381,9 @@ fn r11_alias_uses_each_read_their_recorded_static_verdict() {
                     ResourceAttributeInputs::for_resource_for_test(resource, judged.report())
                         .unwrap()
                 };
-                let report = validation.admit_resource(
+                let (report, _prefixes_for_test) = validation.admit_resource(
                     crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(resource, judged.file(), resource.schema(&schemas).unwrap(), resource.quoted_string_attrs(), inputs, crate::validation::admission::attributes::ValidationEvaluation::None, &bindings, session, &schemas),
-                ).values;
+                ).values.into_parts();
                 assert_eq!(report.errors().count(), 0, "{report:?}");
                 assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
             }
@@ -1714,9 +1718,9 @@ fn r10_pending_nested_shape_validation_matches_the_no_as_control() {
         let ordinary = crate::validation::deferred_types::with_session_for_test(
             &catalog,
             |session| {
-                let result = run.admit_resource(
+                let (result, _prefixes_for_test) = run.admit_resource(
                     crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(resource, judged.file(), resource.schema(&schemas).unwrap(), resource.quoted_string_attrs(), inputs, crate::validation::admission::attributes::ValidationEvaluation::None, &bindings, session, &schemas),
-                ).values;
+                ).values.into_parts();
                 result.errors().map(ToString::to_string).collect::<Vec<_>>()
             },
         );

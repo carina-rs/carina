@@ -86,12 +86,12 @@ pub fn installed(
     match &config.source {
         None => Ok(None),
         Some(ProviderSource::File(_)) => {
-            carina_provider_resolver::find_file_provider_source(&root, config, &mut |_| {})
+            carina_provider_resolver::find_file_provider_source(&root, config)
                 .map(Some)
                 .map_err(|error| error.to_string())
         }
         Some(ProviderSource::Remote(_)) => {
-            carina_provider_resolver::find_installed_provider(&root, config, &mut |_| {})
+            carina_provider_resolver::find_installed_provider(&root, config)
                 .map(Some)
                 .map_err(|error| error.to_string())
         }

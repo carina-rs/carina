@@ -21,13 +21,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use carina_core::effect::PlanOp;
-use carina_core::executor::{AcceptedRequest, complete_create_for_writeback};
+use carina_core::executor::{CreateWriteback, dispatch_create_for_writeback};
 use carina_core::provider::ProviderNormalizer;
 use carina_core::provider::{
     AppliedIdentifier, BoxFuture, CreateRequest, HostCreateFailure as CreateFailure,
     HostCreateFailureKind as CreateFailureKind, HostCreateObservation as CreateObservation,
-    HostCreateOutcome as CreateOutcome, HostCreateOutcomeKind as CreateOutcomeKind,
-    HostError as ProviderError, HostProvider as Provider, HostResumeFailure as ResumeFailure,
+    HostCreateOutcomeKind as CreateOutcomeKind, HostError as ProviderError,
+    HostProvider as Provider, HostResumeFailure as ResumeFailure,
     HostResumeFailureKind as ResumeFailureKind, HostResumeOutcome as ResumeOutcome,
     HostResumeOutcomeKind as ResumeOutcomeKind, HostUnobservedReason as UnobservedReason,
     InFlightCreate, ProviderErrorKind, ProviderFactory, ProviderReadyConfig, RawSavedAttrs,
@@ -425,42 +425,23 @@ fn root_resource_ref(binding: &str, attribute: &str) -> Value {
         .expect("root resource reference contains no placeholders")
 }
 
-fn create_state_for_writeback(outcome: CreateOutcome) -> SnapshotState {
-    let request = AcceptedRequest::create_for_test();
-    complete_create_for_writeback(outcome, request).0
+fn create_state_for_writeback(outcome: CreateWriteback) -> SnapshotState {
+    outcome.state
 }
 
-fn lifted_saved_attrs(
-    entries: impl IntoIterator<Item = (ResourceId, HashMap<String, SnapshotValue>)>,
-) -> carina_core::provider::LiftedSavedAttrs {
-    RawSavedAttrs::from_decoded_values_for_test(entries.into_iter().collect())
-        .lift(&carina_core::schema::SchemaRegistry::new())
-}
-
-fn migrate_legacy_state_attribute(
-    value: serde_json::Value,
-    display_type: &str,
-    identity: &str,
-    key: &str,
-) -> serde_json::Value {
-    let mut attributes = serde_json::Map::new();
-    attributes.insert(key.to_string(), value);
-    let mut document = serde_json::json!({
-        "version": 13,
-        "resources": [{
-            "provider": "",
-            "resource_type": display_type,
-            "identity": identity,
-            "attributes": attributes,
-            "deposed": [],
-        }],
-    });
-    carina_core::resource::legacy_secret_migration::migrate_state_document_v13(&mut document)
-        .expect("migrate legacy test state document");
-    document["resources"][0]["attributes"]
-        .as_object_mut()
-        .and_then(|attributes| attributes.remove(key))
-        .expect("migrated test document must retain its attribute")
+fn lifted_saved_attrs<M>(
+    entries: impl IntoIterator<Item = (ResourceId, M)>,
+) -> carina_core::provider::LiftedSavedAttrs
+where
+    M: IntoIterator<Item = (String, SnapshotValue)>,
+{
+    RawSavedAttrs::from_decoded_values_for_test(
+        entries
+            .into_iter()
+            .map(|(id, attributes)| (id, attributes.into_iter().collect()))
+            .collect(),
+    )
+    .lift(&carina_core::schema::SchemaRegistry::new())
 }
 
 fn redacted_secret_and_legacy_marker(plaintext: &str) -> (SnapshotValue, String) {
@@ -548,7 +529,7 @@ trait DispatchCreateForTest {
         &'a self,
         id: &'a ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'a, Result<CreateOutcome, CreateFailure>>;
+    ) -> BoxFuture<'a, Result<CreateWriteback, CreateFailure>>;
 }
 
 impl<T> DispatchCreateForTest for T
@@ -559,13 +540,13 @@ where
         &'a self,
         id: &'a ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'a, Result<CreateOutcome, CreateFailure>> {
+    ) -> BoxFuture<'a, Result<CreateWriteback, CreateFailure>> {
         assert_eq!(&request.resource().id, id);
         let prepared = carina_core::replacement::create_permit_with_schemas_for_test(
             request,
             &fixture_schemas(),
         );
-        let (create, cancellation) = carina_core::executor::dispatch_create(self, prepared);
+        let (create, cancellation) = dispatch_create_for_writeback(self, prepared);
         Box::pin(async move {
             let _cancellation = cancellation;
             create.await
@@ -978,11 +959,9 @@ fn explicit_test_egress(
         "version = 5\n\n[[provider]]\nname = \"ignored-consent-name\"\nsource = {source:?}\nmode = \"file\"\nsha256 = {sha256:?}\n\n[provider.egress]\nconsent = \"explicit\"\nhosts = [\n{hosts}\n]\n"
     );
     std::fs::write(lock_dir.join("carina-providers.lock"), lock).expect("write test egress lock");
-    let (lock, _migration) =
-        LockFile::load(&carina_core::paths::ResolvedPath::new(lock_dir).unwrap())
-            .expect("load test egress lock")
-            .expect("test egress lock exists")
-            .into_parts();
+    let lock = LockFile::load(&carina_core::paths::ResolvedPath::new(lock_dir).unwrap())
+        .expect("load test egress lock")
+        .expect("test egress lock exists");
     let locked = lock
         .locked_egress(
             &declaration,
@@ -1370,9 +1349,8 @@ fn persisted_create_for_resume(
     let mut document =
         serde_json::to_value(carina_state::StateFile::new()).expect("fixture state serializes");
     document["resources"] = serde_json::json!([row]);
-    let loaded = carina_state::state::check_and_migrate(&document.to_string())
-        .expect("v15 fixture passes the public state loader")
-        .into_state();
+    let loaded = carina_state::state::load_state(&document.to_string())
+        .expect("current fixture passes the public state loader");
     match loaded.build_state_for_resource(id) {
         carina_core::resource::Current::CreateInFlight(pending) => pending,
         carina_core::resource::Current::Absent(state) => {
@@ -1419,7 +1397,7 @@ fn resolved_provider_config(
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
-                &HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },
@@ -2944,7 +2922,8 @@ async fn test_wasm_create_read_back_budget_returns_partial_then_refresh_complete
         .await
         .expect("the final attempt should return a partial success");
     let diagnostic = outcome
-        .diagnostic()
+        .diagnostic
+        .as_ref()
         .expect("budget exhaustion must keep the partial-read diagnostic");
     assert_eq!(diagnostic.missing_attributes(), &["computed".to_string()]);
     let partial = create_state_for_writeback(outcome);
@@ -3444,7 +3423,7 @@ async fn test_wasm_pending_delete_polls_until_success() {
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect("setup create should succeed");
-    let identifier = created.identifier().clone();
+    let identifier = created.identifier.clone();
 
     delete_without_schema(provider.provider(), &id, &identifier)
         .await
@@ -4195,16 +4174,12 @@ async fn canonicalized_composite_identifiers_survive_finished_and_resumed_paths(
         .provider()
         .create_for_test(&finished_id, create_request_for_test(finished).await)
         .await
-        .expect("canonicalized finished create should succeed")
-        .into_kind();
-    match finished {
-        CreateOutcomeKind::Success { state } => {
-            assert_eq!(state.identifier().as_str(), canonical)
-        }
-        CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
-            panic!("unexpected partial canonical create {state:?}: {diagnostic:?}")
-        }
-    }
+        .expect("canonicalized finished create should succeed");
+    assert!(
+        finished.diagnostic.is_none(),
+        "expected full create success"
+    );
+    assert_eq!(finished.identifier.as_str(), canonical);
 
     let resumed_id =
         ResourceId::with_provider_identity("mock", "test.short_budget", "canonical-resumed", None);
@@ -5509,7 +5484,7 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
         .create_for_test(&id, create_request_for_test(resource.clone()).await)
         .await
         .expect("create should seed the mock cloud store");
-    let created_identifier = created.identifier().clone();
+    let created_identifier = created.identifier.clone();
 
     let (persisted_secret, _) = redacted_secret_and_legacy_marker("cloud-secret");
     let from = SnapshotState::existing(
@@ -6695,15 +6670,12 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
     Argon2::default()
         .hash_password_into(&material, salt, &mut output)
         .expect("hash legacy write-only fixture");
-    let encoded = migrate_legacy_state_attribute(
-        serde_json::json!(format!("_secret:argon2:{}", hex::encode(output))),
-        "mock.test.resource",
-        "legacy-write-only",
-        "__mock_write_only_secret__",
-    );
+    let encoded = serde_json::json!({"$secret": format!(
+        "argon2-legacy:{}:{}", hex::encode(salt), hex::encode(output)
+    )});
     let persisted: PersistedValue =
-        serde_json::from_value(encoded).expect("migration emits valid persisted JSON");
-    let typed = persisted.decode().expect("migration emits a typed secret");
+        serde_json::from_value(encoded).expect("fixture contains valid persisted JSON");
+    let typed = persisted.decode().expect("fixture contains a typed secret");
     let saved_attrs = lifted_saved_attrs([(
         id.clone(),
         HashMap::from([("__mock_write_only_secret__".to_string(), typed)]),

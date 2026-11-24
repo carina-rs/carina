@@ -247,7 +247,7 @@ fn write_config(fixture: &ApplyCancellationFixture, generation: &str) {
         format!(
             r#"
 let parent = awscc.test.Parent {{ generation = "{generation}" }}
-let records = for opt in parent.options {{
+let records = for (_, opt) in parent.options {{
   awscc.test.Child {{
     name = opt.name
     value = opt.value

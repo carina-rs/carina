@@ -3,8 +3,8 @@
 use super::NoConversion;
 
 use super::{
-    AuthoredExpr, ConditionSnapshot, ExprKind, ExpressionInstance, ExpressionLocation,
-    ExpressionReport, JudgedExpr, MissingEvidence, Projection,
+    AuthoredExpr, AuthoredSlotKind, ConditionSnapshot, ExprKind, ExpressionInstance,
+    ExpressionLocation, ExpressionReport, JudgedExpr, MissingEvidence, Projection,
 };
 use crate::resource::knowledge::{Apply, Knowledge, PlanResolved};
 use crate::resource::{
@@ -414,7 +414,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             ExprKind::Parens => AuthoredForm::Parens,
             ExprKind::Convert { .. } => AuthoredForm::Convert,
             ExprKind::Definition => AuthoredForm::Definition,
-            ExprKind::Binding(_) => AuthoredForm::Binding,
+            ExprKind::Binding { .. } => AuthoredForm::Binding,
             ExprKind::Reference { .. } => AuthoredForm::Reference,
             ExprKind::List => AuthoredForm::List,
             ExprKind::Map(_) => AuthoredForm::Map,
@@ -434,14 +434,14 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             | ExprKind::Integer { .. }
             | ExprKind::Iterable
             | ExprKind::Resource { .. }
-            | ExprKind::For
+            | ExprKind::For { .. }
             | ExprKind::Wait
             | ExprKind::Compose
             | ExprKind::DynamicAccess
             | ExprKind::ModuleCall
             | ExprKind::Boolean
             | ExprKind::Declaration
-            | ExprKind::RequireCondition(_)
+            | ExprKind::RequireCondition
             | ExprKind::ProviderDeclaration
             | ExprKind::Unsupported(_)
             | ExprKind::NestedBlock { .. } => AuthoredForm::Computed,
@@ -476,7 +476,11 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
     }
 
     pub(crate) fn definition(&self) -> Result<Option<Self>, MissingEvidence> {
-        let ExprKind::Binding(binding) = &self.node.node.kind else {
+        let ExprKind::Binding {
+            binding,
+            authored_binding: _,
+        } = &self.node.node.kind
+        else {
             return Ok(None);
         };
         let Some(expression) = self.node.snapshot.definitions.get(binding) else {
@@ -624,7 +628,6 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
                         authored: true,
                     }
                 }
-                ExprKind::RequireCondition(_) => AuthoredNavigation::Covered,
                 _ => AuthoredNavigation::Covered,
             },
             AuthoredForm::Forward | AuthoredForm::Literal | AuthoredForm::Reference => {
@@ -638,7 +641,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             ExprKind::Interpolation { .. } => EdgeRole::InterpolationPart,
             ExprKind::Call(_) => EdgeRole::CallArgument,
             ExprKind::Integer { .. } => EdgeRole::ArithmeticOperand,
-            ExprKind::RequireCondition(_) => EdgeRole::Condition,
+            ExprKind::RequireCondition => EdgeRole::Condition,
             ExprKind::Access(_) | ExprKind::DynamicAccess => {
                 if index == 0 {
                     EdgeRole::AccessBase
@@ -1048,6 +1051,7 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
                 binding,
                 attribute,
                 segments,
+                authored_binding: _,
             } => Some(SourceReference {
                 binding,
                 attribute,
@@ -1156,6 +1160,38 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
     }
 }
 
+/// A parser-issued capability to put evidence on a provider-attribute row.
+pub(crate) struct AttributeRowKey(String);
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RowAttributes<V>(indexmap::IndexMap<String, V>);
+
+impl<V> Default for RowAttributes<V> {
+    fn default() -> Self {
+        Self(indexmap::IndexMap::new())
+    }
+}
+
+impl<V> RowAttributes<V> {
+    pub(crate) fn insert(&mut self, key: AttributeRowKey, value: V) {
+        self.0.insert(key.0, value);
+    }
+}
+
+impl<V> std::ops::Deref for RowAttributes<V> {
+    type Target = indexmap::IndexMap<String, V>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<V: std::fmt::Debug> std::fmt::Debug for RowAttributes<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
 /// The complete attribute input, sealed by retained construction. Replacing or
 /// expanding a projection must transport this bundle and renew its generation.
 #[derive(Clone)]
@@ -1168,6 +1204,7 @@ pub struct JudgedSlot<B: BindingAddress = RelativeBindingName> {
     snapshot: Option<Arc<ExpressionReport<B>>>,
     snapshot_error: Option<MissingEvidence>,
     schema_kind: crate::schema::SchemaKind,
+    slot_kind: AuthoredSlotKind,
     conditions: ConditionSnapshot,
 }
 
@@ -1182,9 +1219,24 @@ impl<B: BindingAddress> std::fmt::Debug for JudgedSlot<B> {
 }
 
 impl JudgedSlot {
+    #[cfg(test)]
     fn from_expression(
         expression: super::ExprValue,
         schema_kind: crate::schema::SchemaKind,
+        instance: ExpansionInstanceId,
+    ) -> Self {
+        Self::from_classified_expression(
+            expression,
+            schema_kind,
+            AuthoredSlotKind::Attribute,
+            instance,
+        )
+    }
+
+    fn from_classified_expression(
+        expression: super::ExprValue,
+        schema_kind: crate::schema::SchemaKind,
+        slot_kind: AuthoredSlotKind,
         instance: ExpansionInstanceId,
     ) -> Self {
         Self {
@@ -1196,12 +1248,34 @@ impl JudgedSlot {
             snapshot: None,
             snapshot_error: None,
             schema_kind,
+            slot_kind,
             conditions: ConditionSnapshot::default(),
         }
     }
 }
 
 impl<B: BindingAddress> JudgedSlot<B> {
+    pub(crate) fn attribute_row_key(
+        &self,
+        name: &crate::parser::AttributeKey,
+    ) -> Option<AttributeRowKey> {
+        match self.slot_kind {
+            AuthoredSlotKind::Attribute => {
+                Some(AttributeRowKey(name.transport_identity().to_owned()))
+            }
+            AuthoredSlotKind::Directives => None,
+        }
+    }
+
+    /// Diagnostic syntax inventory, independent of the current projection/judgement.
+    /// Inlining an alias or substituting a module argument must retain its authored name.
+    pub(crate) fn dependency_uses(&self) -> Vec<super::AuthoredDependency<B>> {
+        let mut uses = Vec::new();
+        self.root
+            .dependency_uses(crate::resource::DiagnosticScope::Public, &mut uses);
+        uses
+    }
+
     pub(crate) fn secrecy_conditions(&self) -> ConditionSnapshot {
         self.conditions.clone()
     }
@@ -1483,7 +1557,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
             let role = match &usage.node.node.kind {
                 ExprKind::Parens => EdgeRole::Parens,
                 ExprKind::Convert { .. } => EdgeRole::ConvertOperand,
-                ExprKind::RequireCondition(_) => EdgeRole::Condition,
+                ExprKind::RequireCondition => EdgeRole::Condition,
                 ExprKind::Definition => EdgeRole::AliasDefinition,
                 ExprKind::Secret => EdgeRole::SecretArgument,
                 ExprKind::List => EdgeRole::ListItem,
@@ -1498,7 +1572,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 | ExprKind::Parameter(_)
                 | ExprKind::LoopSlot(_)
                 | ExprKind::UntypedParameter
-                | ExprKind::Binding(_)
+                | ExprKind::Binding { .. }
                 | ExprKind::Reference { .. }
                 | ExprKind::NestedBlock { .. }
                 | ExprKind::EmptyInterpolation
@@ -1508,7 +1582,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 | ExprKind::Iterable
                 | ExprKind::Resource { .. }
                 | ExprKind::Sink { .. }
-                | ExprKind::For
+                | ExprKind::For { .. }
                 | ExprKind::Wait
                 | ExprKind::Compose
                 | ExprKind::ModuleCall
@@ -1590,6 +1664,8 @@ pub struct AuthoredSlots<B: BindingAddress = RelativeBindingName> {
     input_origin: Option<SlotDeclarationId>,
     /// Resource expansion identity, retained even when there are no attributes.
     instance: Option<ExpansionInstanceId>,
+    instantiation_origin: Option<(SlotDeclarationId, Option<ExpansionInstanceId>)>,
+    child_secrecy: Option<crate::secrecy::ChildSecrecy>,
 }
 // Admission metadata is not part of a resource's value semantics.
 impl<B: BindingAddress> PartialEq for AuthoredSlots<B> {
@@ -1612,6 +1688,8 @@ impl<B: BindingAddress> Default for AuthoredSlots<B> {
             declaration: None,
             input_origin: None,
             instance: None,
+            instantiation_origin: None,
+            child_secrecy: None,
         }
     }
 }
@@ -1628,6 +1706,22 @@ impl<B: BindingAddress> AuthoredSlots<B> {
     }
     pub(crate) fn instance(&self) -> Option<ExpansionInstanceId> {
         self.instance
+    }
+    pub(crate) fn instantiation_origin(
+        &self,
+    ) -> Option<(&SlotDeclarationId, Option<ExpansionInstanceId>)> {
+        self.instantiation_origin
+            .as_ref()
+            .map(|(declaration, instance)| (declaration, *instance))
+    }
+    pub(crate) fn child_secrecy(&self) -> Option<&crate::secrecy::ChildSecrecy> {
+        self.child_secrecy.as_ref()
+    }
+    pub(in crate::parser) fn set_child_secrecy(
+        &mut self,
+        secrecy: crate::parser::ast::DeferredChildSecrecy,
+    ) {
+        self.child_secrecy = Some(secrecy.into_inner());
     }
     pub(super) fn set_instance(&mut self, instance: ExpansionInstanceId) {
         self.instance = Some(instance);
@@ -1763,6 +1857,11 @@ impl<B: BindingAddress> AuthoredSlots<B> {
         }
     }
     pub(crate) fn reinstance(&mut self) {
+        self.instantiation_origin = self
+            .declaration
+            .clone()
+            .map(|declaration| (declaration, self.instance));
+        self.child_secrecy = None;
         let instance = ExpansionInstanceId::fresh();
         self.set_instance(instance);
         for slot in self.slots.values_mut() {
@@ -1789,6 +1888,8 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             declaration: self.declaration,
             input_origin: self.input_origin,
             instance: self.instance,
+            instantiation_origin: self.instantiation_origin,
+            child_secrecy: self.child_secrecy,
             slots: self
                 .slots
                 .into_iter()
@@ -1810,6 +1911,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
                             snapshot: None,
                             snapshot_error: None,
                             schema_kind: slot.schema_kind,
+                            slot_kind: slot.slot_kind,
                             conditions: slot.conditions,
                         },
                     )
@@ -1860,10 +1962,12 @@ impl AuthoredSlots {
         name: impl Into<crate::parser::AttributeKey>,
         expression: super::ExprValue,
         kind: crate::schema::SchemaKind,
+        slot_kind: AuthoredSlotKind,
         instance: ExpansionInstanceId,
         conditions: ConditionSnapshot,
     ) {
-        let mut slot = JudgedSlot::from_expression(expression, kind, instance);
+        let mut slot =
+            JudgedSlot::from_classified_expression(expression, kind, slot_kind, instance);
         slot.conditions = conditions;
         self.slots.insert(name, slot);
     }

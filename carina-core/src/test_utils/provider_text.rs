@@ -504,7 +504,10 @@ fn resume(payload: Payload, context: &Context) -> Result<HostResumeOutcome, Host
         create_request(),
     )
     .unwrap();
-    block_on(fixture(payload, context).provider().resume_create(request))
+    block_on(crate::executor::dispatch_resume_create(
+        fixture(payload, context).provider(),
+        request,
+    ))
 }
 impl BindProviderText for UpdateOutcome {
     type Host = HostUpdateOutcome;

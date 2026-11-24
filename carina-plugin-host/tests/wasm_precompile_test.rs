@@ -687,7 +687,7 @@ async fn precompiled_factory_is_schema_only() {
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &carina_core::parser::ExpandedInferredFile::default(),
-                &std::collections::HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },

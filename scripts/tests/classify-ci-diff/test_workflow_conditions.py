@@ -23,9 +23,9 @@ AUX_CACHE_JOBS = {"test-provider-cause", "test-doctests"}
 TEST_JOBS = {"test-partition", "test-isolation"} | AUX_CACHE_JOBS
 CACHE_JOBS = MAIN_CACHE_JOBS | AUX_CACHE_JOBS
 SCRIPT_JOBS = {
-    "provider-boundaries", "error-source-display", "no-wall-clock-test-assertions",
-    "docs-spellings", "check-resources-access", "check-cli-hints",
-    "check-no-home-env-reads", "check-crates-not-publishable",
+    "provider-boundaries", "binding-addresses", "error-source-display", "no-wall-clock-test-assertions",
+    "docs-spellings", "check-doctest-module-tree", "check-resources-access",
+    "check-cli-hints", "check-no-home-env-reads", "check-crates-not-publishable",
     "check-wit-bindgen-workspace", "check-plan-fixtures",
     "check-rust-cache-via-local-action", "check-pinned-toolchain", "check-vendored-patches-used",
 }
@@ -217,6 +217,8 @@ class WorkflowConditionTests(unittest.TestCase):
                   'root.join("site/src/content/reference/registry");\n')
             inputs = {
                 "rust-toolchain.toml": True,
+                "scripts/core-cross-checks.sh": True,
+                "scripts/test-core-cross-checks.sh": True,
                 "site/src/content/providers/writing/schemas.md": True,
                 "site/src/content/reference/registry/static-registry.md": True,
                 "site/src/content/reference/dsl/types-and-values.md": True,
@@ -300,12 +302,14 @@ class WorkflowConditionTests(unittest.TestCase):
                 recorder.write_text('#!/usr/bin/env bash\nprintf "cargo %s\\n" "$*" >> "$TRACE"\n'
                                     '[[ "$1" != "$FAIL_COMMAND" ]]\n')
                 recorder.chmod(0o755)
-            for tool in ("cargo-nextest", "cargo-hack", "rustup"):
+            for tool in ("cargo-nextest", "cargo-hack", "rustup", "python3"):
                 if tool in missing:
                     continue
                 substitute = root / "bin" / tool
                 substitute.write_text('#!/bin/sh\nprintf "%s\\n" "$INSTALLED_TARGETS"\n'
-                                      if tool == "rustup" else '#!/bin/sh\nexit 0\n')
+                                      if tool == "rustup" else
+                                      '#!/bin/sh\nprintf "python3 %s\\n" "$*" >> "$TRACE"\n'
+                                      if tool == "python3" else '#!/bin/sh\nexit 0\n')
                 substitute.chmod(0o755)
             (root / "scripts/touched-crates.sh").write_text(
                 'printf "base %s\\n" "$*" >> "$TRACE"\nprintf "%s\\n" "$TOUCHED_SCOPE"\n')

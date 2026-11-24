@@ -321,19 +321,6 @@ pub(super) enum ReloadedProviderBoundPlanFile {
     },
 }
 
-impl ReloadedProviderBoundPlanFile {
-    pub(super) fn legacy_dependency_classification(
-        &self,
-    ) -> Option<&carina_state::LegacyDependencyClassification> {
-        match self {
-            Self::Verified { plan, .. } => plan.plan_file.legacy_dependency_classification(),
-            Self::NeedsSecretVerification { plan, .. } => {
-                plan.plan_file.legacy_dependency_classification()
-            }
-        }
-    }
-}
-
 /// Placeholder-free saved plan awaiting provider-schema verification.
 pub(super) struct ReloadedVerifiedPlanFile {
     plan_file: UnresolvedReloadedPlanFile,
@@ -510,7 +497,7 @@ pub(super) struct ExpansionPriorStates {
 }
 
 fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Orphan {
-    match current {
+    let mut orphan = match current {
         Current::Absent(state) => {
             Orphan::absent(state, row.binding.clone(), row.directives.clone())
         }
@@ -526,7 +513,9 @@ fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Orphan {
         Current::MissingIdentifier(state) => {
             Orphan::missing_identifier(state, row.binding.clone(), row.directives.clone())
         }
-    }
+    };
+    orphan.set_dependency_bindings(row.dependency_bindings.clone());
+    orphan
 }
 
 /// Fresh source values whose managed-resource slice is proven to have crossed
@@ -785,7 +774,13 @@ impl SchemaCheckedPendingPlanFile {
                             from: Box::new(ResolvedResourceId::new(replay_origin.clone())),
                             to: Box::new(ResolvedResourceId::new(id.clone())),
                         })?;
-                    orphans.insert(saved_orphan_from_current(current, row));
+                    let key = ResolvedResourceId::with_provider_identity(
+                        row.provider.clone(),
+                        row.resource_type.clone(),
+                        row.identity.clone(),
+                        row.directives.provider_instance.clone(),
+                    );
+                    orphans.insert(key, saved_orphan_from_current(current, row));
                 } else {
                     managed.insert(replay_origin.clone(), current);
                 }
@@ -1314,7 +1309,7 @@ impl<P> RehydratedPlanFile<P> {
         self.plan_file.current_states()
     }
 
-    fn upstream_snapshot(&self) -> &HashMap<String, HashMap<String, Value>> {
+    fn upstream_snapshot(&self) -> &BTreeMap<String, BTreeMap<String, Value>> {
         self.plan_file.upstream_snapshot()
     }
 
@@ -1391,7 +1386,7 @@ impl ExecutablePlanFile {
         self.plan.current_states()
     }
 
-    pub(super) fn upstream_snapshot(&self) -> &HashMap<String, HashMap<String, Value>> {
+    pub(super) fn upstream_snapshot(&self) -> &BTreeMap<String, BTreeMap<String, Value>> {
         self.plan.upstream_snapshot()
     }
 
@@ -1592,7 +1587,7 @@ mod tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -1616,14 +1611,13 @@ mod tests {
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
-            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
             data_source_origins: Vec::new(),
             data_source_values: Vec::new(),
             current_states: Vec::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         }
@@ -2276,7 +2270,6 @@ mod tests {
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
-            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: (vec![data_source.clone().into_value_snapshot()])
@@ -2289,7 +2282,7 @@ mod tests {
                 value: DataSourceValue::read(redacted.to_snapshot()),
             }],
             current_states: Vec::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         }

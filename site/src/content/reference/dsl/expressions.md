@@ -30,9 +30,21 @@ let vpcs = for env in ['dev', 'stg'] {
 }
 ```
 
+A `let`-bound simple list loop uses distinct, public String values as keys: the example creates `vpcs.dev` and `vpcs.stg`, accessed as `vpcs['dev'].vpc_id`. Positions never determine these addresses. Reordering preserves them; insertion and removal affect only the corresponding keys. Anonymous loops retain their existing schema-derived identity rules.
+
+Non-String concrete elements (including enums), duplicate Strings, protected whole collections or members, and diagnostic-sensitive Strings are rejected. Proven non-String element types are rejected even for empty typed lists; String-based refinements are eligible. Unresolved type names are checked when values become available. Key-admission errors identify safe types or element ordinals without printing their values. Use public Strings or `(i, x)` instead.
+
+String keys that do not round-trip through state address canonicalization and decomposition are also rejected. Use `(i, x)` for those elements. This restriction is lifted automatically when [carina#4552](https://github.com/carina-rs/carina/issues/4552) fixes key escaping; map-loop keys keep their existing behavior.
+
+A partial simple list is recorded as deferred. Planning retries plan-time references, but rejects members known to require apply. A wholly pending collection may expand after its producer applies; unknown members then fail expansion. Newly deferred `read` and module-call bodies are rejected with the indexed-form alternative. Deferred keyed child lookup remains unsupported. Managed resource loops whose pending members are only module arguments expand after argument substitution, so their String-keyed children can be referenced inside the module and appear within its plan group.
+
+A loop binding is a structural handle: bare `length(vpcs)` and value exports are invalid. Select an instance attribute or author an explicit value collection. Numeric subscripts on simple list loops receive a diagnostic explaining String subscripts and indexed iteration.
+
+This changes old simple-list addresses from indices to keys. Use explicit `moved` blocks; there is no automatic migration. See [Migrating index-addressed list loops](/guides/state-management/#migrating-index-addressed-list-loops), including deferred children, and regenerate saved plans.
+
 ### Indexed Iteration
 
-Use `(index, value)` to access both the index and the element:
+Use `(index, value)` to opt into index addresses such as `vpcs[0]`. This form also accepts non-String elements, duplicate Strings, and protected element values:
 
 ```crn
 let vpcs = for (i, env) in ['dev', 'stg'] {
@@ -68,6 +80,8 @@ let vpcs = for name, cidr in cidrs {
   }
 }
 ```
+
+Map loops keep their existing key addresses and traversal rules. Their instance attributes also use String subscripts.
 
 ### Local Bindings in For Body
 
@@ -427,6 +441,8 @@ fn cidr_for_env(env: String): String {
 }
 ```
 
+See [function type promises](/guides/functions/#type-promises-at-validate) for parameter and return validation.
+
 ## Validate Expressions
 
 Validate expressions are boolean expressions used in `arguments` blocks for input validation and in `require` statements. They support comparison and logical operators.
@@ -472,8 +488,7 @@ arguments {
 }
 ```
 
-Use `length` in validate expressions. Root `require` conditions also accept
-`len` as an alias. Evaluating other direct function calls, including `env`
+Use `length` in validate expressions. Evaluating other direct function calls, including `env`
 and user-defined functions, produces an error:
 
 ```crn
@@ -488,27 +503,21 @@ arguments {
 ```
 
 The condition in an argument's `validation` block may reference only that
-argument. To compare two or more module arguments, use a module-level
-`require` statement:
+argument. To compare two or more module arguments, use a `require` statement
+inside the `arguments` block:
 
 ```crn
 arguments {
   min_size: Int
   max_size: Int
+  require min_size <= max_size, 'min_size must not exceed max_size'
 }
-
-require min_size <= max_size, 'min_size must not exceed max_size'
 ```
 
-At the root of a configuration directory, `require` has no arguments in scope.
-Use literal booleans, integers, floats, durations, strings, or `null`, together
-with operators, parentheses, `len`, and `length`. A condition must return a
-boolean. `len` and `length` count string bytes; constraint strings retain
-their authored escape spelling, so `length("a\nb")` is `4`. Collection literals
-are not part of validate expressions; field access and indexing require a module
-argument as their base. Root references to lets, resources, or other names
-are errors, including in a branch that would otherwise short-circuit.
-Root requirements are always decided during validation.
+A requirement sees all module arguments, including later declarations and
+arguments in sibling files. Outside an `arguments` block, `require` is a syntax
+error. A condition must return a boolean. Collection literals are not part of validate
+expressions; field access and indexing require a module argument as their base.
 
 Validate expressions are evaluated when their referenced values become known.
 Literal arguments are checked during validation; reference values are checked

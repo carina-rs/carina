@@ -99,9 +99,7 @@ fn sigint_then_sigterm_flushes_completed_state_releases_lock_and_exits_130() {
         lock_path.display()
     );
 
-    let state = carina_state::check_and_migrate(&fs::read_to_string(&state_path).unwrap())
-        .unwrap()
-        .into_state();
+    let state = carina_state::load_state(&fs::read_to_string(&state_path).unwrap()).unwrap();
     assert!(
         state
             .find_resource("mock", "test.resource", "a_completed")

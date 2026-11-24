@@ -219,8 +219,8 @@ use reads::{KnownReads, ReadsSet};
 
 #[derive(Debug)]
 pub struct DependencyAnalysis {
-    deps_of: HashMap<usize, HashSet<usize>>,
-    dependents_of: HashMap<usize, HashSet<usize>>,
+    deps_of: HashMap<usize, BTreeSet<usize>>,
+    dependents_of: HashMap<usize, BTreeSet<usize>>,
     reads_by_edge: HashMap<usize, HashMap<usize, ReadsSet>>,
     unresolved_required: Vec<UnresolvedRequiredDependency>,
     unresolved_delete_ordering: Vec<UnresolvedDeleteOrderingDependency>,
@@ -228,8 +228,12 @@ pub struct DependencyAnalysis {
 
 impl DependencyAnalysis {
     fn new(effect_count: usize) -> Self {
-        let deps_of = (0..effect_count).map(|idx| (idx, HashSet::new())).collect();
-        let dependents_of = (0..effect_count).map(|idx| (idx, HashSet::new())).collect();
+        let deps_of = (0..effect_count)
+            .map(|idx| (idx, BTreeSet::new()))
+            .collect();
+        let dependents_of = (0..effect_count)
+            .map(|idx| (idx, BTreeSet::new()))
+            .collect();
         Self {
             deps_of,
             dependents_of,
@@ -262,11 +266,11 @@ impl DependencyAnalysis {
         }
     }
 
-    pub fn deps_of(&self, child: usize) -> Option<&HashSet<usize>> {
+    pub fn deps_of(&self, child: usize) -> Option<&BTreeSet<usize>> {
         self.deps_of.get(&child)
     }
 
-    pub fn dependents_of(&self, parent: usize) -> Option<&HashSet<usize>> {
+    pub fn dependents_of(&self, parent: usize) -> Option<&BTreeSet<usize>> {
         self.dependents_of.get(&parent)
     }
 
@@ -276,7 +280,7 @@ impl DependencyAnalysis {
             .and_then(|by_parent| by_parent.get(&parent))
     }
 
-    pub fn into_deps_of(self) -> HashMap<usize, HashSet<usize>> {
+    pub fn into_deps_of(self) -> HashMap<usize, BTreeSet<usize>> {
         self.deps_of
     }
 
@@ -644,7 +648,7 @@ fn build_effect_dependency_analysis_impl<'a, S, P: PlanValueKind, E>(
     effects: &[E],
     unresolved_resource_ids: impl IntoIterator<Item = &'a ResolvedResourceId>,
     inputs: ScheduleInputs<'_>,
-    replacement_edges: HashMap<usize, HashSet<usize>>,
+    replacement_edges: HashMap<usize, BTreeSet<usize>>,
     admitted_pairs: HashSet<(usize, usize)>,
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure>
 where
@@ -726,8 +730,6 @@ where
         #[allow(clippy::iter_over_hash_type)]
         // keyed rebuild: replacement edges union independent prerequisite sets
         for (dependent, dependencies) in replacement_edges {
-            #[allow(clippy::iter_over_hash_type)]
-            // keyed rebuild: duplicate prerequisite edges have identical read metadata
             for dependency in dependencies {
                 analysis.add_edge(dependent, dependency, ReadsSet::unknown());
             }
@@ -814,8 +816,6 @@ pub fn relax_update_update_edges<S, P: PlanValueKind, E: AsRef<Effect<S, P>>>(
         let Some(parents) = analysis.deps_of(child).cloned() else {
             continue;
         };
-        #[allow(clippy::iter_over_hash_type)]
-        // keyed rebuild: independent dependency edges are removed when read/write sets are disjoint
         for parent in parents {
             let Some(writes) = WritesSet::from_update(effects[parent].as_ref()) else {
                 continue;
@@ -851,7 +851,7 @@ mod tests {
     }
 
     fn state_for(id: &ResourceId) -> State {
-        State::existing(id.clone(), Default::default())
+        State::existing(id.clone(), std::collections::BTreeMap::new())
             .with_identifier(id.identity_display().to_string())
     }
 
@@ -924,8 +924,8 @@ mod tests {
         )
     }
 
-    fn total_edges(deps: &HashMap<usize, HashSet<usize>>) -> usize {
-        deps.values().map(HashSet::len).sum()
+    fn total_edges(deps: &HashMap<usize, BTreeSet<usize>>) -> usize {
+        deps.values().map(BTreeSet::len).sum()
     }
 
     #[test]
@@ -1051,7 +1051,7 @@ mod tests {
             build_effect_dependency_analysis(&effects, std::iter::empty(), ScheduleInputs::Apply)
                 .expect("composition-independent dependency analysis must resolve");
 
-        assert_eq!(analysis.deps_of(0), Some(&HashSet::new()));
+        assert_eq!(analysis.deps_of(0), Some(&BTreeSet::new()));
     }
 
     #[test]
@@ -1484,7 +1484,7 @@ mod tests {
         let admitted = crate::replacement::AdmittedReplacementEffects::resolve(
             &effects,
             &crate::schema::SchemaRegistry::new(),
-            |_| HashMap::new(),
+            |_| std::collections::BTreeMap::new(),
         )
         .unwrap();
         let deps = admitted

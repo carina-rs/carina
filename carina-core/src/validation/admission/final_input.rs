@@ -421,7 +421,101 @@ pub struct FinalPlanInputs<S = crate::resource::ModuleSource> {
     data_sources: FinalInput<Vec<ResolvedDataSource<S>>>,
 }
 
+/// Admitted desired data and resource comparison evidence. This is not a
+/// state-release capability: CLI wiring owns the pipeline-only witness.
+/// This carrier deliberately has no Debug or serialization implementation.
+#[derive(Clone)]
+pub struct FinalDesiredValues {
+    resources: std::collections::HashMap<ResourceId, FinalDesiredAttributes>,
+}
+
+#[derive(Clone)]
+pub struct FinalDesiredAttributes {
+    attributes: IndexMap<String, Value>,
+    comparison: Option<(
+        ResourceId,
+        std::sync::Arc<crate::references::ResolvedReferences>,
+    )>,
+}
+
+impl FinalDesiredValues {
+    pub fn get(&self, id: &ResourceId) -> Option<&FinalDesiredAttributes> {
+        self.resources.get(id)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(
+        resources: impl IntoIterator<Item = (ResourceId, IndexMap<String, Value>)>,
+    ) -> Self {
+        Self {
+            resources: resources
+                .into_iter()
+                .map(|(id, attributes)| {
+                    (
+                        id,
+                        FinalDesiredAttributes {
+                            attributes,
+                            comparison: None,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl FinalDesiredAttributes {
+    pub(crate) fn prepared_comparison(
+        &self,
+    ) -> Option<(&ResourceId, &crate::references::ResolvedReferences)> {
+        self.comparison
+            .as_ref()
+            .map(|(id, references)| (id, references.as_ref()))
+    }
+
+    pub fn attributes(&self) -> &IndexMap<String, Value> {
+        &self.attributes
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(attributes: IndexMap<String, Value>) -> Self {
+        Self {
+            attributes,
+            comparison: None,
+        }
+    }
+}
+
 impl<S> FinalPlanInputs<S> {
+    /// Retain the exact final desired side for later row writes, including
+    /// rows for which no provider request is dispatched or accepted.
+    pub fn desired_values(
+        &self,
+        references: &crate::references::ResolvedReferences,
+    ) -> FinalDesiredValues {
+        let references = std::sync::Arc::new(references.clone());
+        FinalDesiredValues {
+            resources: self
+                .resources()
+                .iter()
+                .map(|resource| {
+                    (
+                        resource.id.clone(),
+                        FinalDesiredAttributes {
+                            attributes: resource.attributes.clone(),
+                            comparison: Some((
+                                resource.id.clone(),
+                                std::sync::Arc::clone(&references),
+                            )),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Validate resolved plan inputs. Release authority is owned by the CLI
+    /// pipeline; admission alone grants no state-writing capability.
     pub fn admit(
         resources: Vec<ResolvedResource<S>>,
         data_sources: Vec<ResolvedDataSource<S>>,
@@ -481,6 +575,17 @@ impl<S> FinalPlanInputs<S> {
                 payload: data_sources,
             },
         })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn admit_for_test(
+        resources: Vec<ResolvedResource<S>>,
+        data_sources: Vec<ResolvedDataSource<S>>,
+        schemas: &SchemaRegistry,
+        bindings: &ResolvedBindings,
+        session: &dyn ProviderTypeCheckContext,
+    ) -> Result<Self, FinalInputError> {
+        Self::admit(resources, data_sources, schemas, bindings, session)
     }
 
     pub fn resources(&self) -> &[ResolvedResource<S>] {

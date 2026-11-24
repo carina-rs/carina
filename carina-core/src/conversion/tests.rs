@@ -72,7 +72,7 @@ pub(crate) fn conversion_errors(report: &PresentedFindings) -> Vec<&ConversionEr
         .iter()
         .filter_map(|finding| match finding {
             PresentedFinding::Conversion(finding) => Some(finding.error()),
-            PresentedFinding::Ordinary(_) => None,
+            PresentedFinding::Ordinary(_) | PresentedFinding::FunctionPromise(_) => None,
         })
         .collect()
 }
@@ -81,7 +81,7 @@ pub(crate) fn ordinary_messages(report: &PresentedFindings) -> String {
         .iter()
         .filter_map(|finding| match finding {
             PresentedFinding::Ordinary(finding) => Some(finding.to_string()),
-            PresentedFinding::Conversion(_) => None,
+            PresentedFinding::Conversion(_) | PresentedFinding::FunctionPromise(_) => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -99,6 +99,10 @@ pub(crate) fn conversion_error(
 fn presented_finding(presented: &PresentedFinding) -> Finding {
     match presented {
         PresentedFinding::Conversion(conversion) => finding(conversion.error()),
+        PresentedFinding::FunctionPromise(finding) => Finding {
+            conversion: None,
+            rendered: finding.to_string(),
+        },
         PresentedFinding::Ordinary(OrdinaryFinding::Resource(error)) => finding(error),
         PresentedFinding::Ordinary(OrdinaryFinding::Client(never)) => match **never {},
     }
@@ -383,9 +387,10 @@ where
         {
             let (resource, result) = step.into_parts();
             let attributes = resource.attributes();
-            let mut admitted = result
+            let admitted = result
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| format!("missing fixture schema: {:?}", resource.id()))?;
+            let (mut admitted, _prefixes_for_test) = admitted.into_parts();
             let mut local = admitted
                 .errors()
                 .chain(

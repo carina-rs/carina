@@ -14,7 +14,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{PublicAccessBlockConfiguration, ServerSideEncryption};
 use carina_core::shutdown::CleanupBudget;
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -23,7 +23,7 @@ use crate::backend::{
 };
 use crate::backend_config::S3BackendSettings;
 use crate::lock::LockInfo;
-use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migration_once};
+use crate::state::{self, StateFile};
 
 use super::{S3_BACKEND_PROVIDER_NAME, S3_BACKEND_RESOURCE_TYPE};
 
@@ -132,10 +132,6 @@ pub struct S3Backend {
     region: String,
     /// Admitted storage settings, including the auto-create policy.
     settings: S3BackendSettings,
-    /// Tracks the first in-memory state-schema migration observed by
-    /// `read_state` on this backend instance (carina#3283). See the
-    /// equivalent field on `LocalBackend` for the rationale.
-    migration_logged: OnceLock<MigrationInfo>,
     /// Best-known state of the state object's ETag. Successful full-state reads
     /// (including a 404) and writes resolve this cache so the steady-state
     /// conditional write needs only one PUT. Exports-only reads deliberately do
@@ -352,7 +348,6 @@ impl S3Backend {
             client,
             region,
             settings: config.clone(),
-            migration_logged: OnceLock::new(),
             state_etag: Mutex::new(CachedStateEtag::Unknown),
         }
     }
@@ -885,23 +880,16 @@ impl StateBackend for S3Backend {
         self.settings.cleanup_budget()
     }
 
-    async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
+    async fn read_state(&self) -> BackendResult<Option<StateFile>> {
         let state_location = self.state_location();
         match self.get_state_object().await? {
             Some((bytes, etag)) => {
-                let outcome = state::check_and_migrate_bytes(&bytes)
+                let state = state::load_state_bytes(&bytes)
                     .map_err(|error| error.with_state_read_remote_location(&state_location))?;
-                let (state, migration) = outcome.into_parts();
-                let loaded_state = if let Some(info) = migration {
-                    log_state_migration_once(&self.migration_logged, info, &state_location);
-                    LoadedState::Migrated { state, info }
-                } else {
-                    LoadedState::Pristine(state)
-                };
                 self.set_cached_state_etag(
                     etag.map_or(CachedStateEtag::Unknown, CachedStateEtag::Etag),
                 );
-                Ok(Some(loaded_state))
+                Ok(Some(state))
             }
             None => {
                 self.set_cached_state_etag(CachedStateEtag::Absent);

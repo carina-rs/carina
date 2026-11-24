@@ -1,4 +1,4 @@
 moved {
   from = awscc.ec2.Vpc 'old_vpc'
-  to   = awscc.ec2.Vpc 'vpcs[0]'
+  to   = awscc.ec2.Vpc "vpcs['10.0.0.0/16']"
 }

@@ -18,11 +18,11 @@ fn deferred_replace_test_template() -> crate::parser::DeferredForExpression {
     crate::parser::DeferredForExpression::new(
         Some("main.crn".to_string()),
         12,
-        "for opt in cert.domain_validation_options".to_string(),
+        "for (_, opt) in cert.domain_validation_options".to_string(),
         crate::parser::DeferredForTarget::bound(absolute_binding("validation_records"))
             .expect("fixture binding is valid"),
         Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-        crate::parser::ForBinding::Simple("opt".to_string()),
+        crate::parser::ForBinding::Indexed("_".into(), "opt".to_string()),
         template_resource,
     )
 }
@@ -58,7 +58,7 @@ fn delete_effect_for_binding(binding: &str) -> Effect {
 fn review5_4283_deferred_absorption_uses_the_recorded_generation_snapshot() {
     let current = crate::effect::DeferredReplaceDelete {
         generation: EffectGeneration::Current,
-        previous_attributes: HashMap::from([(
+        previous_attributes: std::collections::BTreeMap::from([(
             "name".into(),
             crate::resource::SnapshotValue::Concrete(ConcreteValue::String("current-B".into())),
         )]),

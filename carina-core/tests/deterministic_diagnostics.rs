@@ -373,7 +373,8 @@ fn canonical_attribute_wins_an_equal_distance_block_alias() {
             >::new(judged.report());
             let outcome = validation.admit_resource(request);
             assert!(outcome.classification_diagnostics.0.is_empty());
-            outcome.values
+            let (values, _prefixes_for_test) = outcome.values.into_parts();
+            values
         };
         let errors = report.errors().collect::<Vec<_>>();
         assert_eq!(errors.len(), 1, "{errors:?}");
@@ -570,4 +571,34 @@ fn unknown_module_argument_findings_keep_authored_order() {
             [3, 4, 5, 6, 7, 8]
         );
     });
+}
+
+#[test]
+fn tp18_authored_function_mismatches_keep_sibling_declaration_order() {
+    let parsed = directory("functions/references");
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let schemas = schemas();
+    let loaded = load_buffer_configuration(&parsed, &schemas, &config);
+    let bindings = loaded.parsed().binding_index(&config);
+    let findings = loaded.report().findings().to_vec();
+    assert!(
+        loaded.function_type_promise_findings(&bindings).is_empty(),
+        "definite mismatches belong entirely to the authored judgement"
+    );
+    assert_eq!(findings.len(), 4, "{findings:#?}");
+    for (finding, function) in findings.iter().zip(["zebra", "sink", "alpha", "sink"]) {
+        let error = finding.detail().to_string();
+        assert!(error.contains(&format!("function '{function}'")), "{error}");
+        assert!(
+            error.contains("expected Int") && error.contains("got String"),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        findings
+            .iter()
+            .map(|finding| finding_location(finding.location()))
+            .collect::<Vec<_>>(),
+        FUNCTION_LOCATIONS.map(|(file, line)| (file.to_owned(), line))
+    );
 }

@@ -123,13 +123,13 @@ fn deferred_create_uses_create_symbol_and_kind() {
     let deferred = DeferredForExpression::new(
         None,
         1,
-        "for opt in cert.domain_validation_options".to_string(),
+        "for (_, opt) in cert.domain_validation_options".to_string(),
         carina_core::parser::DeferredForTarget::bound(
             carina_core::resource::absolute_binding_address_for_test("validation_records"),
         )
         .expect("fixture binding is valid"),
         root_ref("cert", "domain_validation_options"),
-        ForBinding::Simple("opt".to_string()),
+        ForBinding::Indexed("_".into(), "opt".to_string()),
         template_resource,
     );
 
@@ -190,7 +190,7 @@ fn update_effect_has_detail_rows() {
                     Value::Concrete(ConcreteValue::String("Disabled".into())),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
             )
             .with_identifier("my-bucket-id"),
         ),
@@ -838,7 +838,7 @@ fn move_suppressed_when_update_exists_for_same_target() {
                     Value::Concrete(ConcreteValue::String("Disabled".into())),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
             )
             .with_identifier("new-name-id"),
         ),

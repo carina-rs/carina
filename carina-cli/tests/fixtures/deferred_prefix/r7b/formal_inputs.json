@@ -1,0 +1,43 @@
+{
+  "bare": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = prefix }\n"
+  },
+  "alias": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = p }\n",
+    "child/lets.crn": "let p = prefix\n"
+  },
+  "interpolation": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = \"${prefix}-x\" }\n"
+  },
+  "secret": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "",
+    "child/arguments.crn": "arguments { prefix: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = secret(prefix) }\n"
+  },
+  "several": {
+    "providers.crn": "provider mock {}\n",
+    "backend.crn": "backend local { path = 'carina.state.json' }\n",
+    "lets.crn": "",
+    "main.crn": "",
+    "child/arguments.crn": "arguments { first: String second: String }\n",
+    "child/main.crn": "mock.test.resource { name_prefix = \"${first}-${second}\" }\n"
+  }
+}

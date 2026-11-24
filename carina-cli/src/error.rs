@@ -1182,7 +1182,7 @@ pub enum AppError {
     ),
 
     #[error("{0}")]
-    AttributePrefix(Box<carina_core::identifier::AttributePrefixError>),
+    AttributePrefix(Box<carina_core::identifier::AttributePrefixFinding>),
 
     #[error("{0}")]
     ProviderConfiguration(
@@ -2935,6 +2935,10 @@ pub enum PresentedAppError {
     Ordinary(AppError),
     #[error("{0}")]
     Conversion(Box<carina_core::validation::PresentedConversion>),
+    #[error("{0}")]
+    FunctionPromise(
+        Box<carina_core::parser::Located<carina_core::parser::retained::FunctionTypePromise>>,
+    ),
 }
 impl From<AppError> for PresentedAppError {
     fn from(error: AppError) -> Self {
@@ -2946,6 +2950,7 @@ impl PresentedAppError {
         match self {
             Self::Ordinary(error) => format_error_with_source_chain(error),
             Self::Conversion(error) => error.to_string(),
+            Self::FunctionPromise(finding) => finding.to_string(),
         }
     }
     #[cfg(any(test, feature = "test-utils"))]
@@ -2953,6 +2958,7 @@ impl PresentedAppError {
         match self {
             Self::Ordinary(error) => error,
             Self::Conversion(error) => AppError::Validation(error.to_string()),
+            Self::FunctionPromise(finding) => AppError::Validation(finding.to_string()),
         }
     }
     pub(crate) fn from_presented<E: carina_core::validation::ValidationClientError>(
@@ -2968,6 +2974,7 @@ impl PresentedAppError {
                 Self::Ordinary(client(*error))
             }
             PresentedFinding::Conversion(error) => Self::Conversion(Box::new(error)),
+            PresentedFinding::FunctionPromise(finding) => Self::FunctionPromise(Box::new(finding)),
         }
     }
 }

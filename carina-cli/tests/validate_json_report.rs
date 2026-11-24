@@ -305,12 +305,6 @@ fn round8_deferred_headers_keep_parsed_context_on_all_surfaces() {
     for (root, binding, iterable, expected) in [
         ("cert", "secret", "cert.list", "for secret in cert.list"),
         ("cert", "item", "cert.list", "for item in cert.list"),
-        (
-            "cert",
-            "item",
-            "secret(cert.list)",
-            "for item in secret(<redacted>)",
-        ),
         ("secret", "item", "secret.list", "for item in secret.list"),
     ] {
         let source = format!(
@@ -345,6 +339,82 @@ fn round8_deferred_headers_keep_parsed_context_on_all_surfaces() {
             "{diagnostics:?}"
         );
     }
+
+    let source = "let cert = mock.example.consumer { name = 'cert' }\n\
+                  let records = for item in secret(cert.list) { read mock.iam.Roles { name_regex = item } }\n";
+    std::fs::write(&path, source).unwrap();
+    let message = "Protected values cannot be value keys. Use `for (i, x) in ...`.";
+    let human = validate(fixture.path(), false);
+    assert_eq!(human.status.code(), Some(1));
+    assert!(human.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&human.stderr),
+        format!("Error: {}:2:27: {message}\n", path.display())
+    );
+    let json_output = validate(fixture.path(), true);
+    let json = report(&json_output, 1, 0);
+    assert_eq!(json["errors"][0]["message"], message);
+    assert_eq!(
+        json["errors"][0]["location"],
+        serde_json::json!({
+            "file": path.display().to_string(),
+            "range": {
+                "start": { "line": 2, "column": 27 },
+                "end": { "line": 2, "column": 44 },
+            },
+        })
+    );
+    let diagnostics = round_three_diagnostics(source, &path);
+    let finding = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message == message)
+        .unwrap_or_else(|| panic!("{diagnostics:?}"));
+    assert_eq!(finding.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        finding.range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(1, 26),
+            tower_lsp::lsp_types::Position::new(1, 43),
+        )
+    );
+    let surfaces = format!(
+        "{}{}{}{} {diagnostics:?}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr),
+        String::from_utf8_lossy(&json_output.stdout),
+        String::from_utf8_lossy(&json_output.stderr),
+    );
+    assert!(!surfaces.contains("cert.list"), "{surfaces}");
+
+    let source = "let cert = mock.example.consumer { name = 'cert' }\n\
+                  let records = for (i, item) in secret(cert.list) { read mock.iam.Roles { name_regex = item } }\n";
+    std::fs::write(&path, source).unwrap();
+    let message = "Deferred `for` expression `for (i, item) in secret(<redacted>)` at line 2 cannot use read `mock.iam.Roles`: its iterable \
+                   is still unresolved after module expansion, and only a managed resource body can be \
+                   deferred until apply. Iterate over a value known before module expansion, or put \
+                   managed resources directly in the loop body";
+    let warning = "for-loop binding 'i' is unused. Rename to '_' to suppress this warning.";
+    let human = validate(fixture.path(), false);
+    assert_eq!(human.status.code(), Some(1));
+    assert_eq!(human.stdout, b"Validating...\n");
+    assert_eq!(
+        String::from_utf8(human.stderr).unwrap(),
+        format!(
+            "  ⚠ {}:2: {warning}\nError: Module resolution error: Parse error in main.crn: main.crn:2:15: {message}\n",
+            path.display()
+        )
+    );
+    let json = report(&validate(fixture.path(), true), 1, 1);
+    assert_eq!(json["errors"][0]["message"], message);
+    assert_eq!(json["warnings"][0]["message"], warning);
+    let diagnostics = round_three_diagnostics(source, &path);
+    let lsp_message = format!("Parse error in main.crn: main.crn:2:15: {message}");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == lsp_message),
+        "{diagnostics:?}"
+    );
 }
 
 #[test]
@@ -457,7 +527,7 @@ fn public_heredoc_marker_errors_keep_their_original_text() {
 fn constraint_secret_duplicate_is_redacted_in_failed_json_and_lsp() {
     let fixture = tempfile::tempdir().unwrap();
     let path = fixture.path().join("main.crn");
-    let source = "require secret(x[{ 'private-key' = 1 'private-key' = 2 }]), 'no'\n";
+    let source = "arguments { require secret(x[{ 'private-key' = 1 'private-key' = 2 }]), 'no' }\n";
     std::fs::write(&path, source).unwrap();
     let output = validate(fixture.path(), true);
     let json = report(&output, 1, 1);
@@ -957,40 +1027,36 @@ fn local_trust_and_unwritable_cache_notices_belong_to_the_report() {
 }
 
 #[test]
-fn legacy_lock_migration_notices_belong_to_the_report() {
-    for remote in [false, true] {
-        let fixture = tempfile::tempdir().unwrap();
-        std::fs::write(
-            fixture.path().join("main.crn"),
-            if remote {
-                "provider broken { source = 'github.com/example/carina-provider-broken' }\n"
-            } else {
-                "provider mock {}\n"
-            },
-        )
-        .unwrap();
+fn validate_reports_unsupported_lock_versions_in_human_and_json() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let init = carina_core::hint::ProjectCommand::new("init", fixture.path()).to_string();
+    for version in 1..carina_provider_resolver::LockFile::CURRENT_VERSION {
         std::fs::write(
             fixture.path().join("carina-providers.lock"),
-            "version = 1\nprovider = []\n",
+            format!("version = {version}\n"),
         )
         .unwrap();
         let human = validate(fixture.path(), false);
-        let text = String::from_utf8(human.stderr).unwrap();
-        assert_eq!(
-            text.matches("Provider lock format migration:").count(),
-            if remote { 2 } else { 1 },
-            "{text}"
-        );
-        let output = validate(fixture.path(), true);
-        assert_eq!(output.status, human.status);
+        assert_eq!(human.status.code(), Some(1), "{human:?}");
+        let stderr = String::from_utf8(human.stderr).unwrap();
+        let json = report(&validate(fixture.path(), true), 1, 0);
+        let message = json["errors"][0]["message"].as_str().unwrap();
+        for expected in [
+            format!("uses format version {version}"),
+            "reads only version 5".into(),
+            "Carina v0.15.0".into(),
+            format!("run `{init}` with v0.15.0"),
+            "`providers repin-discovery` or `providers repin-identity`".into(),
+            format!("then `{init}` again"),
+        ] {
+            assert!(stderr.contains(&expected), "{stderr}");
+            assert!(message.contains(&expected), "{json}");
+        }
         assert!(
-            output.stderr.is_empty(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            stderr.contains(message),
+            "human and JSON must retain the same UnsupportedVersion diagnostic: {stderr}\n{json}"
         );
-        let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(json["status"], if remote { "error" } else { "ok" });
-        assert!(!json.to_string().contains("Provider lock format migration"));
     }
 }
 

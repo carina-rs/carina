@@ -166,7 +166,7 @@ pub fn resolve_refs_with_state(
             compositions: &[],
             managed_current,
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     );
@@ -1734,7 +1734,7 @@ mod tests {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         })
     }
@@ -2315,7 +2315,7 @@ mod tests {
                 compositions: &[],
                 managed_current: &current,
                 data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-                remote_bindings: &HashMap::new(),
+                remote_bindings: &Default::default(),
                 wait_aliases: &[],
             },
             &stability,
@@ -2469,7 +2469,7 @@ mod tests {
                 compositions: &[],
                 managed_current: &current,
                 data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-                remote_bindings: &HashMap::new(),
+                remote_bindings: &Default::default(),
                 wait_aliases: &[],
             });
         let fallback = Value::Concrete(ConcreteValue::String("d".into()));
@@ -3305,7 +3305,7 @@ mod tests {
         let mut bindings = ResolvedBindings::default();
         bindings.set_historical_with_completeness(
             "h",
-            HashMap::from([("creds".into(), historical)]),
+            std::collections::BTreeMap::from([("creds".into(), historical)]),
             crate::binding_index::BindingValueSource::Local,
             BindingCompleteness::Incomplete,
         );
@@ -4909,7 +4909,7 @@ mod tests {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[crate::binding_index::WaitAliasSpec {
                 binding: absolute_binding("cert_issued"),
                 target: absolute_binding("cert"),
@@ -4942,7 +4942,7 @@ mod tests {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[crate::binding_index::WaitAliasSpec {
                 binding: absolute_binding("cert_issued"),
                 target: absolute_binding("nonexistent"),

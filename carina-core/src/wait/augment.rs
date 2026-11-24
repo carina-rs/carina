@@ -29,11 +29,13 @@ pub fn satisfier_augmentation(
                 }
             }
             BindingPattern::ForLoopChildren { base } => {
-                let prefix = format!("{base}[");
                 additional.extend(
                     known_bindings
                         .iter()
-                        .filter(|(name, _id)| name.as_str().starts_with(&prefix))
+                        .filter(|(name, _id)| {
+                            crate::resource::decompose_binding_address(name.as_str())
+                                .is_some_and(|address| address.is_descendant_of(&base))
+                        })
                         .map(|(_name, id)| id.clone()),
                 );
             }
@@ -217,6 +219,34 @@ mod tests {
             ]
             .into_iter()
             .collect()
+        );
+    }
+
+    #[test]
+    fn for_value_keys_wait_satisfier_members() {
+        let children = [
+            "rs.a",
+            "rs['a.b']",
+            "rs[0]",
+            "rs.a.child",
+            "rs[0].child",
+            "rs['a.b'].child",
+        ];
+        assert_eq!(
+            augment(
+                vec![BindingPattern::ForLoopChildren { base: "rs".into() }],
+                &[
+                    "rs.a",
+                    "rs['a.b']",
+                    "rs[0]",
+                    "rs.a.child",
+                    "rs[0].child",
+                    "rs['a.b'].child",
+                    "rs_extra.a",
+                    "other.rs.a"
+                ],
+            ),
+            children.into_iter().map(hint_id).collect()
         );
     }
 

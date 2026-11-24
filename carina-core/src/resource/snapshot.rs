@@ -180,9 +180,9 @@ where
 /// ```
 ///
 /// ```compile_fail
-/// use carina_core::{resource::{SnapshotValue,AccessMissPolicy},parser::{DeferredForExpression,expand_deferred_children}};
-/// fn cannot_expand(snapshot: SnapshotValue, template: DeferredForExpression, context: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext) {
-///     expand_deferred_children(&template, &snapshot, AccessMissPolicy::Error, context);
+/// use carina_core::{resource::SnapshotValue,parser::ExpandedParsedFile};
+/// fn cannot_expand(snapshot: SnapshotValue, file: &mut ExpandedParsedFile, context: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext) {
+///     file.expand_deferred_for_expressions(&snapshot, context);
 /// }
 /// ```
 ///
@@ -687,14 +687,14 @@ pub(crate) fn apply_snapshot_path_segment<P: PlaceholderKind, B: BindingAddress>
                 }),
                 PathSegment::Subscript {
                     index: Subscript::Int { index },
-                } => Value::Deferred(DeferredValue::BindingRef {
-                    binding: binding_with_index(&binding, index),
-                }),
+                } => BindingLookup::new(&binding)
+                    .select(&Subscript::Int { index })
+                    .reference(),
                 PathSegment::Subscript {
                     index: Subscript::Str { key },
-                } => Value::Deferred(DeferredValue::BindingRef {
-                    binding: binding_with_map_key(&binding, &key),
-                }),
+                } => BindingLookup::new(&binding)
+                    .select(&Subscript::Str { key })
+                    .reference(),
             };
             return Ok(ValuePathSegmentResult::Deferred(reference));
         }

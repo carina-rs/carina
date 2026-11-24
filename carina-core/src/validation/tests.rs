@@ -222,15 +222,18 @@ fn missing_authored_root_keeps_the_resource_invariant_and_other_findings() {
                 )
             })
             .collect();
-        let report = schema.as_schema().validate_admission_report(
-            &classified,
-            classified.iter(),
-            &|_| false,
-            &crate::schema::value_validation::AttributeAdmission {
-                known: &|_, _, _| Default::default(),
-                unknown: None,
-            },
-        );
+        let report = schema
+            .as_schema()
+            .validate_admission_report_with_obligations(
+                &classified,
+                classified.iter(),
+                &|_| false,
+                &crate::schema::value_validation::AttributeAdmission {
+                    known: &|_, _, _| Default::default(),
+                    unknown: None,
+                },
+                &Default::default(),
+            );
         admissions.insert((resource.id().clone(), resource.location().clone()), report);
     }
     let judged = loaded.judged();
@@ -469,7 +472,7 @@ fn single_reference_integer_interpolation_checks_resolved_string_constraints() {
                 compositions: &[],
                 managed_current: &HashMap::new(),
                 data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-                remote_bindings: &HashMap::new(),
+                remote_bindings: &Default::default(),
                 wait_aliases: &[],
             },
         );
@@ -993,7 +996,7 @@ fn deferred_iterable_shape_classifies_concrete_list_without_placeholder_type() {
     let sink = TypeExpr::List(Box::new(TypeExpr::String));
     let shape = deferred_iterable_shape_for_phase(&expression.for_sink(&sink, &context))
         .expect("authored iterable shape");
-    assert_eq!(shape, DeferredIterableShape::List);
+    assert_eq!(shape, DeferredIterableShape::List(None));
 }
 
 #[test]
@@ -1702,6 +1705,52 @@ fn function_ref_schema() -> SchemaRegistry {
         .expect("schema fixture must be valid"),
     );
     schemas
+}
+
+pub(super) fn validate_function_promises_for_test<
+    E: Clone
+        + crate::parser::ExportParamLike<
+            crate::resource::ParserPlaceholder,
+            crate::resource::RelativeBindingName,
+        >,
+>(
+    parsed: &crate::parser::File<E>,
+    bindings: &BindingIndex<'_>,
+    schemas: &SchemaRegistry,
+) -> Result<(), String> {
+    let configuration = crate::config_loader::load_buffer_configuration(
+        parsed,
+        schemas,
+        bindings.provider_context(),
+    );
+    let mut findings: Vec<_> = configuration
+        .judged()
+        .report()
+        .findings()
+        .iter()
+        .map(|finding| {
+            crate::parser::Located::new(finding.location().clone(), finding.detail().to_string())
+        })
+        .collect();
+    for finding in configuration
+        .judged()
+        .function_type_promise_findings(bindings)
+    {
+        let (location, message) = finding.into_parts();
+        let finding = crate::parser::Located::new(location, message.to_string());
+        if !findings.contains(&finding) {
+            findings.push(finding);
+        }
+    }
+    if findings.is_empty() {
+        Ok(())
+    } else {
+        Err(findings
+            .iter()
+            .map(|finding| finding.detail().to_string())
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
 }
 
 #[test]
@@ -2746,6 +2795,14 @@ import {
 }
 
 #[test]
+fn for_value_keys_children_are_not_unused_bindings() {
+    let view = authored_binding_view(
+        "let rs = for x in ['a', 'b c'] { mock.test.resource { name = x } }\nlet unused = mock.test.resource { name = 'unused' }\n",
+    );
+    assert_eq!(check_unused_bindings(&view), vec!["unused"]);
+}
+
+#[test]
 fn dotted_string_literal_does_not_count_as_binding_use() {
     let mut parsed = empty_parsed();
 
@@ -3752,7 +3809,7 @@ fn postfix_and_path_access_report_the_same_unknown_struct_field() {
 fn parenthesized_for_address_reports_the_same_unknown_field_as_direct_path() {
     let parsed = crate::parser::parse(
         r#"
-            let roles = for n in [0] {
+            let roles = for (_, n) in [0] {
                 mock.test.Thing { name = "role" }
             }
             mock.test.Consumer {
@@ -4825,63 +4882,58 @@ fn argument_param(name: &str) -> crate::parser::ArgumentParameter {
     }
 }
 
-fn provider(name: &str) -> crate::parser::ProviderConfig<ParserPlaceholder> {
-    crate::parser::ProviderConfig {
-        name: name.to_string(),
-        attributes: Default::default(),
-        default_tags: Default::default(),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: Default::default(),
-        binding: None,
-    }
+// The maintainer decision on #4398 makes the existing root prohibition
+// block-based. Use directory parsing so empty blocks retain their inventory.
+fn root_arguments_directory(arguments: &str, root: &str) -> Result<(), String> {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("arguments.crn"), arguments).unwrap();
+    std::fs::write(dir.path().join("providers.crn"), root).unwrap();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::config_loader::parse_directory(
+        &crate::paths::ResolvedPath::new(dir.path()).unwrap(),
+        &config,
+    )
+    .unwrap();
+    let tree = crate::parser::AnalysisTree::try_from_file(parsed.parsed()).unwrap();
+    validate_no_arguments_in_root(&tree)
 }
 
 #[test]
 fn arguments_with_backend_errors() {
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(argument_param("state_path"));
-    parsed.backend = Some(crate::parser::BackendConfig {
-        backend_type: "local".to_string(),
-        attributes: Default::default(),
-        attribute_spans: Default::default(),
-    });
-
-    let result = validate_no_arguments_in_root(&parsed);
     assert_eq!(
-        result.unwrap_err(),
+        root_arguments_directory(
+            "arguments { state_path: String }",
+            "backend local { path = 'state.json' }"
+        )
+        .unwrap_err(),
         "arguments blocks are only valid inside module definitions, not in root configurations."
     );
 }
 
 #[test]
 fn arguments_with_provider_errors() {
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(argument_param("vpc_cidr"));
-    parsed.providers.push(provider("aws"));
-
-    let result = validate_no_arguments_in_root(&parsed);
-    assert!(result.is_err());
+    assert!(
+        root_arguments_directory("arguments { vpc_cidr: String }", "provider mock {}").is_err()
+    );
 }
 
 #[test]
 fn arguments_alone_is_ok() {
-    // A directory with only `arguments` looks like a module the user
-    // is validating in isolation; we cannot prove it is a root, so
-    // do not flag it (issue #2198).
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(argument_param("vpc_cidr"));
-
-    let result = validate_no_arguments_in_root(&parsed);
-    assert!(result.is_ok());
+    assert!(root_arguments_directory("arguments { vpc_cidr: String }", "").is_ok());
+    assert!(root_arguments_directory("arguments {}", "").is_ok());
 }
 
 #[test]
-fn empty_arguments_in_root_ok() {
-    let parsed = empty_parsed();
-    let result = validate_no_arguments_in_root(&parsed);
-    assert!(result.is_ok());
+fn issue4398_root_arguments_block_placement() {
+    // Main CLI: succeeds for an empty block. Candidate CLI: existing arguments
+    // placement message. LSP already reports that message at the empty block.
+    for root in ["provider mock {}", "backend local { path = 'state.json' }"] {
+        let error = root_arguments_directory("arguments {}", root).unwrap_err();
+        assert_eq!(
+            error,
+            "arguments blocks are only valid inside module definitions, not in root configurations."
+        );
+    }
 }
 
 // --- rendered_typecheck_result tests ---
@@ -8222,7 +8274,7 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         })
     }
@@ -11764,7 +11816,7 @@ fn issue_4282_deferred_builtin_results_use_existing_resolved_value_checks() {
                     compositions: &[],
                     managed_current: &HashMap::new(),
                     data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     wait_aliases: &[],
                 },
             );
@@ -11870,4 +11922,31 @@ fn review_r3_interpolation_reports_every_computed_access_error() {
     let parsed = crate::parser::parse("let src = mock.test.Source {}\nlet sink = mock.test.Sink { value = \"${[src.first][0][0]}-${[src.second][0][0]}\" }\n", &expression_validation_config()).unwrap();
     let error = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert_eq!(error.lines().count(), 2, "{error}");
+}
+
+#[test]
+fn tp18_authored_nested_call_uses_declared_return_type_as_argument_source() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.resource")
+            .attribute(
+                PatternAttributeSchema::provider_populated("count", PatternAttributeType::int())
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let check = |return_type: &str, body: &str| -> Result<(), String> {
+        let parsed = crate::parser::parse(&format!("let src = mock.test.resource {{}}\nfn f(x: Int): String {{ 'ok' }}\nfn g(y: Int): {return_type} {{ {body} }}\nlet result = f(g(src.count))"), &config).map_err(|error| error.to_string())?;
+        let bindings = BindingIndex::from_parsed(&parsed, &schemas, &config);
+        validate_function_promises_for_test(&parsed, &bindings, &schemas)
+    };
+    let error = check("String", "'str'").expect_err("g(): String must not satisfy f(Int)");
+    assert_eq!(
+        error,
+        "function 'f': parameter 'x': expected Int, got String"
+    );
+    check("Int", "y").unwrap();
 }

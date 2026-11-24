@@ -423,10 +423,10 @@ async fn review1_deferred_final_admission(replace: bool) {
     let template = crate::parser::DeferredForExpression::new(
         Some("main.crn".into()),
         1,
-        "for item in ['one', 'two']".into(),
+        "for (_, item) in ['one', 'two']".into(),
         crate::parser::DeferredForTarget::bound(absolute_binding("children")).unwrap(),
         Value::Concrete(ConcreteValue::List(vec![text("one"), text("two")])),
-        crate::parser::ForBinding::Simple("item".into()),
+        crate::parser::ForBinding::Indexed("_".into(), "item".into()),
         crate::resource::Resource::<ModuleSource, LoopSlot>::new("test", "children"),
     );
     let compiled = crate::test_support::compiled_loop(Box::new(template));
@@ -438,7 +438,7 @@ async fn review1_deferred_final_admission(replace: bool) {
             )),
             identifier: fixture_applied_identifier(format!("old-{i}")),
             generation: EffectGeneration::Current,
-            previous_attributes: HashMap::new(),
+            previous_attributes: std::collections::BTreeMap::new(),
             directives: Default::default(),
             binding: Some(absolute_binding(&format!("children[{i}]"))),
             dependencies: Default::default(),

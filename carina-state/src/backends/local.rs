@@ -7,14 +7,14 @@ use async_trait::async_trait;
 use carina_core::paths::{DisplayPath, NoFollowLeaf, ResolvedPath};
 #[cfg(any(test, feature = "test-utils"))]
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep as async_sleep;
 
 use crate::backend::{BackendError, BackendResult, RawState, StateBackend};
 use crate::backend_config::{LocalBackendLocation, LocalBackendSettings};
 use crate::lock::LockInfo;
-use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migration_once};
+use crate::state::{self, StateFile};
 
 #[cfg(test)]
 type WriteHook = Arc<dyn Fn(&StateFile) + Send + Sync>;
@@ -57,13 +57,6 @@ pub struct LocalBackend {
     /// Path to the lock file
     lock_path: NoFollowLeaf,
     recovery_path: NoFollowLeaf,
-    /// Tracks the first in-memory state-schema migration observed by
-    /// `read_state` on this backend instance, so the warning is emitted
-    /// exactly once per backend (carina#3283). `carina plan` reads state
-    /// twice per run (T0 snapshot + post-plan drift re-read) and an
-    /// unguarded `eprintln!` inside `check_and_migrate` would surface
-    /// the warning twice for a single physical file.
-    migration_logged: OnceLock<MigrationInfo>,
     /// Serializes state replacements even when the async caller that started
     /// one is cancelled while its blocking filesystem work keeps running.
     /// This history is deliberately instance-local and is never seeded from
@@ -112,7 +105,7 @@ impl LocalBackend {
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn with_path(state_path: PathBuf) -> Self {
         Self::from_location(
-            LocalBackendLocation::for_file(&state_path).expect("admit test state path"),
+            LocalBackendLocation::for_address(&state_path).expect("admit test state path"),
         )
         .expect("resolve test lock path")
     }
@@ -131,7 +124,6 @@ impl LocalBackend {
             recovery_path,
             state_path,
             lock_path,
-            migration_logged: OnceLock::new(),
             state_write: Arc::new(Mutex::new(LocalWriteState::default())),
             #[cfg(test)]
             write_hook: None,
@@ -339,23 +331,13 @@ impl StateBackend for LocalBackend {
         carina_core::shutdown::CleanupBudget::TWO_SECOND
     }
 
-    async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
+    async fn read_state(&self) -> BackendResult<Option<StateFile>> {
         let Some((bytes, state_location)) = self.read_state_file().await? else {
             return Ok(None);
         };
-        let outcome = state::check_and_migrate_bytes(&bytes)
+        let state = state::load_state_bytes(&bytes)
             .map_err(|error| error.with_state_read_location(&state_location))?;
-        let (state, migration) = outcome.into_parts();
-        if let Some(info) = migration {
-            log_state_migration_once(
-                &self.migration_logged,
-                info,
-                &self.state_path.display().to_string(),
-            );
-            Ok(Some(LoadedState::Migrated { state, info }))
-        } else {
-            Ok(Some(LoadedState::Pristine(state)))
-        }
+        Ok(Some(state))
     }
 
     async fn read_state_bytes(&self) -> BackendResult<Option<RawState>> {
@@ -768,13 +750,7 @@ mod tests {
                         .is_symlink()
                 );
                 assert_eq!(
-                    backend
-                        .read_state()
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .into_state()
-                        .lineage,
+                    backend.read_state().await.unwrap().unwrap().lineage,
                     state.lineage
                 );
             }
@@ -844,7 +820,7 @@ mod tests {
         // Read back
         let read_state = backend.read_state().await.unwrap();
         assert!(read_state.is_some());
-        let read_state = read_state.unwrap().into_state();
+        let read_state = read_state.unwrap();
         assert_eq!(read_state.serial, 1);
     }
 
@@ -1196,7 +1172,7 @@ mod tests {
         }
         older_write.await.unwrap().unwrap();
 
-        let persisted = backend.read_state().await.unwrap().unwrap().into_state();
+        let persisted = backend.read_state().await.unwrap().unwrap();
         assert_eq!(persisted.lineage, newer.lineage);
         assert_eq!(persisted.serial, newer.serial);
     }
@@ -1224,8 +1200,7 @@ mod tests {
             .read_state()
             .await
             .unwrap()
-            .unwrap()
-            .into_state();
+            .unwrap();
         assert_eq!(persisted.lineage, lower.lineage);
         assert_eq!(persisted.serial, lower.serial);
     }
@@ -1292,7 +1267,7 @@ mod tests {
             .await
             .unwrap();
 
-        let read_state = backend.read_state().await.unwrap().unwrap().into_state();
+        let read_state = backend.read_state().await.unwrap().unwrap();
         assert_eq!(read_state.serial, 1);
 
         backend.release_lock(&lock).await.unwrap();
@@ -1486,6 +1461,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(read.into_state().serial, state.serial);
+        assert_eq!(read.serial, state.serial);
     }
 }

@@ -1,0 +1,56 @@
+{
+  "file": "main.crn",
+  "line": 1,
+  "header": "for item in upstream.items",
+  "resource_type": "mock.test.Child",
+  "target": {
+    "kind": "unbound",
+    "template": {
+      "source": {
+        "display_file": "main.crn",
+        "line": 1,
+        "column": 1,
+        "kind": "for",
+        "system_identity": "_loop_bc61ee8e5622fac9"
+      },
+      "legacy_base": "_items"
+    }
+  },
+  "iterable": {
+    "ResourceRef": {
+      "path": {
+        "binding": "upstream",
+        "attribute": "items"
+      }
+    }
+  },
+  "binding": {
+    "Simple": "item"
+  },
+  "template_resource": {
+    "id": {
+      "provider": "mock",
+      "resource_type": "test.Child",
+      "identity": null
+    },
+    "attributes": {
+      "comment": {
+        "String": "public"
+      },
+      "identity_input": {
+        "Unknown": "ForValue"
+      }
+    },
+    "directives": {
+      "force_delete": false,
+      "create_before_destroy": false,
+      "prevent_destroy": {
+        "kind": "unspecified"
+      }
+    },
+    "prefixes": {},
+    "binding": null,
+    "dependencies": null,
+    "module_source": null
+  }
+}

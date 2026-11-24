@@ -6,7 +6,7 @@ let simple_seed = mock.test.resource {
   }
 }
 
-let simple_children = for rule in simple_seed.rules {
+let simple_children = for (_, rule) in simple_seed.rules {
   mock.test.resource {
     name    = rule.action
     comment = secret(env("SAVED_PLAN_DEFERRED_FOR_SECRET_3990"))

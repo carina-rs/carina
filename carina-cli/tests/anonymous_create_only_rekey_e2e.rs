@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use carina_core::resource::{PersistedDestroyDependencies, ResolvedResourceId};
-use carina_state::{ResourceState, StateFile, check_and_migrate};
+use carina_state::{ResourceState, StateFile, load_state};
 use tempfile::TempDir;
 
 struct Scenario {
@@ -72,8 +72,9 @@ mock.test.resource {{
         fs::write(
             self.project.join("mock-provider-state.json"),
             r#"{
-  "version": 2,
-  "states": {
+  "version": 3,
+  "states": {},
+  "data_sources": {
     "iam.Roles.roles": {
       "name_regex": "late",
       "names": ["resolved-role"]
@@ -137,11 +138,10 @@ mock.compute.Instance {{
     }
 
     fn state(&self) -> StateFile {
-        check_and_migrate(
+        load_state(
             &fs::read_to_string(self.project.join("carina.state.json")).expect("read local state"),
         )
         .expect("load local state")
-        .into_state()
     }
 
     fn anonymous_compute_instance(&self) -> ResourceState {

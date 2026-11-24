@@ -3,7 +3,7 @@ use carina_core::config_loader::get_base_dir;
 use carina_core::planning_state::{StateRowKey, state_row_key_from_parts};
 #[cfg(test)]
 use carina_core::resource::ResolvedResource;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -19,6 +19,7 @@ use crate::output_style::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use carina_core::config_loader::load_configuration_with_config;
+use carina_core::data_source_value::DataSourceValues;
 use carina_core::effect::Effect;
 #[cfg(test)]
 use carina_core::effect::EffectGeneration;
@@ -408,15 +409,10 @@ async fn run_destroy_locked_owned(
 ) -> LockCommandOutcome<Result<(), AppError>> {
     let color_mode = validated_config.context().runtime().color_mode();
     let runtime = validated_config.context().runtime().clone();
-    // Read current state from backend. carina#3315: persist any older-schema
-    // migration under the destroy lock before any short-circuit
-    // (e.g. "No resources to destroy.") returns — see
-    // `apply::load_state_persist_if_migrated`.
-    let mut state_file = match crate::commands::apply::load_state_persist_if_migrated(
-        backend.as_ref(),
-        lock.as_ref(),
-    )
-    .await
+    let mut state_file = match carina_state::ObservationStateAuthority::load(backend.as_ref())
+        .await
+        .map(|(file, authority)| authority.bind(file))
+        .map_err(AppError::Backend)
     {
         Ok(state) => state,
         Err(error) => {
@@ -502,7 +498,7 @@ validated_config.provider_plan())
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
     let mut orphans = carina_core::differ::Orphans::new();
 
-    let validated_config = if refresh {
+    if refresh {
         let progress_backend = ProgressBackend::new(color_mode, ProgressSink::Human);
         let refresh_phase = RefreshPhase::start(&progress_backend);
 
@@ -686,7 +682,7 @@ validated_config.provider_plan())
                         }
                     }
                 };
-                let result: Result<(ResourceId, carina_core::differ::Orphan), AppError> = match next {
+                let result: Result<(ResolvedResourceId, carina_core::differ::Orphan), AppError> = match next {
                     CleanupInterrupted::Completed(Some(result)) => result,
                     CleanupInterrupted::Completed(None) => break,
                     CleanupInterrupted::Abandoned => {
@@ -699,7 +695,7 @@ validated_config.provider_plan())
                     continue;
                 }
                 let (id, loaded) = result?;
-                orphans.insert(loaded.clone());
+                orphans.insert(id.clone(), loaded.clone());
                 let current = loaded.into_current();
                 let exists = match &current {
                     Current::Absent(_state) => false,
@@ -708,13 +704,11 @@ validated_config.provider_plan())
                     Current::CreateOutcomeUnknown(_unknown) => true,
                     Current::MissingIdentifier(_state) => true,
                 };
-                if exists
-                    && let Some(resolved_id) = ResolvedResourceId::try_new(id.clone())
-                {
-                    let orphan_resource = build_orphan_resource(sf, &resolved_id);
+                if exists {
+                    let orphan_resource = build_orphan_resource(sf, &id);
                     all_resources.push(orphan_resource);
                 }
-                managed_current.insert(id, current);
+                managed_current.insert(id.into_inner(), current);
             }
             if refresh_cancelled {
                 return Err(AppError::Interrupted);
@@ -725,85 +719,44 @@ validated_config.provider_plan())
         for id in orphans.keys() {
             managed_current.remove(id);
         }
-        let crate::wiring::MaterializedLegacyConfiguration {
-            config,
-            sorted_resources,
-            parts,
-        } = validated_config.materialize_legacy_configuration(
-            crate::wiring::LegacyConfigurationReadInputs {
-                prelude: expansion_prelude,
-                state: crate::wiring::PreserveDeferredForExpansionInputs {
-                    managed_current,
-                    orphans,
-                    already_refreshed,
-                },
-                provider: &provider,
-                state_file: &state_file,
-                refresh_phase: &refresh_phase,
-                remote_bindings: &HashMap::new(),
-                cancel: &cancel,
-            },
-        ).await?;
+        if cancel.phase() != carina_core::shutdown::ShutdownPhase::Running {
+            return Err(AppError::Interrupted);
+        }
+        let sorted_resources = expansion_prelude.sorted_resources().to_vec();
+        let parts = expansion_prelude.preserve_addresses(
+            crate::wiring::PreserveDeferredForExpansionInputs {
+                managed_current, orphans, already_refreshed,
+            }
+        ).seal(DataSourceValues::empty()).into_parts();
         all_resources = crate::wiring::resources_at_destroy_addresses(sorted_resources, &moved_pairs);
         let crate::wiring::AddressedStateParts { managed_current: expanded_current, orphans, .. } = parts.addressed.into_parts();
         if let Some(state) = state_file.as_ref() {
-            all_resources.extend(orphans.keys().map(|id| build_orphan_resource(state, &ResolvedResourceId::new(id.clone()))));
+            all_resources.extend(orphans.resolved_keys().map(|id| build_orphan_resource(state, id)));
         }
         managed_current = carina_core::differ::into_all_prior_states(orphans, expanded_current);
-        config
-    } else {
-        if let Some(sf) = state_file.as_ref() {
-            // --refresh=false: build states from state file without AWS calls.
-            // carina#3181: `all_resources` is managed-only.
-            for resource in &all_resources {
-                let current = prepared_rows.refreshable.current(&resource.id).map(|row| row.into_current()).unwrap_or_else(|| Current::absent(resource.id.clone()));
-                managed_current.insert(resource.id.clone(), current);
-            }
-
-            // Include orphaned resources (in state but not in .crn)
-            let desired_ids: HashSet<ResourceId> = all_resources.iter().map(|r| r.id.clone()).collect();
-            for (id, loaded) in prepared_rows.refreshable.build_orphans(&desired_ids) {
-                let current = loaded.into_orphan().into_current();
-                if let Some(resolved_id) = ResolvedResourceId::try_new(id.clone()) {
-                    let orphan_resource = build_orphan_resource(sf, &resolved_id);
-                    all_resources.push(orphan_resource);
-                }
-                managed_current.insert(id, current);
-            }
+    } else if let Some(sf) = state_file.as_ref() {
+        // --refresh=false: build states from state file without AWS calls.
+        // carina#3181: `all_resources` is managed-only.
+        for resource in &all_resources {
+            let current = prepared_rows.refreshable.current(&resource.id).map(|row| row.into_current()).unwrap_or_else(|| Current::absent(resource.id.clone()));
+            managed_current.insert(resource.id.clone(), current);
         }
-        validated_config.into_offline_legacy_configuration()
-    };
 
-    let validated = match validated_config.resolve_legacy_graph(
-        &moved_pairs, state_file.as_ref(),
-    )? {
-        carina_state::LegacyClassificationOutcome::Classified(validated) => validated,
-        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
-            let advice = if refresh {
-                "run plan/apply (which reads upstream_state) to migrate"
-            } else {
-                "rerun destroy with --refresh=true"
-            };
-            return Err(AppError::Validation(format!("{rows}: legacy dependency migration requires reads; {advice}")));
+        // Include orphaned resources (in state but not in .crn)
+        let desired_ids: HashSet<ResourceId> = all_resources.iter().map(|r| r.id.clone()).collect();
+        for (id, loaded) in prepared_rows.refreshable.build_orphans(&desired_ids) {
+            let current = loaded.into_orphan().into_current();
+            let orphan_resource = build_orphan_resource(sf, &id);
+            all_resources.push(orphan_resource);
+            managed_current.insert(id.into_inner(), current);
         }
-    };
-    let (ctx, destroy_graph) = validated.config.context_and_resources();
+    }
+
+    let validated_config = validated_config.resolve_graph(state_file.as_ref())?;
+    let (ctx, destroy_graph) = validated_config.context_and_resources();
     let parsed = destroy_graph.configuration();
-    // Preserve wait validation before any migrated-state writeback.
     for wait in &parsed.wait_bindings {
         destroy_graph.resolve_wait_binding(wait)?;
-    }
-    if let Some(migrated) = validated.migrated_state {
-        *state_file = Some(migrated);
-        if let Some(state) = state_file.as_ref() {
-            #[allow(clippy::iter_over_hash_type)] // keyed rebuild: dependency metadata is copied independently by resource ID
-            for (id, current) in &mut managed_current {
-                if let Some(row) = state.find_resource_for_id(id) {
-                    current.set_dependency_bindings(row.dependency_bindings.clone());
-                }
-            }
-        }
-        mid_run_writer.write_schema_migration(state_file.as_mut().expect("validated migration retains state")).await?;
     }
 
     // Backend protection covers every persisted generation, including rows
@@ -1208,23 +1161,18 @@ validated_config.provider_plan())
         if !cancelled {
             // Only the shared scheduler can release delete authority. The CLI
             // retains display priority and its provider-retry gate.
-            let mut newly_ready = Vec::new();
             let capacity = parallelism.get().saturating_sub(in_flight.len());
-            for &idx in &all_indices {
-                if newly_ready.len() == capacity {
-                    break;
-                }
-                if dispatched.contains(&idx) || retry_pending.contains(&idx) {
-                    continue;
-                }
-                if let Some((failure, completion)) = pending_retries.remove(&idx) {
-                    delete_scheduler.retry(completion)?;
-                    active_retries.insert(idx, failure);
-                }
-                if let Some(release) = delete_scheduler.release(idx)? {
-                    newly_ready.push((idx, release));
+            let candidates: Vec<_> = all_indices.iter().copied()
+                .filter(|idx| !dispatched.contains(idx) && !retry_pending.contains(idx)).collect();
+            if capacity > 0 {
+                for &idx in &candidates {
+                    if let Some((failure, completion)) = pending_retries.remove(&idx) {
+                        delete_scheduler.retry(completion)?;
+                        active_retries.insert(idx, failure);
+                    }
                 }
             }
+            let newly_ready = delete_scheduler.release_ready(candidates, capacity)?;
 
             // Process newly ready resources
             for (idx, release) in newly_ready {
@@ -2071,7 +2019,7 @@ fn state_row_key_from_id(id: &ResolvedResourceId) -> StateRowKey {
 
 fn topological_delete_order(
     delete_count: usize,
-    deletion_deps: &HashMap<usize, HashSet<usize>>,
+    deletion_deps: &HashMap<usize, BTreeSet<usize>>,
     depths: &[usize],
     names: &[String],
 ) -> Result<Vec<usize>, String> {
@@ -2109,14 +2057,12 @@ fn topological_delete_order(
 
 fn compute_delete_depths(
     delete_count: usize,
-    deletion_deps: &HashMap<usize, HashSet<usize>>,
+    deletion_deps: &HashMap<usize, BTreeSet<usize>>,
 ) -> Vec<usize> {
-    let mut create_parents: HashMap<usize, HashSet<usize>> = HashMap::new();
+    let mut create_parents: HashMap<usize, BTreeSet<usize>> = HashMap::new();
     #[allow(clippy::iter_over_hash_type)]
     // keyed rebuild: reverse dependency sets union duplicate edges idempotently
     for (&parent, children) in deletion_deps {
-        #[allow(clippy::iter_over_hash_type)]
-        // keyed rebuild: parent membership and maximum depth do not depend on traversal
         for &child in children {
             create_parents.entry(child).or_default().insert(parent);
         }
@@ -2130,7 +2076,7 @@ fn compute_delete_depths(
 
 fn compute_delete_depth(
     idx: usize,
-    create_parents: &HashMap<usize, HashSet<usize>>,
+    create_parents: &HashMap<usize, BTreeSet<usize>>,
     memo: &mut HashMap<usize, usize>,
     visiting: &mut HashSet<usize>,
 ) -> usize {
@@ -2157,12 +2103,12 @@ fn compute_delete_depth(
 
 fn cycle_path(
     delete_count: usize,
-    deletion_deps: &HashMap<usize, HashSet<usize>>,
+    deletion_deps: &HashMap<usize, BTreeSet<usize>>,
     names: &[String],
 ) -> String {
     fn dfs(
         idx: usize,
-        deletion_deps: &HashMap<usize, HashSet<usize>>,
+        deletion_deps: &HashMap<usize, BTreeSet<usize>>,
         visiting: &mut Vec<usize>,
         visited: &mut HashSet<usize>,
     ) -> Option<Vec<usize>> {
@@ -2377,13 +2323,16 @@ mod tests {
         for (dependencies, remaining) in [
             (
                 HashMap::from([
-                    (0, HashSet::from([1])),
-                    (1, HashSet::from([0])),
-                    (2, HashSet::from([0])),
+                    (0, BTreeSet::from([1])),
+                    (1, BTreeSet::from([0])),
+                    (2, BTreeSet::from([0])),
                 ]),
                 HashSet::from([0, 1, 2]),
             ),
-            (HashMap::from([(2, HashSet::from([3]))]), HashSet::from([2])),
+            (
+                HashMap::from([(2, BTreeSet::from([3]))]),
+                HashSet::from([2]),
+            ),
         ] {
             let completed = HashSet::new();
             let apply = carina_core::executor::classify_stalled_effects(
@@ -2915,7 +2864,7 @@ mod tests {
 
     #[test]
     fn topological_delete_order_reports_cycles() {
-        let deletion_deps = HashMap::from([(0, HashSet::from([1])), (1, HashSet::from([0]))]);
+        let deletion_deps = HashMap::from([(0, BTreeSet::from([1])), (1, BTreeSet::from([0]))]);
         let depths = compute_delete_depths(2, &deletion_deps);
         let names = vec!["a".to_string(), "b".to_string()];
 
@@ -2936,13 +2885,13 @@ mod tests {
             "route".to_string(),
         ];
         let deletion_deps = HashMap::from([
-            (0, HashSet::from([1, 2, 5])),
-            (1, HashSet::new()),
-            (2, HashSet::from([4])),
-            (3, HashSet::from([4])),
-            (4, HashSet::from([6])),
-            (5, HashSet::from([6])),
-            (6, HashSet::new()),
+            (0, BTreeSet::from([1, 2, 5])),
+            (1, BTreeSet::new()),
+            (2, BTreeSet::from([4])),
+            (3, BTreeSet::from([4])),
+            (4, BTreeSet::from([6])),
+            (5, BTreeSet::from([6])),
+            (6, BTreeSet::new()),
         ]);
         let depths = compute_delete_depths(names.len(), &deletion_deps);
 
@@ -3085,7 +3034,7 @@ mod tests {
                         !delete_log.exists(),
                         "removed backend bucket generations must never be deleted (refresh={refresh}, run={run}, identifier={deposed_identifier}, bucket={deposed_bucket:?})"
                     );
-                    let state = backend.read_state().await.unwrap().unwrap().into_state();
+                    let state = backend.read_state().await.unwrap().unwrap();
                     let row = state
                         .find_resource("mock", "s3.Bucket", "state")
                         .expect("row with protected deposed generation must be retained");
@@ -3598,7 +3547,7 @@ mod tests {
     #[test]
     fn destroy_plan_rejects_identifier_less_row_loaded_from_state_json() {
         let resource = Resource::with_provider("mock", "test.Widget", "broken", None);
-        let state_file = carina_state::check_and_migrate(
+        let state_file = carina_state::load_state(
             &serde_json::json!({
                 "version": carina_state::StateFile::CURRENT_VERSION,
                 "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
@@ -3619,8 +3568,7 @@ mod tests {
             })
             .to_string(),
         )
-        .expect("malformed legacy row must remain loadable")
-        .into_state();
+        .expect("malformed legacy row must remain loadable");
         let loaded = state_file.build_state_for_resource(&resource.id);
         assert!(matches!(&loaded, Current::MissingIdentifier(_state)));
         let current_states = HashMap::from([(resource.id.clone(), loaded)]);

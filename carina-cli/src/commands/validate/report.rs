@@ -4,6 +4,7 @@ use std::path::Path;
 use carina_core::config_loader::{ConfigurationLoadDiagnostic, load_configuration_report};
 use carina_core::parser::{DeclarationLocation, ParseWarning, ProviderContext, SourceSpan};
 use carina_core::paths::{DisplayPath, ResolvedPath};
+use carina_core::validation::merge_function_promise_diagnostics;
 use serde::Serialize;
 
 use crate::error::{AppError, format_error_with_source_chain};
@@ -186,11 +187,26 @@ impl Diagnostic {
     }
 }
 
+fn diagnostic_position(finding: &Diagnostic) -> Option<(String, Option<(usize, usize)>)> {
+    let location = finding.location.as_ref()?;
+    Some((
+        location.file.to_string(),
+        location
+            .range
+            .as_ref()
+            .map(|range| (range.start.line, range.start.column)),
+    ))
+}
+
 /// Central conversion for residual application errors. Typed branches retain
 /// their own message authorities; the fallback uses the terminal's safe chain.
 fn presented_error_diagnostics(error: &crate::error::PresentedAppError) -> Vec<Diagnostic> {
     match error {
         crate::error::PresentedAppError::Ordinary(error) => error_diagnostics(error),
+        crate::error::PresentedAppError::FunctionPromise(finding) => vec![Diagnostic::located(
+            finding.detail().to_string(),
+            finding.location(),
+        )],
         crate::error::PresentedAppError::Conversion(finding) => vec![Diagnostic {
             code: Some(finding.code().to_owned()),
             ..Diagnostic::located(finding.message().to_owned(), finding.location())
@@ -274,7 +290,7 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
         }
         AppError::AttributePrefix(error) => Diagnostic {
             location: error.location().map(Location::authored),
-            ..Diagnostic::new(error.to_string(), "error")
+            ..Diagnostic::new(error.diagnostic_message(), "error")
         },
         AppError::ParameterReference { finding, .. } => {
             Diagnostic::located(finding.detail().to_string(), finding.location())
@@ -407,12 +423,6 @@ fn module_error_diagnostics(
                 ModuleErrorCallSource::Unavailable => None,
             };
             let mut diagnostics = match finding.error {
-                ModuleError::DirectoryConstraint(finding) => {
-                    vec![Diagnostic::located(
-                        finding.detail().to_string(),
-                        finding.location(),
-                    )]
-                }
                 ModuleError::Parse(error) => vec![parse_diagnostic(error, error.source_file())],
                 ModuleError::ParseInFile { path, error } => {
                     vec![parse_diagnostic(error, Some(path))]
@@ -499,6 +509,19 @@ impl Warning {
     }
 }
 
+pub(in crate::commands) fn merge_function_promise_errors(
+    errors: Vec<crate::error::PresentedAppError>,
+) -> Vec<crate::error::PresentedAppError> {
+    let (promises, ordinary) = errors
+        .into_iter()
+        .partition(|error| matches!(error, crate::error::PresentedAppError::FunctionPromise(_)));
+    merge_function_promise_diagnostics(ordinary, promises, |error| {
+        presented_error_diagnostics(error)
+            .first()
+            .and_then(diagnostic_position)
+    })
+}
+
 impl ValidateReport {
     #[cfg(any(test, feature = "test-utils"))]
     pub(super) fn into_result(self, exit_code: i32) -> Result<(), AppError> {
@@ -521,6 +544,7 @@ impl ValidateReport {
         warnings: Vec<Warning>,
         events: Vec<HumanEvent>,
     ) -> Self {
+        let errors = merge_function_promise_errors(errors);
         let outcome = match NonEmptyValidationErrors::from_presented(errors) {
             Ok(errors) => Outcome::Failure(errors),
             Err(_) => Outcome::Success(resources),
@@ -534,15 +558,27 @@ impl ValidateReport {
     fn output(&self) -> ValidateOutput {
         let (status, resources, errors) = match &self.outcome {
             Outcome::Success(resources) => ("ok", resources.clone(), Vec::new()),
-            Outcome::Failure(errors) => (
-                "error",
-                Vec::new(),
-                errors
-                    .as_slice()
-                    .iter()
-                    .flat_map(presented_error_diagnostics)
-                    .collect(),
-            ),
+            Outcome::Failure(errors) => {
+                let (promises, ordinary): (Vec<_>, Vec<_>) =
+                    errors.as_slice().iter().partition(|error| {
+                        matches!(error, crate::error::PresentedAppError::FunctionPromise(_))
+                    });
+                let diagnostics = |errors: Vec<_>| {
+                    errors
+                        .into_iter()
+                        .flat_map(presented_error_diagnostics)
+                        .collect()
+                };
+                (
+                    "error",
+                    Vec::new(),
+                    merge_function_promise_diagnostics(
+                        diagnostics(ordinary),
+                        diagnostics(promises),
+                        diagnostic_position,
+                    ),
+                )
+            }
         };
         ValidateOutput {
             status,

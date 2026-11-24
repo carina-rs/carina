@@ -64,350 +64,6 @@ fn expressions_equality_includes_authored_secrecy_argument_roots() {
     assert_ne!(original, changed);
 }
 
-fn assert_round4_buffer_membership(buffer_text: &str, disk_text: &str, expected_template: bool) {
-    let directory = tempfile::tempdir().unwrap();
-    let file = directory.path().join("guards.crn");
-    std::fs::write(&file, disk_text).unwrap();
-    let context = config();
-    let buffer =
-        crate::config_loader::ParsedSourceBuffer::parse(buffer_text, &file, &context).unwrap();
-    let schemas = SchemaRegistry::new();
-    let pinned = crate::paths::ResolvedPath::new(directory.path()).unwrap();
-    for overrides in [
-        Default::default(),
-        crate::config_loader::SourceOverrides::single(
-            pinned.join("guards.crn").unwrap(),
-            disk_text.to_string(),
-        ),
-    ] {
-        let snapshot = crate::config_loader::DirectoryBufferSnapshot::capture(
-            &pinned,
-            buffer.clone(),
-            &overrides,
-        )
-        .unwrap();
-        let configuration = crate::config_loader::load_buffer_configuration_in_directory(
-            snapshot, &schemas, &context,
-        );
-        if expected_template {
-            assert!(matches!(
-                require_scope(configuration.parsed()),
-                RequireScope::ModuleTemplate { .. }
-            ));
-            assert!(configuration.judged().report().findings().is_empty());
-        } else {
-            let findings = configuration.judged().report().findings();
-            assert_eq!(
-                findings.len(),
-                1,
-                "a different on-disk template must not suppress the buffer guard"
-            );
-            assert_eq!(findings[0].detail().to_string(), "require failed: guard");
-        }
-    }
-}
-
-#[test]
-fn round4_unsaved_template_cannot_be_admitted_as_disk_directory() {
-    assert_round4_buffer_membership(
-        "arguments { n: Int }\nrequire false, 'guard'\n",
-        "require false, 'guard'\n",
-        true,
-    );
-}
-
-#[test]
-fn round4_unsaved_directory_cannot_inherit_disk_template_scope() {
-    assert_round4_buffer_membership(
-        "require false, 'guard'\n",
-        "arguments { n: Int }\nrequire false, 'guard'\n",
-        false,
-    );
-}
-
-#[test]
-fn round3_test_utils_constructor_cannot_mint_directory_completeness() {
-    let directory = tempfile::tempdir().unwrap();
-    let source = "require false, 'partial guard'\n";
-    let guard = directory.path().join("guards.crn");
-    std::fs::write(&guard, source).unwrap();
-    std::fs::write(
-        directory.path().join("arguments.crn"),
-        "arguments { n: Int }\n",
-    )
-    .unwrap();
-    let parsed = crate::parser::parse_file(source, &guard, &config()).unwrap();
-    let root = crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed);
-    let schemas = SchemaRegistry::new();
-    let buffer =
-        crate::config_loader::load_buffer_configuration(root.parsed(), &schemas, &config());
-    assert!(matches!(
-        require_scope(buffer.parsed()),
-        RequireScope::Unknown
-    ));
-    assert!(buffer.judged().report().findings().is_empty());
-}
-
-#[cfg(unix)]
-#[test]
-fn round3_non_utf8_sibling_is_preserved_in_recovery_discovery() {
-    use std::os::unix::ffi::OsStringExt;
-    let directory = tempfile::tempdir().unwrap();
-    let source = "require false, 'guard'\n";
-    let guard = directory.path().join("guards.crn");
-    let arguments = directory
-        .path()
-        .join(std::ffi::OsString::from_vec(b"\xff.crn".to_vec()));
-    std::fs::write(&guard, source).unwrap();
-    // Unsaved buffers exercise raw Unix paths even on filesystems which
-    // cannot create non-UTF-8 names. Use the physical sibling when supported.
-    let physical = std::fs::write(&arguments, "arguments { n: Int }\n").is_ok();
-    let overrides = crate::config_loader::SourceOverrides::try_from_entries([
-        (
-            crate::paths::ResolvedPath::new(&guard).unwrap(),
-            source.to_string(),
-        ),
-        (
-            crate::paths::ResolvedPath::new(arguments).unwrap(),
-            "arguments { n: Int }\n".to_string(),
-        ),
-    ])
-    .unwrap();
-    let context = config();
-    let parsed = crate::config_loader::ParsedSourceBuffer::parse(source, &guard, &context).unwrap();
-    let schemas = SchemaRegistry::new();
-    let pinned = crate::paths::ResolvedPath::new(directory.path()).unwrap();
-    let snapshot =
-        crate::config_loader::DirectoryBufferSnapshot::capture(&pinned, parsed, &overrides)
-            .unwrap();
-    let buffer =
-        crate::config_loader::load_buffer_configuration_in_directory(snapshot, &schemas, &context);
-    assert!(matches!(
-        require_scope(buffer.parsed()),
-        RequireScope::ModuleTemplate { .. }
-    ));
-    assert!(buffer.judged().report().findings().is_empty());
-    if physical {
-        let cli = crate::config_loader::load_configuration_with_config(&pinned, &context, &schemas)
-            .unwrap();
-        let lsp = crate::config_loader::parse_directory_with_overrides_and_diagnostics(
-            &pinned,
-            &context,
-            &Default::default(),
-        )
-        .unwrap();
-        assert!(matches!(
-            require_scope(cli.parsed.parsed()),
-            RequireScope::ModuleTemplate { .. }
-        ));
-        assert!(matches!(
-            require_scope(lsp.parsed.parsed()),
-            RequireScope::ModuleTemplate { .. }
-        ));
-        let cli_buffer = crate::config_loader::load_buffer_configuration(
-            cli.parsed.parsed(),
-            &schemas,
-            &context,
-        );
-        let lsp_buffer = crate::config_loader::load_buffer_configuration(
-            lsp.parsed.parsed(),
-            &schemas,
-            &context,
-        );
-        assert!(cli_buffer.judged().report().findings().is_empty());
-        assert!(lsp_buffer.judged().report().findings().is_empty());
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn round3_unreadable_sibling_has_a_typed_source_failure_and_no_witness() {
-    use std::os::unix::fs::PermissionsExt;
-    let directory = tempfile::tempdir().unwrap();
-    let source = "require false, 'guard'\n";
-    let guard = directory.path().join("guards.crn");
-    let blocked = directory.path().join("blocked.crn");
-    std::fs::write(&guard, source).unwrap();
-    std::fs::write(&blocked, "let n = 1\n").unwrap();
-    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
-    // Privileged Unix runners may read mode-000 files. Invalid UTF-8 still
-    // makes the source unreadable as configuration text on those runners.
-    if std::fs::read_to_string(&blocked).is_ok() {
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::fs::write(&blocked, [0xff]).unwrap();
-    }
-    let context = config();
-    let pinned = crate::paths::ResolvedPath::new(directory.path()).unwrap();
-    let failure = crate::config_loader::parse_directory_for_metadata_report(
-        &pinned,
-        &context,
-        &Default::default(),
-        &SchemaRegistry::new(),
-    )
-    .expect_err("an unreadable source must fail directory loading");
-    let parsed = crate::config_loader::ParsedSourceBuffer::parse(source, &guard, &context).unwrap();
-    let schemas = SchemaRegistry::new();
-    let snapshot = crate::config_loader::DirectoryBufferSnapshot::capture(
-        &pinned,
-        parsed,
-        &Default::default(),
-    )
-    .unwrap();
-    let buffer =
-        crate::config_loader::load_buffer_configuration_in_directory(snapshot, &schemas, &context);
-    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(matches!(
-        require_scope(buffer.parsed()),
-        RequireScope::Unknown
-    ));
-    assert!(buffer.judged().report().findings().is_empty());
-    assert_eq!(failure.source_file(), Some(blocked.as_path()));
-    assert!(matches!(
-        failure.io_error().unwrap().kind(),
-        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidData
-    ));
-    assert!(std::error::Error::source(&failure).is_none());
-}
-
-#[test]
-fn round2_partial_declarations_cannot_grant_directory_require_admission() {
-    let schemas = SchemaRegistry::new();
-    for condition in ["false", "n > 0"] {
-        let source = format!("require {condition}, 'guard'\n");
-        let parsed =
-            crate::parser::parse_file(&source, std::path::Path::new("guards.crn"), &config())
-                .unwrap();
-        let buffer = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config());
-        assert!(buffer.judged().report().findings().is_empty());
-
-        // A caller-supplied source batch does not prove that siblings are absent.
-        let files = crate::config_loader::parse_directory_files(
-            &[("guards.crn".into(), source)],
-            &config(),
-        )
-        .unwrap();
-        let parsed = files.into_iter().next().unwrap().1.into_inner();
-        let buffer = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config());
-        assert!(buffer.judged().report().findings().is_empty());
-    }
-}
-
-#[test]
-fn round2_recovery_uses_sibling_declaration_evidence() {
-    let directory = tempfile::tempdir().unwrap();
-    let source = "require false, 'guard'\n";
-    let guard = directory.path().join("guards.crn");
-    std::fs::write(&guard, source).unwrap();
-    let arguments = directory.path().join("arguments.crn");
-    std::fs::write(&arguments, "arguments { n: Int }\n").unwrap();
-    let broken = directory.path().join("broken.crn");
-    std::fs::write(&broken, "let broken = [\n").unwrap();
-    let context = config();
-    let parsed = crate::config_loader::ParsedSourceBuffer::parse(source, &guard, &context).unwrap();
-    let schemas = SchemaRegistry::new();
-    let pinned = crate::paths::ResolvedPath::new(directory.path()).unwrap();
-    let overrides = crate::config_loader::SourceOverrides::single(
-        pinned.join("guards.crn").unwrap(),
-        source.to_string(),
-    );
-    let load = || {
-        let snapshot = crate::config_loader::DirectoryBufferSnapshot::capture(
-            &pinned,
-            parsed.clone(),
-            &overrides,
-        )
-        .unwrap();
-        crate::config_loader::load_buffer_configuration_in_directory(snapshot, &schemas, &context)
-    };
-    let template = load();
-    assert!(matches!(
-        require_scope(template.parsed()),
-        RequireScope::ModuleTemplate { .. }
-    ));
-    assert!(template.judged().report().findings().is_empty());
-
-    std::fs::remove_file(arguments).unwrap();
-    let incomplete = load();
-    assert!(incomplete.judged().report().findings().is_empty());
-
-    // The absent sibling must be established by discovery, including a buffer
-    // whose on-disk copy has not yet been saved.
-    std::fs::remove_file(broken).unwrap();
-    std::fs::remove_file(directory.path().join("guards.crn")).unwrap();
-    let complete = load();
-    let findings = complete.judged().report().findings();
-    assert_eq!(findings.len(), 1);
-    assert_eq!(findings[0].detail().to_string(), "require failed: guard");
-}
-
-#[test]
-fn round1_retained_require_cannot_lose_its_evaluation_obligation() {
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::write(
-        directory.path().join("guards.crn"),
-        "require false, 'retained guard'\n",
-    )
-    .unwrap();
-    let parsed = crate::config_loader::parse_directory(
-        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
-        &config(),
-    )
-    .unwrap();
-    let mut parsed = parsed.into_parsed();
-    parsed.requires.clear();
-    let schemas = SchemaRegistry::new();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config());
-    let findings = configuration.judged().report().findings();
-    assert_eq!(
-        findings.len(),
-        1,
-        "removing the public AST list must not erase the retained obligation"
-    );
-    assert_eq!(
-        findings[0].detail().to_string(),
-        "require failed: retained guard"
-    );
-    assert!(findings[0].location().file().path().ends_with("guards.crn"));
-}
-
-#[test]
-fn round1_strict_require_error_retains_location_and_typed_cause() {
-    use std::error::Error;
-    let parsed = crate::parser::parse_file(
-        "require false, 'chain guard'\n",
-        std::path::Path::new("upstream/guards.crn"),
-        &config(),
-    )
-    .unwrap();
-    let require = &parsed.requires[0];
-    let diagnostic = crate::module_resolver::evaluate_directory_require(require).unwrap();
-    let error = crate::module_resolver::ModuleError::DirectoryConstraint(Box::new(
-        crate::parser::Located::new(require.condition_location().clone(), diagnostic),
-    ));
-    assert!(error.to_string().contains("upstream/guards.crn:1:9"));
-    let located = error
-        .directory_constraint()
-        .expect("the located error remains available as a typed cause");
-    assert!(
-        located
-            .location()
-            .file()
-            .path()
-            .ends_with("upstream/guards.crn")
-    );
-    assert_eq!(located.detail().to_string(), "require failed: chain guard");
-    assert!(error.source().is_none());
-    let upstream = crate::upstream_exports::UpstreamExportSourceError::Module {
-        base: std::path::PathBuf::from("upstream"),
-        error: Box::new(error),
-    };
-    let (base, module) = upstream.module_failure().unwrap();
-    assert_eq!(base, std::path::Path::new("upstream"));
-    assert!(module.directory_constraint().is_some());
-    assert!(upstream.source().is_none());
-}
-
 #[test]
 fn heterogeneous_record_keeps_its_field_constraint_checks() {
     let parsed =
@@ -531,6 +187,166 @@ fn source_schema_report(source: &str) -> (crate::parser::ParsedFile, ExpressionR
 }
 
 #[test]
+fn keyed_loop_groups_have_no_value_type_or_collection_sink() {
+    for source in [
+        "let items = { a = 'x' }\nlet children = for k, v in items { mock.test.Source { name = v } }",
+        "let items = ['a']\nlet children = for item in items { mock.test.Source { name = item } }",
+    ] {
+        let (_, report) = source_schema_report(source);
+        let group = report
+            .binding(&RelativeBindingName::new("children"))
+            .unwrap();
+        assert!(
+            group.static_type().is_err(),
+            "{source}: {:?}",
+            group.static_type()
+        );
+        for sink in [
+            TypeExpr::Map(Box::new(TypeExpr::String)),
+            TypeExpr::List(Box::new(TypeExpr::String)),
+            TypeExpr::Struct {
+                fields: vec![("a".into(), TypeExpr::String)],
+            },
+        ] {
+            assert!(admit_expression(group, &sink).is_err(), "{source}: {sink}");
+        }
+    }
+}
+
+#[test]
+fn keyed_loop_addressing_agrees_across_judgement_validation_and_expansion() {
+    use crate::resource::{ForKeyError, ForLoopElement, LoopOriginKind};
+    use crate::validation::DeferredForIterableTypeDiagnostic;
+
+    fn loop_expression(expression: &ExprValue) -> Option<&ExprValue> {
+        if matches!(expression.authored.kind, ExprKind::For { .. }) {
+            return Some(expression);
+        }
+        expression
+            .authored
+            .children
+            .iter()
+            .find_map(loop_expression)
+    }
+
+    let config = config();
+    let sink = TypeExpr::List(Box::new(TypeExpr::String));
+    for (row, header, iterable, expected, expected_validation) in [
+        (
+            "bound indexed list",
+            "let children = for (i, x) in ",
+            "['a-b']",
+            "Indexed",
+            "Indexed",
+        ),
+        (
+            "bound value-keyed list",
+            "let children = for x in ",
+            "['a-b']",
+            "Keyed",
+            "Keyed",
+        ),
+        (
+            "unbound simple list",
+            "for x in ",
+            "['a-b']",
+            "Indexed",
+            "Indexed",
+        ),
+        (
+            "bound map",
+            "let children = for k, v in ",
+            "{ 'a-b' = 'a-b' }",
+            "Keyed",
+            "MapKeyed",
+        ),
+        (
+            "unbound map",
+            "for k, v in ",
+            "{ 'a-b' = 'a-b' }",
+            "Keyed",
+            "MapKeyed",
+        ),
+    ] {
+        let body = "{ mock.test.Source { name = 'child' } }";
+        let (parsed, report) =
+            source_schema_report(&format!("let items = {iterable}\n{header}items {body}"));
+        let expression = parsed
+            .parser_binding_metadata
+            .syntax()
+            .expressions()
+            .roots()
+            .iter()
+            .find_map(loop_expression)
+            .unwrap();
+        let judgement = match report
+            .expression(expression.location())
+            .unwrap()
+            .for_sink(&sink, &config)
+            .collection_kind()
+        {
+            Some(CollectionKind::KeyedGroup) => "Keyed",
+            Some(CollectionKind::List) => "Indexed",
+            other => panic!("{row}: unexpected judged group {other:?}"),
+        };
+
+        // An unresolved Int list reaches the authored validator without eager
+        // parser admission. Only bound simple loops set value_keys and reject
+        // its element type. Map loops never enter that path: their container
+        // rejection is a separate MapKeyed observation.
+        let probe = crate::parser::parse_file(
+            &format!("arguments {{ items: list(Int) }}\n{header}items {body}"),
+            Path::new("agreement.crn"),
+            &config,
+        )
+        .unwrap();
+        let schemas = SchemaRegistry::new();
+        let buffer = crate::config_loader::load_buffer_configuration(&probe, &schemas, &config);
+        let tree = crate::parser::AnalysisTree::try_from(buffer.parsed()).unwrap();
+        let findings = crate::validation::validate_for_iterable_types(&tree, &config);
+        let findings: Vec<_> = findings.iter().map(|finding| finding.detail()).collect();
+        let validation = match findings.as_slice() {
+            [] => "Indexed",
+            [
+                DeferredForIterableTypeDiagnostic::ForKey(ForKeyError::ElementType { kind: "Int" }),
+            ] => "Keyed",
+            [DeferredForIterableTypeDiagnostic::Iterable { message, .. }]
+                if message == "expected map iterable, got list" =>
+            {
+                "MapKeyed"
+            }
+            other => panic!("{row}: unexpected validation findings {other:?}"),
+        };
+
+        // Eager bound expansion calls admit_bound_for_addresses; unbound
+        // expansion records the actual key/index in its child provenance.
+        let resources: Vec<_> = parsed.iter_all_resources().collect();
+        let [crate::parser::ResourceRef::Resource(child)] = resources.as_slice() else {
+            panic!("{row}: expected one expanded child");
+        };
+        let expansion = match child.binding.as_ref().map(|binding| binding.as_str()) {
+            Some("children['a-b']") => "Keyed",
+            Some("children[0]") => "Indexed",
+            None => match child.loop_provenance.direct_origin().unwrap().kind() {
+                LoopOriginKind::For {
+                    element: ForLoopElement::Key(key),
+                } if key == "a-b" => "Keyed",
+                LoopOriginKind::For {
+                    element: ForLoopElement::Index(0),
+                } => "Indexed",
+                other => panic!("{row}: unexpected expanded child origin {other:?}"),
+            },
+            other => panic!("{row}: unexpected expanded child address {other:?}"),
+        };
+        assert_eq!(
+            [judgement, validation, expansion],
+            [expected, expected_validation, expected],
+            "{row}: [judge, validation, expansion]"
+        );
+    }
+}
+
+#[test]
 fn single_reference_interpolation_preserves_child_judgement_and_literal_folding() {
     for definition in [
         "let x = src.name",
@@ -645,7 +461,7 @@ fn if_admits_every_branch_at_the_sink() {
 #[test]
 fn for_admits_the_body_as_the_list_element() {
     let (_, report) = source_schema_report(
-        "let result = for n in [1, 2] { mock.test.Source { name = \"${n}\" } }",
+        "let result = for (_, n) in [1, 2] { mock.test.Source { name = \"${n}\" } }",
     );
     let result = report.binding(&RelativeBindingName::new("result")).unwrap();
     assert!(admit_expression(result, &TypeExpr::List(Box::new(TypeExpr::Int))).is_err());

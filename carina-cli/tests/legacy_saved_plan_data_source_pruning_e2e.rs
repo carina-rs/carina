@@ -65,20 +65,21 @@ let child = query_module { pattern = "origin" }
     );
     let state_path = project.join("carina.state.json");
     let mut state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
-    state["version"] = json!(20);
-    for row in state["resources"].as_array_mut().unwrap() {
-        row["dependency_bindings"] = Value::Array(
-            row["dependency_bindings"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|dependency| dependency["identity"].clone())
-                .collect(),
-        );
-    }
+    assert_eq!(state["version"], 21);
+    let origin = state["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["binding"] == "origin")
+        .expect("seeded state contains the origin row");
+    let origin_dependency = json!({
+        "provider": origin["provider"],
+        "resource_type": origin["resource_type"],
+        "identity": origin["identity"]
+    });
     state["resources"].as_array_mut().unwrap().push(json!({
         "provider": "mock", "resource_type": "iam.Roles", "identity": "child.roles",
-        "binding": "child.roles", "dependency_bindings": ["origin"],
+        "binding": "child.roles", "dependency_bindings": [origin_dependency],
         "current": {"kind": "missing_identifier", "attributes": {"names": ["historical"]}, "nested_write_only": {}}
     }));
     fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
@@ -94,7 +95,7 @@ let child = query_module { pattern = next.name }
     }
     let before = fs::read(&state_path).unwrap();
     assert_success(
-        "save legacy plan",
+        "save plan with stale data-source rows",
         run(&["plan", "--out", "plan.json", "."]),
     );
     assert!(
@@ -114,7 +115,7 @@ let child = query_module { pattern = next.name }
         );
     }
     assert_success(
-        "apply saved legacy classification",
+        "apply saved plan",
         run(&["apply", "--auto-approve", "--lock=false", "plan.json"]),
     );
     let state: Value = serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
@@ -129,11 +130,11 @@ let child = query_module { pattern = next.name }
 }
 
 #[test]
-fn legacy_module_data_source_rows_match_saved_migration_sources() {
+fn legacy_module_data_source_rows_are_pruned_before_saved_plan_apply() {
     probe(false);
 }
 
 #[test]
-fn legacy_deferred_module_data_source_rows_match_saved_migration_sources() {
+fn legacy_deferred_module_data_source_rows_are_pruned_before_saved_plan_apply() {
     probe(true);
 }

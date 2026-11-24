@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::resource::{ResourceId, SnapshotValue as Value};
 use crate::wait::predicate::{AttrPath, WaitPredicate};
@@ -26,7 +26,7 @@ pub struct WaitObservation<'a> {
     binding: &'a str,
     target_id: &'a ResourceId,
     watched_attrs: Vec<&'a AttrPath>,
-    last_attrs: &'a HashMap<String, Value>,
+    last_attrs: &'a BTreeMap<String, Value>,
 }
 
 impl<'a> WaitObservation<'a> {
@@ -38,7 +38,7 @@ impl<'a> WaitObservation<'a> {
         binding: &'a str,
         target_id: &'a ResourceId,
         predicate: &'a WaitPredicate,
-        last_attrs: &'a HashMap<String, Value>,
+        last_attrs: &'a BTreeMap<String, Value>,
     ) -> Self {
         Self {
             binding,
@@ -60,7 +60,7 @@ impl<'a> WaitObservation<'a> {
         &self.watched_attrs
     }
 
-    pub fn last_attrs(&self) -> &HashMap<String, Value> {
+    pub fn last_attrs(&self) -> &BTreeMap<String, Value> {
         self.last_attrs
     }
 
@@ -80,10 +80,10 @@ impl<'a> WaitObservation<'a> {
 /// Unrelated hash leaves never enter the predicate evaluator.
 pub(crate) fn evaluation_inputs(
     predicate: &WaitPredicate,
-    attributes: &HashMap<String, Value>,
-) -> Result<HashMap<String, crate::resource::Value>, crate::resource::UnavailableSecretError> {
+    attributes: &BTreeMap<String, Value>,
+) -> Result<BTreeMap<String, crate::resource::Value>, crate::resource::UnavailableSecretError> {
     use crate::resource::{AccessMissPolicy, ConcreteValue, PathSegment, SnapshotSelectionError};
-    let mut inputs = HashMap::new();
+    let mut inputs = BTreeMap::new();
     for path in predicate.watched_attrs() {
         let (root, rest) = path
             .segments()
@@ -115,7 +115,7 @@ pub(crate) fn evaluation_inputs(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use indexmap::IndexMap;
 
@@ -143,7 +143,7 @@ mod tests {
         let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
         let status = AttrPath::single("status");
         let predicate = equals_predicate(status.clone(), "pending");
-        let last_attrs = HashMap::from([
+        let last_attrs = BTreeMap::from([
             ("arn".to_string(), string_value("arn:demo")),
             ("status".to_string(), string_value("pending")),
         ]);
@@ -164,7 +164,7 @@ mod tests {
             AttrPath::try_new(vec!["renewal_summary".into(), "renewal_status".into()]).unwrap();
         let predicate = equals_predicate(renewal_status.clone(), "PENDING");
         let leaf = string_value("PENDING");
-        let last_attrs = HashMap::from([(
+        let last_attrs = BTreeMap::from([(
             "renewal_summary".to_string(),
             Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                 "renewal_status".to_string(),
@@ -186,7 +186,7 @@ mod tests {
         let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
         let xyz = AttrPath::single("xyz");
         let predicate = equals_predicate(xyz, "present");
-        let last_attrs = HashMap::from([("arn".to_string(), string_value("arn:demo"))]);
+        let last_attrs = BTreeMap::from([("arn".to_string(), string_value("arn:demo"))]);
 
         let observation = WaitObservation::new("demo_ready", &target_id, &predicate, &last_attrs);
 

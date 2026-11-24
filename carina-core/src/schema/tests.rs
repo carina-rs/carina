@@ -17018,10 +17018,10 @@ fn validate_map_with_ref_enum_key_uses_supplied_defs() {
 // strings. On load they become `ConcreteValue::String`. The carina#2986
 // Phase 4 strict validator then rejects them at the `Enum`
 // position because it demands `ConcreteValue::EnumIdentifier`. The
-// schema-aware state-migration lift in
+// schema-aware value lift in
 // `crate::utils::lift_state_enum_leaves` walks loaded
 // attributes against their schema and lifts recognized API-canonical /
-// alias strings to `CanonicalEnum` so old state validates again.
+// alias strings to `CanonicalEnum` before validating current-format state.
 #[test]
 fn lift_state_enum_leaves_fixes_awscc251() {
     use crate::test_support::lift_state_enum_leaves;

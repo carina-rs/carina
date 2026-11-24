@@ -246,7 +246,6 @@ fn format_wait_observed_attr(observation: &WaitObservation) -> String {
 mod tests {
     use crate::provider_text_fixtures::*;
     use carina_core::provider::PartialReadDiagnostic;
-    use std::collections::HashMap;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
 
@@ -384,7 +383,7 @@ mod tests {
     fn wait_observation<'a>(
         target_id: &'a ResourceId,
         predicate: &'a WaitPredicate,
-        last_attrs: &'a HashMap<String, carina_core::resource::SnapshotValue>,
+        last_attrs: &'a std::collections::BTreeMap<String, carina_core::resource::SnapshotValue>,
     ) -> WaitObservation<'a> {
         WaitObservation::new("demo_ready", target_id, predicate, last_attrs)
     }
@@ -403,7 +402,7 @@ mod tests {
     #[test]
     fn wait_observed_attr_is_deterministic() {
         let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
-        let attrs = HashMap::from([
+        let attrs = std::collections::BTreeMap::from([
             (
                 "status".to_string(),
                 Value::Concrete(ConcreteValue::String("pending".into())),
@@ -424,7 +423,7 @@ mod tests {
         let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
         let status = AttrPath::single("status");
         let predicate = equals_predicate(status, "pending");
-        let attrs = HashMap::from([
+        let attrs = std::collections::BTreeMap::from([
             (
                 "arn".to_string(),
                 Value::Concrete(ConcreteValue::String("arn:demo".into())),
@@ -445,7 +444,7 @@ mod tests {
         let renewal_status =
             AttrPath::try_new(vec!["renewal_summary".into(), "renewal_status".into()]).unwrap();
         let predicate = equals_predicate(renewal_status, "PENDING");
-        let attrs = HashMap::from([(
+        let attrs = std::collections::BTreeMap::from([(
             "renewal_summary".to_string(),
             Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                 "renewal_status".to_string(),
@@ -465,7 +464,7 @@ mod tests {
         let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
         let xyz = AttrPath::single("xyz");
         let predicate = equals_predicate(xyz, "present");
-        let attrs = HashMap::from([
+        let attrs = std::collections::BTreeMap::from([
             (
                 "status".to_string(),
                 Value::Concrete(ConcreteValue::String("pending".into())),
@@ -483,7 +482,7 @@ mod tests {
     #[test]
     fn wait_observed_attr_uses_display_formatting() {
         let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
-        let attrs = HashMap::from([(
+        let attrs = std::collections::BTreeMap::from([(
             "arn".to_string(),
             Value::Concrete(ConcreteValue::String(
                 "arn:aws:acm:1:certificate/abc".into(),
@@ -501,7 +500,7 @@ mod tests {
     #[test]
     fn wait_observed_attr_handles_unknown_value() {
         let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
-        let attrs = HashMap::from([(
+        let attrs = std::collections::BTreeMap::from([(
             "status".to_string(),
             Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
                 path: AccessPath::with_fields("bootstrap", "network", vec!["status".into()])
@@ -626,7 +625,7 @@ mod tests {
     fn provider_text_wait_observer_escapes_keys_without_changing_selection() {
         let raw = "\x1b]52;c;ZXZpbA==\x07\x1b[2J";
         let target = ResourceId::with_identity("aws.acm.Certificate", "demo");
-        let attrs = HashMap::from([
+        let attrs = std::collections::BTreeMap::from([
             (
                 raw.to_string(),
                 Value::Concrete(ConcreteValue::String("observed".into())),
@@ -652,7 +651,7 @@ mod tests {
     fn provider_text_wait_observer_escapes_provider_attribute_values() {
         let raw = "\x1b]52;c;ZXZpbA==\x07\x1b[2J";
         let target = ResourceId::with_identity("aws.acm.Certificate", "demo");
-        let attrs = HashMap::from([(
+        let attrs = std::collections::BTreeMap::from([(
             "status".into(),
             Value::Concrete(ConcreteValue::String(raw.into())),
         )]);
@@ -677,7 +676,7 @@ mod tests {
         let key = EffectProgressKey::new(&effect);
         let target_id = ResourceId::with_identity("aws.acm.Certificate", "demo");
         let predicate = equals_predicate(AttrPath::single("status"), "issued");
-        let attrs = HashMap::from([(
+        let attrs = std::collections::BTreeMap::from([(
             "status".to_string(),
             Value::Concrete(ConcreteValue::String("pending".into())),
         )]);
@@ -826,10 +825,10 @@ mod tests {
             })
             .collect();
         let deps = HashMap::from([
-            (0, HashSet::from([3])),
-            (1, HashSet::from([2])),
-            (2, HashSet::from([3])),
-            (3, HashSet::from([1])),
+            (0, std::collections::BTreeSet::from([3])),
+            (1, std::collections::BTreeSet::from([2])),
+            (2, std::collections::BTreeSet::from([3])),
+            (3, std::collections::BTreeSet::from([1])),
         ]);
         let output = SharedWriter::default();
         let observer = Renderer(ProgressBackend::plain(color_mode, output.clone()));

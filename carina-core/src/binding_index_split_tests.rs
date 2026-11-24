@@ -38,7 +38,7 @@ fn updating_changed_iterable_defers_missing_element_output() {
     let mut parsed = parse(
         r#"
         let x = mock.test.Source {}
-        let children = for r in x.rules {
+        let children = for (_, r) in x.rules {
             mock.test.Target { name = r.id }
         }
         "#,
@@ -76,7 +76,7 @@ fn updating_changed_iterable_defers_missing_element_output() {
             compositions: &[],
             managed_current: &current,
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
         &stability,
@@ -110,7 +110,7 @@ fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
         attributes,
         directives: Default::default(),
         resolved_ignore_changes: Default::default(),
-        prefixes: HashMap::new(),
+        prefixes: Default::default(),
         binding: Some(absolute_binding(binding)),
         dependencies: Default::default(),
         module_source: None,
@@ -161,7 +161,7 @@ fn pre_apply_records_dsl_attributes() {
         compositions: &[],
         managed_current: &HashMap::new(),
         data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     let view = bindings.get("a").expect("binding present");
@@ -189,7 +189,7 @@ fn pre_apply_merges_state_for_missing_dsl_keys() {
             &[],
         ),
         data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     let view = bindings.get("a").expect("binding present");
@@ -209,7 +209,7 @@ fn pre_apply_skips_resources_without_binding() {
         compositions: &[],
         managed_current: &HashMap::new(),
         data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     assert!(bindings.get("a").is_none());
@@ -223,7 +223,7 @@ fn pre_apply_composition_is_complete_for_coalesce_absence() {
         compositions: &[composition],
         managed_current: &HashMap::new(),
         data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     let fallback = s("fallback");
@@ -253,7 +253,7 @@ fn add_compositions_layers_on_top_of_resources() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         });
     assert!(bindings.get("a").is_some());
@@ -283,7 +283,7 @@ fn add_compositions_overwrites_same_name_resource_binding() {
         compositions: &[],
         managed_current: &HashMap::new(),
         data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     let virt = make_virtual("rd", &[("v", s("post_apply"))]);
@@ -304,7 +304,7 @@ fn add_compositions_skips_unbound() {
         compositions: &[],
         managed_current: &HashMap::new(),
         data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     bindings
@@ -329,7 +329,7 @@ fn managed_plus_virtual_layering() {
         compositions: &[],
         managed_current: &HashMap::new(),
         data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     typed

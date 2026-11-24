@@ -4,7 +4,7 @@
 use crate::provider::Provider;
 #[cfg(test)]
 use crate::resource::ResolvedResourceId;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -165,12 +165,12 @@ pub(super) fn build_dependency_levels(
 }
 
 fn dependency_cycle_components(
-    deps_of: &HashMap<usize, HashSet<usize>>,
+    deps_of: &HashMap<usize, BTreeSet<usize>>,
     remaining: &HashSet<usize>,
 ) -> Vec<Vec<usize>> {
     fn visit(
         node: usize,
-        graph: &HashMap<usize, HashSet<usize>>,
+        graph: &HashMap<usize, BTreeSet<usize>>,
         allowed: &HashSet<usize>,
         visited: &mut HashSet<usize>,
         order: &mut Vec<usize>,
@@ -224,8 +224,6 @@ fn dependency_cycle_components(
         if !remaining.contains(&node) {
             continue;
         }
-        #[allow(clippy::iter_over_hash_type)]
-        // sorted immediately after: reverse adjacency lists are sorted before SCC traversal
         for &dependency in dependencies {
             if remaining.contains(&dependency) {
                 reverse.entry(dependency).or_default().push(node);
@@ -261,7 +259,7 @@ fn dependency_cycle_components(
 
 fn reachable_cycle(
     start: usize,
-    deps_of: &HashMap<usize, HashSet<usize>>,
+    deps_of: &HashMap<usize, BTreeSet<usize>>,
     cycles: &[(HashSet<usize>, std::sync::Arc<DependencyCycle>)],
     completed: &HashSet<usize>,
 ) -> Option<std::sync::Arc<DependencyCycle>> {
@@ -286,7 +284,7 @@ fn reachable_cycle(
 /// Classify a stalled scheduling graph for both apply and destroy drivers.
 pub fn classify_stalled_effects<S>(
     effects: &[Effect<S>],
-    deps_of: &HashMap<usize, HashSet<usize>>,
+    deps_of: &HashMap<usize, BTreeSet<usize>>,
     remaining: &HashSet<usize>,
     completed: &HashSet<usize>,
 ) -> Vec<(usize, EffectFailureKind)> {
@@ -593,6 +591,7 @@ pub(super) async fn execute_effects_sequential<
 
         // Process newly ready effects: skip those with failed deps, spawn the rest
         let mut completed_synchronous_dispatch = false;
+        let mut failure_view = FailureView::new(&effects, &deps_of, &failed_indices);
         for idx in newly_ready {
             dispatched.insert(idx);
             let effect = effects[idx].clone();
@@ -603,12 +602,12 @@ pub(super) async fn execute_effects_sequential<
                 completed_indices.insert(idx);
                 if failed_indices.contains(&write) {
                     failed_indices.insert(idx);
+                    failure_view.record_failure(idx);
                 }
                 completed_synchronous_dispatch = true;
                 continue;
             }
 
-            let failure_view = FailureView::new(&effects, &deps_of, &failed_indices);
             if let Some(failed_dep) = failure_view.find_failed_dependency(idx) {
                 let c = if effect.is_scheduler_meta() {
                     completed.load(Ordering::Relaxed)
@@ -630,9 +629,11 @@ pub(super) async fn execute_effects_sequential<
                 });
                 accumulated.mutate(|result| result.skip_count += 1);
                 failed_indices.insert(idx);
+                failure_view.record_failure(idx);
                 completed_indices.insert(idx);
                 if let Some(write) = preparation_nodes.write(idx) {
                     failed_indices.insert(write);
+                    failure_view.record_failure(write);
                     completed_indices.insert(write);
                     dispatched.insert(write);
                 }
@@ -645,10 +646,8 @@ pub(super) async fn execute_effects_sequential<
                     &admitted,
                     source,
                     idx,
-                    &effects,
-                    &deps_of,
                     &completed_indices,
-                    &failed_indices,
+                    &failure_view,
                 )
                 .expect("newly ready endpoints have completed prerequisites")
                 .expect("dependency failure was handled above")
@@ -797,6 +796,7 @@ pub(super) async fn execute_effects_sequential<
                         });
                         continue;
                     }
+                    drop(failure_view);
                     accumulated.record_replacement_metadata(&combined);
                     if combined.effects().len() > child_offset {
                         total += count_actionable_effects(&combined.effects()[child_offset..]);
@@ -1531,10 +1531,10 @@ mod tests {
         let template = crate::parser::DeferredForExpression::new(
             None,
             0,
-            "for value in []".into(),
+            "for (_, value) in []".into(),
             crate::parser::DeferredForTarget::bound(absolute("children")).unwrap(),
             crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(Vec::new())),
-            crate::parser::ForBinding::Simple("value".into()),
+            crate::parser::ForBinding::Indexed("_".into(), "value".into()),
             crate::resource::Resource::<crate::resource::ModuleSource, crate::resource::LoopSlot>::with_provider(
                 "mock", "test.Child", "children", None,
             ),
@@ -1562,14 +1562,14 @@ mod tests {
         let admitted = crate::replacement::AdmittedReplacementEffects::resolve(
             &effects,
             &SchemaRegistry::new(),
-            |_| HashMap::new(),
+            |_| std::collections::BTreeMap::new(),
         )
         .unwrap();
         let deps_of = admitted
             .dependency_analysis(std::iter::empty())
             .unwrap()
             .into_deps_of();
-        assert_eq!(deps_of[&0], HashSet::from([1]));
+        assert_eq!(deps_of[&0], BTreeSet::from([1]));
         assert!(
             deps_of[&2].is_empty(),
             "a bound gate cannot claim unrelated deletes with missing metadata"
@@ -1605,7 +1605,7 @@ mod tests {
         let admitted = crate::replacement::AdmittedReplacementEffects::resolve(
             &effects,
             &SchemaRegistry::new(),
-            |_| HashMap::new(),
+            |_| std::collections::BTreeMap::new(),
         )
         .unwrap();
         let deps_of = admitted
@@ -1613,9 +1613,9 @@ mod tests {
             .unwrap()
             .into_deps_of();
 
-        assert_eq!(deps_of.get(&0), Some(&HashSet::from([1, 2])));
-        assert_eq!(deps_of.get(&1), Some(&HashSet::new()));
-        assert_eq!(deps_of.get(&2), Some(&HashSet::new()));
+        assert_eq!(deps_of.get(&0), Some(&BTreeSet::from([1, 2])));
+        assert_eq!(deps_of.get(&1), Some(&BTreeSet::new()));
+        assert_eq!(deps_of.get(&2), Some(&BTreeSet::new()));
     }
 
     fn fixture_id(binding: &str) -> crate::resource::ResolvedResourceId {
@@ -1875,7 +1875,7 @@ mod tests {
         }
     }
 
-    fn dependency_after_relax(parent: Effect, child: Effect) -> HashSet<usize> {
+    fn dependency_after_relax(parent: Effect, child: Effect) -> BTreeSet<usize> {
         let effects = vec![parent, child];
         let unresolved: HashMap<ResolvedResourceId, UnresolvedResource> = effects
             .iter()

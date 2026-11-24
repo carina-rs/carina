@@ -7557,7 +7557,7 @@
             ],
             [
               "main.crn",
-              "let probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -7596,7 +7596,7 @@
             ],
             [
               "main.crn",
-              "let probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -7648,7 +7648,7 @@
             },
             "status": "reject",
             "typed_error_vector": [
-              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[0]: cannot assign String to 'value': expected mock.Expected, got String (from x.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[0]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from x.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from x.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 49,\n                    end_byte: 54,\n                    start_line: 3,\n                    start_column: 5,\n                    end_line: 3,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
+              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[0]: cannot assign String to 'value': expected mock.Expected, got String (from x.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[0]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from x.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from x.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 54,\n                    end_byte: 59,\n                    start_line: 3,\n                    start_column: 5,\n                    end_line: 3,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
             ],
             "typed_input_warnings": [],
             "typed_parse_warnings": []
@@ -7668,7 +7668,7 @@
             ],
             [
               "main.crn",
-              "let probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -7707,7 +7707,7 @@
             ],
             [
               "main.crn",
-              "let probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -7759,7 +7759,7 @@
             },
             "status": "reject",
             "typed_error_vector": [
-              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[1]: cannot assign String to 'value': expected mock.Expected, got String (from y.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[1]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from y.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from y.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 49,\n                    end_byte: 54,\n                    start_line: 3,\n                    start_column: 5,\n                    end_line: 3,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
+              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[1]: cannot assign String to 'value': expected mock.Expected, got String (from y.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[1]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from y.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from y.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 54,\n                    end_byte: 59,\n                    start_line: 3,\n                    start_column: 5,\n                    end_line: 3,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
             ],
             "typed_input_warnings": [],
             "typed_parse_warnings": []
@@ -7779,7 +7779,7 @@
             ],
             [
               "main.crn",
-              "let probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -7818,7 +7818,7 @@
             ],
             [
               "main.crn",
-              "let probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -7878,94 +7878,18 @@
           "observation": {
             "diagnostics": [
               {
-                "channel": "warnings",
-                "class": "O",
+                "channel": "errors",
+                "class": "A",
                 "index": 0,
-                "reason": "unused for-loop binding lint; neither R nor V"
+                "reason": "not unambiguously declared-reference type R or concrete-value V; retain verbatim",
+                "resource_id": null
               },
               {
-                "channel": "warnings",
-                "class": "O",
-                "index": 1,
-                "reason": "unused-binding lint; neither R nor V"
-              }
-            ],
-            "facade_errors": [],
-            "json": {
-              "resource_count": 3,
-              "resources": [
-                "mock.Sink.sink",
-                "mock.Source.built.first",
-                "mock.Source.built.second"
-              ],
-              "status": "ok",
-              "warnings": [
-                {
-                  "code": null,
-                  "location": {
-                    "file": "<DIR>/sources.crn",
-                    "range": null
-                  },
-                  "message": "for-loop binding 'key' is unused. Rename to '_' to suppress this warning.",
-                  "severity": "warning"
-                },
-                {
-                  "code": null,
-                  "location": {
-                    "file": "<DIR>/main.crn",
-                    "range": {
-                      "end": {
-                        "column": 9,
-                        "line": 1
-                      },
-                      "start": {
-                        "column": 5,
-                        "line": 1
-                      }
-                    }
-                  },
-                  "message": "Unused let binding 'sink'",
-                  "severity": "warning",
-                  "type": "unused_binding"
-                }
-              ]
-            },
-            "status": "accept",
-            "typed_error_vector": [],
-            "typed_input_warnings": [],
-            "typed_parse_warnings": [
-              "ParseWarning {\n    file: Some(\n        \"<DIR>/sources.crn\",\n    ),\n    line: 2,\n    kind: UnusedForBinding,\n    span: None,\n    message: \"for-loop binding 'key' is unused. Rename to '_' to suppress this warning.\",\n}"
-            ]
-          }
-        },
-        {
-          "files": [
-            [
-              "sources.crn",
-              "let input = { first = 0, second = 1 }\nlet built = for key, _ in input {\n  mock.Source {\n                 \n             \n}\n}\n"
-            ],
-            [
-              "main.crn",
-              "let sink = mock.Sink { value = built['first'].name }\n"
-            ],
-            [
-              "providers.crn",
-              "provider mock {}\n"
-            ],
-            [
-              "backend.crn",
-              "backend local { path = 'state.json' }\n"
-            ]
-          ],
-          "known": false,
-          "observation": {
-            "diagnostics": [
-              {
                 "channel": "errors",
-                "class": "R",
-                "index": 0,
-                "reason": "declared source type versus destination; direct/protected reference origin",
-                "resource_id": "mock.Sink.sink"
+                "class": "A",
+                "index": 1,
+                "reason": "not unambiguously declared-reference type R or concrete-value V; retain verbatim",
+                "resource_id": null
               },
               {
                 "channel": "warnings",
@@ -7981,7 +7905,8 @@
               }
             ],
             "facade_errors": [
-              "mock.Sink.sink: cannot assign String to 'value': expected mock.Expected, got String (from built.first.name)"
+              "<DIR>/main.crn at line 1\nexpected mock.Expected, got String",
+              "<DIR>/main.crn at line 1\nexpected mock.Expected, got String"
             ],
             "json": {
               "errors": [
@@ -7991,16 +7916,34 @@
                     "file": "<DIR>/main.crn",
                     "range": {
                       "end": {
-                        "column": 29,
+                        "column": 51,
                         "line": 1
                       },
                       "start": {
-                        "column": 24,
+                        "column": 32,
                         "line": 1
                       }
                     }
                   },
-                  "message": "Type mismatch: expected mock.Expected, got String (from built.first.name)",
+                  "message": "expected mock.Expected, got String",
+                  "severity": "error"
+                },
+                {
+                  "code": null,
+                  "location": {
+                    "file": "<DIR>/main.crn",
+                    "range": {
+                      "end": {
+                        "column": 53,
+                        "line": 1
+                      },
+                      "start": {
+                        "column": 12,
+                        "line": 1
+                      }
+                    }
+                  },
+                  "message": "expected mock.Expected, got String",
                   "severity": "error"
                 }
               ],
@@ -8040,7 +7983,145 @@
             },
             "status": "reject",
             "typed_error_vector": [
-              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.sink: cannot assign String to 'value': expected mock.Expected, got String (from built.first.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"sink\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from built.first.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from built.first.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 23,\n                    end_byte: 28,\n                    start_line: 1,\n                    start_column: 24,\n                    end_line: 1,\n                    end_column: 29,\n                },\n            },\n        ),\n    },\n)"
+              "ExpressionType(\n    Located {\n        location: DeclarationLocation {\n            file: SourceFileId(\n                \"<DIR>/main.crn\",\n            ),\n            span: SourceSpan {\n                start_byte: 31,\n                end_byte: 50,\n                start_line: 1,\n                start_column: 32,\n                end_line: 1,\n                end_column: 51,\n            },\n        },\n        detail: UnknownType {\n            reason: \"expected mock.Expected, got String\",\n        },\n    },\n)",
+              "ExpressionType(\n    Located {\n        location: DeclarationLocation {\n            file: SourceFileId(\n                \"<DIR>/main.crn\",\n            ),\n            span: SourceSpan {\n                start_byte: 11,\n                end_byte: 52,\n                start_line: 1,\n                start_column: 12,\n                end_line: 1,\n                end_column: 53,\n            },\n        },\n        detail: UnknownType {\n            reason: \"expected mock.Expected, got String\",\n        },\n    },\n)"
+            ],
+            "typed_input_warnings": [],
+            "typed_parse_warnings": [
+              "ParseWarning {\n    file: Some(\n        \"<DIR>/sources.crn\",\n    ),\n    line: 2,\n    kind: UnusedForBinding,\n    span: None,\n    message: \"for-loop binding 'key' is unused. Rename to '_' to suppress this warning.\",\n}"
+            ]
+          }
+        },
+        {
+          "files": [
+            [
+              "sources.crn",
+              "let input = { first = 0, second = 1 }\nlet built = for key, _ in input {\n  mock.Source {\n                 \n             \n}\n}\n"
+            ],
+            [
+              "main.crn",
+              "let sink = mock.Sink { value = built['first'].name }\n"
+            ],
+            [
+              "providers.crn",
+              "provider mock {}\n"
+            ],
+            [
+              "backend.crn",
+              "backend local { path = 'state.json' }\n"
+            ]
+          ],
+          "known": false,
+          "observation": {
+            "diagnostics": [
+              {
+                "channel": "errors",
+                "class": "A",
+                "index": 0,
+                "reason": "not unambiguously declared-reference type R or concrete-value V; retain verbatim",
+                "resource_id": null
+              },
+              {
+                "channel": "errors",
+                "class": "A",
+                "index": 1,
+                "reason": "not unambiguously declared-reference type R or concrete-value V; retain verbatim",
+                "resource_id": null
+              },
+              {
+                "channel": "warnings",
+                "class": "O",
+                "index": 0,
+                "reason": "unused for-loop binding lint; neither R nor V"
+              },
+              {
+                "channel": "warnings",
+                "class": "O",
+                "index": 1,
+                "reason": "unused-binding lint; neither R nor V"
+              }
+            ],
+            "facade_errors": [
+              "<DIR>/main.crn at line 1\nexpected mock.Expected, got String",
+              "<DIR>/main.crn at line 1\nexpected mock.Expected, got String"
+            ],
+            "json": {
+              "errors": [
+                {
+                  "code": null,
+                  "location": {
+                    "file": "<DIR>/main.crn",
+                    "range": {
+                      "end": {
+                        "column": 51,
+                        "line": 1
+                      },
+                      "start": {
+                        "column": 32,
+                        "line": 1
+                      }
+                    }
+                  },
+                  "message": "expected mock.Expected, got String",
+                  "severity": "error"
+                },
+                {
+                  "code": null,
+                  "location": {
+                    "file": "<DIR>/main.crn",
+                    "range": {
+                      "end": {
+                        "column": 53,
+                        "line": 1
+                      },
+                      "start": {
+                        "column": 12,
+                        "line": 1
+                      }
+                    }
+                  },
+                  "message": "expected mock.Expected, got String",
+                  "severity": "error"
+                }
+              ],
+              "resource_count": 0,
+              "resources": [],
+              "status": "error",
+              "warnings": [
+                {
+                  "code": null,
+                  "location": {
+                    "file": "<DIR>/sources.crn",
+                    "range": null
+                  },
+                  "message": "for-loop binding 'key' is unused. Rename to '_' to suppress this warning.",
+                  "severity": "warning"
+                },
+                {
+                  "code": null,
+                  "location": {
+                    "file": "<DIR>/main.crn",
+                    "range": {
+                      "end": {
+                        "column": 9,
+                        "line": 1
+                      },
+                      "start": {
+                        "column": 5,
+                        "line": 1
+                      }
+                    }
+                  },
+                  "message": "Unused let binding 'sink'",
+                  "severity": "warning",
+                  "type": "unused_binding"
+                }
+              ]
+            },
+            "status": "reject",
+            "typed_error_vector": [
+              "ExpressionType(\n    Located {\n        location: DeclarationLocation {\n            file: SourceFileId(\n                \"<DIR>/main.crn\",\n            ),\n            span: SourceSpan {\n                start_byte: 31,\n                end_byte: 50,\n                start_line: 1,\n                start_column: 32,\n                end_line: 1,\n                end_column: 51,\n            },\n        },\n        detail: UnknownType {\n            reason: \"expected mock.Expected, got String\",\n        },\n    },\n)",
+              "ExpressionType(\n    Located {\n        location: DeclarationLocation {\n            file: SourceFileId(\n                \"<DIR>/main.crn\",\n            ),\n            span: SourceSpan {\n                start_byte: 11,\n                end_byte: 52,\n                start_line: 1,\n                start_column: 12,\n                end_line: 1,\n                end_column: 53,\n            },\n        },\n        detail: UnknownType {\n            reason: \"expected mock.Expected, got String\",\n        },\n    },\n)"
             ],
             "typed_input_warnings": [],
             "typed_parse_warnings": [
@@ -16558,7 +16639,7 @@
             ],
             [
               "main.crn",
-              "let x = mock.Source {\n    name = 'same'\n    count = 1\n}\nlet y = mock.CompatibleSource {\n    name = 'same'\n    count = 1\n}\nlet probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let x = mock.Source {\n    name = 'same'\n    count = 1\n}\nlet y = mock.CompatibleSource {\n    name = 'same'\n    count = 1\n}\nlet probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -16597,7 +16678,7 @@
             ],
             [
               "main.crn",
-              "let x = mock.Source {\n                 \n             \n}\nlet y = mock.CompatibleSource {\n                 \n             \n}\nlet probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let x = mock.Source {\n                 \n             \n}\nlet y = mock.CompatibleSource {\n                 \n             \n}\nlet probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -16649,7 +16730,7 @@
             },
             "status": "reject",
             "typed_error_vector": [
-              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[0]: cannot assign String to 'value': expected mock.Expected, got String (from x.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[0]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from x.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from x.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 171,\n                    end_byte: 176,\n                    start_line: 11,\n                    start_column: 5,\n                    end_line: 11,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
+              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[0]: cannot assign String to 'value': expected mock.Expected, got String (from x.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[0]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from x.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from x.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 176,\n                    end_byte: 181,\n                    start_line: 11,\n                    start_column: 5,\n                    end_line: 11,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
             ],
             "typed_input_warnings": [],
             "typed_parse_warnings": []
@@ -16669,7 +16750,7 @@
             ],
             [
               "main.crn",
-              "let x = mock.CompatibleSource {\n    name = 'same'\n    count = 1\n}\nlet y = mock.Source {\n    name = 'same'\n    count = 1\n}\nlet probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let x = mock.CompatibleSource {\n    name = 'same'\n    count = 1\n}\nlet y = mock.Source {\n    name = 'same'\n    count = 1\n}\nlet probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -16708,7 +16789,7 @@
             ],
             [
               "main.crn",
-              "let x = mock.CompatibleSource {\n                 \n             \n}\nlet y = mock.Source {\n                 \n             \n}\nlet probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let x = mock.CompatibleSource {\n                 \n             \n}\nlet y = mock.Source {\n                 \n             \n}\nlet probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -16760,7 +16841,7 @@
             },
             "status": "reject",
             "typed_error_vector": [
-              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[1]: cannot assign String to 'value': expected mock.Expected, got String (from y.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[1]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from y.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from y.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 171,\n                    end_byte: 176,\n                    start_line: 11,\n                    start_column: 5,\n                    end_line: 11,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
+              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[1]: cannot assign String to 'value': expected mock.Expected, got String (from y.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[1]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from y.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from y.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 176,\n                    end_byte: 181,\n                    start_line: 11,\n                    start_column: 5,\n                    end_line: 11,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
             ],
             "typed_input_warnings": [],
             "typed_parse_warnings": []
@@ -16795,94 +16876,18 @@
           "observation": {
             "diagnostics": [
               {
-                "channel": "warnings",
-                "class": "O",
+                "channel": "errors",
+                "class": "A",
                 "index": 0,
-                "reason": "unused for-loop binding lint; neither R nor V"
+                "reason": "not unambiguously declared-reference type R or concrete-value V; retain verbatim",
+                "resource_id": null
               },
               {
-                "channel": "warnings",
-                "class": "O",
-                "index": 1,
-                "reason": "unused-binding lint; neither R nor V"
-              }
-            ],
-            "facade_errors": [],
-            "json": {
-              "resource_count": 3,
-              "resources": [
-                "mock.Source.built.first",
-                "mock.Source.built.second",
-                "mock.Sink.sink"
-              ],
-              "status": "ok",
-              "warnings": [
-                {
-                  "code": null,
-                  "location": {
-                    "file": "<DIR>/main.crn",
-                    "range": null
-                  },
-                  "message": "for-loop binding 'key' is unused. Rename to '_' to suppress this warning.",
-                  "severity": "warning"
-                },
-                {
-                  "code": null,
-                  "location": {
-                    "file": "<DIR>/main.crn",
-                    "range": {
-                      "end": {
-                        "column": 9,
-                        "line": 8
-                      },
-                      "start": {
-                        "column": 5,
-                        "line": 8
-                      }
-                    }
-                  },
-                  "message": "Unused let binding 'sink'",
-                  "severity": "warning",
-                  "type": "unused_binding"
-                }
-              ]
-            },
-            "status": "accept",
-            "typed_error_vector": [],
-            "typed_input_warnings": [],
-            "typed_parse_warnings": [
-              "ParseWarning {\n    file: Some(\n        \"<DIR>/main.crn\",\n    ),\n    line: 2,\n    kind: UnusedForBinding,\n    span: None,\n    message: \"for-loop binding 'key' is unused. Rename to '_' to suppress this warning.\",\n}"
-            ]
-          }
-        },
-        {
-          "files": [
-            [
-              "sources.crn",
-              ""
-            ],
-            [
-              "main.crn",
-              "let input = { first = 0, second = 1 }\nlet built = for key, _ in input {\n  mock.Source {\n                 \n             \n}\n}\nlet sink = mock.Sink { value = built['first'].name }\n"
-            ],
-            [
-              "providers.crn",
-              "provider mock {}\n"
-            ],
-            [
-              "backend.crn",
-              "backend local { path = 'state.json' }\n"
-            ]
-          ],
-          "known": false,
-          "observation": {
-            "diagnostics": [
-              {
                 "channel": "errors",
-                "class": "R",
-                "index": 0,
-                "reason": "declared source type versus destination; direct/protected reference origin",
-                "resource_id": "mock.Sink.sink"
+                "class": "A",
+                "index": 1,
+                "reason": "not unambiguously declared-reference type R or concrete-value V; retain verbatim",
+                "resource_id": null
               },
               {
                 "channel": "warnings",
@@ -16898,7 +16903,8 @@
               }
             ],
             "facade_errors": [
-              "mock.Sink.sink: cannot assign String to 'value': expected mock.Expected, got String (from built.first.name)"
+              "<DIR>/main.crn at line 8\nexpected mock.Expected, got String",
+              "<DIR>/main.crn at line 8\nexpected mock.Expected, got String"
             ],
             "json": {
               "errors": [
@@ -16908,16 +16914,34 @@
                     "file": "<DIR>/main.crn",
                     "range": {
                       "end": {
-                        "column": 29,
+                        "column": 51,
                         "line": 8
                       },
                       "start": {
-                        "column": 24,
+                        "column": 32,
                         "line": 8
                       }
                     }
                   },
-                  "message": "Type mismatch: expected mock.Expected, got String (from built.first.name)",
+                  "message": "expected mock.Expected, got String",
+                  "severity": "error"
+                },
+                {
+                  "code": null,
+                  "location": {
+                    "file": "<DIR>/main.crn",
+                    "range": {
+                      "end": {
+                        "column": 53,
+                        "line": 8
+                      },
+                      "start": {
+                        "column": 12,
+                        "line": 8
+                      }
+                    }
+                  },
+                  "message": "expected mock.Expected, got String",
                   "severity": "error"
                 }
               ],
@@ -16957,7 +16981,145 @@
             },
             "status": "reject",
             "typed_error_vector": [
-              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.sink: cannot assign String to 'value': expected mock.Expected, got String (from built.first.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"sink\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from built.first.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from built.first.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 147,\n                    end_byte: 152,\n                    start_line: 8,\n                    start_column: 24,\n                    end_line: 8,\n                    end_column: 29,\n                },\n            },\n        ),\n    },\n)"
+              "ExpressionType(\n    Located {\n        location: DeclarationLocation {\n            file: SourceFileId(\n                \"<DIR>/main.crn\",\n            ),\n            span: SourceSpan {\n                start_byte: 155,\n                end_byte: 174,\n                start_line: 8,\n                start_column: 32,\n                end_line: 8,\n                end_column: 51,\n            },\n        },\n        detail: UnknownType {\n            reason: \"expected mock.Expected, got String\",\n        },\n    },\n)",
+              "ExpressionType(\n    Located {\n        location: DeclarationLocation {\n            file: SourceFileId(\n                \"<DIR>/main.crn\",\n            ),\n            span: SourceSpan {\n                start_byte: 135,\n                end_byte: 176,\n                start_line: 8,\n                start_column: 12,\n                end_line: 8,\n                end_column: 53,\n            },\n        },\n        detail: UnknownType {\n            reason: \"expected mock.Expected, got String\",\n        },\n    },\n)"
+            ],
+            "typed_input_warnings": [],
+            "typed_parse_warnings": [
+              "ParseWarning {\n    file: Some(\n        \"<DIR>/main.crn\",\n    ),\n    line: 2,\n    kind: UnusedForBinding,\n    span: None,\n    message: \"for-loop binding 'key' is unused. Rename to '_' to suppress this warning.\",\n}"
+            ]
+          }
+        },
+        {
+          "files": [
+            [
+              "sources.crn",
+              ""
+            ],
+            [
+              "main.crn",
+              "let input = { first = 0, second = 1 }\nlet built = for key, _ in input {\n  mock.Source {\n                 \n             \n}\n}\nlet sink = mock.Sink { value = built['first'].name }\n"
+            ],
+            [
+              "providers.crn",
+              "provider mock {}\n"
+            ],
+            [
+              "backend.crn",
+              "backend local { path = 'state.json' }\n"
+            ]
+          ],
+          "known": false,
+          "observation": {
+            "diagnostics": [
+              {
+                "channel": "errors",
+                "class": "A",
+                "index": 0,
+                "reason": "not unambiguously declared-reference type R or concrete-value V; retain verbatim",
+                "resource_id": null
+              },
+              {
+                "channel": "errors",
+                "class": "A",
+                "index": 1,
+                "reason": "not unambiguously declared-reference type R or concrete-value V; retain verbatim",
+                "resource_id": null
+              },
+              {
+                "channel": "warnings",
+                "class": "O",
+                "index": 0,
+                "reason": "unused for-loop binding lint; neither R nor V"
+              },
+              {
+                "channel": "warnings",
+                "class": "O",
+                "index": 1,
+                "reason": "unused-binding lint; neither R nor V"
+              }
+            ],
+            "facade_errors": [
+              "<DIR>/main.crn at line 8\nexpected mock.Expected, got String",
+              "<DIR>/main.crn at line 8\nexpected mock.Expected, got String"
+            ],
+            "json": {
+              "errors": [
+                {
+                  "code": null,
+                  "location": {
+                    "file": "<DIR>/main.crn",
+                    "range": {
+                      "end": {
+                        "column": 51,
+                        "line": 8
+                      },
+                      "start": {
+                        "column": 32,
+                        "line": 8
+                      }
+                    }
+                  },
+                  "message": "expected mock.Expected, got String",
+                  "severity": "error"
+                },
+                {
+                  "code": null,
+                  "location": {
+                    "file": "<DIR>/main.crn",
+                    "range": {
+                      "end": {
+                        "column": 53,
+                        "line": 8
+                      },
+                      "start": {
+                        "column": 12,
+                        "line": 8
+                      }
+                    }
+                  },
+                  "message": "expected mock.Expected, got String",
+                  "severity": "error"
+                }
+              ],
+              "resource_count": 0,
+              "resources": [],
+              "status": "error",
+              "warnings": [
+                {
+                  "code": null,
+                  "location": {
+                    "file": "<DIR>/main.crn",
+                    "range": null
+                  },
+                  "message": "for-loop binding 'key' is unused. Rename to '_' to suppress this warning.",
+                  "severity": "warning"
+                },
+                {
+                  "code": null,
+                  "location": {
+                    "file": "<DIR>/main.crn",
+                    "range": {
+                      "end": {
+                        "column": 9,
+                        "line": 8
+                      },
+                      "start": {
+                        "column": 5,
+                        "line": 8
+                      }
+                    }
+                  },
+                  "message": "Unused let binding 'sink'",
+                  "severity": "warning",
+                  "type": "unused_binding"
+                }
+              ]
+            },
+            "status": "reject",
+            "typed_error_vector": [
+              "ExpressionType(\n    Located {\n        location: DeclarationLocation {\n            file: SourceFileId(\n                \"<DIR>/main.crn\",\n            ),\n            span: SourceSpan {\n                start_byte: 155,\n                end_byte: 174,\n                start_line: 8,\n                start_column: 32,\n                end_line: 8,\n                end_column: 51,\n            },\n        },\n        detail: UnknownType {\n            reason: \"expected mock.Expected, got String\",\n        },\n    },\n)",
+              "ExpressionType(\n    Located {\n        location: DeclarationLocation {\n            file: SourceFileId(\n                \"<DIR>/main.crn\",\n            ),\n            span: SourceSpan {\n                start_byte: 135,\n                end_byte: 176,\n                start_line: 8,\n                start_column: 12,\n                end_line: 8,\n                end_column: 53,\n            },\n        },\n        detail: UnknownType {\n            reason: \"expected mock.Expected, got String\",\n        },\n    },\n)"
             ],
             "typed_input_warnings": [],
             "typed_parse_warnings": [

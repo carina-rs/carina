@@ -1,17 +1,15 @@
-//! `provider <name> { ... }` block parser and the top-level
-//! `require <expr>, "message"` statement parser.
+//! `provider <name> { ... }` block parser.
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::parser::ParsedValue as Value;
+use crate::parser::ParserProviderConfig as ProviderConfig;
 use crate::parser::Rule;
 use crate::parser::context::{ParseContext, next_pair};
 use crate::parser::error::ParseError;
-use crate::parser::expressions::validate_expr::parse_validate_expr;
 use crate::parser::grammar::{ParserBindingName, ProviderKindAttribute, ProviderSyntaxIssue};
 use crate::parser::parse_expression;
 use crate::parser::util::expression_is_plain_string_literal;
-use crate::parser::{ParserProviderConfig as ProviderConfig, ParserRequireBlock as RequireBlock};
 use crate::resource::{ConcreteValue, ValueString};
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
@@ -212,36 +210,4 @@ pub(in crate::parser) fn parse_provider_expr(
 
     config.binding = Some(binding_name.as_str().to_owned());
     Ok(config)
-}
-
-/// Parse a require statement: `require <validate_expr>, "error message"`
-pub(in crate::parser) fn parse_require_statement(
-    pair: pest::iterators::Pair<Rule>,
-    ctx: &crate::parser::ParseContext,
-    preprocessed_file: &crate::parser::PreprocessedFile,
-    _source_file: &std::path::Path,
-) -> Result<RequireBlock, ParseError> {
-    let mut inner = pair.into_inner();
-    let condition_pair = next_pair(&mut inner, "validate_expr", "require statement")?;
-    // Constraint diagnostics belong to the offending expression, not to the
-    // beginning of a potentially multi-line `require` statement.
-    let source_span = crate::parser::SourceSpan::from_pest(&condition_pair, preprocessed_file);
-    let location = ctx.declaration_location(&condition_pair);
-    let condition_id = ctx
-        .authored_node_id(&condition_pair)
-        .expect("retained require condition");
-    let condition = parse_validate_expr(
-        condition_pair,
-        ctx,
-        crate::parser::ConstraintStringPosition::RequireCondition,
-    )?;
-    let message_pair = next_pair(&mut inner, "string", "require statement")?;
-    let error_message = crate::parser::expressions::validate_expr::parse_constraint_string(
-        message_pair,
-        ctx,
-        crate::parser::ConstraintStringPosition::RequireMessage,
-    )?;
-    let declaration = RequireBlock::new_in_source(condition, error_message, source_span, location);
-    ctx.retain_require(condition_id, declaration.clone());
-    Ok(declaration)
 }

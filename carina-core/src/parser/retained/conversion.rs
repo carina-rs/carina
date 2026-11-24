@@ -515,7 +515,7 @@ fn rejection<B: BindingAddress>(
             | ExprKind::Parameter(_)
             | ExprKind::LoopSlot(_)
             | ExprKind::UntypedParameter
-            | ExprKind::Binding(_)
+            | ExprKind::Binding { .. }
             | ExprKind::Reference { .. }
             | ExprKind::List
             | ExprKind::Map(_)
@@ -535,14 +535,14 @@ fn rejection<B: BindingAddress>(
             | ExprKind::Iterable
             | ExprKind::Resource { .. }
             | ExprKind::Sink { .. }
-            | ExprKind::For
+            | ExprKind::For { .. }
             | ExprKind::Wait
             | ExprKind::Compose
             | ExprKind::DynamicAccess
             | ExprKind::ModuleCall
             | ExprKind::Boolean
             | ExprKind::Declaration
-            | ExprKind::RequireCondition(_)
+            | ExprKind::RequireCondition
             | ExprKind::ProviderDeclaration
             | ExprKind::Unsupported(_) => {
                 match usage.node().judgement().conversion_sources().first() {
@@ -911,7 +911,7 @@ pub(crate) fn check<K: AssignmentKind, P: crate::resource::PlaceholderKind, B: B
         | ExprKind::Parameter(_)
         | ExprKind::LoopSlot(_)
         | ExprKind::UntypedParameter
-        | ExprKind::Binding(_)
+        | ExprKind::Binding { .. }
         | ExprKind::Reference { .. }
         | ExprKind::List
         | ExprKind::Map(_)
@@ -931,14 +931,14 @@ pub(crate) fn check<K: AssignmentKind, P: crate::resource::PlaceholderKind, B: B
         | ExprKind::Iterable
         | ExprKind::Resource { .. }
         | ExprKind::Sink { .. }
-        | ExprKind::For
+        | ExprKind::For { .. }
         | ExprKind::Wait
         | ExprKind::Compose
         | ExprKind::DynamicAccess
         | ExprKind::ModuleCall
         | ExprKind::Boolean
         | ExprKind::Declaration
-        | ExprKind::RequireCondition(_)
+        | ExprKind::RequireCondition
         | ExprKind::ProviderDeclaration
         | ExprKind::Unsupported(_) => Ok(pass(&usage, declaration)),
     }

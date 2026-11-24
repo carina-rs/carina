@@ -386,7 +386,7 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
             compositions: &parsed.compositions,
             managed_current: &HashMap::new(),
             data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     );

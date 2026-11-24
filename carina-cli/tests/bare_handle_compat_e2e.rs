@@ -30,6 +30,21 @@ fn output_text(output: &Output) -> String {
     )
 }
 
+fn validate_diagnostic_messages(root: &Path) -> (Vec<String>, Vec<String>) {
+    let output = run(root, &["validate", ".", "--json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", output_text(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let messages = |kind: &str| {
+        report[kind]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|diagnostic| diagnostic["message"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    (messages("errors"), messages("warnings"))
+}
+
 fn assert_success(label: &str, output: &Output) {
     let text = output_text(output);
     assert!(output.status.success(), "{label} failed:\n{text}");
@@ -61,6 +76,256 @@ fn assert_validate_rejects(files: &[(&str, &str)], expected: &str, line: usize) 
         text.contains(expected) && text.contains(&format!("line {line}")),
         "missing {expected:?} at line {line}:\n{text}",
     );
+}
+
+const LOOP_READER_CASES: [(&str, &str, &str); 3] = [
+    (
+        "map",
+        "let items = { a = 'x' }\nlet children = for k, v in items { mock.test.resource { name = v } }\n",
+        "children['a'].name",
+    ),
+    (
+        "value-keyed",
+        "let items = ['a']\nlet children = for item in items { mock.test.resource { name = item } }\n",
+        "children['a'].name",
+    ),
+    (
+        "indexed",
+        "let items = ['a']\nlet children = for (i, item) in items { mock.test.resource { name = item } }\n",
+        "children[0].name",
+    ),
+];
+
+fn loop_reader_fixture(source: &str) -> tempfile::TempDir {
+    let fixture = tempfile::tempdir().expect("temporary loop project");
+    for (file, contents) in [
+        ("main.crn", source),
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "backend.crn",
+            "backend local { path = 'carina.state.json' }\n",
+        ),
+        ("other.crn", ""),
+        ("exports.crn", "exports {}\n"),
+    ] {
+        write_file(fixture.path(), file, contents);
+    }
+    assert_success("carina init", &run(fixture.path(), &["init", "."]));
+    fixture
+}
+
+fn loop_reader_positions(reader: &str) -> [(&'static str, String); 8] {
+    [
+        ("plain", reader.into()),
+        ("single interpolation", format!("\"${{{reader}}}\"")),
+        ("coalesce", format!("{reader} ?? 'p'")),
+        ("if", format!("if true {{ {reader} }} else {{ 'p' }}")),
+        ("function argument", format!("upper({reader})")),
+        ("multipart interpolation", format!("\"x-${{{reader}}}\"")),
+        ("arithmetic", format!("\"${{length({reader}) + 1}}\"")),
+        ("export", format!("{reader} ?? 'p'")),
+    ]
+}
+
+fn write_loop_reader(root: &Path, position: &str, expression: &str) {
+    let comment = if position == "export" {
+        "'other'"
+    } else {
+        expression
+    };
+    write_file(
+        root,
+        "other.crn",
+        &format!("let other = mock.test.resource {{ name = 'other' comment = {comment} }}\n"),
+    );
+    let export = if position == "export" {
+        expression
+    } else {
+        "other.name"
+    };
+    write_file(
+        root,
+        "exports.crn",
+        &format!("exports {{ out: String = {export} }}\n"),
+    );
+}
+
+fn validate_loop_reader(root: &Path, position: &str, expression: &str) -> Output {
+    write_loop_reader(root, position, expression);
+    run(root, &["validate", "."])
+}
+
+#[test]
+fn keyed_loop_readers_validate_in_every_position() {
+    let mut failures = Vec::new();
+    for (kind, source, reader) in LOOP_READER_CASES {
+        let fixture = loop_reader_fixture(source);
+        for (position, expression) in loop_reader_positions(reader) {
+            let output = validate_loop_reader(fixture.path(), position, &expression);
+            if !output.status.success() {
+                failures.push(format!("{kind}, {position}: {}", output_text(&output)));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn keyed_loop_invalid_reader_spellings_stay_rejected_in_every_position() {
+    for (kind, source, _) in LOOP_READER_CASES {
+        let fixture = loop_reader_fixture(source);
+        let invalid_subscript = if kind == "indexed" {
+            "children['a'].name"
+        } else {
+            "children[0].name"
+        };
+        for reader in ["children.a.name", invalid_subscript] {
+            for (position, expression) in loop_reader_positions(reader) {
+                let expected = match (kind, reader, position) {
+                    ("value-keyed", "children[0].name", _) => vec![
+                        "This loop is value-keyed; use a string subscript, or `for (i, x) in ...` for index addressing.",
+                    ],
+                    ("indexed", "children['a'].name", "plain" | "single interpolation") => {
+                        vec!["Undefined identifier `children.a`. Did you mean `children`?"]
+                    }
+                    ("indexed", "children['a'].name", _) => vec![
+                        "Undefined identifier `children.a`. Did you mean `children`?",
+                        "cannot apply access ['a'] to list(mock.test.resource)",
+                    ],
+                    (_, "children.a.name", "plain") => {
+                        vec!["unknown binding 'children' in reference children.a"]
+                    }
+                    (_, "children.a.name", "single interpolation") => vec![
+                        "mock.test.resource.other: unknown binding 'children' in reference children.a.name",
+                    ],
+                    ("indexed", "children.a.name", _) => {
+                        vec!["cannot apply access .a to list(mock.test.resource)"]
+                    }
+                    (_, "children.a.name", _) => vec!["cannot apply access .a to keyed loop group"],
+                    ("map", "children[0].name", "plain") => {
+                        vec!["unknown binding 'children[0]' in reference children[0].name"]
+                    }
+                    ("map", "children[0].name", "single interpolation") => vec![
+                        "mock.test.resource.other: unknown binding 'children[0]' in reference children[0].name",
+                    ],
+                    ("map", "children[0].name", _) => {
+                        vec!["cannot apply access [0] to keyed loop group"]
+                    }
+                    other => panic!("uncovered invalid reader case: {other:?}"),
+                };
+                write_loop_reader(fixture.path(), position, &expression);
+                let (errors, _) = validate_diagnostic_messages(fixture.path());
+                assert_eq!(errors, expected, "{kind}, {position}, {reader}");
+            }
+        }
+    }
+}
+
+#[test]
+fn keyed_loop_missing_keys_keep_the_plain_error_in_every_position() {
+    for (kind, source, _) in LOOP_READER_CASES.into_iter().take(2) {
+        let fixture = loop_reader_fixture(source);
+        for (position, expression) in loop_reader_positions("children['zzz'].name") {
+            write_loop_reader(fixture.path(), position, &expression);
+            let (errors, _) = validate_diagnostic_messages(fixture.path());
+            assert_eq!(
+                errors,
+                vec!["Undefined identifier `children.zzz`. Did you mean `children.a`?"],
+                "{kind}, {position}"
+            );
+        }
+    }
+}
+
+#[test]
+fn keyed_loop_whole_groups_stay_rejected_as_values() {
+    for (kind, source, _) in LOOP_READER_CASES {
+        let fixture = loop_reader_fixture(source);
+        for (position, expression) in loop_reader_positions("children") {
+            let output = validate_loop_reader(fixture.path(), position, &expression);
+            let text = output_text(&output);
+            assert!(!output.status.success(), "{kind}, {position}: {text}");
+            assert!(
+                text.contains("is a for binding, not a value"),
+                "{kind}, {position}: {text}"
+            );
+        }
+        for (other, exports) in [
+            (
+                "for c in children { mock.test.resource { name = c.name } }",
+                "exports {}",
+            ),
+            ("let count = length(children)", "exports {}"),
+            ("", "exports { out = children }"),
+            ("", "exports { out: map(String) = children }"),
+        ] {
+            write_file(fixture.path(), "other.crn", other);
+            write_file(fixture.path(), "exports.crn", exports);
+            let output = run(fixture.path(), &["validate", "."]);
+            let text = output_text(&output);
+            assert!(
+                !output.status.success(),
+                "{kind}, {other}, {exports}: {text}"
+            );
+            assert!(
+                text.contains("is a for binding, not a value"),
+                "{kind}, {other}, {exports}: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn keyed_loop_group_directory_diagnostic_lists() {
+    let fixture = loop_reader_fixture(LOOP_READER_CASES[0].1);
+    let bare_group = "'children' is a for binding, not a value; reference an instance attribute, e.g. 'children['key'].<attribute>'";
+    let coalesce = "coalesce default type `map` does not match left type `keyed loop group`";
+    let unused_key = "for-loop binding 'k' is unused. Rename to '_' to suppress this warning.";
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for (position, other, exports, errors) in [
+        (
+            "iterable",
+            "let copies = for c in children { mock.test.resource { name = c.name } }\n",
+            "exports {}\n",
+            vec![bare_group],
+        ),
+        (
+            "sink",
+            "let other = mock.test.resource { name = 'other' comment = children }\n",
+            "exports { out: String = other.name }\n",
+            vec![bare_group],
+        ),
+        (
+            "coalesce sink",
+            "let other = mock.test.resource { name = 'other' comment = children ?? {} }\n",
+            "exports { out: String = other.name }\n",
+            vec![coalesce, bare_group],
+        ),
+        (
+            "export",
+            "",
+            "exports { out = children }\n",
+            vec![bare_group],
+        ),
+        (
+            "coalesce export",
+            "",
+            "exports { out = children ?? {} }\n",
+            vec![bare_group],
+        ),
+    ] {
+        write_file(fixture.path(), "other.crn", other);
+        write_file(fixture.path(), "exports.crn", exports);
+        let (errors_actual, warnings) = validate_diagnostic_messages(fixture.path());
+        actual.push((position, errors_actual, warnings));
+        expected.push((
+            position,
+            errors.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+            vec![unused_key.to_owned()],
+        ));
+    }
+    assert_eq!(actual, expected, "complete CLI diagnostic lists");
 }
 
 #[test]
@@ -1184,7 +1449,7 @@ checked { r = vpc }
     write_file(
         fixture.path(),
         "checked/constraints.crn",
-        "require r.name == \"vpc\", \"wrong resource name\"\n",
+        "arguments { require r.name == \"vpc\", \"wrong resource name\" }\n",
     );
     write_file(
         fixture.path(),
@@ -1224,8 +1489,8 @@ checked { inner = r }
     write_file(
         fixture.path(),
         "checked/main.crn",
-        r#"arguments { inner: mock.compute.Instance }
-require inner.name == "vpc", "wrong nested resource name"
+        r#"arguments { inner: mock.compute.Instance
+require inner.name == "vpc", "wrong nested resource name" }
 mock.test.resource { name = "consumer" parent = inner.name }
 "#,
     );
@@ -1262,8 +1527,8 @@ checked { inner = r }
     write_file(
         fixture.path(),
         "checked/main.crn",
-        r#"arguments { inner: mock.compute.Instance }
-require inner.name == "nope", "wrong nested resource name"
+        r#"arguments { inner: mock.compute.Instance
+require inner.name == "nope", "wrong nested resource name" }
 mock.test.resource { name = "consumer" parent = inner.name }
 "#,
     );
@@ -1302,7 +1567,7 @@ checked { r = vpc }
     write_file(
         false_fixture.path(),
         "checked/constraints.crn",
-        "require r.name == \"nope\", \"wrong resource name\"\n",
+        "arguments { require r.name == \"nope\", \"wrong resource name\" }\n",
     );
     write_file(
         false_fixture.path(),
@@ -1327,14 +1592,14 @@ checked { r = vpc }
     for (arguments, constraint, expression, source_file, line) in [
         (
             "arguments { r: mock.compute.Instance }\n",
-            "require r == \"x\", \"bare handle\"\n",
+            "arguments { require r == \"x\", \"bare handle\" }\n",
             "r == \"x\"",
             "checked/constraints.crn",
             1,
         ),
         (
             "arguments { r: mock.compute.Instance }\n",
-            "require\n  length(r) > 0,\n  \"bare handle\"\n",
+            "arguments { require\n  length(r) > 0,\n  \"bare handle\" }\n",
             "length(r)",
             "checked/constraints.crn",
             2,
@@ -1647,7 +1912,7 @@ fn deferred_handle_constraint_reports_the_selected_operand() {
     write_file(
         fixture.path(),
         "checked/main.crn",
-        "arguments { r: mock.test.resource }\nrequire r.identifier == \"nope\", \"bad identifier\"\nmock.test.resource { name = \"consumer\" parent = r.identifier }\n",
+        "arguments { r: mock.test.resource \nrequire r.identifier == \"nope\", \"bad identifier\" }\nmock.test.resource { name = \"consumer\" parent = r.identifier }\n",
     );
 
     assert_success("carina init", &run(fixture.path(), &["init", "."]));
@@ -1677,7 +1942,7 @@ fn validation_subscript_uses_the_regular_expression_parser() {
     write_file(
         fixture.path(),
         "checked/main.crn",
-        "arguments { values: map(String) }\nrequire values[(\"ONE\")] == \"one\", \"wrong element\"\nmock.test.resource { name = \"consumer\" }\n",
+        "arguments { values: map(String) \nrequire values[(\"ONE\")] == \"one\", \"wrong element\" }\nmock.test.resource { name = \"consumer\" }\n",
     );
 
     assert_success(

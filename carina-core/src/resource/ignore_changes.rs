@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 
 use serde::{Deserialize, Serialize};
@@ -238,8 +238,9 @@ impl ResolvedIgnoreChanges {
         attribute: &str,
         desired: &Value<P>,
         observed: Option<&Value<Q>>,
-    ) -> super::SnapshotValue {
+    ) -> (super::SnapshotValue, Vec<LeafPath>) {
         let mut value = super::state_value_snapshot(desired);
+        let mut grafted = Vec::new();
         let observed = observed.map(super::state_value_snapshot);
         for path in self
             .for_attribute(attribute)
@@ -249,8 +250,9 @@ impl ResolvedIgnoreChanges {
                 .as_ref()
                 .and_then(|value| value_at_leaf(value, &path.leaf));
             set_leaf(&mut value, path.leaf.segments(), observed_leaf.cloned());
+            grafted.push(path.leaf.clone());
         }
-        value
+        (value, grafted)
     }
 
     /// Make an historical comparison baseline agree with a fresh observation
@@ -261,8 +263,8 @@ impl ResolvedIgnoreChanges {
     /// their current values.
     pub fn mask_observed_readable_leaves(
         &self,
-        baseline: &mut HashMap<String, super::SnapshotValue>,
-        observed: &HashMap<String, super::SnapshotValue>,
+        baseline: &mut std::collections::BTreeMap<String, super::SnapshotValue>,
+        observed: &std::collections::BTreeMap<String, super::SnapshotValue>,
     ) {
         let attributes = self
             .iter()
@@ -289,7 +291,7 @@ impl ResolvedIgnoreChanges {
             let Some(value) = baseline.get(&attribute).cloned() else {
                 continue;
             };
-            let masked =
+            let (masked, _grafted) =
                 self.with_observed_readable_leaves(&attribute, &value, observed.get(&attribute));
             baseline.insert(attribute, masked);
         }

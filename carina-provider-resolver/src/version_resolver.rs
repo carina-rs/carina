@@ -427,13 +427,6 @@ pub(crate) fn resolve_from_releases(
     }
 }
 
-pub(crate) fn resolve_release_at_version(
-    releases: &[GithubRelease],
-    version: &Version,
-) -> Result<Option<GithubRelease>, ReleaseResolutionError> {
-    resolve_exact_release(releases, version)
-}
-
 pub(crate) fn fetch_releases_with_api<H: GithubHttp + ?Sized>(
     source: &GithubSource,
     api: &GithubApi<'_, H>,

@@ -1,5 +1,6 @@
 // Production root modules for crate-visible compile-fail doctests.
 // The positive control catches source-map and visibility failures.
+// Keep in sync with lib.rs via scripts/check-doctest-module-tree.sh.
 
 #[cfg(all(feature = "provider-host", target_arch = "wasm32"))]
 compile_error!(
@@ -44,7 +45,9 @@ pub(crate) mod eval_value;
 pub mod execution_authority;
 pub mod executor;
 pub mod explicit;
+pub mod finding;
 pub mod formatter;
+pub mod github_auth;
 pub mod heredoc;
 pub mod hint;
 pub mod identifier;

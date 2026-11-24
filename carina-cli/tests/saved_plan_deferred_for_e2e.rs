@@ -174,8 +174,26 @@ let rs = for _, t in (src.tags ?? {}) {
             self.expected_sources,
             "the mock omits tags for an untagged test.resource, so the coalesced deferred loop must create zero children: {states:#?}",
         );
+        let applied = read_json(&self.project.join("carina.state.json"));
+        let source_identifiers = applied["resources"]
+            .as_array()
+            .expect("applied resources")
+            .iter()
+            .filter(|row| {
+                row["identity"]
+                    .as_str()
+                    .is_some_and(|identity| identity == "src" || identity.ends_with(".src"))
+            })
+            .map(|row| {
+                row["current"]["identifier"]
+                    .as_str()
+                    .expect("source identifier")
+            })
+            .collect::<std::collections::BTreeSet<_>>();
         assert!(
-            states.keys().all(|address| address.ends_with(".src")),
+            states
+                .keys()
+                .all(|identifier| source_identifiers.contains(identifier.as_str())),
             "every created resource must be a deferred-loop source: {states:#?}"
         );
 

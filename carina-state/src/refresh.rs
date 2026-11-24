@@ -1,5 +1,7 @@
 //! Current-instance refresh eligibility is decided before desired/orphan splitting.
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 
 use carina_core::{
     differ::Orphan,
@@ -67,24 +69,30 @@ impl ResolvedRemovedClaims {
         })
     }
 
-    fn partition(&self, rows: impl IntoIterator<Item = (ResourceId, RefreshRow)>) -> PreparedRows {
+    fn partition(
+        &self,
+        rows: impl IntoIterator<Item = (ResolvedResourceId, RefreshRow)>,
+    ) -> PreparedRows {
         let claims: HashSet<_> = self.0.iter().map(ResolvedResourceId::as_inner).collect();
         let mut refreshable = RefreshRows::default();
+        let mut rows_in_order = Vec::new();
         let mut removed = RemovedRows::default();
         for (id, mut row) in rows {
             // Deposed generations retain their independent refresh lifecycle.
             for key in std::mem::take(&mut row.deposed) {
-                refreshable
-                    .deposed
-                    .push((ResolvedResourceId::new(id.clone()), key));
+                refreshable.deposed.push((id.clone(), key));
             }
             // The single current-instance refresh eligibility decision.
-            if claims.contains(&id) {
-                removed.ids.push(ResolvedResourceId::new(id));
+            if claims.contains(id.as_inner()) {
+                removed.ids.push(id);
             } else {
-                refreshable.rows.insert(id, row);
+                let orphan = row.into_orphan();
+                let mut dependencies = orphan.destroy_dependencies().clone();
+                dependencies.extend_projected(&orphan.directives().depends_on);
+                rows_in_order.push((id, dependencies, orphan));
             }
         }
+        refreshable.rows = carina_core::differ::CanonicalOrphanRows::new(rows_in_order);
         PreparedRows {
             refreshable,
             removed,
@@ -98,6 +106,36 @@ struct RefreshRow {
     current: Current,
     binding: Option<AbsoluteBindingAddress>,
     directives: PersistedDirectives,
+    dependencies: Option<carina_core::resource::PersistedDestroyDependencies>,
+}
+
+impl RefreshRow {
+    fn into_orphan(self) -> Orphan {
+        let Self {
+            current,
+            binding,
+            directives,
+            dependencies,
+            ..
+        } = self;
+        let mut orphan = match current {
+            Current::Absent(state) => Orphan::absent(state, binding, directives),
+            Current::Present(present) => Orphan::present(present, binding, directives),
+            Current::CreateInFlight(pending) => {
+                Orphan::create_in_flight(pending, binding, directives)
+            }
+            Current::CreateOutcomeUnknown(unknown) => {
+                Orphan::create_outcome_unknown(unknown, binding, directives)
+            }
+            Current::MissingIdentifier(state) => {
+                Orphan::missing_identifier(state, binding, directives)
+            }
+        };
+        if let Some(dependencies) = dependencies {
+            orphan.set_dependency_bindings(dependencies);
+        }
+        orphan
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -110,14 +148,7 @@ impl PreparedRows {
     pub fn from_state(state: Option<&StateFile>, claims: &ResolvedRemovedClaims) -> Self {
         claims.partition(state.into_iter().flat_map(|state| {
             state.resources().iter().map(|row| {
-                let id = ResolvedResourceId::with_provider_identity(
-                    row.provider.clone(),
-                    row.resource_type.clone(),
-                    row.identity.clone(),
-                    row.directives.provider_instance.clone(),
-                )
-                .into_inner();
-                let current = state.build_state_for_resource(&id);
+                let (id, current) = state.orphan_row(row);
                 (
                     id,
                     RefreshRow {
@@ -129,6 +160,7 @@ impl PreparedRows {
                         current,
                         binding: row.binding.clone(),
                         directives: row.directives.clone(),
+                        dependencies: Some(row.dependency_bindings.clone()),
                     },
                 )
             })
@@ -136,7 +168,7 @@ impl PreparedRows {
     }
 
     pub fn from_snapshots(
-        snapshots: impl IntoIterator<Item = (ResourceId, Current)>,
+        snapshots: impl IntoIterator<Item = (ResolvedResourceId, Current)>,
         claims: &ResolvedRemovedClaims,
     ) -> Self {
         claims.partition(snapshots.into_iter().map(|(id, current)| {
@@ -147,6 +179,7 @@ impl PreparedRows {
                     current,
                     binding: None,
                     directives: PersistedDirectives::default(),
+                    dependencies: None,
                 },
             )
         }))
@@ -156,7 +189,7 @@ impl PreparedRows {
 /// The only authority that can mint current-instance refresh inputs.
 #[derive(Debug, Clone, Default)]
 pub struct RefreshRows {
-    rows: HashMap<ResourceId, RefreshRow>,
+    rows: carina_core::differ::CanonicalOrphanRows<Orphan>,
     deposed: Vec<(ResolvedResourceId, DeposedKey)>,
 }
 
@@ -167,7 +200,7 @@ impl RefreshRows {
     ) -> impl Iterator<Item = RefreshableDeposed> + 'a {
         self.deposed.iter().filter_map(move |(row_id, key)| {
             // Selection belongs to the partition. Reload the payload after
-            // dependency migration so refresh cannot write back stale metadata.
+            // state mutations so refresh cannot write back stale metadata.
             let row = state.find_resource_for_id(row_id.as_inner())?;
             let generation = row
                 .deposed
@@ -189,49 +222,24 @@ impl RefreshRows {
     pub fn current(&self, id: &ResourceId) -> Option<RefreshableCurrent> {
         self.rows.get(id).map(|row| RefreshableCurrent {
             id: id.clone(),
-            current: row.current.clone(),
+            current: row.current().clone(),
         })
     }
 
     pub fn build_orphans(&self, desired: &HashSet<ResourceId>) -> RefreshableOrphans {
-        RefreshableOrphans(
+        RefreshableOrphans(carina_core::differ::CanonicalOrphanRows::new(
             self.rows
                 .iter()
-                .filter_map(|(id, row)| {
-                    if desired.contains(id) {
-                        return None;
-                    }
-                    let orphan = match row.current.clone() {
-                        Current::Absent(_) => return None,
-                        Current::Present(present) => {
-                            Orphan::present(present, row.binding.clone(), row.directives.clone())
-                        }
-                        Current::CreateInFlight(pending) => Orphan::create_in_flight(
-                            pending,
-                            row.binding.clone(),
-                            row.directives.clone(),
-                        ),
-                        Current::CreateOutcomeUnknown(unknown) => Orphan::create_outcome_unknown(
-                            unknown,
-                            row.binding.clone(),
-                            row.directives.clone(),
-                        ),
-                        Current::MissingIdentifier(state) => Orphan::missing_identifier(
-                            state,
-                            row.binding.clone(),
-                            row.directives.clone(),
-                        ),
-                    };
-                    Some((
-                        id.clone(),
-                        RefreshableOrphan {
-                            id: id.clone(),
-                            orphan,
-                        },
-                    ))
+                .filter(|(id, orphan)| {
+                    !desired.contains(id.as_inner())
+                        && !matches!(orphan.current(), Current::Absent(_))
                 })
-                .collect(),
-        )
+                .map(|(id, orphan)| {
+                    let mut dependencies = orphan.destroy_dependencies().clone();
+                    dependencies.extend_projected(&orphan.directives().depends_on);
+                    (id.clone(), dependencies, orphan.clone())
+                }),
+        ))
     }
 }
 
@@ -306,20 +314,37 @@ impl RefreshableOrphan {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct RefreshableOrphans(Vec<(ResourceId, RefreshableOrphan)>);
+pub struct RefreshableOrphans(carina_core::differ::CanonicalOrphanRows<Orphan>);
 impl RefreshableOrphans {
     pub fn into_plan_orphans(self) -> carina_core::differ::Orphans {
-        self.0
-            .into_iter()
-            .map(|(_, row)| row.into_orphan())
-            .collect()
+        self.0.into_iter().collect()
     }
 }
+
+pub struct RefreshableOrphansIter(
+    <carina_core::differ::CanonicalOrphanRows<Orphan> as IntoIterator>::IntoIter,
+);
+impl Iterator for RefreshableOrphansIter {
+    type Item = (ResolvedResourceId, RefreshableOrphan);
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|(id, orphan)| {
+            let row = RefreshableOrphan {
+                id: id.as_inner().clone(),
+                orphan,
+            };
+            (id, row)
+        })
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+impl ExactSizeIterator for RefreshableOrphansIter {}
 impl IntoIterator for RefreshableOrphans {
-    type Item = (ResourceId, RefreshableOrphan);
-    type IntoIter = std::vec::IntoIter<Self::Item>;
+    type Item = (ResolvedResourceId, RefreshableOrphan);
+    type IntoIter = RefreshableOrphansIter;
     fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
+        RefreshableOrphansIter(self.0.into_iter())
     }
 }
 
@@ -472,6 +497,32 @@ mod tests {
     }
 
     #[test]
+    fn issue_4491_snapshot_orphan_read_uses_lookup_key_instead_of_payload_id() {
+        let lookup = id("before_move", Some("source"));
+        let payload = id("after_move", Some("destination"));
+        let state = State::existing(payload.as_inner().clone(), HashMap::new())
+            .with_identifier("provider-identifier");
+        let rows = PreparedRows::from_snapshots(
+            [(lookup.clone(), Current::from_state(state))],
+            &ResolvedRemovedClaims::resolve(&[], None),
+        );
+        let current_target = rows
+            .refreshable
+            .current(lookup.as_inner())
+            .unwrap()
+            .read_target()
+            .unwrap();
+        assert_eq!(current_target.id(), lookup.as_inner());
+        let mut orphans = rows.refreshable.build_orphans(&HashSet::new()).into_iter();
+        let (_, orphan) = orphans.next().unwrap();
+        let target = orphan.read_target().unwrap();
+        assert_eq!(target.id(), lookup.as_inner());
+        assert_eq!(target.identifier().as_str(), "provider-identifier");
+        assert_eq!(orphan.current().id(), payload.as_inner());
+        assert!(orphans.next().is_none());
+    }
+
+    #[test]
     fn snapshots_use_recorded_routed_remove_effects() {
         let removed = id("old", Some("alias"));
         let other_route = id("old", None);
@@ -485,7 +536,7 @@ mod tests {
             [removed.clone(), other_route.clone()].map(|id| {
                 let state = State::existing(id.as_inner().clone(), HashMap::new())
                     .with_identifier("identifier");
-                (id.into_inner(), Current::from_state(state))
+                (id, Current::from_state(state))
             }),
             &claims,
         );
@@ -562,20 +613,20 @@ mod tests {
     }
 
     #[test]
-    fn deposed_targets_reload_migrated_dependency_metadata() {
+    fn deposed_targets_reload_updated_dependency_metadata() {
         let mut state = StateFile::new();
         let mut row = ResourceState::new("test.resource", "historical", "mock");
         row.deposed.push(generation("old", None));
         state.upsert_resource(row.clone()).unwrap();
         let rows =
             PreparedRows::from_state(Some(&state), &ResolvedRemovedClaims::resolve(&[], None));
-        let migrated = carina_core::resource::PersistedDestroyDependencies::from_test_dependencies(
+        let updated = carina_core::resource::PersistedDestroyDependencies::from_test_dependencies(
             [id("dependency", None)],
         );
-        row.deposed[0].dependency_bindings = migrated.clone();
+        row.deposed[0].dependency_bindings = updated.clone();
         state.upsert_resource(row).unwrap();
         let target = rows.refreshable.deposed_targets(&state).next().unwrap();
-        assert_eq!(target.generation().dependency_bindings, migrated);
+        assert_eq!(target.generation().dependency_bindings, updated);
         assert_eq!(
             target.read_target().unwrap().identifier().as_str(),
             "old-identifier"
@@ -588,9 +639,12 @@ mod tests {
         let missing = id("missing", None).into_inner();
         let rows = PreparedRows::from_snapshots(
             [
-                (absent.clone(), Current::absent(absent.clone())),
                 (
-                    missing.clone(),
+                    ResolvedResourceId::new(absent.clone()),
+                    Current::absent(absent.clone()),
+                ),
+                (
+                    ResolvedResourceId::new(missing.clone()),
                     Current::from_state(State::existing(missing.clone(), HashMap::new())),
                 ),
             ],
@@ -625,5 +679,76 @@ mod tests {
                 .current(),
             Current::MissingIdentifier(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+    use crate::{LoadedOrphans, ResourceState};
+    use carina_core::resource::{PersistedDestroyDependencies, ResourceIdentity};
+
+    #[test]
+    fn issue_4491_refresh_and_loaded_orphans_share_delete_order() {
+        let id = |name: &str| {
+            ResolvedResourceId::with_provider_identity(
+                "mock",
+                "test.resource",
+                ResourceIdentity::try_from(name.to_owned()).unwrap(),
+                None,
+            )
+        };
+        let mut state = StateFile::new();
+        for name in ["alpha", "theta", "beta", "delta", "zulu", "gamma"] {
+            let mut row = ResourceState::try_applied("test.resource", name, "mock", name).unwrap();
+            let parent = match name {
+                "zulu" => Some("beta"),
+                "beta" => Some("alpha"),
+                _ => None,
+            };
+            let dependencies = PersistedDestroyDependencies::decode_persisted(
+                parent.map(id).into_iter().collect(),
+            )
+            .unwrap();
+            if name == "beta" {
+                row.directives.depends_on = dependencies;
+            } else {
+                row.dependency_bindings = dependencies;
+            }
+            state.upsert_resource(row).unwrap();
+        }
+        let prepared = PreparedRows::from_state(
+            Some(&state),
+            &ResolvedRemovedClaims::resolve(&[], Some(&state)),
+        );
+        let expected = ["delta", "gamma", "theta", "zulu", "beta", "alpha"];
+        let refreshable = prepared.refreshable.build_orphans(&HashSet::new());
+        let names: Vec<_> = refreshable
+            .clone()
+            .into_iter()
+            .map(|(id, _)| id.identity_str().to_owned())
+            .collect();
+        assert_eq!(names, expected);
+        let mut loaded = LoadedOrphans::default();
+        let mut entries: Vec<_> = refreshable.into_iter().collect();
+        entries.reverse();
+        for (id, row) in entries {
+            loaded.insert(id, row.into_orphan());
+        }
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|(id, _)| id.identity_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            loaded
+                .into_plan_orphans()
+                .keys()
+                .map(|id| id.identity_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 }

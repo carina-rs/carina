@@ -13,8 +13,7 @@ pub(crate) mod binding_address;
 mod dependencies;
 pub use dependencies::{
     DeferredDependencyPhase, DeferredDependencyTemplate, NotAManagedRow,
-    PersistedDestroyDependencies, PersistedDestroyDependencyProjection, ResolvedDependencies,
-    UnexpandedDependencyFields,
+    PersistedDestroyDependencies, ResolvedDependencies, UnexpandedDependencyFields,
 };
 pub(crate) use dependencies::{
     ResolvedDependencyReads, SYNTHETIC_TYPE_PREFIX, deserialize_persisted_destroy_dependencies,
@@ -68,9 +67,13 @@ use crate::schema::{
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use binding_address::absolute_binding_address_for_test;
-pub use binding_address::{AbsoluteBindingAddress, BindingAddress, RelativeBindingName};
+pub use binding_address::{
+    AbsoluteBindingAddress, BindingAddress, BoundForAddress, CheckedBindingAddress,
+    ForAddressDefer, ForKeyError, RelativeBindingName, decompose_binding_address,
+};
 pub(crate) use binding_address::{
-    binding_with_index, binding_with_map_key, module_argument_placeholder,
+    AdmittedForMember, BindingLookup, ForAddressAdmission, ForAddressMoment, ForAdmissionFailure,
+    admit_bound_for_addresses, classify_for_key_type, module_argument_placeholder,
 };
 pub use directive_expr::{
     ArgumentValueOrigin, DirectiveExpr, DirectiveResolutionError, DirectiveResolutionErrors,
@@ -297,7 +300,7 @@ pub fn enum_attr_at_schema_path<'a>(
 /// let identity = String::from("runtime-identity");
 /// let _ = ResourceId::with_identity("test.Resource", identity);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceIdentity(String);
 
 /// Error returned when a runtime value cannot be used as a resource identity.
@@ -961,7 +964,7 @@ struct ResourceWithDependenciesWire<S, P: ValueKind> {
     #[serde(default)]
     directives: Directives<AbsoluteBindingAddress, P>,
     #[serde(default)]
-    prefixes: HashMap<String, String>,
+    prefixes: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     binding: Option<AbsoluteBindingAddress>,
     dependencies: (),
@@ -2776,14 +2779,14 @@ fn select_classified_segment<P: PlaceholderKind, B: BindingAddress>(
                     }),
                     PathSegment::Subscript {
                         index: Subscript::Int { index },
-                    } => Value::Deferred(DeferredValue::BindingRef {
-                        binding: binding_with_index(binding, index),
-                    }),
+                    } => BindingLookup::new(binding)
+                        .select(&Subscript::Int { index })
+                        .reference(),
                     PathSegment::Subscript {
                         index: Subscript::Str { key },
-                    } => Value::Deferred(DeferredValue::BindingRef {
-                        binding: binding_with_map_key(binding, &key),
-                    }),
+                    } => BindingLookup::new(binding)
+                        .select(&Subscript::Str { key })
+                        .reference(),
                 },
                 Value::Deferred(DeferredValue::Secret(_)) => {
                     unreachable!("Secret has an opaque known arm")
@@ -4867,6 +4870,30 @@ enum RedactedSecretHashKind {
     },
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) mod secret_hash_test_entropy {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SALT: Cell<Option<[u8; 16]>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn salt() -> Option<[u8; 16]> {
+        SALT.get()
+    }
+
+    pub(crate) fn with_salt<T>(salt: [u8; 16], record: impl FnOnce() -> T) -> T {
+        struct Restore(Option<[u8; 16]>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SALT.set(self.0);
+            }
+        }
+        let _restore = Restore(SALT.replace(Some(salt)));
+        record()
+    }
+}
+
 impl RedactedSecretHash {
     const SALT_LEN: usize = 16;
     const MAX_EXPLICIT_LEGACY_SALT_LEN: usize = 4096;
@@ -4874,12 +4901,15 @@ impl RedactedSecretHash {
     /// Historical prefix retained only as stable identity and list-pairing hash
     /// material. Current persisted state uses the structural `$secret` tag.
     const V2_MARKER_PREFIX: &'static str = "_secret:$argon2id$";
-    const LEGACY_MARKER_PREFIX: &'static str = "_secret:argon2:";
-    const STATE_MARKER_PREFIX: &'static str = "_secret:";
     const EXPLICIT_LEGACY_DIGEST_PREFIX: &'static str = "argon2-legacy:";
     const LEGACY_FALLBACK_SALT: &'static [u8] = b"carina-secret-v1";
 
     pub(crate) fn generate(plaintext: &[u8]) -> Self {
+        #[cfg(any(test, feature = "test-utils"))]
+        let salt = secret_hash_test_entropy::salt()
+            .map(|salt| SaltString::encode_b64(&salt).expect("fixture salt has valid length"))
+            .unwrap_or_else(|| SaltString::generate(&mut OsRng));
+        #[cfg(not(any(test, feature = "test-utils")))]
         let salt = SaltString::generate(&mut OsRng);
         let encoded = Argon2::default()
             .hash_password(plaintext, &salt)
@@ -4924,49 +4954,6 @@ impl RedactedSecretHash {
                 verify_with_salt(salt) | verify_with_salt(Self::LEGACY_FALLBACK_SALT)
             }
         }
-    }
-
-    /// Parse a self-contained state marker. Raw pre-v12 legacy markers
-    /// deliberately fail; only the state-file row decoder may upgrade those.
-    fn parse_legacy_persisted_marker(marker: &str) -> Option<Self> {
-        marker
-            .strip_prefix(Self::STATE_MARKER_PREFIX)
-            .and_then(Self::from_encoded_digest)
-    }
-
-    fn upgrade_raw_legacy_marker_for_state_row(
-        marker: &str,
-        display_type: &str,
-        identity: &str,
-        top_level_attribute_key: &str,
-    ) -> Result<Option<Self>, legacy_secret_migration::LegacySecretMigrationError> {
-        let Some(encoded) = marker.strip_prefix(Self::LEGACY_MARKER_PREFIX) else {
-            return Ok(None);
-        };
-        let mut hash = [0_u8; Self::HASH_LEN];
-        if hex::decode_to_slice(encoded, &mut hash).is_err() {
-            return Ok(None);
-        }
-        let row_salt = format!(
-            "carina:{}:{}:{}",
-            display_type, identity, top_level_attribute_key
-        )
-        .into_bytes();
-        if row_salt.len() > Self::MAX_EXPLICIT_LEGACY_SALT_LEN {
-            return Err(
-                legacy_secret_migration::LegacySecretMigrationError::LegacySaltTooLong {
-                    actual: row_salt.len(),
-                    maximum: Self::MAX_EXPLICIT_LEGACY_SALT_LEN,
-                },
-            );
-        }
-        Ok(Some(Self(RedactedSecretHashKind::ExplicitSaltLegacy {
-            // Pre-v12 write-only attributes could use a context-free fallback
-            // salt. Verification tries that fixed constant from code after
-            // the row-derived salt, so the marker need not store it.
-            salt: row_salt,
-            hash,
-        })))
     }
 
     pub fn from_encoded_digest(encoded: &str) -> Option<Self> {
@@ -5033,435 +5020,6 @@ impl RedactedSecretHash {
                     hex::encode(hash)
                 )
             }
-        }
-    }
-}
-
-/// Parsers and rewrites for state formats that encoded secret identity in
-/// `_secret:...` strings. Current persisted/provider/WASM decoders do not use
-/// this module; only version-checked whole-document migrations are public.
-/// Bare JSON values cannot be submitted for marker classification:
-///
-/// ```compile_fail
-/// use carina_core::resource::legacy_secret_migration;
-///
-/// let mut value = serde_json::json!("_secret:argon2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-/// let _ = legacy_secret_migration::migrate_state_row_attribute(
-///     &mut value,
-///     "mock.test.resource",
-///     "example",
-///     "password",
-/// );
-/// ```
-///
-/// ```compile_fail
-/// use carina_core::resource::legacy_secret_migration;
-///
-/// let mut value = serde_json::json!("_secret:argon2-legacy:73616c74:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-/// legacy_secret_migration::migrate_self_contained_markers(&mut value);
-/// ```
-pub mod legacy_secret_migration {
-    use super::RedactedSecretHash;
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum LegacySecretMigrationError {
-        InvalidDocument {
-            artifact: &'static str,
-            detail: &'static str,
-        },
-        UnsupportedVersion {
-            artifact: &'static str,
-            found: u64,
-            expected: &'static str,
-        },
-        LegacySaltTooLong {
-            actual: usize,
-            maximum: usize,
-        },
-        StateAttribute {
-            key: String,
-            source: Box<LegacySecretMigrationError>,
-        },
-    }
-
-    impl std::fmt::Display for LegacySecretMigrationError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::InvalidDocument { artifact, detail } => {
-                    write!(f, "invalid {artifact} migration document: {detail}")
-                }
-                Self::UnsupportedVersion {
-                    artifact,
-                    found,
-                    expected,
-                } => write!(
-                    f,
-                    "cannot apply {artifact} migration to version {found}; expected {expected}"
-                ),
-                Self::LegacySaltTooLong { actual, maximum } => write!(
-                    f,
-                    "pre-v12 legacy salt has {actual} bytes; the maximum is {maximum} bytes"
-                ),
-                Self::StateAttribute { key, source } => {
-                    write!(f, "failed to migrate state attribute {key:?}: {source}")
-                }
-            }
-        }
-    }
-
-    impl std::error::Error for LegacySecretMigrationError {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            match self {
-                Self::StateAttribute { source, .. } => Some(source),
-                Self::InvalidDocument { .. }
-                | Self::UnsupportedVersion { .. }
-                | Self::LegacySaltTooLong { .. } => None,
-            }
-        }
-    }
-
-    fn structural_secret(hash: &RedactedSecretHash) -> serde_json::Value {
-        serde_json::json!({
-            crate::value::PERSISTED_SECRET_KEY: hash.encoded_digest(),
-        })
-    }
-
-    /// Migrate the self-contained marker strings understood by mock-state v1.
-    /// Raw row-bound markers remain strings because that format never carried
-    /// the resource-row inputs required to assign them secret semantics.
-    fn migrate_self_contained_markers(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::String(marker) => {
-                if let Some(hash) = RedactedSecretHash::parse_legacy_persisted_marker(marker) {
-                    *value = structural_secret(&hash);
-                }
-            }
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    migrate_self_contained_markers(value);
-                }
-            }
-            serde_json::Value::Object(values) => {
-                for value in values.values_mut() {
-                    migrate_self_contained_markers(value);
-                }
-            }
-            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            }
-        }
-    }
-
-    /// Migrate one top-level resource attribute from state v13 or earlier.
-    /// The row metadata binds exact pre-v12 raw digests to their historical
-    /// salt; self-contained markers need no row context.
-    fn migrate_state_row_attribute(
-        value: &mut serde_json::Value,
-        display_type: &str,
-        identity: &str,
-        top_level_attribute_key: &str,
-    ) -> Result<(), LegacySecretMigrationError> {
-        match value {
-            serde_json::Value::String(marker) => {
-                if let Some(hash) = RedactedSecretHash::parse_legacy_persisted_marker(marker) {
-                    *value = structural_secret(&hash);
-                } else if let Some(hash) =
-                    RedactedSecretHash::upgrade_raw_legacy_marker_for_state_row(
-                        marker,
-                        display_type,
-                        identity,
-                        top_level_attribute_key,
-                    )?
-                {
-                    *value = structural_secret(&hash);
-                }
-            }
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    migrate_state_row_attribute(
-                        value,
-                        display_type,
-                        identity,
-                        top_level_attribute_key,
-                    )?;
-                }
-            }
-            serde_json::Value::Object(values) => {
-                for value in values.values_mut() {
-                    migrate_state_row_attribute(
-                        value,
-                        display_type,
-                        identity,
-                        top_level_attribute_key,
-                    )?;
-                }
-            }
-            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            }
-        }
-        Ok(())
-    }
-
-    fn document_version(
-        document: &serde_json::Value,
-        artifact: &'static str,
-    ) -> Result<u64, LegacySecretMigrationError> {
-        let object = document
-            .as_object()
-            .ok_or(LegacySecretMigrationError::InvalidDocument {
-                artifact,
-                detail: "root must be an object",
-            })?;
-        object
-            .get("version")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or(LegacySecretMigrationError::InvalidDocument {
-                artifact,
-                detail: "version must be an unsigned integer",
-            })
-    }
-
-    /// Upgrade a complete Carina state document through the v13 secret-marker
-    /// migration. Only current and deposed resource attribute trees are
-    /// classified; exports and all host metadata remain untouched.
-    pub fn migrate_state_document_v13(
-        document: &mut serde_json::Value,
-    ) -> Result<(), LegacySecretMigrationError> {
-        const ARTIFACT: &str = "Carina state v13";
-        let version = document_version(document, ARTIFACT)?;
-        if version > 13 {
-            return Err(LegacySecretMigrationError::UnsupportedVersion {
-                artifact: ARTIFACT,
-                found: version,
-                expected: "version 13 or earlier",
-            });
-        }
-
-        let mut migrated = document.clone();
-        let resources = migrated
-            .get_mut("resources")
-            .and_then(serde_json::Value::as_array_mut)
-            .ok_or(LegacySecretMigrationError::InvalidDocument {
-                artifact: ARTIFACT,
-                detail: "resources must be an array",
-            })?;
-        for resource in resources {
-            let provider = resource
-                .get("provider")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let resource_type = resource
-                .get("resource_type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let identity = resource
-                .get("identity")
-                .or_else(|| resource.get("name"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let display_type = if provider.is_empty() {
-                resource_type
-            } else {
-                format!("{provider}.{resource_type}")
-            };
-
-            let migrate_attributes =
-                |attributes: &mut serde_json::Map<String, serde_json::Value>| {
-                    for (key, value) in attributes {
-                        migrate_state_row_attribute(value, &display_type, &identity, key).map_err(
-                            |source| LegacySecretMigrationError::StateAttribute {
-                                key: key.clone(),
-                                source: Box::new(source),
-                            },
-                        )?;
-                    }
-                    Ok::<(), LegacySecretMigrationError>(())
-                };
-
-            if let Some(attributes) = resource
-                .get_mut("attributes")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                migrate_attributes(attributes)?;
-            }
-            if let Some(deposed) = resource
-                .get_mut("deposed")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                for generation in deposed {
-                    if let Some(attributes) = generation
-                        .get_mut("attributes")
-                        .and_then(serde_json::Value::as_object_mut)
-                    {
-                        migrate_attributes(attributes)?;
-                    }
-                }
-            }
-        }
-        migrated["version"] = serde_json::json!(14);
-        *document = migrated;
-        Ok(())
-    }
-
-    /// Upgrade a complete mock-provider v1 state document. Only values below
-    /// `states.<resource>.<attribute>` are eligible for legacy marker
-    /// classification.
-    pub fn migrate_mock_state_document_v1(
-        document: &mut serde_json::Value,
-    ) -> Result<(), LegacySecretMigrationError> {
-        const ARTIFACT: &str = "mock-provider state v1";
-        let version = document_version(document, ARTIFACT)?;
-        if version != 1 {
-            return Err(LegacySecretMigrationError::UnsupportedVersion {
-                artifact: ARTIFACT,
-                found: version,
-                expected: "version 1",
-            });
-        }
-
-        let mut migrated = document.clone();
-        let states = migrated
-            .get_mut("states")
-            .and_then(serde_json::Value::as_object_mut)
-            .ok_or(LegacySecretMigrationError::InvalidDocument {
-                artifact: ARTIFACT,
-                detail: "states must be an object",
-            })?;
-        for attributes in states.values_mut() {
-            let attributes =
-                attributes
-                    .as_object_mut()
-                    .ok_or(LegacySecretMigrationError::InvalidDocument {
-                        artifact: ARTIFACT,
-                        detail: "each resource state must be an attribute object",
-                    })?;
-            for value in attributes.values_mut() {
-                migrate_self_contained_markers(value);
-            }
-        }
-        migrated["version"] = serde_json::json!(2);
-        *document = migrated;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn migrate_legacy_state_attribute_for_test(
-        value: serde_json::Value,
-        display_type: &str,
-        identity: &str,
-        key: &str,
-    ) -> Result<serde_json::Value, LegacySecretMigrationError> {
-        let mut attributes = serde_json::Map::new();
-        attributes.insert(key.to_string(), value);
-        let mut document = serde_json::json!({
-            "version": 13,
-            "resources": [{
-                "provider": "",
-                "resource_type": display_type,
-                "identity": identity,
-                "attributes": attributes,
-                "deposed": [],
-            }],
-        });
-        migrate_state_document_v13(&mut document)?;
-        Ok(document["resources"][0]["attributes"]
-            .as_object_mut()
-            .and_then(|attributes| attributes.remove(key))
-            .expect("migrated test document must retain its attribute"))
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn state_v13_migration_checks_version_and_only_walks_resource_attributes() {
-            let raw_marker = format!("_secret:argon2:{}", "ab".repeat(32));
-            let mut document = serde_json::json!({
-                "version": 13,
-                "exports": {"literal": raw_marker},
-                "resources": [{
-                    "provider": "mock",
-                    "resource_type": "test.resource",
-                    "identity": "example",
-                    "attributes": {"token": raw_marker},
-                    "deposed": [{"attributes": {"nested": [raw_marker]}}]
-                }]
-            });
-
-            migrate_state_document_v13(&mut document).expect("migrate v13 state document");
-
-            assert_eq!(document["version"], 14);
-            assert!(
-                document["resources"][0]["attributes"]["token"][crate::value::PERSISTED_SECRET_KEY]
-                    .as_str()
-                    .is_some_and(|digest| digest.starts_with("argon2-legacy:"))
-            );
-            assert!(
-                document["resources"][0]["deposed"][0]["attributes"]["nested"][0]
-                    [crate::value::PERSISTED_SECRET_KEY]
-                    .as_str()
-                    .is_some_and(|digest| digest.starts_with("argon2-legacy:"))
-            );
-            assert_eq!(
-                document["exports"]["literal"],
-                serde_json::Value::String(raw_marker)
-            );
-
-            let mut current = serde_json::json!({
-                "version": 14,
-                "resources": [{
-                    "provider": "mock",
-                    "resource_type": "test.resource",
-                    "identity": "example",
-                    "attributes": {"token": format!("_secret:argon2:{}", "cd".repeat(32))}
-                }]
-            });
-            let unchanged = current.clone();
-            assert!(migrate_state_document_v13(&mut current).is_err());
-            assert_eq!(current, unchanged);
-        }
-
-        #[test]
-        fn mock_v1_migration_checks_version_and_walks_only_states() {
-            let marker = format!("_secret:argon2-legacy:73616c74:{}", "ab".repeat(32));
-            let mut document = serde_json::json!({
-                "version": 1,
-                "metadata": marker,
-                "states": {
-                    "test.resource.example": {
-                        "token": marker,
-                        "nested": [marker]
-                    }
-                }
-            });
-
-            migrate_mock_state_document_v1(&mut document).expect("migrate mock v1 document");
-
-            assert_eq!(document["version"], 2);
-            assert!(
-                document["states"]["test.resource.example"]["token"]
-                    [crate::value::PERSISTED_SECRET_KEY]
-                    .is_string()
-            );
-            assert!(
-                document["states"]["test.resource.example"]["nested"][0]
-                    [crate::value::PERSISTED_SECRET_KEY]
-                    .is_string()
-            );
-            assert_eq!(document["metadata"], marker);
-
-            let mut current = serde_json::json!({
-                "version": 2,
-                "states": {
-                    "test.resource.example": {"token": marker}
-                }
-            });
-            let unchanged = current.clone();
-            assert!(migrate_mock_state_document_v1(&mut current).is_err());
-            assert_eq!(current, unchanged);
         }
     }
 }
@@ -9391,7 +8949,7 @@ pub struct Resource<
     /// Attribute prefixes: maps attribute name -> prefix string
     /// e.g., {"bucket_name": "my-app-"} from `bucket_name_prefix = "my-app-"`
     #[serde(default)]
-    pub prefixes: HashMap<String, String>,
+    pub prefixes: std::collections::BTreeMap<String, String>,
     /// Binding name from `let` bindings in DSL (e.g., `let vpc = ...`)
     #[serde(default)]
     pub binding: Option<B>,
@@ -9705,7 +9263,7 @@ impl<P: ValueKind, B: BindingAddress> Resource<ModuleSource, P, B> {
             attributes: IndexMap::new(),
             directives: Directives::default(),
             resolved_ignore_changes: ResolvedIgnoreChanges::default(),
-            prefixes: HashMap::new(),
+            prefixes: Default::default(),
             binding: None,
             dependencies: UnexpandedDependencyFields::default(),
             module_source: None,
@@ -9759,6 +9317,41 @@ impl<P: ValueKind, B: BindingAddress> Resource<ModuleSource, P, B> {
             resource_type,
             provider_instance,
         ))
+    }
+}
+
+impl<S, P: ValueKind, B: BindingAddress, D> Resource<S, P, B, D> {
+    /// The only secrecy reader for anonymous and executor-produced deferred-for
+    /// children. The hand-over survives identity computation and effect
+    /// materialization; an attached row that no longer matches reads
+    /// `ChildSecrecyRead::RowMismatch`.
+    ///
+    /// A child expanded from a decoded saved-plan template reads
+    /// `ChildSecrecyRead::Unavailable(TemplateEvidenceUnavailable::SavedPlan)`.
+    /// Authored metadata is in-memory only (`#[serde(skip)]`), so decoding a
+    /// resource directly instead reads `ChildSecrecyRead::NotLoopChild`.
+    /// The shape of the unavailable case is provisional until carina#4442.
+    ///
+    /// Known gap: the hand-over lives in public, clonable `authored_slots`.
+    /// Rust code can copy a child's `authored_slots` and `loop_provenance` onto
+    /// another resource of the same provider and type, or clone a child and
+    /// replace only its attributes, and still read `ChildSecrecyRead::Row`:
+    /// attributes are not part of the match. No `.crn` input reaches this, and
+    /// no production code reads the row yet. carina#4442 decides where the
+    /// judgement is kept together with the consumer (see also carina#4563).
+    pub fn child_secrecy(&self) -> crate::secrecy::ChildSecrecyRead<'_> {
+        use crate::secrecy::{ChildSecrecy, ChildSecrecyRead};
+        match self.authored_slots.child_secrecy() {
+            Some(ChildSecrecy::Row(row)) => {
+                if row.matches_resource(self) {
+                    ChildSecrecyRead::Row(row)
+                } else {
+                    ChildSecrecyRead::RowMismatch
+                }
+            }
+            Some(ChildSecrecy::Unavailable(reason)) => ChildSecrecyRead::Unavailable(*reason),
+            None => ChildSecrecyRead::NotLoopChild,
+        }
     }
 }
 
@@ -11170,7 +10763,7 @@ impl UnidentifiedState {
 /// use carina_core::resource::{Current, ResourceId, SnapshotState};
 ///
 /// let id = ResourceId::with_identity("test.Resource", "example");
-/// let state = SnapshotState::existing(id, Default::default());
+/// let state = SnapshotState::existing(id, std::collections::BTreeMap::new());
 /// let current = Current::MissingIdentifier(state);
 /// ```
 ///
@@ -11199,7 +10792,7 @@ pub struct StateBearingCurrentMut<'a> {
 }
 
 impl StateBearingCurrentMut<'_> {
-    pub fn attributes_mut(&mut self) -> &mut HashMap<String, SnapshotValue> {
+    pub fn attributes_mut(&mut self) -> &mut BTreeMap<String, SnapshotValue> {
         &mut self.state.attributes
     }
 
@@ -11284,7 +10877,7 @@ impl Current {
         }
     }
 
-    pub fn attributes_mut(&mut self) -> Option<&mut HashMap<String, SnapshotValue>> {
+    pub fn attributes_mut(&mut self) -> Option<&mut BTreeMap<String, SnapshotValue>> {
         self.state_bearing_mut()
             .map(|projection| &mut projection.state.attributes)
     }
@@ -11327,8 +10920,10 @@ impl Current {
             Self::Present(present) => {
                 present.state.dependency_bindings = dependency_bindings;
             }
-            Self::CreateInFlight(_pending) => {}
-            Self::CreateOutcomeUnknown(_unknown) => {}
+            Self::CreateInFlight(pending) => *pending.dependency_bindings = dependency_bindings,
+            Self::CreateOutcomeUnknown(unknown) => {
+                *unknown.dependency_bindings = dependency_bindings
+            }
             Self::MissingIdentifier(state) => {
                 state.0.dependency_bindings = dependency_bindings;
             }
@@ -11430,17 +11025,19 @@ pub struct PlanInputDesired<'a> {
 /// post-order canonicalization without mutating the provider-bound resource.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CanonicalComparisonAttributes {
-    attributes: HashMap<String, SnapshotValue>,
+    attributes: BTreeMap<String, SnapshotValue>,
 }
 
 /// Attribute values used only when no resource schema exists.
 ///
 /// The wrapper makes schema-less passthrough construction explicit instead of
 /// presenting it as an already-canonical comparison map.
-pub(crate) struct UnschematizedComparisonAttributes(HashMap<String, SnapshotValue>);
+pub(crate) struct UnschematizedComparisonAttributes(BTreeMap<String, SnapshotValue>);
 
 impl UnschematizedComparisonAttributes {
-    pub(crate) fn new<P: StateValueLeaf>(attributes: HashMap<String, Value<P>>) -> Self {
+    pub(crate) fn new<P: StateValueLeaf>(
+        attributes: impl IntoIterator<Item = (String, Value<P>)>,
+    ) -> Self {
         Self(
             attributes
                 .into_iter()
@@ -11454,10 +11051,10 @@ impl CanonicalComparisonAttributes {
     /// Secret-grafted apply views retain the authored hash material even when
     /// provider normalization changed a secret's structural representation.
     pub(crate) fn canonicalize_preserving_secret_shapes<P: StateValueLeaf>(
-        attributes: HashMap<String, Value<P>>,
+        attributes: impl IntoIterator<Item = (String, Value<P>)>,
         schema: &crate::schema::CompiledResourceSchema,
     ) -> Self {
-        let mut attributes: HashMap<_, _> = attributes
+        let mut attributes: BTreeMap<_, _> = attributes
             .into_iter()
             .map(|(key, value)| (key, state_value_snapshot(&value)))
             .collect();
@@ -11473,10 +11070,10 @@ impl CanonicalComparisonAttributes {
 
     /// Build the state-style canonical comparison view for one resource.
     pub fn canonicalize<P: StateValueLeaf>(
-        attributes: HashMap<String, Value<P>>,
+        attributes: impl IntoIterator<Item = (String, Value<P>)>,
         schema: &crate::schema::CompiledResourceSchema,
     ) -> Self {
-        let mut attributes: HashMap<_, _> = attributes
+        let mut attributes: BTreeMap<_, _> = attributes
             .into_iter()
             .map(|(key, value)| (key, state_value_snapshot(&value)))
             .collect();
@@ -11513,7 +11110,7 @@ impl CanonicalComparisonAttributes {
 
 impl<'a> IntoIterator for &'a CanonicalComparisonAttributes {
     type Item = (&'a String, &'a SnapshotValue);
-    type IntoIter = std::collections::hash_map::Iter<'a, String, SnapshotValue>;
+    type IntoIter = std::collections::btree_map::Iter<'a, String, SnapshotValue>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.attributes.iter()
@@ -11522,7 +11119,7 @@ impl<'a> IntoIterator for &'a CanonicalComparisonAttributes {
 
 impl IntoIterator for CanonicalComparisonAttributes {
     type Item = (String, SnapshotValue);
-    type IntoIter = std::collections::hash_map::IntoIter<String, SnapshotValue>;
+    type IntoIter = std::collections::btree_map::IntoIter<String, SnapshotValue>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.attributes.into_iter()
@@ -11690,7 +11287,7 @@ pub struct State<P: ValueKind = NoPlaceholder> {
     pub id: ResourceId,
     /// AWS internal identifier (e.g., vpc-xxx, subnet-xxx)
     pub identifier: Option<String>,
-    pub attributes: HashMap<String, Value<P>>,
+    pub attributes: BTreeMap<String, Value<P>>,
     /// Whether this state exists
     pub exists: bool,
     /// Binding names this resource depended on when it was last applied.
@@ -11709,18 +11306,21 @@ impl<P: ValueKind> State<P> {
         Self {
             id,
             identifier: None,
-            attributes: HashMap::new(),
+            attributes: BTreeMap::new(),
             exists: false,
             dependency_bindings: PersistedDestroyDependencies::default(),
             partial_read: None,
         }
     }
 
-    pub fn existing(id: ResourceId, attributes: HashMap<String, Value<P>>) -> Self {
+    pub fn existing(
+        id: ResourceId,
+        attributes: impl IntoIterator<Item = (String, Value<P>)>,
+    ) -> Self {
         Self {
             id,
             identifier: None,
-            attributes,
+            attributes: attributes.into_iter().collect(),
             exists: true,
             dependency_bindings: PersistedDestroyDependencies::default(),
             partial_read: None,

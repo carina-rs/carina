@@ -1,4 +1,4 @@
-let vpcs = for cidr in ['10.0.0.0/16', '10.0.0.0/16'] {
+let vpcs = for (_, cidr) in ['10.0.0.0/16', '10.0.0.0/16'] {
   awscc.ec2.Vpc {
     cidr_block = cidr
   }

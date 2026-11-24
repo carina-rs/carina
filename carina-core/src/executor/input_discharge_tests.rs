@@ -278,7 +278,7 @@ fn replacement_with_delete_dependencies(
         id: create.resolved_id(),
         identifier: AppliedIdentifier::new("old-id").unwrap(),
         generation: EffectGeneration::Current,
-        previous_attributes: HashMap::new(),
+        previous_attributes: std::collections::BTreeMap::new(),
         directives: Default::default(),
         binding: create.binding.clone(),
         dependencies,
@@ -1223,10 +1223,10 @@ fn loop_effect(replace: bool) -> Effect {
     let template = crate::parser::DeferredForExpression::new(
         Some("main.crn".into()),
         1,
-        "for item in source.items".into(),
+        "for (_, item) in source.items".into(),
         crate::parser::DeferredForTarget::bound(absolute_binding("children")).unwrap(),
         Value::root_resource_ref("source", "items", vec![]),
-        crate::parser::ForBinding::Simple("item".into()),
+        crate::parser::ForBinding::Indexed("_".into(), "item".into()),
         crate::resource::Resource::new("test", "children").with_attribute(
             "name",
             crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
@@ -1245,7 +1245,7 @@ fn loop_effect(replace: bool) -> Effect {
                 .map(|index| DeferredReplaceDelete {
                     id: test_resolved_id("test", &format!("children[{index}]")),
                     generation: EffectGeneration::Current,
-                    previous_attributes: HashMap::new(),
+                    previous_attributes: std::collections::BTreeMap::new(),
                     identifier: AppliedIdentifier::new(format!("old-{index}")).unwrap(),
                     directives: Default::default(),
                     binding: Some(absolute_binding(&format!("children[{index}]"))),
@@ -1764,13 +1764,13 @@ fn round1_rule_bearing_template_keeps_unrelated_delete_and_non_input_edges() {
                 .chain([unrelated, non_input])
                 .collect(),
         ),
-        (own_deletes[0], HashSet::from([template])),
-        (own_deletes[1], HashSet::from([template])),
-        (unrelated, HashSet::new()),
-        (non_input, HashSet::new()),
+        (own_deletes[0], BTreeSet::from([template])),
+        (own_deletes[1], BTreeSet::from([template])),
+        (unrelated, BTreeSet::new()),
+        (non_input, BTreeSet::new()),
     ]);
     nodes.dependencies(&effects, &mut deps);
-    assert_eq!(deps[&template], HashSet::from([unrelated, non_input]));
+    assert_eq!(deps[&template], BTreeSet::from([unrelated, non_input]));
     assert!(deps[&own_deletes[0]].contains(&template));
     assert!(deps[&own_deletes[1]].contains(&template));
 }
@@ -1900,10 +1900,10 @@ async fn input_discharge_conflicting_child_in_cbd_parent_window_keeps_old_on_rej
         let template = crate::parser::DeferredForExpression::new(
             Some("main.crn".into()),
             1,
-            "for item in source.items".into(),
+            "for (_, item) in source.items".into(),
             crate::parser::DeferredForTarget::bound(absolute_binding("children")).unwrap(),
             Value::root_resource_ref("source", "items", vec![]),
-            crate::parser::ForBinding::Simple("item".into()),
+            crate::parser::ForBinding::Indexed("_".into(), "item".into()),
             crate::resource::Resource::new("test", "children").with_attribute(
                 "name",
                 crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(

@@ -371,7 +371,9 @@ impl<'a> CstBuilder<'a> {
             // ordinary expressions. Keeping the wrappers in the CST lets the
             // formatter normalize operators without scanning raw source text (and
             // therefore without mistaking operators in strings/comments for code).
-            Rule::validate_expr => Some(CstChild::Node(
+            // Keep require conditions identical to validation expressions in the CST
+            // so their formatting, including trivia, stays unchanged.
+            Rule::require_condition | Rule::validate_expr => Some(CstChild::Node(
                 self.build_node(NodeKind::ValidateExpr, pair),
             )),
             Rule::validate_or_expr
@@ -416,6 +418,7 @@ impl<'a> CstBuilder<'a> {
             // but suppresses its output, so this arm should be unreachable
             // in practice. Exists only so the exhaustive match compiles.
             Rule::numeric_tail => None,
+            Rule::identifier_continue => None,
             Rule::plus_op
             | Rule::minus_op
             | Rule::multiply_op

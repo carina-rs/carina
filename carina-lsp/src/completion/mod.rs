@@ -205,6 +205,7 @@ impl CompletionProvider {
         let context = self.get_completion_context(&text, position);
 
         match context {
+            CompletionContext::InsideArgumentsBlock => self.arguments_member_completions(),
             CompletionContext::TopLevel => {
                 self.top_level_completions(position, &text, base_path, provider_ctx.catalog())
             }
@@ -448,7 +449,7 @@ impl CompletionProvider {
                 binding,
             } => Some((selector, struct_path, binding.as_ref())),
             EnclosingBlock::ModuleCall { .. } => None,
-            EnclosingBlock::Other => None,
+            EnclosingBlock::Arguments | EnclosingBlock::Other => None,
         };
 
         // `directives { ... }` is the meta-arg block, not a struct
@@ -598,6 +599,15 @@ impl CompletionProvider {
         // lexer-aware enclosing-block walk.
         let current_segment = cursor_line_segment(text, position);
         match &block_context {
+            EnclosingBlock::Arguments => {
+                if current_segment
+                    .trim()
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                {
+                    return CompletionContext::InsideArgumentsBlock;
+                }
+            }
             EnclosingBlock::Resource {
                 selector,
                 struct_path,
@@ -873,6 +883,7 @@ enum AttributeValueTarget {
 #[allow(dead_code)]
 enum CompletionContext {
     TopLevel,
+    InsideArgumentsBlock,
     InsideResourceBlock {
         selector: SchemaSelector,
     },

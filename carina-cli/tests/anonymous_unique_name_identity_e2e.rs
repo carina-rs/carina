@@ -75,23 +75,21 @@ impl Scenario {
         };
         assert_eq!(row["identity"], current_identity);
         let persisted_attributes = row["current"]["attributes"].clone();
+        let identifier = row["current"]["identifier"].as_str().unwrap().to_owned();
         row["identity"] = Value::String(legacy_identity.to_string());
         write_json(&state_path, &state);
 
         let mut provider = read_json(&self.mock_state);
         let states = provider["states"].as_object_mut().expect("mock states");
-        let current_key = format!("test.unique_identity.{current_identity}");
-        let attributes = states.remove(&current_key).unwrap_or_else(|| {
+        // Restoring a missing fixture object uses the provider ID, independently
+        // of the legacy Carina address under test.
+        if !states.contains_key(&identifier) {
             assert!(
                 states.is_empty(),
-                "missing mock state {current_key}: {states:#?}"
+                "missing mock state {identifier}: {states:#?}"
             );
-            persisted_attributes
-        });
-        states.insert(
-            format!("test.unique_identity.{legacy_identity}"),
-            attributes,
-        );
+            states.insert(identifier, persisted_attributes);
+        }
         write_json(&self.mock_state, &provider);
     }
 }

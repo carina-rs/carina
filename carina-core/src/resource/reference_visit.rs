@@ -26,6 +26,10 @@ impl<K> DependencyKey<K> {
     pub fn new(key: K) -> Self {
         Self(key)
     }
+    /// Change a graph key's binding phase without using diagnostic spelling.
+    pub(crate) fn map_key<T>(self, map: impl FnOnce(K) -> T) -> DependencyKey<T> {
+        DependencyKey::new(map(self.0))
+    }
     /// Add an identity to an existing graph's key collection.
     pub(crate) fn record_graph_key(&self, keys: &mut impl Extend<K>)
     where
@@ -67,8 +71,9 @@ impl<B: BindingAddress> DependencyKey<B> {
     pub fn matches_name(&self, name: &str) -> bool {
         self.0.as_str() == name
     }
-    pub fn starts_with(&self, prefix: &str) -> bool {
-        self.0.as_str().starts_with(prefix)
+    pub fn is_descendant_of(&self, ancestor: &B) -> bool {
+        super::decompose_binding_address(self.0.as_str())
+            .is_some_and(|address| address.is_descendant_of(ancestor.as_str()))
     }
     pub fn lookup_by_name<'a, V>(&self, keys: &'a HashMap<String, V>) -> Option<&'a V> {
         keys.get(self.0.as_str())
@@ -102,6 +107,9 @@ pub struct DependencyResourceRef<'a, B: BindingAddress> {
 impl<'a, B: BindingAddress> DependencyResourceRef<'a, B> {
     pub(super) fn new(path: &'a AccessPath<B>) -> Self {
         Self { path }
+    }
+    pub(crate) fn path_key(&self) -> DependencyKey<AccessPath<B>> {
+        DependencyKey::new(self.path.clone())
     }
     pub fn binding_key(&self) -> DependencyKey<B> {
         DependencyKey::new(self.path.binding_address().clone())

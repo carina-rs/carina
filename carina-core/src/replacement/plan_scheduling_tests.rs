@@ -249,7 +249,7 @@ fn gate_read_barriers_survive_known_child_projection_and_saved_plan_loading() {
                 "the parent must be promoted even when the child's Create was projected before admission"
             );
             assert!(graph.deps_of(2).unwrap().contains(&4));
-            let mut completed = std::collections::HashSet::new();
+            let mut completed = std::collections::BTreeSet::new();
             loop {
                 let before = completed.len();
                 for index in 0..scheduled.effects().len() {
@@ -354,7 +354,7 @@ fn relaxed_update_plan() -> Plan {
         Effect::Update {
             from: Box::new(SnapshotState::existing(
                 target.as_inner().clone(),
-                Default::default(),
+                std::collections::BTreeMap::new(),
             )),
             identifier: AppliedIdentifier::new("existing-id").unwrap(),
             to: ResolvedResource::from_resolved_parts_with_reads(

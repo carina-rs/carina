@@ -1,3 +1,6 @@
+#[path = "support/mock_state.rs"]
+mod mock_state;
+
 use std::{
     fs,
     process::{Command, Output},
@@ -298,7 +301,7 @@ fn pending_inputs_saves_without_certificates_and_live_apply_discharges_before_cr
         serde_json::from_slice(&fs::read(fixture.0.path().join("mock-state.json")).unwrap())
             .unwrap();
     assert_eq!(
-        provider_state["states"]["test.creation_constrained.pending"]["name"],
+        provider_state["states"][&mock_state::identifier(fixture.0.path(), "pending")]["name"],
         "suffix-id"
     );
     assert!(fixture.0.path().join("carina.state.json").exists());
@@ -380,7 +383,7 @@ fn save_pending_input_plan(fixture: &Fixture, producer_name: &str, replacement: 
     );
     let saved = fs::read_to_string(fixture.0.path().join("plan.json")).unwrap();
     let json: serde_json::Value = serde_json::from_str(&saved).unwrap();
-    assert_eq!(json["version"], 46);
+    assert_eq!(json["version"], 47);
     for field in [
         "pending_inputs",
         "PendingInputObligation",
@@ -395,15 +398,10 @@ fn save_pending_input_plan(fixture: &Fixture, producer_name: &str, replacement: 
 
 #[test]
 fn saved_input_readmission_rejects_tampered_create_before_effects_or_state_write() {
-    tampered_saved_create_is_rejected(false);
+    tampered_saved_create_is_rejected();
 }
 
-#[test]
-fn saved_input_readmission_rejection_precedes_legacy_state_migration_write() {
-    tampered_saved_create_is_rejected(true);
-}
-
-fn tampered_saved_create_is_rejected(legacy_state: bool) {
+fn tampered_saved_create_is_rejected() {
     let fixture = Fixture::new();
     fs::write(
         fixture.0.path().join("main.crn"),
@@ -412,13 +410,6 @@ fn tampered_saved_create_is_rejected(legacy_state: bool) {
     .unwrap();
     let output = fixture.run(&["apply", "--auto-approve"]);
     assert!(output.status.success(), "{}", text(&output));
-    if legacy_state {
-        let path = fixture.0.path().join("carina.state.json");
-        let mut state: serde_json::Value =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        state["version"] = serde_json::json!(20);
-        fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
-    }
     let before = fs::read(fixture.0.path().join("carina.state.json")).unwrap();
     let provider_before = fs::read(fixture.0.path().join("mock-state.json")).unwrap();
     save_pending_input_plan(&fixture, "short", false);
@@ -489,7 +480,7 @@ fn saved_input_discharge_applies_valid_runtime_value() {
         serde_json::from_slice(&fs::read(fixture.0.path().join("mock-state.json")).unwrap())
             .unwrap();
     assert_eq!(
-        state["states"]["test.estimated_input.consumer"]["name"],
+        state["states"][&mock_state::identifier(fixture.0.path(), "consumer")]["name"],
         "short-id"
     );
     assert_eq!(
@@ -575,8 +566,8 @@ fn saved_input_discharge_runtime_violation_preserves_replaced_resource() {
         serde_json::from_slice(&fs::read(fixture.0.path().join("mock-state.json")).unwrap())
             .unwrap();
     assert_eq!(
-        after["states"]["test.estimated_input.consumer"],
-        before["states"]["test.estimated_input.consumer"]
+        after["states"][&mock_state::identifier(fixture.0.path(), "consumer")],
+        before["states"][&mock_state::identifier(fixture.0.path(), "consumer")]
     );
     let state: serde_json::Value =
         serde_json::from_slice(&fs::read(fixture.0.path().join("carina.state.json")).unwrap())

@@ -28,10 +28,11 @@ enum DeferredCase {
 }
 async fn deferred(case: DeferredCase, read: bool, resource_iterable: bool) {
     let fixture = Fixture::new();
-    fixture.upstream(matches!(
+    let integer_source = matches!(
         case,
         DeferredCase::WrongKind | DeferredCase::PlainMismatch | DeferredCase::PlainLoop
-    ));
+    );
+    fixture.upstream(integer_source);
     let (query, sink, expression, rejection) = match case {
         DeferredCase::WrongTarget => (
             "Query",
@@ -82,7 +83,13 @@ async fn deferred(case: DeferredCase, read: bool, resource_iterable: bool) {
     } else {
         ""
     };
-    let source = format!("{prelude}{producer}let outputs = for n in {iterable} {{ {body} }}\n");
+    let binding = if integer_source && !resource_iterable {
+        "(_, n)"
+    } else {
+        "n"
+    };
+    let source =
+        format!("{prelude}{producer}let outputs = for {binding} in {iterable} {{ {body} }}\n");
     let result = fixture
         .observe(
             &format!(
@@ -627,9 +634,8 @@ fn r10_state_refresh_cannot_dispatch_an_unjudged_data_source_argument() {
     // Keep the provider's query result, but remove its managed state row so
     // the only iam.Roles read below is the configured data-source call.
     let state_path = fixture.path().join("carina.state.json");
-    let mut saved = carina_state::check_and_migrate(&std::fs::read_to_string(&state_path).unwrap())
-        .unwrap()
-        .into_state();
+    let mut saved =
+        carina_state::load_state(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
     assert!(
         saved
             .remove_resource("mock", "iam.Roles", "query")

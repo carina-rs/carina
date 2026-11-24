@@ -1,28 +1,30 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-default-tags-update-replace",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-default-tags-update-replace",
   "resources": [
     {
-      "resource_type": "ec2.Vpc",
-      "identity": "updated",
-      "provider": "awscc",
-      "identifier": "vpc-updated",
-      "attributes": {
-        "cidr_block": "10.0.0.0/16",
-        "tags": {
-          "ManagedBy": "carina"
-        }
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "updated",
+      "current": {
+        "attributes": {
+          "cidr_block": "10.0.0.0/16",
+          "tags": {
+            "ManagedBy": "carina"
+          }
+        },
+        "identifier": "vpc-updated",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "cidr_block": {
             "kind": "leaf"
@@ -30,28 +32,38 @@
           "tags": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "updated",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Vpc"
     },
     {
-      "resource_type": "ec2.Vpc",
-      "identity": "replaced",
-      "provider": "awscc",
-      "identifier": "vpc-replaced",
-      "attributes": {
-        "cidr_block": "10.1.0.0/16",
-        "tags": {
-          "ManagedBy": "legacy"
-        }
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "replaced",
+      "current": {
+        "attributes": {
+          "cidr_block": "10.1.0.0/16",
+          "tags": {
+            "ManagedBy": "legacy"
+          }
+        },
+        "identifier": "vpc-replaced",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "cidr_block": {
             "kind": "leaf"
@@ -59,8 +71,17 @@
           "tags": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "replaced",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Vpc"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

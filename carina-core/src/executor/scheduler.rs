@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::binding_index::ResolvedBindings;
 use crate::effect::{Effect, SchedulerKey};
@@ -40,8 +41,11 @@ impl CreatePermit {
     pub fn request(&self) -> &crate::provider::CreateRequest {
         self.request.request()
     }
-    pub(crate) fn into_request(self) -> crate::provider::CreateRequest {
-        (*self.request).into_parts().0
+    pub(crate) fn prepared_write(&self) -> &super::PreparedWrite<crate::provider::CreateRequest> {
+        &self.request
+    }
+    pub(super) fn into_write(self) -> super::PreparedWrite<crate::provider::CreateRequest> {
+        *self.request
     }
 }
 
@@ -63,7 +67,7 @@ pub fn create_permit_with_schemas_for_test(
     );
     let attributes = request.resource().as_resource().resolved_attributes();
     let writeback = crate::binding_index::SecretPreservingAttributes::from_provider_values(
-        &attributes,
+        request.resource().protected_desired_tree().attributes(),
         &attributes,
     );
     let write = check
@@ -106,14 +110,14 @@ pub fn update_permit_with_schemas_for_test(
         },
         schemas,
     );
-    let attributes = desired
+    let attributes: std::collections::BTreeMap<_, _> = desired
         .as_resource()
         .attributes
         .clone()
         .into_iter()
         .collect();
     let writeback = crate::binding_index::SecretPreservingAttributes::from_provider_values(
-        &attributes,
+        desired.protected_desired_tree().attributes(),
         &attributes,
     );
     let write = check
@@ -141,17 +145,12 @@ fn fixture_write_authority(
     let scheduled = checked.schedule(&HashMap::new());
     let dependencies = build_scheduler_deps(&scheduled, std::iter::empty());
     assert!(dependencies.unresolved.is_empty());
-    let ready = release_ready_effect(
-        &scheduled,
-        0,
-        &dependencies.deps_of,
-        &HashSet::new(),
-        &HashSet::new(),
-    )
-    .expect("fixture slot is dependency ready")
-    .expect("fixture has no failed dependencies")
-    .into_basic()
-    .expect("fixture provider write");
+    let failures = FailureView::new(scheduled.effects(), &dependencies.deps_of, &HashSet::new());
+    let ready = release_ready_effect(&scheduled, 0, &HashSet::new(), &failures)
+        .expect("fixture slot is dependency ready")
+        .expect("fixture has no failed dependencies")
+        .into_basic()
+        .expect("fixture provider write");
     let check = super::input_discharge::ExecutionInputChecks::new(
         checked.execution_input_checks(),
         scheduled.effects(),
@@ -255,24 +254,15 @@ impl<S: Clone> ScheduledResume<S> {
         self,
         resource: &crate::resource::ResolvedResource<S>,
         write: super::PreparedWrite<crate::provider::CreateRequest>,
-    ) -> Result<
-        (
-            PreparedResume,
-            crate::binding_index::SecretPreservingAttributes,
-            super::AcceptedRequest,
-        ),
-        super::EffectFailureKind,
-    > {
-        let attributes = write.writeback().clone();
-        let accepted = super::AcceptedRequest::from_create_request(write.request())
-            .with_resolved_desired_attributes(attributes.clone());
+    ) -> Result<(PreparedResume, super::AcceptedRequest), super::EffectFailureKind> {
+        let accepted = super::AcceptedRequest::from_prepared_create(&write);
         let request = match self {
             Self::Resend { pending, create } => PreparedResume::Resend(
                 crate::provider::ResumeCreateRequest::new(*pending, create.authorize(write))
                     .map_err(super::EffectFailureKind::execution)?,
             ),
             Self::Poll(pending) => PreparedResume::Poll(
-                crate::provider::PollCreateRequest::new(*pending, write.into_parts().0)
+                crate::provider::PollCreateRequest::new(*pending, write)
                     .map_err(super::EffectFailureKind::execution)?,
             ),
             Self::Missing => {
@@ -282,7 +272,7 @@ impl<S: Clone> ScheduledResume<S> {
                 )));
             }
         };
-        Ok((request, attributes, accepted))
+        Ok((request, accepted))
     }
 }
 
@@ -408,40 +398,28 @@ impl<S: Clone> ReadyEffect<S> {
 pub(super) fn release_ready_effect<S: Clone>(
     scheduled: &crate::replacement::ScheduledPlan<'_, S>,
     index: usize,
-    dependencies: &HashMap<usize, HashSet<usize>>,
     completed: &HashSet<usize>,
-    failed: &HashSet<usize>,
+    failures: &FailureView<'_, S>,
 ) -> Option<Result<ReadyEffect<S>, FailedDependency>> {
-    release_ready_effect_mapped(
-        scheduled,
-        index,
-        index,
-        scheduled.effects(),
-        dependencies,
-        completed,
-        failed,
-    )
+    release_ready_effect_mapped(scheduled, index, index, completed, failures)
 }
 
 pub(super) fn release_ready_effect_mapped<S: Clone>(
     scheduled: &crate::replacement::ScheduledPlan<'_, S>,
     source: usize,
     index: usize,
-    effects: &[Effect<S>],
-    dependencies: &HashMap<usize, HashSet<usize>>,
     completed: &HashSet<usize>,
-    failed: &HashSet<usize>,
+    failures: &FailureView<'_, S>,
 ) -> Option<Result<ReadyEffect<S>, FailedDependency>> {
-    if !dependencies
+    if !failures
+        .deps_of
         .get(&index)?
         .iter()
         .all(|dependency| completed.contains(dependency))
     {
         return None;
     }
-    if let Some(failed) =
-        FailureView::new(effects, dependencies, failed).find_failed_dependency(index)
-    {
+    if let Some(failed) = failures.find_failed_dependency(index) {
         return Some(Err(failed));
     }
     let effect = scheduled.effects().get(source)?.clone();
@@ -500,6 +478,7 @@ pub async fn prepare_initial_create(
     .map_err(|error| input_error(super::EffectFailureKind::execution(error)))?;
     let dependencies = build_scheduler_deps(&scheduled, plan.graph.scheduler_target_ids());
     let completed = HashSet::new();
+    let failures = FailureView::new(scheduled.effects(), &dependencies.deps_of, &HashSet::new());
     for index in 0..scheduled.effects().len() {
         if dependencies
             .unresolved
@@ -508,13 +487,7 @@ pub async fn prepare_initial_create(
         {
             continue;
         }
-        let Some(Ok(ready)) = release_ready_effect(
-            &scheduled,
-            index,
-            &dependencies.deps_of,
-            &completed,
-            &HashSet::new(),
-        ) else {
+        let Some(Ok(ready)) = release_ready_effect(&scheduled, index, &completed, &failures) else {
             continue;
         };
         if let Some(ScheduledBasicEffect::Create { create, .. }) = ready.into_basic() {
@@ -546,19 +519,14 @@ pub(crate) fn release_basic_for_test<S: Clone>(
     completed: &HashSet<usize>,
 ) -> Option<ScheduledBasicEffect<S>> {
     let dependencies = build_scheduler_deps(scheduled, std::iter::empty());
-    release_ready_effect(
-        scheduled,
-        index,
-        &dependencies.deps_of,
-        completed,
-        &HashSet::new(),
-    )?
-    .ok()?
-    .into_basic()
+    let failures = FailureView::new(scheduled.effects(), &dependencies.deps_of, &HashSet::new());
+    release_ready_effect(scheduled, index, completed, &failures)?
+        .ok()?
+        .into_basic()
 }
 
 pub(super) struct SchedulerDeps {
-    pub(super) deps_of: HashMap<usize, HashSet<usize>>,
+    pub(super) deps_of: HashMap<usize, BTreeSet<usize>>,
     pub(super) unresolved: Vec<UnresolvedRequiredDependency>,
 }
 
@@ -568,7 +536,7 @@ pub(super) struct SchedulerDeps {
 pub(super) struct PreparationNodes {
     writes: HashMap<usize, usize>,
     pairs: Vec<(usize, usize, Vec<usize>)>,
-    replacement_templates: HashMap<usize, HashSet<usize>>,
+    replacement_templates: HashMap<usize, BTreeSet<usize>>,
     schedule_to_runtime: Vec<usize>,
 }
 
@@ -622,7 +590,7 @@ impl PreparationNodes {
     pub(super) fn dependencies<S>(
         &self,
         effects: &[Effect<S>],
-        deps: &mut HashMap<usize, HashSet<usize>>,
+        deps: &mut HashMap<usize, BTreeSet<usize>>,
     ) {
         #[allow(clippy::iter_over_hash_type)]
         // keyed rebuild: each replacement template removes its own absorbed prerequisites
@@ -861,35 +829,45 @@ pub(super) enum FailedDependency {
 /// Wait terminal checks share this view so their visibility cannot drift.
 pub(super) struct FailureView<'a, S> {
     pub(super) effects: &'a [Effect<S>],
-    pub(super) deps_of: &'a HashMap<usize, HashSet<usize>>,
-    pub(super) failed_indices: &'a HashSet<usize>,
-    failed_dependency_labels: HashMap<SchedulerKey, String>,
+    pub(super) deps_of: &'a HashMap<usize, BTreeSet<usize>>,
+    failed_indices: HashSet<usize>,
+    failed_by_key: BTreeMap<SchedulerKey, usize>,
 }
 
 impl<'a, S> FailureView<'a, S> {
     pub(super) fn new(
         effects: &'a [Effect<S>],
-        deps_of: &'a HashMap<usize, HashSet<usize>>,
-        failed_indices: &'a HashSet<usize>,
+        deps_of: &'a HashMap<usize, BTreeSet<usize>>,
+        failed_indices: &HashSet<usize>,
     ) -> Self {
-        let failed_dependency_labels = failed_indices
-            .iter()
-            .flat_map(|idx| {
-                let effect = effects.get(*idx)?;
-                let label = failure_display_name(effect)?;
-                Some(
-                    failure_dependency_keys(effect)
-                        .into_iter()
-                        .map(move |key| (key, label.clone())),
-                )
-            })
-            .flatten()
-            .collect();
-        Self {
+        let mut view = Self {
             effects,
             deps_of,
-            failed_indices,
-            failed_dependency_labels,
+            failed_indices: HashSet::new(),
+            failed_by_key: BTreeMap::new(),
+        };
+        #[allow(clippy::iter_over_hash_type)]
+        // Commutative: membership and each key's minimum are independent of failure order.
+        for &index in failed_indices {
+            view.record_failure(index);
+        }
+        view
+    }
+
+    /// Include synchronous skips without rebuilding the per-pass index.
+    pub(super) fn record_failure(&mut self, index: usize) {
+        if !self.failed_indices.insert(index) {
+            return;
+        }
+        if let Some(effect) = self.effects.get(index)
+            && failure_display_name(effect).is_some()
+        {
+            for key in failure_dependency_keys(effect) {
+                self.failed_by_key
+                    .entry(key)
+                    .and_modify(|minimum| *minimum = (*minimum).min(index))
+                    .or_insert(index);
+            }
         }
     }
 
@@ -897,21 +875,28 @@ impl<'a, S> FailureView<'a, S> {
     /// skipped before dispatch. Checks both in-phase graph edges and the
     /// cross-phase binding fallback used for phase-scoped dependency maps.
     pub(super) fn find_failed_dependency(&self, idx: usize) -> Option<FailedDependency> {
-        if let Some(deps) = self.deps_of.get(&idx)
-            && let Some(&dep_idx) = deps.iter().find(|d| self.failed_indices.contains(d))
-        {
-            let label = self.effects.get(dep_idx).and_then(failure_display_name);
-            return Some(match label {
+        let direct = self.deps_of.get(&idx).and_then(|neighbors| {
+            neighbors
+                .iter()
+                .copied()
+                .find(|index| self.failed_indices.contains(index))
+        });
+        let cross_phase = if self.failed_by_key.is_empty() {
+            None
+        } else {
+            self.effects[idx]
+                .blocking_keys()
+                .iter()
+                .filter_map(|key| self.failed_by_key.get(key).copied())
+                .min()
+        };
+        let index = direct.into_iter().chain(cross_phase).min()?;
+        Some(
+            match self.effects.get(index).and_then(failure_display_name) {
                 Some(label) => FailedDependency::Labeled(label),
                 None => FailedDependency::Anonymous,
-            });
-        }
-
-        self.effects[idx]
-            .blocking_keys()
-            .into_iter()
-            .find_map(|key| self.failed_dependency_labels.get(&key).cloned())
-            .map(FailedDependency::Labeled)
+            },
+        )
     }
 
     pub(super) fn is_effectively_pre_skipped(&self, idx: usize) -> bool {
@@ -924,6 +909,61 @@ mod tests {
     use super::*;
     use crate::effect::EffectGeneration;
     use crate::resource::ResourceId;
+
+    #[test]
+    fn issue_4491_skipped_child_names_lowest_plan_index_of_four_failed_dependencies() {
+        let effects: Vec<Effect> = ["zeta", "alpha", "theta", "beta", "child"]
+            .into_iter()
+            .map(|name| Effect::Delete {
+                id: crate::resource::ResolvedResourceId::with_identity("test.Resource", name),
+                identifier: crate::effect::fixture_applied_identifier(name),
+                generation: EffectGeneration::Current,
+                directives: Default::default(),
+                binding: Some(crate::resource::RootScope::new().resolve(name.into())),
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
+            })
+            .collect();
+        for _ in 0..32 {
+            let deps = HashMap::from([(4, [3, 1, 0, 2].into_iter().collect())]);
+            let failed = [3, 2, 1, 0].into_iter().collect();
+            let reason = FailureView::new(&effects, &deps, &failed)
+                .find_failed_dependency(4)
+                .unwrap();
+            assert_eq!(
+                dependency_failed_reason(&reason),
+                "dependency 'zeta' failed"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_4491_cross_phase_failure_label_also_uses_lowest_plan_index() {
+        use crate::resource::{ResolvedResource, Resource};
+        let parents = ["zeta", "alpha", "theta", "beta"].map(|name| {
+            let mut resource = Resource::with_provider("test", "Widget", name, None);
+            resource.binding = Some(crate::resource::RootScope::new().resolve(name.into()));
+            ResolvedResource::new(resource.into_value_snapshot())
+        });
+        let mut effects: Vec<Effect> = parents.iter().cloned().map(Effect::Create).collect();
+        effects.push(Effect::Create(ResolvedResource::from_resolved_parts(
+            Resource::with_provider("test", "Widget", "child", None).into_value_snapshot(),
+            parents.iter().map(ResolvedResource::resolved_id).collect(),
+            Default::default(),
+        )));
+        for _ in 0..16 {
+            let deps = HashMap::new();
+            let failed = [3, 2, 1, 0].into_iter().collect();
+            let reason = FailureView::new(&effects, &deps, &failed)
+                .find_failed_dependency(4)
+                .unwrap();
+            assert_eq!(
+                dependency_failed_reason(&reason),
+                "dependency 'zeta' failed"
+            );
+        }
+    }
 
     #[test]
     fn resource_identity_does_not_collide_with_binding_failure_key() {
@@ -1053,7 +1093,7 @@ mod tests {
             "a binding that spells like an unbound-loop key must remain a distinct scheduler key",
         );
 
-        let deps_of = HashMap::from([(1, HashSet::from([0]))]);
+        let deps_of = HashMap::from([(1, BTreeSet::from([0]))]);
         let failed = FailureView::new(&effects, &deps_of, &failed_indices)
             .find_failed_dependency(1)
             .expect("the explicit graph dependency must be recognized");

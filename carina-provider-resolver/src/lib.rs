@@ -52,6 +52,10 @@ pub(crate) struct ScopedEnvVar {
 
 #[cfg(test)]
 impl ScopedEnvVar {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "carina_core::github_auth::get_github_token reads GITHUB_TOKEN and PATH from the process; remove once carina#4553 passes an EnvironmentSnapshot"
+    )]
     pub(crate) fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let previous = std::env::var_os(name);
         // SAFETY: callers hold test_env_guard() while this process-wide override is active.
@@ -62,6 +66,10 @@ impl ScopedEnvVar {
 
 #[cfg(test)]
 impl Drop for ScopedEnvVar {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "carina_core::github_auth::get_github_token reads GITHUB_TOKEN and PATH from the process; remove once carina#4553 passes an EnvironmentSnapshot"
+    )]
     fn drop(&mut self) {
         // SAFETY: the test still holds test_env_guard() while this guard is dropped.
         match self.previous.take() {

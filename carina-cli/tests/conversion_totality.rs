@@ -135,7 +135,8 @@ fn round5_generated_p1_covers_every_grammar_context() {
                 .iter()
                 .filter_map(|finding| match finding {
                     carina_core::validation::PresentedFinding::Conversion(error) => Some(error),
-                    carina_core::validation::PresentedFinding::Ordinary(_) => None,
+                    carina_core::validation::PresentedFinding::Ordinary(_)
+                    | carina_core::validation::PresentedFinding::FunctionPromise(_) => None,
                 })
                 .collect::<Vec<_>>();
             let expected = match context.placement {
@@ -383,43 +384,16 @@ fn lsp_findings(
         .collect()
 }
 
-#[test]
-fn merge_require_keeps_an_unrelated_conversion_inventory_owner() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut outputs = Vec::new();
-    for converted in [true, false] {
-        let mut generated = fixture(Position::Root, true, false, converted);
-        let source = generated.files.get_mut("main.crn").unwrap();
-        *source = source.replace("let sink = ", "");
-        source.push_str("require 2 == 2, 'root guard'\n");
-        generated.write(directory.path());
-        let cli = validate(directory.path());
-        assert_eq!(cli["status"], "ok", "{cli}");
-        assert_eq!(cli["resource_count"], 1, "{cli}");
-        assert!(cli.get("errors").is_none(), "{cli}");
-        assert!(cli.get("warnings").is_none(), "{cli}");
-        outputs.push(cli);
-        let diagnostics = lsp_findings(&generated, directory.path());
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
-    }
-    assert_eq!(outputs[0], outputs[1], "no-as twin preserves main's output");
-}
-
-fn require_validation_fixture(module: bool, condition: &str, resource: &str) -> Fixture {
+fn require_validation_fixture(condition: &str, resource: &str) -> Fixture {
     let mut generated = fixture(Position::Root, true, false, false);
-    let requirement = format!("require {condition}, 'require merge guard'\n");
-    if module {
-        generated.files.insert(
-            "child/main.crn".into(),
-            format!("arguments {{ unused: String }}\n{requirement}{resource}\n"),
-        );
-        generated.files.insert(
-            "main.crn".into(),
-            "let child = use { source = './child' }\nlet net = child { unused = 'ok' }\n".into(),
-        );
-    } else {
-        generated.files.insert("guards.crn".into(), requirement);
-    }
+    generated.files.insert(
+        "child/main.crn".into(),
+        format!("arguments {{ unused: String\nrequire {condition}, 'require merge guard' }}\n{resource}\n"),
+    );
+    generated.files.insert(
+        "main.crn".into(),
+        "let child = use { source = './child' }\nlet net = child { unused = 'ok' }\n".into(),
+    );
     generated
 }
 
@@ -427,101 +401,94 @@ fn require_validation_fixture(module: bool, condition: &str, resource: &str) -> 
 fn merge_require_conversions_remain_ordinary_syntax_errors() {
     use carina_core::parser::{ParseError, ProviderContext, parse_file};
     use tower_lsp::lsp_types::DiagnosticSeverity;
-    for module in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
-        let mut cli_shapes = Vec::new();
-        let mut lsp_shapes = Vec::new();
-        for suffix in ["as mock.Name", "unexpected"] {
-            let generated = require_validation_fixture(
-                module,
-                &format!("('ok' {suffix}) == 'ok'"),
-                "mock.Sink { attr = 'ok' }",
-            );
-            generated.write(directory.path());
-            let cli = validate(directory.path());
-            assert_eq!(cli["status"], "error", "{module}/{suffix}: {cli}");
-            assert_eq!(conversion_count(&cli), 0, "{cli}");
-            assert!(!internal(&cli.to_string()), "{cli}");
-            let errors = cli["errors"].as_array().unwrap();
-            assert_eq!(errors.len(), 1, "{cli}");
-            assert!(
-                errors[0]["message"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("Syntax error:"),
-                "{cli}"
-            );
-            assert!(errors[0]["code"].is_null(), "{cli}");
-            assert_eq!(errors[0]["severity"], "error", "{cli}");
-            assert!(errors[0]["location"]["range"]["start"].is_object(), "{cli}");
-            cli_shapes.push((
-                errors[0]["code"].clone(),
-                errors[0]["severity"].clone(),
-                errors[0]["location"].clone(),
-            ));
-
-            let file = if module {
-                "child/main.crn"
-            } else {
-                "guards.crn"
-            };
-            let parsed = parse_file(
-                &generated.files[file],
-                &directory.path().join(file),
-                &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            );
-            assert!(
-                matches!(&parsed, Err(ParseError::Located { error, .. }) if matches!(error.as_ref(), ParseError::Syntax(_))),
-                "unexpected token must retain main's ParseError::Syntax class: {parsed:?}"
-            );
-            let diagnostics = lsp_findings(&generated, directory.path());
-            assert!(!diagnostics.is_empty(), "{module}/{suffix}");
-            assert!(
-                !diagnostics
-                    .iter()
-                    .any(|diagnostic| internal(&diagnostic.message)),
-                "{diagnostics:?}"
-            );
-            assert!(
-                diagnostics
-                    .iter()
-                    .all(|diagnostic| diagnostic.code.is_none()),
-                "{diagnostics:?}"
-            );
-            // Main's syntax recovery may also diagnose an unloaded dotted
-            // type in the invalid buffer. Compare the parser diagnostics,
-            // while every diagnostic must remain ordinary and non-internal.
-            let errors: Vec<_> = diagnostics
-                .iter()
-                .filter(|diagnostic| {
-                    diagnostic.severity == Some(DiagnosticSeverity::ERROR)
-                        && diagnostic.message.contains("expected")
-                })
-                .collect();
-            assert!(!errors.is_empty(), "{diagnostics:?}");
-            lsp_shapes.push(
-                errors
-                    .iter()
-                    .map(|diagnostic| {
-                        (
-                            diagnostic.severity,
-                            diagnostic.code.clone(),
-                            diagnostic.source.clone(),
-                            diagnostic.range.start,
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            );
-        }
-        assert_eq!(
-            cli_shapes[0], cli_shapes[1],
-            "as is the same unexpected-token diagnostic shape: {module}"
+    let directory = tempfile::tempdir().unwrap();
+    let mut cli_shapes = Vec::new();
+    let mut lsp_shapes = Vec::new();
+    for suffix in ["as mock.Name", "unexpected"] {
+        let generated = require_validation_fixture(
+            &format!("('ok' {suffix}) == 'ok'"),
+            "mock.Sink { attr = 'ok' }",
         );
-        assert_eq!(
-            lsp_shapes[0], lsp_shapes[1],
-            "as is the same unexpected-token diagnostic shape: {module}"
+        generated.write(directory.path());
+        let cli = validate(directory.path());
+        assert_eq!(cli["status"], "error", "{suffix}: {cli}");
+        assert_eq!(conversion_count(&cli), 0, "{cli}");
+        assert!(!internal(&cli.to_string()), "{cli}");
+        let errors = cli["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{cli}");
+        assert!(
+            errors[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Syntax error:"),
+            "{cli}"
+        );
+        assert!(errors[0]["code"].is_null(), "{cli}");
+        assert_eq!(errors[0]["severity"], "error", "{cli}");
+        assert!(errors[0]["location"]["range"]["start"].is_object(), "{cli}");
+        cli_shapes.push((
+            errors[0]["code"].clone(),
+            errors[0]["severity"].clone(),
+            errors[0]["location"].clone(),
+        ));
+
+        let file = "child/main.crn";
+        let parsed = parse_file(
+            &generated.files[file],
+            &directory.path().join(file),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        );
+        assert!(
+            matches!(&parsed, Err(ParseError::Located { error, .. }) if matches!(error.as_ref(), ParseError::Syntax(_))),
+            "unexpected token must retain main's ParseError::Syntax class: {parsed:?}"
+        );
+        let diagnostics = lsp_findings(&generated, directory.path());
+        assert!(!diagnostics.is_empty(), "{suffix}");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| internal(&diagnostic.message)),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code.is_none()),
+            "{diagnostics:?}"
+        );
+        // Main's syntax recovery may also diagnose an unloaded dotted
+        // type in the invalid buffer. Compare the parser diagnostics,
+        // while every diagnostic must remain ordinary and non-internal.
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+                    && diagnostic.message.contains("expected")
+            })
+            .collect();
+        assert!(!errors.is_empty(), "{diagnostics:?}");
+        lsp_shapes.push(
+            errors
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.severity,
+                        diagnostic.code.clone(),
+                        diagnostic.source.clone(),
+                        diagnostic.range.start,
+                    )
+                })
+                .collect::<Vec<_>>(),
         );
     }
+    assert_eq!(
+        cli_shapes[0], cli_shapes[1],
+        "as is the same unexpected-token diagnostic shape"
+    );
+    assert_eq!(
+        lsp_shapes[0], lsp_shapes[1],
+        "as is the same unexpected-token diagnostic shape"
+    );
 }
 
 #[test]
@@ -529,7 +496,7 @@ fn r11_module_require_failure_keeps_already_judged_static_conversion_findings() 
     let directory = tempfile::tempdir().unwrap();
     for passes in [false, true] {
         let condition = if passes { "true" } else { "false" };
-        require_validation_fixture(true, condition, "mock.Sink { attr = 42 as mock.Name }")
+        require_validation_fixture(condition, "mock.Sink { attr = 42 as mock.Name }")
             .write(directory.path());
         let cli = validate(directory.path());
         assert_eq!(cli["status"], "error", "{cli}");
@@ -557,7 +524,7 @@ fn r11_module_require_failure_keeps_already_judged_static_conversion_findings() 
                 ordinary[0]["message"],
                 "module 'child' (call 'net'): arguments : require merge guard"
             );
-            require_validation_fixture(true, condition, "mock.Sink { attr = 'ok' }")
+            require_validation_fixture(condition, "mock.Sink { attr = 'ok' }")
                 .write(directory.path());
             let control = validate(directory.path());
             assert_eq!(

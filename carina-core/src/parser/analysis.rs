@@ -165,6 +165,8 @@ impl DeclarationLocation {
                 | Rule::variable_ref
                 | Rule::postfix_expr
                 | Rule::subscripted_id
+                | Rule::index_access
+                | Rule::field_access
                 | Rule::validate_additive_expr
                 | Rule::validate_multiplicative_expr
                 | Rule::validate_primary
@@ -174,6 +176,7 @@ impl DeclarationLocation {
                 | Rule::attributes_param
                 | Rule::exports_param
                 | Rule::validate_expr
+                | Rule::require_condition
                 | Rule::for_expr
                 | Rule::if_expr
                 | Rule::resource_address
@@ -460,12 +463,7 @@ fn locate_unknown_key(
             .unwrap_or(declaration),
         SchemaDiagnosticKey::Attribute { name } => {
             let root = authored_root(name)?;
-            let assignment = root.assignment_location();
-            if assignment.span().start_line() == assignment.span().end_line() {
-                assignment
-            } else {
-                root.location()
-            }
+            root.finding_location()
         }
         SchemaDiagnosticKey::Value {
             root: name,
@@ -481,6 +479,14 @@ fn locate_unknown_key(
 }
 
 impl DeclarationProvenance {
+    pub(crate) fn attribute_key_finding_location(&self, name: &str) -> Option<DeclarationLocation> {
+        self.elements()
+            .diagnostic_index()
+            .attribute(name)
+            .and_then(|node| node.root_key(self.elements()))
+            .map(|key| key.finding_location().clone())
+    }
+
     /// Locate a schema finding while its declaration is still in hand. Unauthored
     /// programmatic resources have no source span; an authored missing root is an invariant.
     pub(crate) fn schema_diagnostic_location(
@@ -1002,6 +1008,10 @@ impl<'a, P: ValueKind, B: BindingAddress> AnalysisForRef<'a, P, B> {
     pub fn binding(&self) -> &'a super::ForBinding {
         self.site.binding
     }
+    pub fn target(&self) -> &'a super::DeferredForTarget<B> {
+        self.site.target
+    }
+
     pub fn header(&self) -> &'a str {
         self.site.header
     }
@@ -1592,6 +1602,32 @@ where
             ResourceRef::DataSource(source) => source.module_source.as_ref(),
             ResourceRef::Deferred { resource, .. } => resource.as_resource().module_source.as_ref(),
             ResourceRef::LiveComposition(_) => None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn prefix_declaration(&self) -> Option<&'a super::DeclarationProvenance> {
+        match self.resource {
+            ResourceRef::Resource(resource) => Some(&resource.declaration),
+            ResourceRef::DataSource(resource) => Some(&resource.declaration),
+            ResourceRef::Deferred { resource, .. } => Some(&resource.as_resource().declaration),
+            ResourceRef::LiveComposition(_) => None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn loop_iterable(&self) -> Option<&'a Value<P, B>> {
+        match self.resource {
+            ResourceRef::Deferred { deferred, .. } => Some(D::deferred_iterable(deferred)),
+            _ => None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn loop_binding(&self) -> Option<&'a super::ForBinding> {
+        match self.resource {
+            ResourceRef::Deferred { deferred, .. } => Some(D::deferred_binding(deferred)),
+            _ => None,
         }
     }
 
@@ -2281,19 +2317,10 @@ where
             .filter(|(_, handle)| handle.is_for_binding())
             .map(|(binding, _)| binding.to_string())
             .collect();
-        for resource in file.iter_all_resources() {
-            if matches!(
-                resource,
-                ResourceRef::Resource(_) | ResourceRef::Deferred { .. }
-            ) && let Some(binding) = resource.binding_address()
-            {
-                loop_groups.extend(
-                    crate::resolved_graph::loop_group_bindings(binding)
-                        .into_iter()
-                        .map(|group| group.to_string()),
-                );
-            }
-        }
+        loop_groups.extend(
+            file.deferred_for_sites()
+                .filter_map(|site| site.target.bound_binding_address().map(ToString::to_string)),
+        );
         for export in &file.export_params {
             if let Some(value) = export.value() {
                 collect_value_references(

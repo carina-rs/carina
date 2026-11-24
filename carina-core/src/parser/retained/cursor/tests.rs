@@ -1001,7 +1001,8 @@ where
                         &mut coverage,
                     );
                     assert!(outcome.classification_diagnostics.0.is_empty());
-                    outcome.values
+                    let (values, _prefixes_for_test) = outcome.values.into_parts();
+                    values
                 };
                 (findings, coverage.len())
             })
@@ -1590,7 +1591,7 @@ fn seam_deferred_loop_substitution_rebuilds_the_whole_slot() {
         .into_known()
         .unwrap();
     let children = crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        crate::parser::expand_deferred_children(
+        crate::parser::expand_deferred_children_for_test(
             deferred,
             crate::resource::knowledge::PlanIterable::from_known(known).unwrap(),
             crate::resource::AccessMissPolicy::Error,
@@ -2236,7 +2237,8 @@ fn review_seam_prepared_inputs_reject_other_instances_and_stale_generations() {
                     &mut Default::default(),
                 );
                 assert!(outcome.classification_diagnostics.0.is_empty());
-                outcome.values
+                let (values, _prefixes_for_test) = outcome.values.into_parts();
+                values
             };
             assert!(
                 findings.errors().any(|error| error

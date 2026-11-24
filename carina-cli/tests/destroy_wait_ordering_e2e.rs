@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile, check_and_migrate};
+use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile, load_state};
 use tempfile::TempDir;
 
 const DELETE_DELAY_MS: &str = "1500";
@@ -125,17 +125,18 @@ let lst = mock.test.resource {{
 
     fn seed_carina_state_with_cert_name(&self, cert_name: &str) {
         let mut state = StateFile::new();
-        let mut cert = ResourceState::try_applied("test.resource", "cert", "mock", "mock-id")
-            .expect("fixture identifier is non-empty")
-            .with_attribute("name", serde_json::json!(cert_name))
-            .with_attribute("id", serde_json::json!("cert-id"))
-            .with_attribute("status", serde_json::json!("ISSUED"));
+        let mut cert =
+            ResourceState::try_applied("test.resource", "cert", "mock", "cert-provider-id")
+                .expect("fixture identifier is non-empty")
+                .with_attribute("name", serde_json::json!(cert_name))
+                .with_attribute("id", serde_json::json!("cert-id"))
+                .with_attribute("status", serde_json::json!("ISSUED"));
         cert.binding = Some(absolute_binding("cert"));
         state
             .upsert_resource(cert)
             .expect("test state setup must be valid");
 
-        let mut lst = ResourceState::try_applied("test.resource", "lst", "mock", "mock-id")
+        let mut lst = ResourceState::try_applied("test.resource", "lst", "mock", "lst-provider-id")
             .expect("fixture identifier is non-empty")
             .with_attribute("name", serde_json::json!("lst"))
             .with_attribute("id", serde_json::json!("lst-id"))
@@ -171,18 +172,18 @@ let lst = mock.test.resource {{
     }
 
     fn seed_mock_provider_state_with_cert_name(&self, cert_name: &str) {
-        let provider_state = serde_json::json!({
-            "test.resource.cert": {
+        let provider_state = serde_json::json!({"version": 3, "states": {
+            "cert-provider-id": {
                 "name": cert_name,
                 "id": "cert-id",
                 "status": "ISSUED"
             },
-            "test.resource.lst": {
+            "lst-provider-id": {
                 "name": "lst",
                 "id": "lst-id",
                 "upstream": "cert-id"
             }
-        });
+        }});
         fs::write(
             &self.mock_state_path,
             carina_core::utils::pretty_with_newline(&provider_state).unwrap(),
@@ -221,13 +222,13 @@ let lst = mock.test.resource {{
     }
 
     fn seed_single_mock_provider_state(&self) {
-        let provider_state = serde_json::json!({
-            "test.resource.main": {
+        let provider_state = serde_json::json!({"version": 3, "states": {
+            "main-current": {
                 "name": "main",
                 "id": "main-current",
                 "status": "ACTIVE"
             }
-        });
+        }});
         fs::write(
             &self.mock_state_path,
             carina_core::utils::pretty_with_newline(&provider_state).unwrap(),
@@ -326,9 +327,8 @@ let lst = mock.test.resource {{
     }
 
     fn written_state(&self) -> StateFile {
-        check_and_migrate(&fs::read_to_string(&self.state_path).unwrap())
+        load_state(&fs::read_to_string(&self.state_path).unwrap())
             .expect("written state should deserialize")
-            .into_state()
     }
 }
 

@@ -46,6 +46,7 @@ pub(super) fn evaluation_form(rule: super::Rule) -> EvaluationForm {
         | Rule::file
         | Rule::statement
         | Rule::require_head
+        | Rule::require_condition
         | Rule::require_statement
         | Rule::upstream_state_expr
         | Rule::wait_expr

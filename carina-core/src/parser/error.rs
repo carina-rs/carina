@@ -7,6 +7,9 @@ use crate::eval_value::EvalValueError;
 use crate::resource::InsideSecret;
 use std::path::{Path, PathBuf};
 
+const REQUIRE_OUTSIDE_ARGUMENTS_MESSAGE: &str =
+    "`require` must be written inside an `arguments` block";
+
 pub const SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE: &str = "single-quoted string contains '${...}' which is not interpolated; use double quotes (\"...\") for interpolation, or keep single quotes if the literal text is intended";
 
 /// A body kind that cannot be expanded after a deferred `for` iterable
@@ -37,7 +40,7 @@ pub enum DeferredForIterableResolution {
 /// Details for a deferred `for` body that cannot cross the final module
 /// expansion seam.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{}", format_deferred_for_body_unsupported(*line, header, body, *iterable_resolution,phase_detail.as_deref()))]
+#[error("{}", format_deferred_for_body_unsupported(*line, header, body, *iterable_resolution, phase_detail.as_deref(), *value_keys_pending))]
 pub struct DeferredForBodyUnsupportedError {
     pub line: usize,
     pub header: super::AuthoredExpressionText,
@@ -45,6 +48,7 @@ pub struct DeferredForBodyUnsupportedError {
     pub span: SourceSpan,
     pub iterable_resolution: DeferredForIterableResolution,
     pub phase_detail: Option<String>,
+    pub value_keys_pending: bool,
 }
 
 /// Typed identity and authored token span for an unresolved declaration type.
@@ -102,6 +106,14 @@ pub(crate) fn parse_float_literal(text: &str, line: usize) -> Result<crate::Fini
         crate::FiniteF64::new(raw).map_err(FloatLiteralError::NonFinite)
     };
     admit().map_err(|source| ParseError::InvalidFloatLiteral { line, source })
+}
+
+/// A key-admission leaf created only together with its declaration ownership.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{error}")]
+pub struct ForKeyDiagnostic {
+    error: crate::resource::ForKeyError,
+    span: SourceSpan,
 }
 
 /// Parse error.
@@ -213,8 +225,23 @@ pub enum ParseError {
     #[error("Syntax error: {0}")]
     Syntax(super::SyntaxDiagnostic),
 
+    #[error("Syntax error at {}:{}: {REQUIRE_OUTSIDE_ARGUMENTS_MESSAGE}", span.start_line(), span.start_column())]
+    RequireOutsideArguments { span: SourceSpan },
+
     #[error("Invalid expression at line {line}: {message}")]
     InvalidExpression { line: usize, message: String },
+    #[error("{0}")]
+    ForKey(ForKeyDiagnostic),
+
+    #[error(
+        "This loop is value-keyed; use a string subscript, or `for (i, x) in ...` for index addressing."
+    )]
+    ValueKeyedSubscript { span: SourceSpan },
+    #[error("{error}")]
+    ForIterableShape {
+        error: super::ShapeMismatch,
+        span: SourceSpan,
+    },
 
     #[error("Invalid expression at line {line}{column}: {diagnostic}", column = .diagnostic.column_suffix())]
     InvalidAuthoredExpression {
@@ -396,7 +423,9 @@ fn format_deferred_for_body_unsupported(
     body: &DeferredForBodyKind,
     iterable_resolution: DeferredForIterableResolution,
     phase_detail: Option<&str>,
+    value_keys_pending: bool,
 ) -> String {
+    let header = header.as_str();
     let message = match iterable_resolution {
         DeferredForIterableResolution::StillDeferred => format!(
             "Deferred `for` expression `{header}` at line {line} cannot use {body}: its iterable \
@@ -418,7 +447,14 @@ fn format_deferred_for_body_unsupported(
              during parsing, or put managed resources directly in the loop body"
         ),
     };
-    phase_detail.map_or_else(|| message.clone(), |detail| format!("{message}. {detail}"))
+    let message =
+        phase_detail.map_or_else(|| message.clone(), |detail| format!("{message}. {detail}"));
+    if value_keys_pending {
+        let separator = if message.ends_with('.') { " " } else { ". " };
+        format!("{message}{separator}Use `for (i, x) in ...`.")
+    } else {
+        message
+    }
 }
 
 /// Render the `UndefinedIdentifier` message. When a close match exists
@@ -504,7 +540,8 @@ impl ParseError {
             Self::Located { error, .. } => error.diagnostic_range(),
             Self::AtElement(finding) => Some(from_span(finding.location().span())),
             Self::InvalidAuthoredExpression { diagnostic, .. } => diagnostic.range(),
-            Self::InterpolationInConstraintString { span, .. } => Some(from_span(*span)),
+            Self::InterpolationInConstraintString { span, .. }
+            | Self::RequireOutsideArguments { span } => Some(from_span(*span)),
             Self::ProtectedFile(failure) => Some(failure.range().clone()),
             Self::Syntax(error) => {
                 let (start, end) = match error.line_col {
@@ -559,6 +596,10 @@ impl ParseError {
                 end_line: *line,
                 end_column: *column + name.chars().count(),
             }),
+            Self::ForKey(diagnostic) => Some(from_span(diagnostic.span)),
+            Self::ValueKeyedSubscript { span } | Self::ForIterableShape { span, .. } => {
+                Some(from_span(*span))
+            }
             Self::DeferredForBodyUnsupported(details) => Some(from_span(details.span)),
             Self::DeferredForBodyTemplate { span, .. }
             | Self::UnboundLoopRead {
@@ -580,6 +621,7 @@ impl ParseError {
             // Pest's Display includes the source line. Keep authored text out
             // of machine diagnostics, including malformed secret expressions.
             Self::Syntax(error) => format!("Syntax error: {}", error.variant.message()),
+            Self::RequireOutsideArguments { .. } => REQUIRE_OUTSIDE_ARGUMENTS_MESSAGE.to_string(),
             Self::ProtectedFile(failure) => failure.kind().to_string(),
             Self::InsideSecret { .. } => crate::resource::INSIDE_SECRET_MESSAGE.to_string(),
             Self::InterpolationInConstraintString { kind, .. } => {
@@ -676,6 +718,52 @@ impl ParseError {
             }
             _ => Self::AtElement(Box::new(super::Located::new(location.clone(), self))),
         }
+    }
+
+    pub(crate) fn into_element_at(
+        self,
+        location: &super::DeclarationLocation,
+    ) -> super::Located<Self> {
+        match self.at(location) {
+            Self::AtElement(finding) => *finding,
+            _ => unreachable!("at always supplies element ownership"),
+        }
+    }
+
+    pub(crate) fn for_admission_failure<B: crate::resource::BindingAddress>(
+        error: crate::resource::ForAdmissionFailure<B>,
+        location: &super::DeclarationLocation,
+    ) -> Self {
+        match error {
+            crate::resource::ForAdmissionFailure::Shape(error) => Self::ForIterableShape {
+                error,
+                span: location.span(),
+            }
+            .at(location),
+            crate::resource::ForAdmissionFailure::Knowledge(error) => {
+                Self::from_resolution(error.into(), location.span().start_line()).at(location)
+            }
+        }
+    }
+
+    pub(crate) fn for_key(
+        error: crate::resource::ForKeyError,
+        location: &super::DeclarationLocation,
+    ) -> Self {
+        Self::AtElement(Box::new(Self::for_key_finding(error, location)))
+    }
+
+    pub(in crate::parser) fn for_key_finding(
+        error: crate::resource::ForKeyError,
+        location: &super::DeclarationLocation,
+    ) -> super::Located<Self> {
+        super::Located::new(
+            location.clone(),
+            Self::ForKey(ForKeyDiagnostic {
+                error,
+                span: location.span(),
+            }),
+        )
     }
 
     /// Borrow an existing parser-owned finding without constructing provenance.

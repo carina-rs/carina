@@ -10,6 +10,7 @@ use crate::explicit::{ExplicitFields, ExplicitProjection};
 use crate::numeric::compare_int_float;
 use crate::provider::{InitializedProvider, NestedWriteOnlyRecord, ReferenceScope};
 use crate::references::{ReferenceOperand, ReferenceSide};
+use crate::resource::knowledge::is_known_public;
 use crate::resource::{
     ApplyTimeUnknown, CanonicalComparisonAttributes, ConcreteValue, DeferredValue,
     InterpolationPart, MaskedComparisonAttributes, ResolvedIgnoreChanges, SavedValueViews,
@@ -21,6 +22,17 @@ use crate::schema::{
     empty_defs_for_schema_walks,
 };
 use crate::value::{PersistedValue, SerializationError, contains_secret};
+
+#[cfg(any(test, feature = "test-utils"))]
+thread_local! {
+    static PUBLIC_HASH_VERIFICATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn public_hash_verification_count_for_test() -> u64 {
+    PUBLIC_HASH_VERIFICATIONS.with(std::cell::Cell::get)
+}
 
 /// A comparison cannot publish a verdict without its required evidence.
 #[derive(Debug, thiserror::Error)]
@@ -82,6 +94,13 @@ pub struct ComparisonContext<'a, R: ReferenceEquality> {
     origins: [Option<&'a OperandOrigins>; 2],
     merge_origins: Option<&'a std::cell::RefCell<OperandOrigins>>,
     rendered: Option<&'a std::cell::RefCell<RenderedChanges>>,
+    values: ComparedValues,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComparedValues {
+    Observations,
+    StoredAndFinalDesired,
 }
 
 pub type PlanningComparison<'a> = ComparisonContext<'a, PlanningEquality<'a>>;
@@ -95,6 +114,9 @@ mod sealed {
 
 /// A closed set of policies for shared structural comparison helpers.
 pub trait ReferenceEquality: sealed::Sealed + std::fmt::Debug + Copy {
+    #[doc(hidden)]
+    const PLANNING: bool = false;
+
     #[doc(hidden)]
     fn validate_secret(
         &self,
@@ -142,6 +164,8 @@ impl sealed::Sealed for AuthoringEquality<'_> {}
 impl sealed::Sealed for DisplayEquality {}
 
 impl ReferenceEquality for PlanningEquality<'_> {
+    const PLANNING: bool = true;
+
     fn validate_secret(
         &self,
         operand: &ReferenceOperand,
@@ -267,6 +291,7 @@ impl<'a> ComparisonSchema<'a> {
             origins: [None, None],
             merge_origins: None,
             rendered: None,
+            values: ComparedValues::Observations,
         }
     }
 
@@ -327,6 +352,7 @@ impl<'a> ComparisonSchema<'a> {
             origins: [None, None],
             merge_origins: None,
             rendered: None,
+            values: ComparedValues::Observations,
         }
     }
 
@@ -391,6 +417,7 @@ impl<R: ReferenceEquality> ComparisonContext<'_, R> {
             origins: self.origins,
             merge_origins: self.merge_origins,
             rendered: self.rendered,
+            values: ComparedValues::Observations,
         }
     }
 
@@ -876,6 +903,109 @@ pub(crate) fn type_aware_equal<
     type_aware_equal_on_path(&a, &b, attr_type, defs, &[], context)
 }
 
+impl<'a, R: ReferenceEquality> ComparisonContext<'a, R> {
+    /// The same initialized provider scope and reference forms, without changing
+    /// this context's observation/authoring/planning policy.
+    pub fn schema(&self) -> ComparisonSchema<'a> {
+        self.schema
+    }
+
+    fn for_effect_decision(&self) -> Self {
+        Self {
+            values: ComparedValues::StoredAndFinalDesired,
+            ..*self
+        }
+    }
+}
+
+/// Only attribute effect decisions enter this role. Structural comparisons
+/// used by observation, authoring and recorded display keep their own role.
+pub(super) fn planned_values_equal<
+    R: ReferenceEquality,
+    P: crate::resource::StateValueLeaf,
+    Q: crate::resource::StateValueLeaf,
+>(
+    stored: &crate::resource::Value<P>,
+    desired: &crate::resource::Value<Q>,
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_, R>,
+) -> bool {
+    type_aware_equal(
+        stored,
+        desired,
+        attr_type,
+        defs,
+        &context.for_effect_decision(),
+    )
+}
+
+/// Compare plaintext provider material with the final desired value through
+/// the same canonical attribute projection and typed comparison as planning.
+/// Missing comparison evidence and comparison failures grant no release.
+pub fn public_final_desired_matches_provider(
+    provider: &crate::resource::Value,
+    desired: &crate::validation::admission::final_input::FinalDesiredAttributes,
+    key: &str,
+    schema: Option<&ResourceSchema>,
+    scope: &ComparisonSchema<'_>,
+) -> bool {
+    let Some(desired_value) = desired.attributes().get(key).filter(|v| is_known_public(v)) else {
+        return false;
+    };
+    if !is_known_public(provider) {
+        return false;
+    }
+    let canonical = |value: &crate::resource::Value| match schema {
+        Some(schema) => crate::resource::CanonicalComparisonAttributes::canonicalize(
+            [(key.to_owned(), value.clone())],
+            schema,
+        ),
+        None => crate::resource::CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new::<crate::resource::SnapshotLeaf>(
+                [(key.to_owned(), value.to_snapshot())],
+            ),
+        ),
+    };
+    let provider = canonical(provider);
+    let desired_value = canonical(desired_value);
+    let provider = provider
+        .get(key)
+        .expect("canonical projection retains the key");
+    let desired_value = desired_value
+        .get(key)
+        .expect("canonical projection retains the key");
+    let attr_type = schema.and_then(|schema| schema.attributes.get(key).map(|a| &a.attr_type));
+    let defs = schema
+        .map(|schema| &schema.defs)
+        .unwrap_or(empty_defs_for_schema_walks());
+    match desired.prepared_comparison() {
+        Some((resource, references)) => scope
+            .with_references(references, resource, |context| {
+                planned_values_equal(
+                    provider,
+                    desired_value,
+                    attr_type,
+                    defs,
+                    &context.at_path(key),
+                )
+            })
+            .unwrap_or(false),
+        // Only test-utils constructors omit the final preparation evidence.
+        None => scope
+            .with_observation(|context| {
+                planned_values_equal(
+                    provider,
+                    desired_value,
+                    attr_type,
+                    defs,
+                    &context.at_path(key),
+                )
+            })
+            .unwrap_or(false),
+    }
+}
+
 fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
     a: &Value,
     b: &Value,
@@ -891,6 +1021,38 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
     }
     if let Value::Deferred(DeferredValue::Secret(inner)) = b {
         return context.secret_matches_state(inner, a);
+    }
+
+    // Public-desired verification belongs only to a planning effect decision.
+    // Operand sides retain this direction through list pairing and saved merges.
+    let stored_and_desired = match context.sides {
+        [
+            ReferenceSide::Current | ReferenceSide::Saved,
+            ReferenceSide::Desired,
+        ] => Some((a, b)),
+        [
+            ReferenceSide::Desired,
+            ReferenceSide::Current | ReferenceSide::Saved,
+        ] => Some((b, a)),
+        _ => None,
+    };
+    if R::PLANNING
+        && context.values == ComparedValues::StoredAndFinalDesired
+        && let Some((stored, desired)) = stored_and_desired
+        && stored.secret_hash().is_some()
+        && desired
+            .to_value_at("comparison.secret")
+            .is_ok_and(|value| is_known_public(&value))
+    {
+        #[cfg(any(test, feature = "test-utils"))]
+        PUBLIC_HASH_VERIFICATIONS.with(|count| count.set(count.get() + 1));
+        return match secret_matches_state(desired, stored) {
+            Ok(equal) => equal,
+            Err(error) => {
+                context.errors.retain(error.into());
+                false
+            }
+        };
     }
 
     // Retain top-level Ref names across non-consuming Union recursion. Each
@@ -2002,6 +2164,7 @@ pub(super) fn find_changed_attributes_with_ignores(
         }
     }
 
+    let effect_decision = context.for_effect_decision();
     for (key, desired_value) in masked.desired() {
         if ignore_changes.ignores_whole_attribute(key) {
             continue;
@@ -2060,7 +2223,7 @@ pub(super) fn find_changed_attributes_with_ignores(
             LeafProvenance::Recorded(nested_write_only.get(key)),
             comparison,
             ignore_changes,
-            context,
+            &effect_decision,
         );
         if should_patch {
             changed.push(key.clone());
@@ -2127,6 +2290,7 @@ pub(crate) fn find_apply_time_changed_attributes<S>(
     ignores: &ResolvedIgnoreChanges,
     context: &PlanningComparison<'_>,
 ) -> Result<Vec<String>, ApplyTimeCreateOnlyChange> {
+    let effect_decision = context.for_effect_decision();
     let changed = masked
         .desired()
         .iter()
@@ -2146,7 +2310,7 @@ pub(crate) fn find_apply_time_changed_attributes<S>(
                     type_info,
                 },
                 ignores,
-                &context.at_path(key),
+                &effect_decision.at_path(key),
             )
             .then(|| key.clone())
         })
@@ -2166,9 +2330,9 @@ pub(crate) fn find_apply_time_changed_attributes<S>(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn find_changed_attributes(
-    desired: &HashMap<String, Value>,
-    current: &HashMap<String, Value>,
-    saved: Option<&HashMap<String, Value>>,
+    desired: &BTreeMap<String, Value>,
+    current: &BTreeMap<String, Value>,
+    saved: Option<&BTreeMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
@@ -2205,6 +2369,278 @@ pub(super) fn find_changed_attributes(
 mod tests {
     use super::*;
     use crate::schema::{DslTransform, TypeIdentity};
+
+    fn public_comparison_hash(material: &crate::resource::Value) -> Value {
+        crate::value::PersistedValue::encode_desired_value(
+            &crate::resource::Value::Deferred(crate::resource::DeferredValue::Secret(
+                Box::new(material.clone()).into(),
+            )),
+            None,
+        )
+        .unwrap()
+        .decode()
+        .unwrap()
+    }
+
+    fn planned_equal(
+        stored: &Value,
+        desired: &Value,
+        attr_type: Option<&AttributeType>,
+        defs: &BTreeMap<String, AttributeType>,
+    ) -> bool {
+        let observed = crate::differ::exact_comparison_context_for_tests();
+        observed
+            .schema()
+            .with_references(
+                &crate::references::prepare_empty_for_tests(),
+                &crate::resource::ResourceId::with_provider_identity(
+                    "mock",
+                    "test.resource",
+                    "sink",
+                    None,
+                ),
+                |context| super::planned_values_equal(stored, desired, attr_type, defs, context),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn comparison_planning_reference_scope_does_not_grant_effect_role() {
+        let material = crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+            "public".into(),
+        ));
+        let hash = public_comparison_hash(&material);
+        let desired = material.to_snapshot();
+        crate::differ::exact_comparison_context_for_tests()
+            .schema()
+            .with_references(
+                &crate::references::prepare_empty_for_tests(),
+                &crate::resource::ResourceId::with_provider_identity(
+                    "mock",
+                    "test.resource",
+                    "sink",
+                    None,
+                ),
+                |context| {
+                    let before = public_hash_verification_count_for_test();
+                    let display_changed = super::key_should_enter_patch(
+                        "computed",
+                        None,
+                        LeafProvenance::DecidedByPlan { key_changed: true },
+                        AttrComparison {
+                            from: Some(&hash),
+                            to: &desired,
+                            saved: None,
+                            type_info: None,
+                        },
+                        context,
+                    );
+                    assert!(
+                        display_changed,
+                        "a display comparison must show the hash-to-plaintext transition"
+                    );
+                    assert_eq!(public_hash_verification_count_for_test() - before, 0);
+                    assert!(super::planned_values_equal(
+                        &hash,
+                        &desired,
+                        None,
+                        &BTreeMap::new(),
+                        context
+                    ));
+                    assert_eq!(public_hash_verification_count_for_test() - before, 1);
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn comparison_previous_secret_hash_matches_public_desired() {
+        let public = crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+            "public".into(),
+        ));
+        let hash = public_comparison_hash(&public);
+        let public = crate::resource::state_value_snapshot(&public);
+        assert!(!planned_equal(
+            &public,
+            &hash,
+            None,
+            empty_defs_for_schema_walks()
+        ));
+        assert!(planned_equal(
+            &hash,
+            &public,
+            None,
+            empty_defs_for_schema_walks()
+        ));
+    }
+
+    #[test]
+    fn comparison_previous_secret_hash_mismatch_is_changed() {
+        let hash = public_comparison_hash(&crate::resource::Value::Concrete(
+            crate::resource::ConcreteValue::String("old material".into()),
+        ));
+        let public = Value::Concrete(ConcreteValue::String("public".into()));
+        assert!(!planned_equal(
+            &hash,
+            &public,
+            None,
+            empty_defs_for_schema_walks()
+        ));
+    }
+
+    #[test]
+    fn comparison_previous_secret_hash_matches_public_nested_leaf() {
+        let material = crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+            "public".into(),
+        ));
+        let public = crate::resource::state_value_snapshot(&material);
+        let hash = public_comparison_hash(&material);
+        let nested = |leaf| {
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "nested".into(),
+                Value::Concrete(ConcreteValue::List(vec![leaf])),
+            )])))
+        };
+        assert!(planned_equal(
+            &nested(hash),
+            &nested(public),
+            None,
+            empty_defs_for_schema_walks()
+        ));
+    }
+
+    #[test]
+    fn comparison_public_hash_typed_path_is_planning_only() {
+        let public = crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+            "public".into(),
+        ));
+        let hash = public_comparison_hash(&public);
+        let public = crate::resource::state_value_snapshot(&public);
+        let ty = AttributeType::string();
+        assert!(planned_equal(
+            &hash,
+            &public,
+            Some(&ty),
+            empty_defs_for_schema_walks()
+        ));
+        assert!(!type_aware_equal(
+            &hash,
+            &public,
+            Some(&ty),
+            empty_defs_for_schema_walks()
+        ));
+        assert!(!type_aware_equal(
+            &public,
+            &hash,
+            Some(&ty),
+            empty_defs_for_schema_walks()
+        ));
+    }
+
+    #[test]
+    fn comparison_public_hash_typed_numeric_control_does_not_coerce_hash_material() {
+        let float = crate::resource::Value::Concrete(crate::resource::ConcreteValue::Float(
+            crate::finite(1.0),
+        ));
+        let hash = public_comparison_hash(&float);
+        let integer = Value::Concrete(ConcreteValue::Int(1));
+        let ty = AttributeType::float();
+        assert!(!planned_equal(
+            &hash,
+            &integer,
+            Some(&ty),
+            empty_defs_for_schema_walks()
+        ));
+        assert!(planned_equal(
+            &float.to_snapshot(),
+            &integer,
+            Some(&ty),
+            empty_defs_for_schema_walks()
+        ));
+    }
+
+    #[test]
+    fn comparison_public_hash_unordered_list_verifies_nested_leaves() {
+        let text = |s: &str| {
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(s.into()))
+        };
+        let stored = Value::Concrete(ConcreteValue::List(vec![
+            public_comparison_hash(&text("second")),
+            public_comparison_hash(&text("first")),
+        ]));
+        let desired = Value::Concrete(ConcreteValue::List(vec![
+            text("first").to_snapshot(),
+            text("second").to_snapshot(),
+        ]));
+        let ty = AttributeType::unordered_list(AttributeType::string());
+        assert!(planned_equal(
+            &stored,
+            &desired,
+            Some(&ty),
+            empty_defs_for_schema_walks()
+        ));
+    }
+
+    #[test]
+    fn comparison_public_hash_pending_desired_control_never_verifies() {
+        let hash = public_comparison_hash(&crate::resource::Value::Concrete(
+            crate::resource::ConcreteValue::String("public".into()),
+        ));
+        let pending: Value =
+            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
+                crate::resource::PendingReRead::incomplete("pending".to_owned()),
+            )));
+        let before = public_hash_verification_count_for_test();
+        let _equal = planned_equal(
+            &hash,
+            &pending,
+            Some(&AttributeType::string()),
+            empty_defs_for_schema_walks(),
+        );
+        assert_eq!(public_hash_verification_count_for_test() - before, 0);
+    }
+
+    #[test]
+    fn comparison_public_hash_hash_control_never_verifies() {
+        let material = crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+            "public".into(),
+        ));
+        let first = public_comparison_hash(&material);
+        let second = public_comparison_hash(&crate::resource::Value::Concrete(
+            crate::resource::ConcreteValue::String("other".into()),
+        ));
+        let before = public_hash_verification_count_for_test();
+        assert!(planned_equal(
+            &first,
+            &first,
+            Some(&AttributeType::string()),
+            empty_defs_for_schema_walks()
+        ));
+        assert!(!planned_equal(
+            &first,
+            &second,
+            Some(&AttributeType::string()),
+            empty_defs_for_schema_walks()
+        ));
+        assert_eq!(public_hash_verification_count_for_test() - before, 0);
+    }
+
+    #[test]
+    fn comparison_previous_secret_hash_desired_secret_is_unchanged() {
+        let material = crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+            "public".into(),
+        ));
+        let hash = public_comparison_hash(&material);
+        let desired = crate::resource::state_value_snapshot(&crate::resource::Value::Deferred(
+            crate::resource::DeferredValue::Secret(Box::new(material).into()),
+        ));
+        assert!(type_aware_equal(
+            &desired,
+            &hash,
+            None,
+            empty_defs_for_schema_walks()
+        ));
+    }
 
     fn type_aware_equal(
         a: &Value,

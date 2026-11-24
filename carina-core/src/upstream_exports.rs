@@ -927,17 +927,6 @@ pub enum UpstreamExportSourceError {
 }
 
 impl UpstreamExportSourceError {
-    /// Source directory and typed resolver failure whose complete diagnostic
-    /// is already rendered by this error's Display.
-    pub fn module_failure(
-        &self,
-    ) -> Option<(&std::path::Path, &crate::module_resolver::ModuleError)> {
-        match self {
-            Self::Module { base, error } => Some((base, error)),
-            _ => None,
-        }
-    }
-
     fn into_resolve_failure(
         self,
         binding: String,
@@ -1886,7 +1875,7 @@ fn visit_subscript_access<B: BindingAddress>(
 mod tests {
     #[cfg(unix)]
     #[test]
-    fn round3_non_utf8_upstream_guard_is_not_omitted() {
+    fn non_utf8_upstream_syntax_error_keeps_its_authored_path() {
         use std::os::unix::ffi::OsStringExt;
         let directory = tempfile::tempdir().unwrap();
         let upstream_dir = directory.path().join("upstream");
@@ -1913,21 +1902,18 @@ mod tests {
                 &overrides,
             )
             .unwrap();
-            assert_eq!(errors.len(), 1, "upstream guard was omitted");
-            let (_, error) = errors[0].detail().module_failure().unwrap();
-            let crate::module_resolver::ModuleError::DirectoryConstraint(finding) =
-                error.root_cause()
-            else {
-                panic!("expected a located directory constraint: {error}");
-            };
-            assert_eq!(finding.location().file().path(), guard);
-            assert_eq!(finding.location().span().start_line(), 1);
-            assert_eq!(finding.location().span().start_column(), 9);
-            assert_eq!(finding.location().span().end_column(), 14);
-            assert_eq!(
-                finding.detail().to_string(),
-                "require failed: upstream guard"
+            assert_eq!(errors.len(), 1, "upstream syntax error was omitted");
+            let failure = errors[0].detail().parse_failure().unwrap();
+            assert_eq!(failure.source_file(), Some(guard.as_path()));
+            let error = failure.parse_error().unwrap();
+            assert!(
+                error
+                    .diagnostic_message()
+                    .contains("`require` must be written inside an `arguments` block")
             );
+            let location = error.diagnostic_range().unwrap();
+            assert_eq!(location.start_line, 1);
+            assert!(errors[0].detail().to_string().contains("upstream"));
             if physical {
                 let (_, errors) = super::resolve_upstream_export_report_inner(
                     &ResolvedPath::new(directory.path()).unwrap(),
@@ -3287,7 +3273,7 @@ mod tests {
         for (expression, field_error) in [("up.missing", true), ("up.names['bad']", false)] {
             let parsed = parse_project_with_provider(
                 &format!(
-                    "let up = upstream_state {{ source = './up' }}\nlet copies = for n in [1, 2] {{ test.r.res {{ name = {expression} }} }}\n"
+                    "let up = upstream_state {{ source = './up' }}\nlet copies = for (_, n) in [1, 2] {{ test.r.res {{ name = {expression} }} }}\n"
                 ),
                 "test",
             );

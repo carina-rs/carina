@@ -1,0 +1,2 @@
+provider mock {}
+let y = mock.test.resource { name = 'y' }

@@ -719,10 +719,9 @@ impl UnboundLoopTemplate {
     }
 
     pub(crate) fn matches_legacy_binding(&self, binding: &str) -> bool {
-        binding == self.legacy_base.exact_state_name()
-            || binding
-                .strip_prefix(self.legacy_base.exact_state_name())
-                .is_some_and(|suffix| suffix.starts_with(['[', '.']))
+        super::decompose_binding_address(binding).is_some_and(|address| {
+            address.is_self_or_descendant_of(self.legacy_base.exact_state_name())
+        })
     }
 
     pub(crate) fn set_display_file(&mut self, file: &str) {
@@ -755,4 +754,308 @@ pub(crate) fn replace_identity_prefix(value: &str, from: &str, to: &str) -> Opti
         return None;
     }
     Some(format!("{to}{suffix}"))
+}
+
+#[cfg(test)]
+mod for_key_type_tests {
+    use crate::parser::{ResourceTypePath, TypeExpr};
+    use crate::resource::binding_address::{
+        ForAddressAdmission, ForAddressMoment, ForAdmissionFailure, ForKeyEligibility, ForKeyError,
+        admit_bound_for_addresses, classify_for_key_type,
+    };
+
+    #[test]
+    fn for_value_keys_admission_owns_all_outcomes() {
+        for source in [
+            include_str!("../parser/expressions/for_expr.rs"),
+            include_str!("../parser/ast.rs"),
+            include_str!("../executor/deferred_dispatch.rs"),
+            include_str!("../module_resolver/expander.rs"),
+        ] {
+            assert!(!source.contains("ClassifiedRef::from(&classification).is_protected()"));
+            assert!(!source.contains("members.is_protected()"));
+            assert!(!source.contains("ForKeyError::PlanPending"));
+        }
+    }
+
+    #[test]
+    fn for_value_keys_raw_minting_is_confined() {
+        let source = include_str!("binding_address.rs");
+        assert!(!source.contains("pub(crate) fn binding_with_index"));
+        assert!(!source.contains("pub(crate) fn binding_with_map_key"));
+        assert!(!include_str!("../parser/dependencies.rs").contains("binding_with_index("));
+        assert!(!include_str!("../parser/dependencies.rs").contains("binding_with_map_key("));
+    }
+
+    #[test]
+    fn for_value_keys_admitted_keys_roundtrip_state() {
+        // This property is the link to carina#4552: fixing escaping there
+        // admits more keys here without changing the admission policy.
+        use crate::resource::{ConcreteValue, RelativeBindingName, Value};
+        let target =
+            crate::parser::BoundDeferredTarget::new(RelativeBindingName::new("m.rs")).unwrap();
+        let ordinary = ["a", "a b", "example.com", "a-b", "/a/b", "2001:db8::1"];
+        let mut keys = ordinary.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        keys.extend(["a[b]".to_string(), "q'].z['w".to_string()]);
+        for left in b' '..=b'~' {
+            for right in b' '..=b'~' {
+                keys.push(String::from_utf8(vec![left, right]).unwrap());
+            }
+        }
+        for key in keys {
+            let value: Value<crate::resource::ParserPlaceholder, RelativeBindingName> =
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String(key.clone().into()),
+                )]));
+            let classified = value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .unwrap()
+                .into_classification();
+            let admission = admit_bound_for_addresses(
+                &crate::parser::ForBinding::Simple("x".into()),
+                &target,
+                crate::resource::knowledge::ClassifiedRef::from(&classified),
+                ForAddressMoment::Validation,
+            );
+            if ordinary.contains(&key.as_str()) {
+                assert!(
+                    matches!(&admission, Ok(ForAddressAdmission::Admitted(addresses)) if addresses.len() == 1),
+                    "ordinary keys must be admitted"
+                );
+            }
+            if key == "a[b]" {
+                // Flip this rejection assertion when carina#4552 fixes escaping.
+                assert!(matches!(
+                    &admission,
+                    Ok(ForAddressAdmission::Reject(
+                        ForKeyError::NonRoundTrippingKey { element: 1 }
+                    ))
+                ));
+            }
+            if let Ok(ForAddressAdmission::Admitted(addresses)) = admission {
+                let minted = addresses[0].address().binding_address().as_str();
+                let canonical = crate::utils::canonicalize_map_key_address(minted);
+                assert_eq!(
+                    crate::resource::decompose_binding_address(&canonical)
+                        .and_then(|address| address.direct_key_of("m.rs")),
+                    Some(key.as_str())
+                );
+                assert!(
+                    crate::resource::decompose_binding_address(&canonical)
+                        .is_some_and(|address| address.is_direct_child_of("m.rs")),
+                    "admitted key must stay a direct child: {key:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn for_value_keys_common_keys_roundtrip_state() {
+        let source = "let rs = for x in ['a b', 'example.com', 'a-b', '/a/b', '2001:db8::1'] { mock.test.resource { name = x } }";
+        let parsed = crate::parser::parse(
+            source,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let actual = parsed
+            .resources
+            .iter()
+            .map(|r| r.binding.as_ref().unwrap().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                "rs['a b']",
+                "rs['example.com']",
+                "rs['a-b']",
+                "rs['/a/b']",
+                "rs['2001:db8::1']"
+            ]
+        );
+        for binding in actual {
+            assert_eq!(crate::utils::canonicalize_map_key_address(binding), binding);
+            assert!(
+                crate::resource::decompose_binding_address(binding)
+                    .unwrap()
+                    .is_direct_child_of("rs")
+            );
+        }
+    }
+
+    #[test]
+    fn for_value_keys_protected_non_simple_validation_is_unchanged() {
+        let mut failures = Vec::new();
+        for header in [
+            "for (_, x) in secret(['CONTROL'])",
+            "for k, x in secret({ key = 'CONTROL' })",
+        ] {
+            let source = format!("let rs = {header} {{ mock.test.resource {{ name = x }} }}");
+            let parsed = crate::parser::parse(
+                &source,
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap();
+            assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
+            for deferred in parsed.parsed_deferred_for_expressions() {
+                if let Err(error) = deferred.clone().into_resource_expression(&[]) {
+                    failures.push(format!("{header}: {error:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn for_value_keys_failed_member_propagates_knowledge_error() {
+        use crate::resource::{
+            ConcreteValue, DeferredValue, NoPlaceholder, RelativeBindingName, Value,
+        };
+        let value: Value<NoPlaceholder, RelativeBindingName> = Value::Concrete(
+            ConcreteValue::List(vec![Value::Deferred(DeferredValue::Unavailable {
+                name: crate::builtins::BuiltinFunction::env,
+                args: vec![],
+                reason: crate::resource::UnavailableReason::from_builtin_error(
+                    "unavailable".into(),
+                ),
+                source_line: 0.into(),
+            })]),
+        );
+        let classification = value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .unwrap()
+            .into_classification();
+        let target =
+            crate::parser::BoundDeferredTarget::new(RelativeBindingName::new("rs")).unwrap();
+        let error = admit_bound_for_addresses(
+            &crate::parser::ForBinding::Simple("x".into()),
+            &target,
+            crate::resource::knowledge::ClassifiedRef::from(&classification),
+            ForAddressMoment::Validation,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("env(): unavailable"), "{error}");
+    }
+
+    #[test]
+    fn for_value_keys_failed_member_is_not_apply_evidence() {
+        use crate::resource::{
+            ConcreteValue, DeferredValue, NoPlaceholder, RelativeBindingName, Value,
+        };
+        let value: Value<NoPlaceholder, RelativeBindingName> = Value::Concrete(
+            ConcreteValue::List(vec![Value::Deferred(DeferredValue::Unavailable {
+                name: crate::builtins::BuiltinFunction::env,
+                args: vec![],
+                reason: crate::resource::UnavailableReason::from_builtin_error(
+                    "unavailable".into(),
+                ),
+                source_line: 0.into(),
+            })]),
+        );
+        let classified = value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .unwrap()
+            .into_classification();
+        let target =
+            crate::parser::BoundDeferredTarget::new(RelativeBindingName::new("rs")).unwrap();
+        let error = admit_bound_for_addresses(
+            &crate::parser::ForBinding::Simple("x".into()),
+            &target,
+            crate::resource::knowledge::ClassifiedRef::from(&classified),
+            ForAddressMoment::Validation,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ForAdmissionFailure::Knowledge(_)),
+            "a failed evaluation supplies no apply-phase evidence: {error}"
+        );
+    }
+
+    #[test]
+    fn for_value_keys_refinement_eligibility() {
+        use crate::parser::{BuiltinTypeName, OwnedTypeIdentity, UnloadedSchemaType};
+        use crate::schema::{RefinedScalarKind, TypeIdentity};
+        assert_eq!(
+            classify_for_key_type(&TypeExpr::Simple(
+                BuiltinTypeName::lookup("ipv4_cidr").unwrap()
+            )),
+            Ok(ForKeyEligibility::String)
+        );
+        assert_eq!(
+            classify_for_key_type(&TypeExpr::Simple(
+                BuiltinTypeName::lookup("positive_int").unwrap()
+            )),
+            Err(ForKeyError::ElementType {
+                kind: "non-String refinement"
+            })
+        );
+        for (scalar, expected) in [
+            (RefinedScalarKind::String, Ok(ForKeyEligibility::String)),
+            (
+                RefinedScalarKind::Int,
+                Err(ForKeyError::ElementType {
+                    kind: "non-String refinement",
+                }),
+            ),
+            (
+                RefinedScalarKind::Float,
+                Err(ForKeyError::ElementType {
+                    kind: "non-String refinement",
+                }),
+            ),
+        ] {
+            let owned = OwnedTypeIdentity::provider(
+                "mock",
+                TypeIdentity::new(Some("mock"), ["test"], "Refinement"),
+                scalar,
+            );
+            assert_eq!(
+                classify_for_key_type(&TypeExpr::SchemaType {
+                    owned: owned.unbounded_witness_for_test()
+                }),
+                expected
+            );
+        }
+        let unloaded =
+            UnloadedSchemaType::try_from(TypeIdentity::new(Some("mock"), ["test"], "Unknown"))
+                .unwrap();
+        assert_eq!(
+            classify_for_key_type(&TypeExpr::UnloadedSchemaType(unloaded)),
+            Ok(ForKeyEligibility::Unjudged)
+        );
+    }
+
+    #[test]
+    fn for_value_keys_static_classifier() {
+        for ty in [
+            TypeExpr::String,
+            TypeExpr::StringLiteral("TYPE_LITERAL_CANARY".into()),
+            TypeExpr::Union(vec![
+                TypeExpr::StringLiteral("a".into()),
+                TypeExpr::StringLiteral("b".into()),
+            ]),
+        ] {
+            assert_eq!(classify_for_key_type(&ty), Ok(ForKeyEligibility::String));
+        }
+        let unknown = TypeExpr::DottedUnresolved(ResourceTypePath::new("mock", "Unknown"));
+        assert_eq!(
+            classify_for_key_type(&unknown),
+            Ok(ForKeyEligibility::Unjudged)
+        );
+        assert_eq!(
+            classify_for_key_type(&TypeExpr::Union(vec![unknown.clone(), TypeExpr::String])),
+            Ok(ForKeyEligibility::Unjudged)
+        );
+        let error = classify_for_key_type(&TypeExpr::Union(vec![
+            unknown,
+            TypeExpr::Bool,
+            TypeExpr::StringLiteral("TYPE_LITERAL_CANARY".into()),
+        ]))
+        .unwrap_err();
+        assert_eq!(error, ForKeyError::ElementType { kind: "Bool" });
+        assert!(!error.to_string().contains("TYPE_LITERAL_CANARY"));
+        assert_eq!(
+            classify_for_key_type(&TypeExpr::Ref(ResourceTypePath::new("mock", "Resource"))),
+            Err(ForKeyError::ElementType { kind: "Ref" })
+        );
+    }
 }

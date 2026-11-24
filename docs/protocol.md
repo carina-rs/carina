@@ -166,13 +166,13 @@ rule: all alternatives must infer identical `TypeExpr`s. Slot reads differing
 only in member layers therefore compare equal. An explicit compatible annotation
 accepts otherwise mixed declarations; inference does not widen their types.
 
-Schema fingerprint encoding is v13. Saved-plan format 46 supersedes 45.
+Schema fingerprint encoding is v13. Saved-plan format 47 supersedes 46.
 Replacement `required_by` and `required_children` values are non-empty ordered
 sets of resource or deferred-effect identities. Decoding rejects empty lists.
 The format retains quoted validation string literals, checked for interpolation on decode.
 Saved module `pending_constraints` contain value expressions (`ValidateExpr`), not retained type records. Saved-plan
 replay reloads identity/member constraints from fingerprint-checked provider
-schemas. Format-45 and older plans must be regenerated; their version gate fails
+schemas. Format-46 and older plans must be regenerated; their version gate fails
 before payload decoding or fingerprint verification.
 
 Every typed destination uses one String/Int identity rule: same identity
@@ -203,7 +203,7 @@ names alone would be identical.
 
 At version 27, both `PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION`
 were 27. Protocol-26 providers had to rebuild against the protocol-27 SDK before
-they could load, including on schema-only migration paths. Version 27 kept WIT
+they could load. Version 27 kept WIT
 `carina:provider@0.2.0`: schemas already cross the boundary as JSON, and
 `validate-custom-type` continues to identify semantic checks by type identity. This is the next unreleased protocol after the conditional input rules in version 26.
 
@@ -878,9 +878,8 @@ exists, while `carina state forget` clears only the current instance after the
 operator confirms the resource is absent; any deposed generations remain
 tracked for deletion.
 
-State format 20 also stores `prevent_destroy` as a tri-state directive. During
-the v19→v20 migration, legacy `true` becomes explicit true, while legacy
-`false` or a missing field becomes unspecified. Unspecified state rows inherit
+State format 21 stores `prevent_destroy` as a tri-state directive.
+Unspecified state rows inherit
 the resource schema default; an explicit false is the only persisted opt-out.
 
 Saved-plan format 31 persists authored `ignore_changes` paths for schema-time
@@ -926,10 +925,9 @@ be regenerated; there is no saved-plan backward compatibility.
 
 Saved-plan format 39 supersedes main format 38 and retains its resolved
 lifecycle directives and per-element loop expressions. It stores complete
-resolved dependency addresses,
-graph-projected managed-row destroy dependencies, and the exact legacy
-dependency migration classification approved during planning. Saved-plan apply
-replays that classification against locked legacy state before any write.
+resolved dependency addresses and
+graph-projected managed-row destroy dependencies. Current saved plans require
+state v21; older plans must be regenerated before apply.
 Deferred effects carry compiled dependency templates; live module handles are
 consumed before saved compositions are encoded. Older plans must be regenerated
 with `carina plan --out`.
@@ -953,12 +951,13 @@ independently of replacement display metadata. Format 42 and older plans fail th
 version gate before payload decoding and must be regenerated with `carina plan --out`.
 
 State format 21 stores current and deposed dependencies and persisted
-`depends_on` directives as complete managed resource addresses. Pre-v21 state
-must pass configuration-aware legacy classification, warning reporting, and
-strict graph validation before it can be written as v21. Source-less inspection
-leaves that migration pending. `carina state migrate --check` checks a local
-state file offline without rewriting it; unresolved deferred loops report the
-reads required to classify their rows.
+`depends_on` directives as complete managed resource addresses. Full-state reads
+accept exactly v21; see [State format upgrades](../site/src/content/guides/state-management.md#state-format-upgrades)
+for rewriting older state. Saved plans must be regenerated.
+Exports-only reads check `exports_version` without inspecting the state body
+version, so v17 and later bodies, including future versions, remain readable
+when their exports encoding is supported. Exports-only reads always require
+`exports_version`.
 
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host
@@ -992,9 +991,8 @@ would make nested write-only provenance ambiguous or contradictory:
 
 The host uses nested write-only typing both to reassert the containing
 top-level attribute during an otherwise necessary update and to compare the
-unobservable leaves against accepted-request provenance. State format v18 adds
-that typed per-instance leaf record; the v17 migration initializes it empty so
-the first plan performs one reconciling update.
+unobservable leaves against accepted-request provenance. State format v21
+requires that typed per-instance leaf record on applied and missing-identifier rows.
 
 Version 12 hosts and providers required an exact v12 match. Rejecting v11 at
 provider load was intentional: either direction of host/provider skew would
@@ -1071,7 +1069,7 @@ State format 15 stores managed current instances as one tagged value:
 `none`, `applied`, `create_in_flight`, or `missing_identifier`. An in-flight
 instance contains its opaque envelope and the UTC `started_at` timestamp, and
 cannot simultaneously contain applied attributes or an applied identifier.
-State format 14 is migrated through an explicit DTO. An unfinished create is
+An unfinished create is
 planned as token-free `ResumeCreate`; the token is joined from locked state
 immediately before dispatch. Only a terminal provider verdict may clear that
 row.

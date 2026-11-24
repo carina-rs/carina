@@ -13,6 +13,7 @@ use crate::wiring::ProviderLoad;
 
 mod report;
 pub use report::ValidateReport;
+pub(super) use report::merge_function_promise_errors;
 #[cfg(test)]
 use report::{Diagnostic as ValidateWarning, ValidateOutput};
 

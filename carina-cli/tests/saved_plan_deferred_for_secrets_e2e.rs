@@ -313,7 +313,7 @@ let renamed_seed = mock.test.deferred_source {
   }
 }
 
-let moved_children = for rule in renamed_seed.generated_rules {
+let moved_children = for (_, rule) in renamed_seed.generated_rules {
   mock.test.resource {
     name    = rule.action
     comment = secret(env("SAVED_PLAN_DEFERRED_FOR_SECRET_3990"))

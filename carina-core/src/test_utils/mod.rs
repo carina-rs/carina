@@ -3,6 +3,8 @@
 pub mod configuration;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod loopback;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod prepared_write;
 pub mod resolver_kind;
 
 // Host boundary fixtures must not become guest display authority through
@@ -60,6 +62,28 @@ where
     crate::validation::admission::attributes::resource_attribute_admissions(request, coverage)
 }
 
+/// Supply caller projections in tests while retaining the canonical owner's
+/// metadata and the replacement findings. This API exists only in test-utils.
+pub fn canonical_caller_values<X, D, B: crate::resource::BindingAddress>(
+    owner: &crate::identifier::CanonicalResource<'_, X, D, B>,
+    values: &indexmap::IndexMap<
+        String,
+        crate::resource::Value<crate::resource::ParserPlaceholder, B>,
+    >,
+) -> Result<
+    crate::identifier::CanonicalAttributeValues<crate::resource::ParserPlaceholder, B>,
+    crate::identifier::RejectedPrefixValues,
+>
+where
+    D: crate::parser::DeferredForPhaseTraversal<
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            B,
+        >,
+{
+    owner.with_values(values)
+}
+
 /// Run resource value fixtures through production validation admission.
 pub fn admit_resource_attribute_report<
     P: crate::resource::PlaceholderKind,
@@ -79,7 +103,7 @@ pub fn admit_resource_attribute_report<
         schema.schema().parts().resource_type,
         None,
     );
-    let attributes = match crate::identifier::canonicalize_prefix_values(
+    let attributes = match crate::identifier::canonicalize_fixture_prefix_values(
         schema,
         &id,
         attributes.clone(),
@@ -89,6 +113,7 @@ pub fn admit_resource_attribute_report<
         Err(errors) => {
             return crate::schema::ResourceValueValidation::from_errors(
                 errors
+                    .into_live_findings()
                     .into_iter()
                     .map(|error| crate::schema::TypeError::AttributePrefix(Box::new(error)))
                     .collect(),
@@ -100,13 +125,22 @@ pub fn admit_resource_attribute_report<
         .filter(|name| is_string_literal(name))
         .cloned()
         .collect();
-    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+    let admitted = crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         crate::validation::admission::attributes::admit_value_only_attributes::<
             crate::validation::admission::kind::ResourceAttribute,
             P,
             B,
         >(schema, &id, &attributes, &quoted, session)
-    })
+    });
+    let (mut report, companions) = admitted.into_parts();
+    report.append_values(crate::schema::ResourceValueValidation::from_errors(
+        companions
+            .into_live_findings()
+            .into_iter()
+            .map(|finding| crate::schema::TypeError::AttributePrefix(Box::new(finding.into())))
+            .collect(),
+    ));
+    report
 }
 
 /// Validate a resource's authored attributes through production admission.
@@ -652,4 +686,10 @@ pub fn ordinary_sink_result_for_test<T, E>(
 pub fn conversion_validation<E: crate::validation::ValidationClientError>()
 -> crate::validation::ConversionValidation<E> {
     crate::validation::ConversionValidation::for_test()
+}
+
+/// Record a synchronous fixture with fixed secret-hash entropy on this thread.
+/// Restores the prior source on return or panic. Ordinary hashing uses OsRng.
+pub fn with_secret_hash_salt_for_test<T>(salt: [u8; 16], record: impl FnOnce() -> T) -> T {
+    crate::resource::secret_hash_test_entropy::with_salt(salt, record)
 }

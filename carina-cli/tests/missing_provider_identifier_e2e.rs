@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use carina_state::check_and_migrate;
+use carina_state::load_state;
 use tempfile::TempDir;
 
 struct Scenario {
@@ -222,11 +222,10 @@ let roles = read mock.iam.Roles {
     }
 
     fn state_resource_count(&self) -> usize {
-        let state = check_and_migrate(
+        let state = load_state(
             &fs::read_to_string(self.project.join("carina.state.json")).expect("read state"),
         )
-        .expect("load state")
-        .into_state();
+        .expect("load state");
         state.resources().len()
     }
 }
@@ -486,6 +485,13 @@ fn managed_to_data_source_destroy_still_deletes_managed_orphan() {
 fn removed_then_import_recovers_missing_identifier_with_and_without_refresh() {
     for no_refresh in [false, true] {
         let scenario = Scenario::new(1);
+        let original: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(scenario.project.join("carina.state.json")).unwrap(),
+        )
+        .unwrap();
+        let identifier = original["resources"][0]["current"]["identifier"]
+            .as_str()
+            .expect("created provider identifier");
         scenario.clear_current_identifiers();
         scenario.write_removed(&["r1"]);
 
@@ -505,7 +511,7 @@ fn removed_then_import_recovers_missing_identifier_with_and_without_refresh() {
             "removed must not mutate provider state"
         );
 
-        scenario.write_import("r1", "mock-id");
+        scenario.write_import("r1", identifier);
         let mut args = vec!["plan", "."];
         if no_refresh {
             args.push("--refresh=false");
@@ -516,17 +522,16 @@ fn removed_then_import_recovers_missing_identifier_with_and_without_refresh() {
             "apply import recovery",
             &scenario.carina(&["apply", ".", "--auto-approve", "--lock=false"]),
         );
-        let state = check_and_migrate(
+        let state = load_state(
             &fs::read_to_string(scenario.project.join("carina.state.json")).expect("read state"),
         )
-        .expect("load imported state")
-        .into_state();
+        .expect("load imported state");
         let row = state
             .find_resource("mock", "test.resource", "r1")
             .expect("imported row must exist");
         assert_eq!(
             row.identifier().map(|value| value.as_str()),
-            Some("mock-id")
+            Some(identifier)
         );
     }
 }

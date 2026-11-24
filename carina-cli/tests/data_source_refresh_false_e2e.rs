@@ -103,7 +103,7 @@ impl Scenario {
         let mut state: Value =
             serde_json::from_slice(&fs::read(&self.mock_state).expect("read mock-provider state"))
                 .expect("parse mock-provider state");
-        state["states"][key]["names"] = Value::Array(
+        state["data_sources"][key]["names"] = Value::Array(
             names
                 .iter()
                 .map(|name| Value::String((*name).into()))
@@ -232,7 +232,7 @@ fn state_refresh_retries_data_source_after_deferred_for_child_expands() {
         .as_array_mut()
         .expect("state resources")
         .iter_mut()
-        .find(|resource| resource["identity"] == "kids[0]")
+        .find(|resource| resource["identity"] == "kids.kid")
         .expect("expanded child state row");
     child["binding"] = Value::Null;
     fs::write(
@@ -243,7 +243,7 @@ fn state_refresh_retries_data_source_after_deferred_for_child_expands() {
     scenario.write_project_file(
         "selected.crn",
         r#"let selected = read mock.iam.Roles {
-  name_regex = kids[0].name
+  name_regex = kids['kid'].name
 }
 "#,
     );

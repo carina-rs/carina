@@ -40,7 +40,7 @@ impl MidRunStateWriter {
         Self::unlocked(backend, LockingDisabled::for_test())
     }
 
-    async fn write_state(&self, state: &mut StateFile) -> Result<(), AppError> {
+    pub(crate) async fn write_state(&self, state: &mut StateFile) -> Result<(), AppError> {
         match self {
             Self::Locked(writer) => writer.write_state(state).await.map_err(AppError::Backend),
             Self::Unlocked {
@@ -59,15 +59,6 @@ impl MidRunStateWriter {
         removed: &carina_state::RemovedRows,
     ) -> Result<(), AppError> {
         removed.apply_to(state);
-        self.write_state(state).await
-    }
-
-    /// Persist a graph-classified schema migration while the heartbeat owns
-    /// the same lock used by later incremental writes.
-    pub(crate) async fn write_schema_migration(
-        &self,
-        state: &mut StateFile,
-    ) -> Result<(), AppError> {
         self.write_state(state).await
     }
 }
@@ -233,9 +224,7 @@ mod tests {
 
     use async_trait::async_trait;
     use carina_core::shutdown::ShutdownToken;
-    use carina_state::{
-        BackendError, BackendResult, LoadedState, LockInfo, StateBackend, StateFile,
-    };
+    use carina_state::{BackendError, BackendResult, LockInfo, StateBackend, StateFile};
     use tokio::sync::{Notify, Semaphore};
 
     use super::{IncrementalStateSaver, MidRunStateWriter};
@@ -298,7 +287,7 @@ mod tests {
             carina_core::shutdown::CleanupBudget::TWO_SECOND
         }
 
-        async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
+        async fn read_state(&self) -> BackendResult<Option<StateFile>> {
             Ok(None)
         }
 

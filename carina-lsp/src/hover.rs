@@ -418,7 +418,7 @@ impl HoverProvider {
                     return Some(hover);
                 }
             }
-            EnclosingBlock::Other => {}
+            EnclosingBlock::Arguments | EnclosingBlock::Other => {}
         }
 
         // Check for built-in function hover, but skip when the word is a type

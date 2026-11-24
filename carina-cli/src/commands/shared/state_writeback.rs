@@ -35,8 +35,8 @@ use carina_core::value::PersistedExportValue;
 #[cfg(test)]
 use carina_core::value::PersistedValue;
 use carina_state::{
-    BackendError, DeposedAttributes, DeposedInstance, DeposedKey, PreviousSecretHashAuthority,
-    ResourceState, RowBasis, StateBackend, StateFile,
+    BackendError, DeposedAttributes, DeposedInstance, DeposedKey, ResourceState, RowBasis,
+    StateBackend, StateFile,
 };
 use serde::{Deserialize, Serialize};
 
@@ -305,6 +305,7 @@ pub(crate) struct ApplyStateSaveInputs<S = ModuleSource> {
     planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
     comparisons: ResolvedComparisonTable,
     references: Option<carina_core::references::ResolvedReferences>,
+    final_desired: Option<crate::wiring::ReleaseWitness>,
 }
 
 impl<S: Clone> ApplyStateSaveInputs<S> {
@@ -324,6 +325,7 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
             planned_secret_hashes,
             comparisons,
             references: None,
+            final_desired: None,
         })
     }
 
@@ -332,6 +334,11 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
         references: Option<carina_core::references::ResolvedReferences>,
     ) -> Self {
         self.references = references;
+        self
+    }
+
+    pub(crate) fn with_final_desired(mut self, desired: crate::wiring::ReleaseWitness) -> Self {
+        self.final_desired = Some(desired);
         self
     }
 
@@ -385,6 +392,7 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
             self.references.as_ref(),
             &result.permanent_name_overrides,
             &result.replacement_writeback,
+            self.final_desired.as_ref(),
         )
     }
 }
@@ -720,7 +728,7 @@ pub(crate) fn resolve_export_values_post_apply<D>(
                         compositions: &[],
                         managed_current: &plan_input_current,
                         data_source_values: input.post_apply_states.data_source_values(),
-                        remote_bindings: &HashMap::new(),
+                        remote_bindings: &Default::default(),
                         wait_aliases: input.wait_aliases,
                     },
                 );
@@ -1277,22 +1285,19 @@ fn planned_depose<S>(
         // provider-echoed write-only value enter this snapshot.
         existing.deposed_attributes_from_current_generation(desired_resource, schema)
     } else {
-        let previous_hash_authority = existing_attributes
-            .map(PreviousSecretHashAuthority::AllPreviouslyHashedKeys)
-            .unwrap_or(PreviousSecretHashAuthority::None);
         if let Some(previous) = delete.previous_attributes {
             ResourceState::deposed_attributes_from_replacement_history(
                 desired_resource,
                 schema,
                 previous,
-                previous_hash_authority,
+                existing_attributes,
             )
         } else if let Some(current) = current_state {
             ResourceState::deposed_attributes_without_previous(
                 desired_resource,
                 schema,
                 &current.attributes,
-                previous_hash_authority,
+                existing_attributes,
             )
         } else {
             Ok(DeposedAttributes::default())
@@ -1749,6 +1754,7 @@ pub(crate) fn build_state_after_apply<S: Clone>(
         None,
         &HashMap::new(),
         &[],
+        None,
     )
 }
 
@@ -1762,6 +1768,7 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
         HashMap<String, carina_core::name_override::NameOverride>,
     >,
     runtime_replacements: &[carina_core::replacement::ReplacementWriteback],
+    final_desired: Option<&crate::wiring::ReleaseWitness>,
 ) -> Result<StateFile, AppError> {
     let ApplyStateSave {
         state_file,
@@ -1815,12 +1822,15 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
                 let schema = Some(owner_schema.schema().as_schema());
                 Ok::<_, AppError>(match &planned.source {
                     UpsertSource::Complete { state, request } => {
-                        ResourceState::from_provider_state_for_resource_and_schema(
+                        crate::wiring::write_resource_state(
                             resource,
-                            state,
+                            carina_state::ResourceStateWrite::Provider {
+                                state,
+                                basis: RowBasis::Applied(request),
+                            },
                             existing,
                             schema,
-                            RowBasis::Applied(request),
+                            final_desired,
                             preferred_hashes,
                             comparison,
                         )
@@ -1832,12 +1842,15 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
                         // Import sends no resource attributes, so it establishes no
                         // write-only baseline. An updatable key is sent by the next
                         // plan; a create-only key remains subject to the #1232 guard.
-                        ResourceState::from_provider_state_for_resource_and_schema(
+                        crate::wiring::write_resource_state(
                             resource,
-                            state,
+                            carina_state::ResourceStateWrite::Provider {
+                                state,
+                                basis: RowBasis::Imported,
+                            },
                             existing,
                             schema,
-                            RowBasis::Imported,
+                            final_desired,
                             preferred_hashes,
                             comparison,
                         )
@@ -1847,12 +1860,15 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
                     }
                     UpsertSource::CurrentPresent(state)
                     | UpsertSource::CurrentMissingIdentifier(state) => {
-                        ResourceState::from_provider_state_for_resource_and_schema(
+                        crate::wiring::write_resource_state(
                             resource,
-                            state,
+                            carina_state::ResourceStateWrite::Provider {
+                                state,
+                                basis: RowBasis::Carried,
+                            },
                             existing,
                             schema,
-                            RowBasis::Carried,
+                            final_desired,
                             preferred_hashes,
                             comparison,
                         )
@@ -1860,11 +1876,12 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
                             AppError::from_resource_state_encoding(id.clone(), source)
                         })?
                     }
-                    UpsertSource::Observed(identified) => ResourceState::from_observation(
+                    UpsertSource::Observed(identified) => crate::wiring::write_resource_state(
                         resource,
-                        identified,
+                        carina_state::ResourceStateWrite::Observation(identified),
                         existing,
                         schema,
+                        final_desired,
                         preferred_hashes,
                         comparison,
                     )
@@ -2131,23 +2148,26 @@ mod post_apply_states_tests {
 
         // state.resources carries the POST-apply value — this must win.
         let json = serde_json::json!({
-            "version": 5,
+            "version": 21,
+            "exports_version": 1,
             "serial": 1,
             "lineage": "test",
             "carina_version": "0.4.0",
             "resources": [
                 {
                     "resource_type": "s3.Bucket",
-                    "name": "log",
-                    "identifier": "log-bucket",
+                    "identity": "log",
                     "provider": "awscc",
-                    "attributes": { "versioning": "Enabled" }
+                    "current": {
+                        "kind": "applied",
+                        "identifier": "log-bucket",
+                        "attributes": { "versioning": "Enabled" },
+                        "nested_write_only": {}
+                    }
                 }
             ]
         });
-        let state = carina_state::check_and_migrate(&json.to_string())
-            .unwrap()
-            .into_state();
+        let state = carina_state::load_state(&json.to_string()).unwrap();
 
         let managed_current = crate::managed_current_from_states(managed_states);
         let post = PostApplyStates::from_current_and_state(
@@ -2717,13 +2737,13 @@ mod apply_state_save_tests {
         let template = DeferredForExpression::new(
             Some("main.crn".to_string()),
             1,
-            "for opt in cert.domain_validation_options".to_string(),
+            "for (_, opt) in cert.domain_validation_options".to_string(),
             carina_core::parser::DeferredForTarget::bound(
                 carina_core::resource::absolute_binding_address_for_test("validation_records"),
             )
             .expect("fixture binding is valid"),
             root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Simple("opt".to_string()),
+            ForBinding::Indexed("_".into(), "opt".to_string()),
             // Comparison pre-resolution keys the materialized template by
             // provider instance and type before any runtime child exists.
             Resource::pending_with_provider("aws", "route53.Record", None),
@@ -2748,17 +2768,39 @@ mod apply_state_save_tests {
         assert_eq!(comparison.owner_schema().owner(), "aws");
     }
 
-    fn complete_create(state: State) -> Applied {
+    fn complete_create<S, D>(
+        state: State,
+        desired: &carina_core::resource::Resource<
+            S,
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+            D,
+        >,
+    ) -> Applied {
         Applied::Complete {
             state: state.to_snapshot(),
-            request: AcceptedRequest::create_for_test(),
+            request: AcceptedRequest::from_create_permit_for_test(
+                &carina_core::test_utils::prepared_write::create_permit(desired),
+            ),
         }
     }
 
-    fn complete_update(state: State, sent: &[&str], removed: &[&str]) -> Applied {
+    fn complete_update<S, D>(
+        from: carina_core::resource::SnapshotState,
+        state: State,
+        changed: &[&str],
+        desired: &carina_core::resource::Resource<
+            S,
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+            D,
+        >,
+    ) -> Applied {
         Applied::Complete {
             state: state.to_snapshot(),
-            request: AcceptedRequest::update_for_test(sent, removed),
+            request: AcceptedRequest::from_update_permit_for_test(
+                &carina_core::test_utils::prepared_write::update_permit(desired, from, changed),
+            ),
         }
     }
 
@@ -2796,8 +2838,11 @@ mod apply_state_save_tests {
         token: &str,
         identifier: Option<&str>,
         sent: carina_core::provider::Sent,
+        attributes: &indexmap::IndexMap<String, Value>,
     ) -> carina_core::provider::InFlightCreate {
-        crate::fixture_in_flight_create(id, token, identifier, sent)
+        let mut resource = Resource::from_id(id.clone());
+        resource.attributes = attributes.clone();
+        crate::fixture_in_flight_create_for_resource(resource, token, identifier, sent)
     }
 
     fn secret_string(value: &str) -> Value {
@@ -2813,8 +2858,11 @@ mod apply_state_save_tests {
         id: &ResourceId,
         attributes: HashMap<String, Value>,
         sent: carina_core::provider::Sent,
+        desired: &indexmap::IndexMap<String, Value>,
     ) -> carina_core::provider::HostIdentifiedCreate {
-        crate::fixture_identified_create(id, attributes, sent)
+        let mut resource = Resource::from_id(id.clone());
+        resource.attributes = desired.clone();
+        crate::fixture_identified_create(resource, attributes, sent)
     }
 
     #[test]
@@ -2906,6 +2954,7 @@ mod apply_state_save_tests {
                             "persisted-token",
                             Some("pending-id"),
                             carina_core::provider::Sent::AllRequestAttributes,
+                            &resolved_resource.attributes,
                         )),
                     )]),
                     plan: &Plan::new(),
@@ -2962,6 +3011,7 @@ mod apply_state_save_tests {
                     )]),
                 )
                 .with_identifier("complete-id"),
+                &resolved_resource,
             ),
             ReplacementAppliedKind::Observed => Applied::Observed(
                 identified_create(
@@ -2971,6 +3021,7 @@ mod apply_state_save_tests {
                         Value::Concrete(ConcreteValue::String("observed.example.com".into())),
                     )]),
                     carina_core::provider::Sent::AllRequestAttributes,
+                    &resolved_resource.attributes,
                 )
                 .into(),
             ),
@@ -2979,6 +3030,7 @@ mod apply_state_save_tests {
                 "new-token",
                 Some("pending-id"),
                 carina_core::provider::Sent::AllRequestAttributes,
+                &resolved_resource.attributes,
             )),
             ReplacementAppliedKind::CreateEnded => Applied::CreateEnded,
         };
@@ -3183,7 +3235,11 @@ mod apply_state_save_tests {
         let Current::CreateInFlight(pending) = initial.build_state_for_resource(&id) else {
             panic!("matrix fixture must load an in-flight current instance");
         };
-        let repended = crate::fixture_repend_in_flight_create(pending, "repended-token");
+        let repended = crate::fixture_repend_in_flight_create(
+            pending,
+            "repended-token",
+            &resolved_desired.attributes,
+        );
         let managed_current = HashMap::from([(id.clone(), initial.build_state_for_resource(&id))]);
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
@@ -3313,6 +3369,7 @@ mod apply_state_save_tests {
                             provider_attributes,
                         )
                         .with_identifier("provider-id"),
+                        resource,
                     ),
                 )]),
                 plan: &Plan::new(),
@@ -3683,10 +3740,10 @@ mod apply_state_save_tests {
         let saved = build_state_after_apply(
             ApplyStateSave {
                 state_file: existing,
-                sorted_resources: std::slice::from_ref(&resolved(desired)),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &managed_current,
-                applied_states: &HashMap::from([(id.clone(), complete_create(applied))]),
+                applied_states: &HashMap::from([(id.clone(), complete_create(applied, &desired))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -3791,12 +3848,20 @@ mod apply_state_save_tests {
         let saved = build_state_after_apply(
             ApplyStateSave {
                 state_file: existing,
-                sorted_resources: std::slice::from_ref(&resolved(desired)),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     id.clone(),
-                    complete_update(applied, &["comment"], &[]),
+                    complete_update(
+                        carina_core::resource::SnapshotState::existing(
+                            desired.id.clone(),
+                            std::collections::BTreeMap::new(),
+                        ),
+                        applied,
+                        &["comment"],
+                        &desired,
+                    ),
                 )]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
@@ -3827,12 +3892,20 @@ mod apply_state_save_tests {
         let saved = build_state_after_apply(
             ApplyStateSave {
                 state_file: existing,
-                sorted_resources: std::slice::from_ref(&resolved(desired)),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     id.clone(),
-                    complete_update(applied, &["password"], &[]),
+                    complete_update(
+                        carina_core::resource::SnapshotState::existing(
+                            desired.id.clone(),
+                            std::collections::BTreeMap::new(),
+                        ),
+                        applied,
+                        &["password"],
+                        &desired,
+                    ),
                 )]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
@@ -3906,12 +3979,12 @@ mod apply_state_save_tests {
         let saved = build_state_after_apply(
             ApplyStateSave {
                 state_file: existing,
-                sorted_resources: std::slice::from_ref(&resolved(desired)),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     id.clone(),
-                    complete_update(applied, &[], &["password"]),
+                    complete_update(applied.to_snapshot(), applied, &["password"], &desired),
                 )]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
@@ -3985,7 +4058,13 @@ mod apply_state_save_tests {
                 managed_current: &managed_current,
                 applied_states: &HashMap::from([(
                     id.clone(),
-                    complete_update(applied, &["comment"], &["password"]),
+                    complete_update(
+                        State::existing(before.id.clone(), before.resolved_attributes())
+                            .to_snapshot(),
+                        applied,
+                        &["comment", "password"],
+                        &desired,
+                    ),
                 )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -4121,7 +4200,7 @@ mod apply_state_save_tests {
         schemas: &SchemaRegistry,
     ) -> StateFile {
         let id = resource.id.clone();
-        let identified = identified_create(&id, observed_attributes, sent);
+        let identified = identified_create(&id, observed_attributes, sent, &resource.attributes);
         build_state_after_apply(
             ApplyStateSave {
                 state_file: StateFile::new(),
@@ -4149,7 +4228,7 @@ mod apply_state_save_tests {
             value
                 .verify_secret(&material)
                 .expect("fixture secret material serializes"),
-            "secret hash did not match {plaintext:?}"
+            "secret hash did not match the fixture value"
         );
     }
 
@@ -4383,6 +4462,7 @@ mod apply_state_save_tests {
             "first-token",
             Some("issued-id"),
             carina_core::provider::Sent::AllRequestAttributes,
+            &resolved_resource.attributes,
         );
         let initial = build_state_after_apply(
             ApplyStateSave {
@@ -4451,6 +4531,7 @@ mod apply_state_save_tests {
             "original-token",
             Some("issued-id"),
             carina_core::provider::Sent::AllRequestAttributes,
+            &source_resource.attributes,
         );
         let initial = build_state_after_apply(
             ApplyStateSave {
@@ -4600,7 +4681,15 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     destination.clone(),
-                    complete_update(applied, &["name"], &[]),
+                    complete_update(
+                        carina_core::resource::SnapshotState::existing(
+                            destination_resource.id.clone(),
+                            std::collections::BTreeMap::new(),
+                        ),
+                        applied,
+                        &["name"],
+                        &destination_resource,
+                    ),
                 )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -4663,6 +4752,7 @@ mod apply_state_save_tests {
             "first-token",
             Some("issued-id"),
             carina_core::provider::Sent::only(["password", "api_key"]),
+            &resolved_resource.attributes,
         );
         let initial = build_state_after_apply(
             ApplyStateSave {
@@ -4699,7 +4789,11 @@ mod apply_state_save_tests {
         let Current::CreateInFlight(loaded) = initial.build_state_for_resource(&id) else {
             panic!("written pending row must load as in flight");
         };
-        let repended = crate::fixture_repend_in_flight_create(loaded, "second-token");
+        let repended = crate::fixture_repend_in_flight_create(
+            loaded,
+            "second-token",
+            &resolved_resource.attributes,
+        );
         let changed_resource = resource
             .clone()
             .with_attribute(
@@ -4747,6 +4841,7 @@ mod apply_state_save_tests {
             "first-token",
             None,
             carina_core::provider::Sent::AllRequestAttributes,
+            &resolved_resource.attributes,
         );
         let mut existing = ResourceState::from_in_flight(
             &resolved_resource,
@@ -4766,7 +4861,11 @@ mod apply_state_save_tests {
         let Current::CreateInFlight(loaded) = state.build_state_for_resource(&resource.id) else {
             panic!("persisted fixture must load as in flight");
         };
-        let repended = crate::fixture_repend_in_flight_create(loaded, "second-token");
+        let repended = crate::fixture_repend_in_flight_create(
+            loaded,
+            "second-token",
+            &resolved_resource.attributes,
+        );
 
         let seeded_without_prior = ResourceState::from_in_flight(
             &resolved_resource,
@@ -4823,6 +4922,7 @@ mod apply_state_save_tests {
             "source-token",
             None,
             carina_core::provider::Sent::AllRequestAttributes,
+            &source_resource.attributes,
         );
         let source_row = ResourceState::from_in_flight(
             &source_resource,
@@ -4845,6 +4945,7 @@ mod apply_state_save_tests {
             "destination-token",
             None,
             carina_core::provider::Sent::AllRequestAttributes,
+            &destination_resource.attributes,
         );
         let destination_row = ResourceState::from_in_flight(
             &destination_resource,
@@ -4867,6 +4968,7 @@ mod apply_state_save_tests {
         let repended = crate::fixture_repend_in_flight_create(
             loaded_destination,
             "destination-repended-token",
+            &destination_resource.attributes,
         );
 
         let mut plan = Plan::new();
@@ -4915,6 +5017,7 @@ mod apply_state_save_tests {
             "first-token",
             Some("issued-id"),
             carina_core::provider::Sent::AllRequestAttributes,
+            &resolved_resource.attributes,
         );
         let mut initial = build_state_after_apply(
             ApplyStateSave {
@@ -5042,8 +5145,11 @@ mod apply_state_save_tests {
         .with_identifier("sibling-id");
         let resources = vec![resolved(resource.clone()), resolved(sibling.clone())];
         let applied_states = HashMap::from([
-            (id.clone(), complete_create(applied_state)),
-            (sibling_id.clone(), complete_create(sibling_state)),
+            (id.clone(), complete_create(applied_state, &resources[0])),
+            (
+                sibling_id.clone(),
+                complete_create(sibling_state, &resources[1]),
+            ),
         ]);
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -5099,9 +5205,7 @@ mod apply_state_save_tests {
 
         assert_aligned(&state);
         let serialized = serde_json::to_string(&state).expect("serialize state");
-        let round_tripped = carina_state::check_and_migrate(&serialized)
-            .expect("deserialize state")
-            .into_state();
+        let round_tripped = carina_state::load_state(&serialized).expect("deserialize state");
         assert_aligned(&round_tripped);
 
         let listener_current = round_tripped.build_state_for_resource(&id);
@@ -5120,8 +5224,18 @@ mod apply_state_save_tests {
         .with_identifier("sibling-id");
         let resources = vec![resolved(resource.clone()), resolved(sibling)];
         let managed_current = HashMap::from([(id.clone(), listener_current)]);
-        let applied_states =
-            HashMap::from([(sibling_id, complete_update(sibling_state, &["name"], &[]))]);
+        let applied_states = HashMap::from([(
+            sibling_id,
+            complete_update(
+                carina_core::resource::SnapshotState::existing(
+                    resources[1].id.clone(),
+                    std::collections::BTreeMap::new(),
+                ),
+                sibling_state,
+                &["name"],
+                &resources[1],
+            ),
+        )]);
         let carried = build_state_after_apply(
             ApplyStateSave {
                 state_file: round_tripped,
@@ -5181,7 +5295,7 @@ mod apply_state_save_tests {
             .expect("test state setup must be valid");
         let applied_states = HashMap::from([(
             id.clone(),
-            complete_create(applied_name_state(&id, "new-temp")),
+            complete_create(applied_name_state(&id, "new-temp"), &sorted_resources[0]),
         )]);
         let plan = plan_with_name_override(&id, "new-temp", "dsl-new");
 
@@ -5237,7 +5351,7 @@ mod apply_state_save_tests {
             .expect("test state setup must be valid");
         let applied_states = HashMap::from([(
             id.clone(),
-            complete_create(applied_name_state(&id, "legacy-temp")),
+            complete_create(applied_name_state(&id, "legacy-temp"), &sorted_resources[0]),
         )]);
         let plan = plan_with_name_override(&id, "legacy-temp", "dsl-value");
 
@@ -5292,8 +5406,13 @@ mod apply_state_save_tests {
                 state_file: StateFile::new(),
                 sorted_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(child_id.clone(), complete_create(child_state))]),
-                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                applied_states: &HashMap::from([(
+                    child_id.clone(),
+                    complete_create(child_state, &runtime_child),
+                )]),
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(
+                    runtime_child.clone(),
+                )),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -5418,13 +5537,13 @@ mod apply_state_save_tests {
         let template = DeferredForExpression::new(
             Some("main.crn".to_string()),
             1,
-            "for opt in cert.domain_validation_options".to_string(),
+            "for (_, opt) in cert.domain_validation_options".to_string(),
             carina_core::parser::DeferredForTarget::bound(
                 carina_core::resource::absolute_binding_address_for_test("validation_records"),
             )
             .expect("fixture binding is valid"),
             root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Simple("opt".to_string()),
+            ForBinding::Indexed("_".into(), "opt".to_string()),
             Resource::with_provider("aws", "route53.Record", "validation_records", None)
                 .with_test_binding("validation_records"),
         );
@@ -5496,13 +5615,13 @@ mod apply_state_save_tests {
             Box::new(DeferredForExpression::new(
                 Some("main.crn".to_string()),
                 1,
-                "for opt in cert.domain_validation_options".to_string(),
+                "for (_, opt) in cert.domain_validation_options".to_string(),
                 carina_core::parser::DeferredForTarget::bound(
                     carina_core::resource::absolute_binding_address_for_test("validation_records"),
                 )
                 .expect("fixture binding is valid"),
                 root_resource_ref("cert", "domain_validation_options", Vec::new()),
-                ForBinding::Simple("opt".to_string()),
+                ForBinding::Indexed("_".into(), "opt".to_string()),
                 template_resource,
             )),
         )))
@@ -5525,13 +5644,14 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::new();
-        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &runtime_child))]);
         let successfully_deleted =
             HashSet::from([DeletedInstanceKey::current(id.clone(), "old-record-id")]);
         let failed_refreshes = HashSet::new();
         let schemas = SchemaRegistry::new();
 
-        let runtime_child = resolved(runtime_child);
+        let runtime_child = resolved(runtime_child.clone());
         let wb = decompose(DecomposeInput {
             state_file: &StateFile::new(),
             sorted_resources: &[],
@@ -5608,13 +5728,16 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &runtime_child))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
                 state_file,
                 sorted_resources: &[],
-                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(
+                    runtime_child.clone(),
+                )),
                 managed_current: &crate::managed_current_from_states(current_states.clone()),
                 applied_states: &applied_states,
                 plan: &plan,
@@ -5666,13 +5789,16 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &runtime_child))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
                 state_file: StateFile::new(),
                 sorted_resources: &[],
-                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(
+                    runtime_child.clone(),
+                )),
                 managed_current: &crate::managed_current_from_states(current_states.clone()),
                 applied_states: &applied_states,
                 plan: &plan,
@@ -5745,7 +5871,15 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     id,
-                    complete_update(applied_state, &["cidr_block"], &[]),
+                    complete_update(
+                        carina_core::resource::SnapshotState::existing(
+                            desired.id.clone(),
+                            std::collections::BTreeMap::new(),
+                        ),
+                        applied_state,
+                        &["cidr_block"],
+                        &desired,
+                    ),
                 )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -5811,7 +5945,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, complete_create(applied_state))]),
+                applied_states: &HashMap::from([(id, complete_create(applied_state, &desired))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -5884,7 +6018,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::from([(id.clone(), Current::from_state(current_state))]),
-                applied_states: &HashMap::from([(id, complete_create(applied_state))]),
+                applied_states: &HashMap::from([(id, complete_create(applied_state, &desired))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -5944,7 +6078,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, complete_create(applied_state))]),
+                applied_states: &HashMap::from([(id, complete_create(applied_state, &desired))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -6057,7 +6191,10 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&saved_desired),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(create_id, complete_create(applied_state))]),
+                applied_states: &HashMap::from([(
+                    create_id,
+                    complete_create(applied_state, &saved_desired),
+                )]),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
                 failed_refreshes: &HashSet::new(),
@@ -6119,7 +6256,10 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(create_id, complete_create(applied_state))]),
+                applied_states: &HashMap::from([(
+                    create_id,
+                    complete_create(applied_state, &desired),
+                )]),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
                 failed_refreshes: &HashSet::new(),
@@ -6240,7 +6380,10 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&saved_desired),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, complete_create(applied_state))]),
+                applied_states: &HashMap::from([(
+                    id,
+                    complete_create(applied_state, &saved_desired),
+                )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -6376,7 +6519,10 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&saved_desired),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, complete_create(applied_state))]),
+                applied_states: &HashMap::from([(
+                    id,
+                    complete_create(applied_state, &saved_desired),
+                )]),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
                 failed_refreshes: &HashSet::new(),
@@ -6514,7 +6660,15 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     id.clone(),
-                    complete_update(applied_state, &["password"], &[]),
+                    complete_update(
+                        carina_core::resource::SnapshotState::existing(
+                            desired.id.clone(),
+                            std::collections::BTreeMap::new(),
+                        ),
+                        applied_state,
+                        &["password"],
+                        &desired,
+                    ),
                 )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -6602,10 +6756,13 @@ mod apply_state_save_tests {
         let saved = build_state_after_apply(
             ApplyStateSave {
                 state_file: StateFile::new(),
-                sorted_resources: std::slice::from_ref(&resolved(desired)),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id.clone(), complete_create(applied_state))]),
+                applied_states: &HashMap::from([(
+                    id.clone(),
+                    complete_create(applied_state, &desired),
+                )]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -6675,7 +6832,15 @@ mod apply_state_save_tests {
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(
                     id.clone(),
-                    complete_update(applied_state, &["password"], &[]),
+                    complete_update(
+                        carina_core::resource::SnapshotState::existing(
+                            desired.id.clone(),
+                            std::collections::BTreeMap::new(),
+                        ),
+                        applied_state,
+                        &["password"],
+                        &desired,
+                    ),
                 )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -6877,12 +7042,17 @@ mod apply_state_save_tests {
             ApplyStateSave {
                 state_file,
                 sorted_resources: &[],
-                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(
+                    runtime_child.clone(),
+                )),
                 managed_current: &crate::managed_current_from_states(HashMap::from([(
                     id.clone(),
                     current_state,
                 )])),
-                applied_states: &HashMap::from([(id.clone(), complete_create(applied_state))]),
+                applied_states: &HashMap::from([(
+                    id.clone(),
+                    complete_create(applied_state, &runtime_child),
+                )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -6989,7 +7159,10 @@ mod apply_state_save_tests {
                 sorted_resources: &sorted_resources,
                 runtime_synthesized_resources: &[],
                 managed_current: &crate::managed_current_from_states(current_states),
-                applied_states: &HashMap::from([(id.clone(), complete_create(applied_state))]),
+                applied_states: &HashMap::from([(
+                    id.clone(),
+                    complete_create(applied_state, &sorted_resources[0]),
+                )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -7059,13 +7232,16 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &runtime_child))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
                 state_file: StateFile::new(),
                 sorted_resources: &[],
-                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(
+                    runtime_child.clone(),
+                )),
                 managed_current: &crate::managed_current_from_states(current_states.clone()),
                 applied_states: &applied_states,
                 plan: &plan,
@@ -7145,13 +7321,16 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &runtime_child))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
                 state_file,
                 sorted_resources: &[],
-                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(
+                    runtime_child.clone(),
+                )),
                 managed_current: &crate::managed_current_from_states(current_states.clone()),
                 applied_states: &applied_states,
                 plan: &plan,
@@ -7214,7 +7393,8 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &runtime_child))]);
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
@@ -7231,7 +7411,9 @@ mod apply_state_save_tests {
             ApplyStateSave {
                 state_file: StateFile::new(),
                 sorted_resources: &[],
-                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(
+                    runtime_child.clone(),
+                )),
                 managed_current: &crate::managed_current_from_states(current_states.clone()),
                 applied_states: &applied_states,
                 plan: &plan,
@@ -7463,13 +7645,16 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &runtime_child))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
                 state_file,
                 sorted_resources: &[],
-                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(
+                    runtime_child.clone(),
+                )),
                 managed_current: &crate::managed_current_from_states(current_states.clone()),
                 applied_states: &applied_states,
                 plan: &plan,
@@ -7834,7 +8019,10 @@ mod apply_state_save_tests {
             )]),
         )
         .with_identifier("bucket-new-id");
-        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
+        let applied_states = HashMap::from([(
+            id.clone(),
+            complete_create(applied_state, &sorted_resources[0]),
+        )]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -7902,12 +8090,13 @@ mod apply_state_save_tests {
             origin: None,
         });
         let current_states = HashMap::new();
-        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
+        let applied_states =
+            HashMap::from([(id.clone(), complete_create(applied_state, &desired))]);
         let successfully_deleted = HashSet::new();
         let failed_refreshes = HashSet::new();
         let schemas = SchemaRegistry::new();
 
-        let desired = resolved(desired);
+        let desired = resolved(desired.clone());
         let result = decompose(DecomposeInput {
             state_file: &StateFile::new(),
             sorted_resources: std::slice::from_ref(&desired),
@@ -7969,7 +8158,10 @@ mod apply_state_save_tests {
         result.runtime_synthesized_resources.push(resource);
         result.applied_states.insert(
             id.clone(),
-            complete_create(applied_name_state(&id, "new-temp")),
+            complete_create(
+                applied_name_state(&id, "new-temp"),
+                &result.runtime_synthesized_resources[0],
+            ),
         );
         result.permanent_name_overrides.insert(
             id.clone(),

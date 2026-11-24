@@ -1,4 +1,7 @@
 use std::fs;
+#[path = "support/mock_state.rs"]
+mod mock_state;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -80,7 +83,7 @@ let r1 = mock.test.resource {{
         let mut state: Value =
             serde_json::from_str(&fs::read_to_string(&self.mock_state).expect("read mock state"))
                 .expect("decode mock state");
-        state["states"]["test.resource.source"]["identifier"] =
+        state["states"][&mock_state::identifier(&self.project, "source")]["identifier"] =
             Value::String(identifier.to_string());
         fs::write(
             &self.mock_state,
@@ -171,8 +174,12 @@ fn partial_create_records_state_and_next_plan_surfaces_unknown_reason() {
         "state file must persist partial missing attributes:\n{state_text}"
     );
     let state: Value = serde_json::from_str(&state_text).unwrap();
+    let provider: Value = serde_json::from_slice(&fs::read(&scenario.mock_state).unwrap()).unwrap();
+    let identifiers = provider["states"].as_object().unwrap();
+    assert_eq!(identifiers.len(), 1);
+    let identifier = identifiers.keys().next().unwrap();
     assert!(
-        contains_identifier(&state, "mock-id"),
+        contains_identifier(&state, identifier),
         "state file must contain the provider identifier:\n{}",
         serde_json::to_string_pretty(&state).unwrap()
     );

@@ -4,7 +4,7 @@
 //! The shared row builders encapsulate all logic for deciding
 //! which rows to show for a given effect, keeping rendering frontends thin.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use indexmap::IndexMap;
 
@@ -72,9 +72,9 @@ pub enum DetailLevel {
 /// Previously: the raw-map call compiled successfully.
 ///
 /// ```compile_fail,E0599
-/// use std::collections::HashMap;
+/// use std::collections::BTreeMap;
 /// use carina_core::{detail_rows::HistoricalDisplayAttributes, resource::{ResourceId, SnapshotValue}};
-/// fn bypass(display: &mut HistoricalDisplayAttributes, id: ResourceId, raw: HashMap<String, SnapshotValue>) {
+/// fn bypass(display: &mut HistoricalDisplayAttributes, id: ResourceId, raw: BTreeMap<String, SnapshotValue>) {
 ///     display.set_update_from_provider_and_persisted(id, &raw, None);
 /// }
 /// ```
@@ -97,14 +97,14 @@ struct HistoricalListKeyRelease {
 
 #[derive(Debug, Clone)]
 struct HistoricalUpdateAttributes {
-    attributes: HashMap<String, Value>,
-    stored_attributes: Option<HashMap<String, Value>>,
+    attributes: BTreeMap<String, Value>,
+    stored_attributes: Option<BTreeMap<String, Value>>,
 }
 
 #[derive(Debug, Clone)]
 struct HistoricalDeleteAttributes {
-    attributes: HashMap<String, Value>,
-    stored_attributes: Option<HashMap<String, Value>>,
+    attributes: BTreeMap<String, Value>,
+    stored_attributes: Option<BTreeMap<String, Value>>,
     nested_write_only: NestedWriteOnlyRecord,
 }
 
@@ -155,7 +155,7 @@ impl HistoricalDisplayAttributes {
 
     pub(crate) fn reference_values(
         &self,
-    ) -> impl Iterator<Item = (&ResourceId, &HashMap<String, Value>)> {
+    ) -> impl Iterator<Item = (&ResourceId, &BTreeMap<String, Value>)> {
         self.updates
             .iter()
             .flat_map(|(id, entry)| {
@@ -230,7 +230,7 @@ impl HistoricalDisplayAttributes {
                             identifier.to_string(),
                         ),
                         HistoricalDeleteAttributes {
-                            attributes: HashMap::new(),
+                            attributes: Default::default(),
                             stored_attributes: None,
                             nested_write_only: NestedWriteOnlyRecord::new(),
                         },
@@ -272,7 +272,7 @@ impl HistoricalDisplayAttributes {
         &self,
         plan: &AdmittedPlan<S, V>,
     ) -> Plan<S, V> {
-        let protect_delete = |key: &DeletedInstanceKey, _values: &HashMap<String, Value>| {
+        let protect_delete = |key: &DeletedInstanceKey, _values: &BTreeMap<String, Value>| {
             self.deferred
                 .get(key)
                 .map(|observation| observation.display_attributes().clone())
@@ -313,8 +313,8 @@ impl HistoricalDisplayAttributes {
     fn filter_released(
         &self,
         id: &ResourceId,
-        mut attributes: HashMap<String, Value>,
-    ) -> HashMap<String, Value> {
+        mut attributes: BTreeMap<String, Value>,
+    ) -> BTreeMap<String, Value> {
         let Some(releases) = self.releases.get(id) else {
             return attributes;
         };
@@ -394,7 +394,7 @@ impl HistoricalDisplayAttributes {
     pub(crate) fn set_update_from_provider_and_persisted(
         &mut self,
         id: ResourceId,
-        attributes: &HashMap<String, Value>,
+        attributes: &BTreeMap<String, Value>,
         persisted: Option<&PersistedAttributes>,
     ) {
         let state = crate::resource::SnapshotState::existing(id, attributes.clone());
@@ -419,7 +419,7 @@ impl HistoricalDisplayAttributes {
     pub(crate) fn set_delete_from_provider_and_persisted(
         &mut self,
         key: DeletedInstanceKey,
-        attributes: &HashMap<String, Value>,
+        attributes: &BTreeMap<String, Value>,
         persisted: Option<&PersistedAttributes>,
         nested: &NestedWriteOnlyRecord,
     ) {
@@ -2046,9 +2046,9 @@ fn build_replace_rows_from_attributes<
     R: ReferenceEquality,
     V: crate::resource::PlanValueKind,
 >(
-    previous_attributes: &HashMap<String, Value>,
+    previous_attributes: &BTreeMap<String, Value>,
     raw_comparison: &CanonicalComparisonAttributes,
-    stored_attributes: Option<&HashMap<String, Value>>,
+    stored_attributes: Option<&BTreeMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
     to: &crate::resource::Resource<S, V, crate::resource::AbsoluteBindingAddress, D>,
     comparison_attributes: &CanonicalComparisonAttributes,
@@ -3333,7 +3333,7 @@ mod tests {
         effect: &Effect,
         registry: Option<&SchemaRegistry>,
         detail: DetailLevel,
-        delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
+        delete_attributes: Option<&HashMap<ResourceId, BTreeMap<String, Value>>>,
         prev_explicit: Option<&HashMap<ResourceId, crate::explicit::ExplicitFields>>,
     ) -> Vec<DetailRow> {
         let mut plan = Plan::new();
@@ -3778,7 +3778,7 @@ mod tests {
         let from = State {
             id: to.id.clone(),
             identifier: Some("resource-123".into()),
-            attributes: HashMap::from([
+            attributes: std::collections::BTreeMap::from([
                 ("key".into(), string("canonical/old")),
                 ("name".into(), string("old")),
             ]),
@@ -4673,14 +4673,14 @@ mod tests {
 
     #[test]
     fn test_update_changed_attributes() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("s3.Bucket", "my-bucket"),
             [(
                 "versioning".to_string(),
                 Value::Concrete(ConcreteValue::String("Disabled".into())),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("s3.Bucket", "my-bucket").with_attribute(
             "versioning",
@@ -4724,7 +4724,7 @@ mod tests {
                 ),
             ]),
         );
-        let from = State::existing(
+        let from: State = State::existing(
             to.id.clone(),
             [(
                 "tags".to_string(),
@@ -4744,7 +4744,7 @@ mod tests {
                 ]))),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier(
@@ -4979,7 +4979,7 @@ mod tests {
 
     #[test]
     fn test_update_hidden_unchanged_in_full_mode() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("s3.Bucket", "my-bucket"),
             [
                 (
@@ -4996,7 +4996,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute(
@@ -5072,7 +5072,7 @@ mod tests {
         // Both desired fields contribute even when prior authoring records only one.
         use crate::explicit::ExplicitFields;
 
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("s3.Bucket", "my-bucket"),
             [
                 (
@@ -5089,7 +5089,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute(
@@ -5161,7 +5161,7 @@ mod tests {
             explicit_dependencies: Default::default(),
             blocked_by_updates: Default::default(),
         };
-        let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
+        let mut delete_attrs: HashMap<ResourceId, BTreeMap<String, Value>> = HashMap::new();
         delete_attrs.insert(
             id.clone(),
             [(
@@ -5209,7 +5209,7 @@ mod tests {
 
     #[test]
     fn test_update_removed_attribute() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("s3.Bucket", "my-bucket"),
             [
                 (
@@ -5222,7 +5222,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("s3.Bucket", "my-bucket").with_attribute(
             "name",
@@ -5406,9 +5406,11 @@ mod tests {
         let old_rules = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::Map(rule.clone()),
         )]));
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("test.Widget", "beta"),
-            [("rules".to_string(), old_rules)].into_iter().collect(),
+            [("rules".to_string(), old_rules)]
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "beta");
         let effect = Effect::Update {
@@ -5762,9 +5764,12 @@ mod tests {
             .with_attribute("rules", applied_rules.clone());
         let desired: Resource =
             Resource::new("test.Listener", "listener").with_attribute("rules", desired_rules);
-        let stored = HashMap::from([("rules".to_string(), applied_rules.clone())]);
-        let sent = crate::executor::AcceptedRequest::create_for_test();
-        let sent_desired = sent.sent_desired_attributes(&applied);
+        let stored =
+            std::collections::BTreeMap::from([("rules".to_string(), applied_rules.clone())]);
+        let sent = crate::executor::AcceptedRequest::from_create_permit_for_test(
+            &crate::test_utils::prepared_write::create_permit(&applied),
+        );
+        let sent_desired = sent.sent_desired_attributes();
         let prior = crate::explicit::build_from_resource_for_stored_values_after_send(
             &applied,
             None,
@@ -5943,7 +5948,7 @@ mod tests {
             "Name".to_string(),
             Value::Concrete(ConcreteValue::String("test".into())),
         );
-        let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
+        let mut delete_attrs: HashMap<ResourceId, BTreeMap<String, Value>> = HashMap::new();
         delete_attrs.insert(
             id.clone(),
             [(
@@ -5998,7 +6003,7 @@ mod tests {
         let dvo = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::Map(entry),
         )]));
-        let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
+        let mut delete_attrs: HashMap<ResourceId, BTreeMap<String, Value>> = HashMap::new();
         delete_attrs.insert(
             id.clone(),
             [("domain_validation_options".to_string(), dvo)]
@@ -6036,7 +6041,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
             "cidr_block",
@@ -6066,7 +6071,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("tok".into())),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "beta");
         let rows = replace_rows_for_test(
@@ -6105,7 +6110,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::Map(settings)),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "beta");
         let rows =
@@ -6146,7 +6151,9 @@ mod tests {
         )]));
         let from = State::existing(
             ResourceId::with_identity("test.Widget", "beta"),
-            [("rules".to_string(), old_rules)].into_iter().collect(),
+            [("rules".to_string(), old_rules)]
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "beta");
         let rows = replace_rows_for_test(from, to, &["rules"], DetailLevel::Explicit, vec![], None);
@@ -6206,7 +6213,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("wafv2.WebAcl", "edge")
             .with_attribute(
@@ -6280,7 +6287,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("arn:old".into())),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "w").with_attribute(
             "arn",
@@ -6316,7 +6323,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("arn:old".into())),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "w").with_attribute(
             "arn",
@@ -6377,7 +6384,7 @@ mod tests {
                 )])),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "w").with_attribute(
             "rules",
@@ -6419,7 +6426,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::Map(old_settings)),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "w").with_attribute(
             "settings",
@@ -6445,7 +6452,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::StringList(vec!["only-one".into()])),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "w").with_attribute(
             "aliases",
@@ -6485,7 +6492,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "w")
             .with_attribute(
@@ -6604,7 +6611,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("test.Widget", "w").with_attribute(
             "external_name",
@@ -6823,7 +6830,7 @@ mod tests {
     /// "Allow"`.
     #[test]
     fn update_with_only_enum_equal_leaves_emits_no_phantom_row() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("iam.Role", "r"),
             [(
                 "policy".to_string(),
@@ -6833,7 +6840,7 @@ mod tests {
                 ),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("iam.Role", "r").with_attribute(
             "policy",
@@ -6980,7 +6987,7 @@ mod tests {
     /// it. Guards against the fix over-suppressing.
     #[test]
     fn update_real_sibling_change_still_renders_without_enum_phantom() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("iam.Role", "r"),
             [
                 (
@@ -6996,7 +7003,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("iam.Role", "r")
             .with_attribute(
@@ -7035,7 +7042,7 @@ mod tests {
     /// aliases, so the shared exact comparison keeps the raw-spelling change.
     #[test]
     fn update_with_empty_schema_uses_exact_comparison() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("iam.Role", "r"),
             [(
                 "policy".to_string(),
@@ -7045,7 +7052,7 @@ mod tests {
                 ),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("iam.Role", "r").with_attribute(
             "policy",
@@ -7077,7 +7084,7 @@ mod tests {
     /// counted — the displayed total would not add up.
     #[test]
     fn update_full_mode_counts_enum_equal_attr_as_unchanged() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("iam.Role", "r"),
             [(
                 "policy".to_string(),
@@ -7087,7 +7094,7 @@ mod tests {
                 ),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("iam.Role", "r").with_attribute(
             "policy",
@@ -7150,14 +7157,14 @@ mod tests {
             m.insert("a".to_string(), Value::Concrete(v));
             Value::Concrete(ConcreteValue::Map(m))
         };
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("x.Thing", "t"),
             [(
                 "modes".to_string(),
                 mk(ConcreteValue::enum_identifier("on".to_string())),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("x.Thing", "t")
             .with_attribute("modes", mk(ConcreteValue::String("On".into())));
@@ -7182,7 +7189,7 @@ mod tests {
     /// real enum-value changes.
     #[test]
     fn update_real_enum_change_still_renders_with_registry() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("iam.Role", "r"),
             [(
                 "policy".to_string(),
@@ -7192,7 +7199,7 @@ mod tests {
                 ),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         // Desired flips effect to the API-canonical `Deny` — a real
         // change, not a spelling alias of `allow`.
@@ -7228,7 +7235,7 @@ mod tests {
     /// just `count == 1` in isolation.
     #[test]
     fn update_full_mode_multi_attr_tally_balances() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("iam.Role", "r"),
             [
                 (
@@ -7248,7 +7255,7 @@ mod tests {
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("iam.Role", "r")
             .with_attribute(
@@ -7631,11 +7638,11 @@ mod tests {
     #[test]
     fn update_string_list_of_enum_only_genuine_add_renders() {
         let registry = modes_registry();
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("x.Thing", "t"),
             [("modes".to_string(), enum_list(&["allow"]))]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to =
             Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
@@ -7845,14 +7852,14 @@ mod tests {
         // uses `Value::semantically_equal`, which compares
         // `StringList(["x"])` to `List([String("x")])` as unequal even
         // though both `format_value` to `["x"]`.
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("x.Thing", "t"),
             [(
                 "tags".to_string(),
                 Value::Concrete(ConcreteValue::StringList(vec!["only-one".into()])),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("x.Thing", "t").with_attribute(
             "tags",
@@ -7888,7 +7895,7 @@ mod tests {
     /// rather than dropping the change entirely.
     #[test]
     fn top_level_changed_keeps_secret_rotation_visible() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("x.Thing", "t"),
             [(
                 "password".to_string(),
@@ -7897,7 +7904,7 @@ mod tests {
                 )),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to = Resource::new("x.Thing", "t").with_attribute(
             "password",
@@ -8282,11 +8289,11 @@ mod tests {
     /// aliases to canonicalize, so the raw-spelling list change remains.
     #[test]
     fn update_string_list_of_enum_with_empty_schema_uses_exact_comparison() {
-        let from = State::existing(
+        let from: State = State::existing(
             ResourceId::with_identity("x.Thing", "t"),
             [("modes".to_string(), enum_list(&["allow"]))]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let to =
             Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));

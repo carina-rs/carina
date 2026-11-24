@@ -9,7 +9,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::lock::{LockInfo, format_lock_expiry, format_lock_last_updated};
-use crate::state::{self, LoadedState, PublishedExports, StateFile};
+use crate::state::{PublishedExports, StateFile};
 
 /// A persisted resource row whose identity cannot be represented by the
 /// resolved-only state model.
@@ -235,11 +235,6 @@ pub enum BackendError {
     #[error(transparent)]
     InvalidDestroyDependency(#[from] carina_core::resource::NotAManagedRow),
 
-    /// A pre-v21 binding-text dependency cannot be mapped to exactly one
-    /// complete resource address.
-    #[error("Invalid state file: {0}")]
-    LegacyDependencyMigration(state::LegacyDependencyMigrationError),
-
     /// State decoding failed at a concrete backend location.
     #[error("Failed to read state at {location}: {error}")]
     StateRead {
@@ -262,9 +257,15 @@ pub enum BackendError {
         error: ResourceIdentityError,
     },
 
-    /// A legacy state row contains an identity that can no longer be matched.
+    /// A persisted state row contains an identity that cannot be matched.
     #[error("{0}")]
     InvalidResourceIdentity(InvalidResourceIdentityError),
+
+    /// The state file predates the only supported format.
+    #[error(
+        "State file version {found} is older than supported version {supported}. Rewrite this state with carina v0.15.0 (`apply` or `state refresh`), then retry."
+    )]
+    StateVersionTooOld { found: u32, supported: u32 },
 
     /// The state file was written by a newer Carina than this binary supports
     #[error(
@@ -323,12 +324,6 @@ pub enum BackendError {
 impl From<InvalidResourceIdentityError> for BackendError {
     fn from(error: InvalidResourceIdentityError) -> Self {
         Self::InvalidResourceIdentity(error)
-    }
-}
-
-impl From<state::LegacyDependencyMigrationError> for BackendError {
-    fn from(error: state::LegacyDependencyMigrationError) -> Self {
-        Self::LegacyDependencyMigration(error)
     }
 }
 
@@ -613,11 +608,11 @@ impl BackendError {
             | Self::BucketNotFound(_)
             | Self::InvalidState(_)
             | Self::InvalidDestroyDependency(_)
-            | Self::LegacyDependencyMigration(_)
             | Self::InvalidStateJson(_)
             | Self::InvalidCanonicalBinding(_)
             | Self::InvalidStateIdentity { .. }
             | Self::InvalidResourceIdentity(_)
+            | Self::StateVersionTooOld { .. }
             | Self::StateVersionTooNew { .. }
             | Self::ExportsVersionTooNew { .. }
             | Self::LineageMismatch { .. }
@@ -702,7 +697,7 @@ impl BackendError {
         }
     }
 
-    /// Return the typed legacy-row error, including through upstream read context.
+    /// Return the typed resource-identity error, including through upstream read context.
     pub fn invalid_resource_identity(&self) -> Option<&InvalidResourceIdentityError> {
         match self {
             Self::InvalidResourceIdentity(error) => Some(error),
@@ -762,14 +757,6 @@ impl RawState {
     /// Borrow the state-file bytes.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
-    }
-
-    /// Return the backend location used in diagnostics and migration warnings.
-    pub fn display_location(&self) -> String {
-        match &self.location {
-            StateReadLocation::File(path) => path.to_string(),
-            StateReadLocation::Remote(url) => url.clone(),
-        }
     }
 
     fn locate_error(&self, error: BackendError) -> BackendError {
@@ -861,18 +848,8 @@ pub trait StateBackend: Send + Sync {
     /// Cleanup limits selected explicitly by each backend's type or configuration.
     fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget;
 
-    /// Read the current state from the backend.
-    ///
-    /// Returns `None` if no state exists (first-time use). When the
-    /// on-disk schema is older than [`StateFile::CURRENT_VERSION`],
-    /// `check_and_migrate` lifts it in memory and the result is
-    /// returned as the [`LoadedState::Migrated`] variant carrying the
-    /// migration info; otherwise [`LoadedState::Pristine`].
-    /// Lock-held callers (`apply`, `destroy`, `state refresh`)
-    /// destructure the `Migrated` arm and persist `state` so the
-    /// carina#3283 warning text matches reality — otherwise the
-    /// warning re-emits forever (carina#3315).
-    async fn read_state(&self) -> BackendResult<Option<LoadedState>>;
+    /// Read the current state document, rejecting every other state version.
+    async fn read_state(&self) -> BackendResult<Option<StateFile>>;
 
     /// Read the raw state-file bytes without applying a decoding policy.
     ///
@@ -971,11 +948,8 @@ pub async fn read_published_exports(
     let Some(raw_state) = backend.read_state_bytes().await? else {
         return Ok(None);
     };
-    let (exports, migration) = PublishedExports::decode_state_bytes(raw_state.bytes())
+    let exports = PublishedExports::from_state_bytes(raw_state.bytes())
         .map_err(|error| raw_state.locate_error(error))?;
-    if let Some(info) = migration {
-        state::log_state_migration(info, &raw_state.display_location());
-    }
     Ok(Some(exports))
 }
 

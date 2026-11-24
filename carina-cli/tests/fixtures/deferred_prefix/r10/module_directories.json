@@ -1,0 +1,70 @@
+{
+  "m1a_empty": [
+    "child"
+  ],
+  "m1a2_conflict": [
+    "child"
+  ],
+  "m1b_secret": [
+    "child"
+  ],
+  "m1c_parse": [
+    "child"
+  ],
+  "m1c_upstream_missing_state": [
+    "child"
+  ],
+  "m1c_upstream_missing_source": [
+    "child"
+  ],
+  "m1c_upstream_missing_export": [
+    "child"
+  ],
+  "m2_two_roots": [
+    "modules/app"
+  ],
+  "m2_ancestor_provider": [
+    "modules/app"
+  ],
+  "m3_invalid_attribute": [],
+  "m3_undefined_binding": [],
+  "m4_unimported_child": [
+    "child"
+  ],
+  "m4_standalone_with_provider": [
+    "child"
+  ],
+  "m4_bad_argument_type": [
+    "child"
+  ],
+  "m4_missing_argument": [
+    "child"
+  ],
+  "m4_standalone_with_backend": [
+    "child"
+  ],
+  "m1c_upstream_prefix_missing_export": [
+    "child"
+  ],
+  "m1c_upstream_prefix_missing_source": [
+    "child"
+  ],
+  "r7b_formal_bare": [
+    "child"
+  ],
+  "r7b_formal_alias": [
+    "child"
+  ],
+  "r7b_formal_interpolation": [
+    "child"
+  ],
+  "r7b_formal_secret": [
+    "child"
+  ],
+  "r7b_formal_several": [
+    "child"
+  ],
+  "r9_literal_only": [
+    "child"
+  ]
+}

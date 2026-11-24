@@ -328,6 +328,15 @@ pub(crate) fn same_parse_error(
         }};
     }
     match a {
+        ParseError::ValueKeyedSubscript { span } => {
+            matches!(b, ParseError::ValueKeyedSubscript { span: other } if span == other)
+        }
+        ParseError::ForIterableShape { error, span } => {
+            matches!(b, ParseError::ForIterableShape { error: other_error, span: other_span } if error == other_error && span == other_span)
+        }
+        ParseError::ForKey(diagnostic) => {
+            matches!(b, ParseError::ForKey(other) if diagnostic == other)
+        }
         ParseError::Located { path, error } => {
             if let ParseError::Located {
                 path: other_path,
@@ -372,6 +381,9 @@ pub(crate) fn same_parse_error(
         }
         ParseError::Syntax(error) => {
             matches!(b, ParseError::Syntax(other) if std::ops::Deref::deref(error) == std::ops::Deref::deref(other))
+        }
+        ParseError::RequireOutsideArguments { span } => {
+            same_fields!(RequireOutsideArguments { span })
         }
         ParseError::DeferredForBodyUnsupported(error) => {
             matches!(b, ParseError::DeferredForBodyUnsupported(other) if error == other)

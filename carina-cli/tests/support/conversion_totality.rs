@@ -831,6 +831,7 @@ pub const CONTEXTS: &[Context] = &[
         label: "require-alias",
         rules: &[
             "require_head",
+            "require_condition",
             "require_statement",
             "validate_expr",
             "validate_or_expr",
@@ -844,7 +845,7 @@ pub const CONTEXTS: &[Context] = &[
         ],
         placement: Placement::Computed,
         prefix: "",
-        expression: "let converted = VALUE\nrequire converted == 'ok', 'guard'",
+        expression: "let converted = VALUE\narguments { require converted == 'ok', 'guard' }",
         structural: false,
         statement: true,
         operand: "'ok'",
@@ -1102,7 +1103,7 @@ impl OwnerPosition {
                     .into()
             }
             Self::KnownIterableRead => format!(
-                "let results = for n in [7] {{ read mock.Query {{ attr = {} }} }}\n",
+                "let results = for (_, n) in [7] {{ read mock.Query {{ attr = {} }} }}\n",
                 cast("n")
             ),
             Self::DeferredManaged => format!(

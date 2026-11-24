@@ -1,22 +1,43 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "anonymous-if-legacy",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "anonymous-if-legacy",
   "resources": [
     {
-      "resource_type": "ec2.Vpc",
-      "identity": "_if0",
-      "provider": "awscc",
-      "identifier": "vpc-if0",
-      "attributes": { "vpc_id": "vpc-if0", "cidr_block": "10.0.0.0/16" },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "_if0",
+      "current": {
+        "attributes": {
+          "cidr_block": "10.0.0.0/16",
+          "vpc_id": "vpc-if0"
+        },
+        "identifier": "vpc-if0",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
-      "explicit": { "kind": "struct", "children": { "cidr_block": { "kind": "leaf" } } }
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
+      "explicit": {
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "_if0",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Vpc"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

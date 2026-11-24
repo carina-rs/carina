@@ -73,7 +73,7 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
-                &HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },
@@ -176,7 +176,7 @@ provider mock {}
             .expect("test state setup must be valid");
 
         let mut consumer =
-            ResourceState::try_applied("test.resource", "consumer", "mock", "mock-id")
+            ResourceState::try_applied("test.resource", "consumer", "mock", "consumer-id")
                 .expect("fixture identifier is non-empty")
                 .with_attribute("name", serde_json::json!("consumer"))
                 .with_attribute("identifier", serde_json::json!("consumer-id"))
@@ -209,17 +209,17 @@ provider mock {}
     }
 
     fn seed_mock_provider_state(&self) {
-        let provider_state = serde_json::json!({
-            "test.resource.validation_records[0]": {
+        let provider_state = serde_json::json!({"version": 3, "states": {
+            "old-validation-id": {
                 "name": "old-validation-token",
                 "identifier": "old-validation-id"
             },
-            "test.resource.consumer": {
+            "consumer-id": {
                 "name": "consumer",
                 "identifier": "consumer-id",
                 "web_acl_arn": "old-validation-id"
             }
-        });
+        }});
         fs::write(
             &self.mock_state_path,
             carina_core::utils::pretty_with_newline(&provider_state).unwrap(),
@@ -291,7 +291,7 @@ fn consumer_current_state(id: &ResourceId) -> State {
             ("web_acl_arn".to_string(), string("old-validation-id")),
         ]),
     )
-    .with_identifier("mock-id")
+    .with_identifier("consumer-id")
 }
 
 fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFile) -> PlanFile {
@@ -341,7 +341,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
     let template = DeferredForExpression::new(
         Some("main.crn".to_string()),
         1,
-        "for opt in cert.domain_validation_options".to_string(),
+        "for (_, opt) in cert.domain_validation_options".to_string(),
         carina_core::parser::DeferredForTarget::bound(
             carina_core::resource::absolute_binding_address_for_test("validation_records"),
         )
@@ -352,7 +352,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             Vec::new(),
         )
         .resolve_root_for_test(),
-        ForBinding::Simple("opt".to_string()),
+        ForBinding::Indexed("_".into(), "opt".to_string()),
         template_resource,
     );
 
@@ -447,7 +447,6 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             })
             .collect(),
         sorted_explicit_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
-        legacy_dependency_classification: None,
         unresolved_resources: sorted_resources
             .into_iter()
             .map(Resource::into_value_snapshot)
@@ -458,7 +457,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         data_source_origins: vec![],
         data_source_values: vec![],
         current_states,
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: vec![],
         wait_bindings: vec![],
     };
@@ -510,9 +509,8 @@ fn review10_4283_promoted_deferred_child_keeps_authored_directives() {
     let plan_path = scenario.write_plan(&state);
     assert_success("carina apply plan", &scenario.apply_plan(&plan_path));
 
-    let state = carina_state::check_and_migrate(&fs::read_to_string(&scenario.state_path).unwrap())
-        .unwrap()
-        .into_state();
+    let state =
+        carina_state::load_state(&fs::read_to_string(&scenario.state_path).unwrap()).unwrap();
     let child = state
         .find_resource("mock", "test.resource", "validation_records[0]")
         .unwrap();

@@ -1,0 +1,7 @@
+exports {
+  typed: String = src.identifier
+  untyped = src.identifier
+  count: Int = src.count
+  items: list(String) = src.items
+  named: test.Name = src.typed_name
+}

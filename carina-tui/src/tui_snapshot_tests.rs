@@ -119,7 +119,7 @@ fn build_mixed_operations_plan() -> Plan {
                     Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
             )
             .with_identifier("my-vpc-id"),
         ),
@@ -203,7 +203,7 @@ fn build_map_key_diff_plan() -> Plan {
     plan.add(Effect::Update {
         identifier: crate::fixture_applied_identifier("my-vpc-id"),
         from: Box::new(
-            State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(
                 ResourceId::with_identity("ec2.Vpc", "my-vpc"),
                 [
                     (
@@ -216,7 +216,7 @@ fn build_map_key_diff_plan() -> Plan {
                     ),
                 ]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
             )
             .with_identifier("my-vpc-id")
             .to_snapshot(),
@@ -245,13 +245,13 @@ fn build_deferred_for_plan() -> Plan {
     let deferred = DeferredForExpression::new(
         None,
         1,
-        "for opt in cert.domain_validation_options".to_string(),
+        "for (_, opt) in cert.domain_validation_options".to_string(),
         carina_core::parser::DeferredForTarget::bound(
             carina_core::resource::absolute_binding_address_for_test("validation_records"),
         )
         .expect("fixture binding is valid"),
         root_ref("cert", "domain_validation_options"),
-        ForBinding::Simple("opt".to_string()),
+        ForBinding::Indexed("_".into(), "opt".to_string()),
         template_resource,
     );
 
@@ -326,13 +326,13 @@ fn build_deferred_replace_plan() -> Plan {
     let deferred = DeferredForExpression::new(
         None,
         1,
-        "for opt in cert.domain_validation_options".to_string(),
+        "for (_, opt) in cert.domain_validation_options".to_string(),
         carina_core::parser::DeferredForTarget::bound(
             carina_core::resource::absolute_binding_address_for_test("validation_records"),
         )
         .expect("fixture binding is valid"),
         root_ref("cert", "domain_validation_options"),
-        ForBinding::Simple("opt".to_string()),
+        ForBinding::Indexed("_".into(), "opt".to_string()),
         template_resource,
     );
 
@@ -533,7 +533,7 @@ fn snapshot_deferred_replace() {
             "-/+ aws.route53.Record validation_records[*] (N records after cert applies)"
         )
     );
-    assert!(output.contains("<- for opt in cert.domain_validation_options"));
+    assert!(output.contains("<- for (_, opt) in cert.domain_validation_options"));
     assert!(!output.contains("- destroying validation_records[0]"));
     assert!(!output.contains("+ replaced by deferred for-loop"));
     insta::assert_snapshot!(output);
@@ -713,7 +713,7 @@ fn build_moved_with_changes_plan() -> Plan {
                     Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
             )
             .with_identifier("new-vpc-id"),
         ),

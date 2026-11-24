@@ -9,7 +9,6 @@ use crate::provider_resolver::RegistrySignatureProtection;
 use crate::user_trust::{UserTrustRecordError, UserVerifiedIdentity};
 
 const CARINA_RS_GITHUB_ORG_ID: &str = "260157389";
-const CARINA_RS_GITHUB_SAN_PREFIX: &str = "https://github.com/carina-rs/";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderTrustClass {
@@ -446,10 +445,6 @@ fn signer_is_carina_rs(signature: Option<&RegistrySignatureProtection>) -> bool 
         None
         | Some(RegistrySignatureProtection::NotRequired)
         | Some(RegistrySignatureProtection::Required(SignerPinState::Unpinned)) => true,
-        Some(RegistrySignatureProtection::Required(SignerPinState::Legacy(pin))) => pin
-            .certificate_san
-            .strip_prefix(CARINA_RS_GITHUB_SAN_PREFIX)
-            .is_some_and(|suffix| !suffix.is_empty()),
         Some(RegistrySignatureProtection::Required(SignerPinState::Current(pins))) => {
             pins.source.repository_owner_id == CARINA_RS_GITHUB_ORG_ID
         }
@@ -462,7 +457,7 @@ mod tests {
 
     use super::*;
     use crate::provider_resolver::{
-        CurrentSignerPins, LegacySignerPin, SignerPinState, SourcePin, WorkflowPin, WorkflowPins,
+        CurrentSignerPins, SignerPinState, SourcePin, WorkflowPin, WorkflowPins,
     };
 
     fn source_key(source: &str) -> RemoteSourceKey {
@@ -535,15 +530,7 @@ mod tests {
     #[test]
     fn official_source_with_non_carina_signer_pin_has_no_loadable_trust() {
         let source = source_key("carina-rs/aws");
-        let signatures = [
-            current_signer("999"),
-            RegistrySignatureProtection::Required(SignerPinState::Legacy(LegacySignerPin {
-                certificate_san:
-                    "https://github.com/evil/aws/.github/workflows/release.yml@refs/heads/main"
-                        .into(),
-                oidc_issuer: "https://token.actions.githubusercontent.com".into(),
-            })),
-        ];
+        let signatures = [current_signer("999")];
 
         for signature in &signatures {
             let trust = classify_verified_remote(&source, Some(signature));
@@ -556,10 +543,6 @@ mod tests {
         let source = source_key("carina-rs/aws");
         let signatures = [
             current_signer("260157389"),
-            RegistrySignatureProtection::Required(SignerPinState::Legacy(LegacySignerPin {
-                certificate_san: "https://github.com/carina-rs/carina-provider-aws/.github/workflows/release.yml@refs/heads/main".into(),
-                oidc_issuer: "https://token.actions.githubusercontent.com".into(),
-            })),
             RegistrySignatureProtection::Required(SignerPinState::Unpinned),
             RegistrySignatureProtection::NotRequired,
         ];
