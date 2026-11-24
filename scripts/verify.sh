@@ -173,6 +173,7 @@ run_kind() {
             bash scripts/test-setup-hooks.sh
             bash scripts/test-verify-sh.sh
             bash scripts/test-touched-crates.sh
+            bash scripts/test-core-cross-checks.sh
             ;;
         pinned-toolchain)
             bash scripts/check-pinned-toolchain.sh

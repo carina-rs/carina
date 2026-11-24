@@ -114,7 +114,7 @@ for f in "${files[@]}"; do
             echo '--workspace'
             exit 0
             ;;
-        scripts/verify.sh|scripts/touched-crates.sh|scripts/test-in-process-isolation.sh|\
+        scripts/verify.sh|scripts/touched-crates.sh|scripts/core-cross-checks.sh|scripts/test-in-process-isolation.sh|\
         scripts/setup-nextest-user-dirs.sh|scripts/require-wasm-fixtures.sh|scripts/wasm-fixture-crates.txt|\
         rust-toolchain.toml|.config/*|.cargo/*|.github/workflows/ci.yml|.github/actions/*)
             echo '--workspace'
