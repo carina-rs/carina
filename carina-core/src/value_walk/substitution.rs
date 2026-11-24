@@ -72,8 +72,8 @@ pub(super) trait ParserRewrite<B: BindingAddress> {
     }
     fn resolved_call(
         &mut self,
-        _function: &Arc<crate::parser::ClassifiedUserFunction<B>>,
-        _functions: &Arc<crate::parser::ClassifiedUserFunctions<B>>,
+        _function: &Arc<crate::parser::UserFunction<B>>,
+        _functions: &Arc<indexmap::IndexMap<String, crate::parser::UserFunction<B>>>,
         _args: &[FunctionArgument<ParserPlaceholder, B>],
         _source_line: DiagnosticSourceLine,
     ) -> Result<Option<Value<ParserPlaceholder, B>>, Self::Error> {
@@ -538,8 +538,8 @@ impl<B: BindingAddress, R: ParserRewrite<B>> BoundTransform<ParserPlaceholder, B
     fn resolved_call(
         &mut self,
         at: &At<'_>,
-        function: Arc<crate::parser::ClassifiedUserFunction<B>>,
-        functions: Arc<crate::parser::ClassifiedUserFunctions<B>>,
+        function: Arc<crate::parser::UserFunction<B>>,
+        functions: Arc<indexmap::IndexMap<String, crate::parser::UserFunction<B>>>,
         args: Vec<FunctionArgument<ParserPlaceholder, B>>,
         source_line: DiagnosticSourceLine,
     ) -> Result<Value<ParserPlaceholder, B>, WalkError> {

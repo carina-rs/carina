@@ -8,7 +8,6 @@ use crate::{
 type FunctionSubstitutionPosition = RewritePosition;
 type ParserStageValue<B> = Value<ParserPlaceholder, B>;
 type ParserStageFunctionArgument<B> = FunctionArgument<ParserPlaceholder, B>;
-
 pub(crate) fn substitute_function_parameters<B: BindingAddress>(
     value: &ParserStageValue<B>,
     substitutions: &HashMap<String, ParserStageFunctionArgument<B>>,
@@ -78,45 +77,6 @@ impl<B: BindingAddress> ParserRewrite<B> for FunctionParameterRewrite<'_, B> {
         self.source_line = line;
     }
 
-    fn access(
-        &mut self,
-        access: crate::resource::AccessExpr<ParserPlaceholder, B>,
-        base: ParserStageValue<B>,
-    ) -> Result<ParserStageValue<B>, ParseError> {
-        // Parameters retain their neutral head until the caller supplies a
-        // typed argument. Select while that argument still carries its For
-        // handle, before generic access can lower it to a resource attribute.
-        if let Value::Deferred(DeferredValue::Placeholder(
-            ParserPlaceholder::FnParam { name } | ParserPlaceholder::FnLocal { name },
-        )) = access.base()
-            && let Some(handle) = self
-                .substitutions
-                .get(name)
-                .and_then(|argument| argument.handle())
-            && let Some(group) = handle.loop_group()
-            && let crate::resource::PathSegment::Field { name } = access.step()
-        {
-            let mut selected = match crate::eval_value::select_dot(group, name) {
-                Ok(child) => child.into_lookup().reference(),
-                Err(rejected) => {
-                    rejected.preserve(handle.canonical_binding(), access.source_line())
-                }
-            };
-            if let Some(locations) = access.access_locations()
-                && let Value::Deferred(DeferredValue::Access(rejected)) = &mut selected
-            {
-                rejected.set_access_locations(locations.clone());
-            }
-            return Ok(selected);
-        }
-        access
-            .rebuild_with_base(base, crate::resource::AccessMissPolicy::Error)
-            .map_err(|error| ParseError::InvalidExpression {
-                line: access.source_line(),
-                message: error.to_string(),
-            })
-    }
-
     fn leaf(
         &mut self,
         input: &LeafInput<'_, Transform, ParserPlaceholder, B>,
@@ -147,8 +107,7 @@ impl<B: BindingAddress> ParserRewrite<B> for FunctionParameterRewrite<'_, B> {
             LeafInput::BindingRef(_)
             | LeafInput::Unknown(_)
             | LeafInput::Placeholder(
-                ParserPlaceholder::FunctionHead(_)
-                | ParserPlaceholder::ModuleArgument {
+                ParserPlaceholder::ModuleArgument {
                     name: _,
                     diagnostic: _,
                 }

@@ -56,11 +56,7 @@ pub(crate) fn apply_pipe_step(
             }
 
             if crate::builtins::builtin_arity(&func_name).is_some() {
-                reject_builtin_handle_arguments(
-                    &eval_args,
-                    line,
-                    ctx.function_declaration.as_ref().map(|_| &location),
-                )?;
+                reject_builtin_handle_arguments(&eval_args, line)?;
             }
 
             if let Some(user_fn) = ctx.resolved_user_function(&func_name) {
@@ -90,10 +86,14 @@ pub(crate) fn apply_pipe_step(
                     Some(column),
                     location,
                 );
-                return crate::parser::functions::defer_user_function_call(
-                    &user_fn, args, ctx, line,
-                )
-                .map(EvalValue::from_value);
+                return Ok(EvalValue::from_value(Value::Deferred(
+                    DeferredValue::ResolvedFunctionCall {
+                        function: user_fn,
+                        functions: ctx.shared_user_function_scope(),
+                        args,
+                        source_line: (line).into(),
+                    },
+                )));
             }
 
             let builtin = crate::builtins::Builtin::from_name(&func_name).ok_or_else(|| {

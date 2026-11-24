@@ -142,18 +142,16 @@ pub use config::{
 pub(crate) use config::{fixture_custom_type_rejection, fixture_invalid_custom_type_value};
 pub use deferred_if::{DeferredIfBody, DeferredIfCondition, DeferredStructuralIf, DeferredValueIf};
 pub use entry::{
-    AnonymousResourceSourceSpan, AttributeValueSourceSpans, ClassifiedUserFunction,
-    ClassifiedUserFunctions, LetBindingSourceSpans, SourceSpanIndex, TopLevelBlockSourceSpan,
-    attribute_value_source_span, attribute_value_source_spans, parse_file, parse_file_and_resolve,
-    parse_file_scoped, parse_provider_factory_declarations, parse_syntax_inventory,
-    top_level_anonymous_resource_spans, top_level_backend_block_spans,
+    AnonymousResourceSourceSpan, AttributeValueSourceSpans, LetBindingSourceSpans, SourceSpanIndex,
+    TopLevelBlockSourceSpan, attribute_value_source_span, attribute_value_source_spans, parse_file,
+    parse_file_and_resolve, parse_file_scoped, parse_provider_factory_declarations,
+    parse_syntax_inventory, top_level_anonymous_resource_spans, top_level_backend_block_spans,
     top_level_exports_block_spans, top_level_let_binding_spans, top_level_state_block_spans,
     top_level_upstream_state_spans,
 };
 pub(crate) use entry::{
-    BindingSeed, discover_directory_declarations, parse_with_directory_context,
-    parse_with_refining_directory_context, top_level_argument_names, top_level_let_binding_names,
-    top_level_user_functions_in_files, top_level_user_functions_with_bindings,
+    BindingSeed, parse_with_directory_context, top_level_argument_names,
+    top_level_let_binding_names, top_level_user_functions_in_files,
 };
 #[cfg(test)]
 pub(crate) use entry::{parse, parse_and_resolve, parse_with_seeded_bindings};

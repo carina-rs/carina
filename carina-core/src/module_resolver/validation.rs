@@ -928,7 +928,6 @@ impl<P: PlaceholderKind, B: BindingAddress> EvalValue<P, B> {
             Self::Value(Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })) => {
                 "function call"
             }
-
             Self::Value(Value::Deferred(DeferredValue::Access(_))) => "access expression",
             Self::Value(Value::Deferred(DeferredValue::Unknown(_))) => "unknown",
             Self::Value(Value::Deferred(DeferredValue::Placeholder(_))) => "placeholder",

@@ -8699,7 +8699,6 @@ impl<P: crate::resource::ValueKind, B: BindingAddress> Value<P, B> {
             ) => {
                 format!("FunctionCall({name})")
             }
-
             Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
                 format!("FunctionCall({})", function.name)
             }

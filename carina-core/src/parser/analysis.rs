@@ -2025,7 +2025,7 @@ pub struct AnalysisTree<
     value_references: Vec<AnalysisValueReference<B>>,
     validation_values: Vec<Located<FunctionValidationValue<'a, P, B>>>,
     iterables: Vec<AnalysisForRef<'a, P, B>>,
-    functions: &'a super::ClassifiedUserFunctions<B>,
+    functions: &'a indexmap::IndexMap<String, super::UserFunction<B>>,
     module_calls: &'a [super::ModuleCall<P, B>],
     binding_names: std::collections::HashSet<String>,
     module_definition: bool,
@@ -3803,13 +3803,8 @@ mod diagnostic_order_tests {
         .into_parsed();
         let annotations = parsed
             .user_functions
-            .values_mut()
-            .map(|function| {
-                (
-                    function.name.clone(),
-                    std::mem::take(&mut function.type_annotations),
-                )
-            })
+            .iter_mut()
+            .map(|(name, function)| (name.clone(), std::mem::take(&mut function.type_annotations)))
             .collect::<Vec<_>>();
         assert_eq!(
             annotations

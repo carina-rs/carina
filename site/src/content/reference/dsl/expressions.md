@@ -40,7 +40,7 @@ A partial simple list is recorded as deferred. Planning retries plan-time refere
 
 A loop binding is a structural handle: bare `length(vpcs)` and value exports are invalid. Select an instance attribute or author an explicit value collection. Numeric subscripts on simple list loops receive a diagnostic explaining String subscripts and indexed iteration.
 
-Map and `let`-bound simple list loops also accept dot spelling for identifier keys: `vpcs.dev.vpc_id` means `vpcs['dev'].vpc_id`. The key must match `[A-Za-z][A-Za-z0-9_]*`; other keys require String subscripts. Indexed loops require integer subscripts and reject every dot field, including `.0`.
+Outside function bodies and parameter defaults, map and `let`-bound simple list loops also accept dot spelling for identifier keys: `vpcs.dev.vpc_id` means `vpcs['dev'].vpc_id`. The key must match `[A-Za-z][A-Za-z0-9_]*`; other keys require String subscripts. Indexed loops require integer subscripts and reject every dot field, including `.0`.
 
 This changes old simple-list addresses from indices to keys. Use explicit `moved` blocks; there is no automatic migration. See [Migrating index-addressed list loops](/guides/state-management/#migrating-index-addressed-list-loops), including deferred children, and regenerate saved plans.
 

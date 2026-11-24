@@ -560,7 +560,6 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
             name: name.to_string(),
             context: SerializationContext::WasmBoundary,
         }),
-
         CoreValue::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
             Err(SerializationError::UnresolvedFunctionCall {
                 name: function.name.clone(),

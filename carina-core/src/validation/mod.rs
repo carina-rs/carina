@@ -8225,39 +8225,40 @@ fn resolve_file_type_exprs_with_annotations<
     }
     for function in parsed.user_functions.values_mut() {
         let previous_errors = errors.len();
-        let function_name = function.name.clone();
-        for (parameter_name, ty) in function.parameter_types_mut() {
-            let name = format!("{}' parameter '{}", function_name, parameter_name);
-            let location = annotation(TypeResolutionDeclarationKind::FunctionParameter, &name);
-            let site = ProviderTypeCheckSite::new(
-                location.clone(),
-                format!(
-                    "function '{}' parameter '{}'",
-                    function_name, parameter_name
-                ),
-            );
-            for error in resolve_declaration_type(ty, config, &site) {
-                errors.push(TypeResolutionDiagnostic::declaration(
-                    TypeResolutionDeclarationKind::FunctionParameter,
-                    name.clone(),
-                    error,
+        for parameter in &mut function.params {
+            if let Some(ty) = &mut parameter.param_type {
+                let name = format!("{}' parameter '{}", function.name, parameter.name);
+                let location = annotation(TypeResolutionDeclarationKind::FunctionParameter, &name);
+                let site = ProviderTypeCheckSite::new(
                     location.clone(),
-                ));
+                    format!(
+                        "function '{}' parameter '{}'",
+                        function.name, parameter.name
+                    ),
+                );
+                for error in resolve_declaration_type(ty, config, &site) {
+                    errors.push(TypeResolutionDiagnostic::declaration(
+                        TypeResolutionDeclarationKind::FunctionParameter,
+                        name.clone(),
+                        error,
+                        location.clone(),
+                    ));
+                }
             }
         }
-        if let Some(ty) = function.return_type_mut() {
+        if let Some(ty) = &mut function.return_type {
             let location = annotation(
                 TypeResolutionDeclarationKind::FunctionReturn,
-                &function_name,
+                &function.name,
             );
             let site = ProviderTypeCheckSite::new(
                 location.clone(),
-                format!("function '{}' return value", function_name),
+                format!("function '{}' return value", function.name),
             );
             for error in resolve_declaration_type(ty, config, &site) {
                 errors.push(TypeResolutionDiagnostic::declaration(
                     TypeResolutionDeclarationKind::FunctionReturn,
-                    function_name.clone(),
+                    function.name.clone(),
                     error,
                     location.clone(),
                 ));

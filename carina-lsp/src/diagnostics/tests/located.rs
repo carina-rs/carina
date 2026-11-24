@@ -16,7 +16,23 @@ fn loop_dot_review_round3_function_diagnostics() {
 
 #[test]
 fn loop_dot_review_round3_whole_group_function_location() {
-    let directory = Directory::new(&[]);
+    run_loop_dot_case_table(|row| row.id == "2-24");
+}
+
+#[test]
+fn loop_dot_review_round1_function_contexts() {
+    run_loop_dot_case_table(|row| row.id == "2-19");
+}
+
+#[test]
+fn loop_dot_function_body_and_default_keep_main_call_site_diagnostics() {
+    let directory = Directory::new(&[
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "backend.crn",
+            "backend local { path = 'carina.state.json' }\n",
+        ),
+    ]);
     let engine = DiagnosticEngine::new(
         loaded_providers_from_factories(vec![Box::new(
             carina_provider_mock::ConfiguredBuiltinMock::new(
@@ -26,38 +42,33 @@ fn loop_dot_review_round3_whole_group_function_location() {
         )]),
         vec!["mock".into()],
     );
+    let main: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../carina-cli/tests/fixtures/loop_dot_function_main.json"
+    ))
+    .unwrap();
     let root = directory.root.path();
-    let row = loop_dot_cases::rows()
-        .into_iter()
-        .find(|row| row.id == "2-24")
-        .unwrap();
-    loop_dot_cases::fixture(root, &row);
-    for &position in row.positions {
-        let owner = loop_dot_cases::reader(root, position, row.reader);
-        let path = root.join(owner);
-        let source = std::fs::read_to_string(&path).unwrap();
-        let diagnostics: Vec<_> = engine
-            .analyze(&create_document_at(&source, path.clone()), Some(&path))
-            .into_iter()
-            .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
-            .collect();
-        assert_eq!(diagnostics.len(), 1, "{position}: {diagnostics:?}");
+    for (label, case) in main["direct_calls"].as_object().unwrap() {
+        loop_dot_cases::write(root, "main.crn", case["source"].as_str().unwrap());
         assert_eq!(
-            diagnostics[0].range.start,
-            tower_lsp::lsp_types::Position::new(1, 14),
-            "{position}"
-        );
-        assert_eq!(
-            diagnostics[0].range.end,
-            tower_lsp::lsp_types::Position::new(1, 30),
-            "{position}"
+            observe_complete_diagnostics(&engine, root, "main.crn"),
+            case["lsp"],
+            "{label}"
         );
     }
 }
 
-#[test]
-fn loop_dot_review_round1_function_contexts() {
-    run_loop_dot_case_table(|row| row.id == "2-19");
+fn observe_complete_diagnostics(
+    engine: &DiagnosticEngine,
+    root: &std::path::Path,
+    owner: &str,
+) -> serde_json::Value {
+    let path = root.join(owner);
+    let source = std::fs::read_to_string(&path).unwrap();
+    let diagnostics = engine.analyze(&create_document_at(&source, path.clone()), Some(&path));
+    let normalized = serde_json::to_string(&diagnostics)
+        .unwrap()
+        .replace(root.to_str().unwrap(), "<fixture>");
+    serde_json::from_str(&normalized).unwrap()
 }
 
 #[test]
@@ -317,8 +328,21 @@ fn run_loop_dot_case_table(include: impl Fn(&loop_dot_cases::Row) -> bool) {
         loop_dot_cases::fixture(root, &row);
         for &position in row.positions {
             let owner = loop_dot_cases::reader(root, position, row.reader);
+            if matches!(row.expected, loop_dot_cases::Outcome::MainFunction) {
+                let actual = observe_complete_diagnostics(&engine, root, owner);
+                assert_eq!(
+                    actual,
+                    loop_dot_cases::main_function_record(&row, position)["lsp"],
+                    "{}, {:?}, {position}, {}",
+                    row.id,
+                    row.kind,
+                    row.reader
+                );
+                continue;
+            }
             let dot = observe(owner, row.id == "2-23");
             let expected = match row.expected {
+                loop_dot_cases::Outcome::MainFunction => unreachable!("main records checked above"),
                 loop_dot_cases::Outcome::Validates => Vec::new(),
                 loop_dot_cases::Outcome::Error(errors) => {
                     errors.iter().map(|error| (*error).to_owned()).collect()
@@ -360,8 +384,6 @@ fn run_loop_dot_case_table(include: impl Fn(&loop_dot_cases::Row) -> bool) {
                         .into_iter()
                         .map(str::to_owned)
                         .collect()
-                    } else if row.id == "2-22" {
-                        bracket.clone()
                     } else if row.id == "2-6a" {
                         vec![format!(
                             "deferred-for iterable `{subscript}`: expected list iterable, got map"

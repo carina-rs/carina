@@ -1735,8 +1735,7 @@ fn source_argument_name<B: BindingAddress, C: BindingAddress>(
                     | ApplyTimeUnknown::PendingReRead(_),
                 )
                 | DeferredValue::Placeholder(
-                    ParserPlaceholder::FunctionHead(_)
-                    | ParserPlaceholder::FnParam { name: _ }
+                    ParserPlaceholder::FnParam { name: _ }
                     | ParserPlaceholder::ModuleArgument {
                         name: _,
                         diagnostic: _,
@@ -2096,8 +2095,7 @@ fn authored_value_reference_path(value: &Value) -> Option<crate::resource::Autho
                 | ApplyTimeUnknown::PendingReRead(_),
             )
             | DeferredValue::Placeholder(
-                ParserPlaceholder::FunctionHead(_)
-                | ParserPlaceholder::FnParam { name: _ }
+                ParserPlaceholder::FnParam { name: _ }
                 | ParserPlaceholder::ModuleArgument {
                     name: _,
                     diagnostic: _,
@@ -2241,8 +2239,7 @@ pub(crate) fn module_parameter_postfix<B: BindingAddress>(
                     | ApplyTimeUnknown::PendingReRead(_),
                 )
                 | DeferredValue::Placeholder(
-                    ParserPlaceholder::FunctionHead(_)
-                    | ParserPlaceholder::FnParam { name: _ }
+                    ParserPlaceholder::FnParam { name: _ }
                     | ParserPlaceholder::ModuleArgument {
                         name: _,
                         diagnostic: _,
@@ -3675,8 +3672,7 @@ fn expand_module_composition(
                                 | ApplyTimeUnknown::PendingReRead(_),
                             )
                             | DeferredValue::Placeholder(
-                                ParserPlaceholder::FunctionHead(_)
-                                | ParserPlaceholder::FnParam { name: _ }
+                                ParserPlaceholder::FnParam { name: _ }
                                 | ParserPlaceholder::FnLocal { name: _ }
                                 | ParserPlaceholder::Loop(LoopSlot::Key)
                                 | ParserPlaceholder::Loop(LoopSlot::Index)

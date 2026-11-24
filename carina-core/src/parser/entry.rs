@@ -6,9 +6,7 @@
 use super::ParserWaitBinding as WaitBinding;
 use super::ProviderContext;
 use super::Rule;
-use super::ast::{
-    BindingSeedMetadata, ParsedFile, ParserBindingMetadata, UpstreamState, UserFunction,
-};
+use super::ast::{ParsedFile, ParserBindingMetadata, UpstreamState, UserFunction};
 use super::blocks::attributes::{
     parse_arguments_block, parse_attributes_block, parse_exports_block,
 };
@@ -41,289 +39,6 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// Definitions compiled with the seeded binding scope. The resolver below
-/// owns construction; provisional declarations cannot enter this table.
-#[derive(Debug, Clone)]
-pub struct ClassifiedUserFunctions<
-    B: crate::resource::BindingAddress = crate::resource::RelativeBindingName,
->(IndexMap<String, ClassifiedUserFunction<B>>);
-
-/// A callee from a classified lexical scope, suitable for a deferred capture.
-#[derive(Debug, Clone)]
-pub struct ClassifiedUserFunction<
-    B: crate::resource::BindingAddress = crate::resource::RelativeBindingName,
->(UserFunction<B>);
-
-impl<B: crate::resource::BindingAddress> std::ops::Deref for ClassifiedUserFunction<B> {
-    type Target = UserFunction<B>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<B: crate::resource::BindingAddress> AsRef<UserFunction<B>> for ClassifiedUserFunction<B> {
-    fn as_ref(&self) -> &UserFunction<B> {
-        &self.0
-    }
-}
-
-#[cfg(test)]
-impl<B: crate::resource::BindingAddress> std::ops::DerefMut for ClassifiedUserFunction<B> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<B: crate::resource::BindingAddress> ClassifiedUserFunction<B> {
-    pub(crate) fn map_bindings<T: crate::resource::BindingAddress>(
-        self,
-        map: &mut impl FnMut(B) -> T,
-    ) -> ClassifiedUserFunction<T> {
-        ClassifiedUserFunction(self.0.map_bindings(map))
-    }
-
-    pub(crate) fn try_map_values<E>(
-        &self,
-        map: impl FnMut(
-            crate::resource::Value<crate::resource::ParserPlaceholder, B>,
-            crate::value_walk::ExpressionEdge,
-        )
-            -> Result<crate::resource::Value<crate::resource::ParserPlaceholder, B>, E>,
-    ) -> Result<Self, E> {
-        self.0.clone().try_map_values(map).map(Self)
-    }
-
-    pub(crate) fn set_source_file(&mut self, path: &Path) {
-        self.0.body.source_file = Some(path.to_path_buf());
-    }
-
-    pub(crate) fn parameter_types_mut(
-        &mut self,
-    ) -> impl Iterator<Item = (&str, &mut super::TypeExpr)> {
-        self.0.params.iter_mut().filter_map(|parameter| {
-            parameter
-                .param_type
-                .as_mut()
-                .map(|ty| (parameter.name.as_str(), ty))
-        })
-    }
-
-    pub(crate) fn return_type_mut(&mut self) -> Option<&mut super::TypeExpr> {
-        self.0.return_type.as_mut()
-    }
-}
-
-impl<B: crate::resource::BindingAddress> Default for ClassifiedUserFunctions<B> {
-    fn default() -> Self {
-        Self(IndexMap::new())
-    }
-}
-
-impl<B: crate::resource::BindingAddress> std::ops::Deref for ClassifiedUserFunctions<B> {
-    type Target = IndexMap<String, ClassifiedUserFunction<B>>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<B: crate::resource::BindingAddress> ClassifiedUserFunctions<B> {
-    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
-        self.0.retain(|name, _| keep(name));
-    }
-
-    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut ClassifiedUserFunction<B>> {
-        self.0.values_mut()
-    }
-
-    pub(crate) fn insert(&mut self, name: String, function: ClassifiedUserFunction<B>) {
-        self.0.insert(name, function);
-    }
-
-    pub(crate) fn extend(
-        &mut self,
-        functions: impl IntoIterator<Item = (String, ClassifiedUserFunction<B>)>,
-    ) {
-        self.0.extend(functions);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn get_mut(&mut self, name: &str) -> Option<&mut ClassifiedUserFunction<B>> {
-        self.0.get_mut(name)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shift_remove(&mut self, name: &str) -> Option<ClassifiedUserFunction<B>> {
-        self.0.shift_remove(name)
-    }
-
-    pub(crate) fn map_bindings<T: crate::resource::BindingAddress>(
-        &self,
-        map: &mut impl FnMut(B) -> T,
-    ) -> ClassifiedUserFunctions<T> {
-        ClassifiedUserFunctions(
-            self.0
-                .iter()
-                .map(|(name, function)| (name.clone(), function.clone().map_bindings(map)))
-                .collect(),
-        )
-    }
-}
-
-impl<B: crate::resource::BindingAddress> IntoIterator for ClassifiedUserFunctions<B> {
-    type Item = (String, ClassifiedUserFunction<B>);
-    type IntoIter = indexmap::map::IntoIter<String, ClassifiedUserFunction<B>>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
-    }
-}
-
-impl<'a, B: crate::resource::BindingAddress> IntoIterator for &'a ClassifiedUserFunctions<B> {
-    type Item = (&'a String, &'a ClassifiedUserFunction<B>);
-    type IntoIter = indexmap::map::Iter<'a, String, ClassifiedUserFunction<B>>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
-
-impl<B: crate::resource::BindingAddress> FromIterator<(String, ClassifiedUserFunction<B>)>
-    for ClassifiedUserFunctions<B>
-{
-    fn from_iter<T: IntoIterator<Item = (String, ClassifiedUserFunction<B>)>>(iter: T) -> Self {
-        Self(iter.into_iter().collect())
-    }
-}
-
-impl<B: crate::resource::BindingAddress> From<IndexMap<String, ClassifiedUserFunction<B>>>
-    for ClassifiedUserFunctions<B>
-{
-    fn from(functions: IndexMap<String, ClassifiedUserFunction<B>>) -> Self {
-        Self(functions)
-    }
-}
-
-/// A prepass result can seed only the bootstrap parser, never a final parse
-/// or a resolved call's lexical scope.
-#[derive(Debug, Clone)]
-pub(crate) struct ProvisionalUserFunctions(IndexMap<String, UserFunction>);
-
-impl std::ops::Deref for ProvisionalUserFunctions {
-    type Target = IndexMap<String, UserFunction>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-enum DirectoryParsePhase<'a> {
-    Provisional(&'a ProvisionalUserFunctions),
-    Refining(&'a ClassifiedUserFunctions),
-    Classified(&'a ClassifiedUserFunctions),
-}
-
-/// Discovery exports declaration shape only. No expression value or raw
-/// function capture can seed a subsequent parse phase through this type.
-pub(crate) struct DiscoveredDeclarations {
-    pub(crate) value_names: Vec<String>,
-    pub(crate) local_names: HashSet<String>,
-    pub(crate) structural_names: HashSet<String>,
-    pub(crate) parameter_types: HashMap<String, super::TypeExpr>,
-    pub(crate) metadata: super::ParserSeedMetadata,
-}
-
-impl DiscoveredDeclarations {
-    fn from_provisional(parsed: ParsedFile) -> Self {
-        Self {
-            value_names: parsed.variables.keys().cloned().collect(),
-            local_names: parsed
-                .variables
-                .keys()
-                .cloned()
-                .chain(
-                    parsed
-                        .parser_binding_metadata
-                        .structural_handles()
-                        .keys()
-                        .map(ToString::to_string),
-                )
-                .collect(),
-            structural_names: parsed
-                .structural_binding_names()
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            parameter_types: parsed
-                .arguments
-                .iter()
-                .map(|argument| (argument.name.clone(), argument.static_type.clone()))
-                .collect(),
-            metadata: parsed.parser_binding_metadata.binding_seed_snapshot(),
-        }
-    }
-}
-
-impl DirectoryParsePhase<'_> {
-    fn prepare(&self, ctx: &mut ParseContext<'_>) {
-        match self {
-            Self::Provisional(functions) => {
-                ctx.replace_provisional_user_functions(Arc::new(functions.0.clone()));
-                ctx.seeded_user_functions.extend(functions.keys().cloned());
-            }
-            Self::Refining(functions) | Self::Classified(functions) => {
-                ctx.replace_classified_user_functions(Arc::new((*functions).clone()));
-                ctx.seeded_user_functions.extend(functions.keys().cloned());
-            }
-        }
-    }
-}
-
-trait FunctionResolution {
-    type Functions;
-    fn prepare(ctx: &mut ParseContext<'_>, may_have_loop_heads: bool);
-    fn register(ctx: &mut ParseContext<'_>, name: String, function: UserFunction);
-    fn finish(functions: IndexMap<String, UserFunction>) -> Self::Functions;
-}
-
-struct ProvisionalFunctionResolution;
-struct ClassifiedFunctionResolution;
-
-impl FunctionResolution for ProvisionalFunctionResolution {
-    type Functions = ProvisionalUserFunctions;
-    fn prepare(ctx: &mut ParseContext<'_>, may_have_loop_heads: bool) {
-        ctx.replace_provisional_user_functions(Arc::default());
-        ctx.provisional_function_heads = may_have_loop_heads;
-    }
-    fn register(ctx: &mut ParseContext<'_>, name: String, function: UserFunction) {
-        ctx.insert_user_function(name, function);
-    }
-    fn finish(functions: IndexMap<String, UserFunction>) -> Self::Functions {
-        ProvisionalUserFunctions(functions)
-    }
-}
-
-impl FunctionResolution for ClassifiedFunctionResolution {
-    type Functions = ClassifiedUserFunctions;
-    fn prepare(ctx: &mut ParseContext<'_>, _: bool) {
-        ctx.provisional_function_heads = false;
-        ctx.replace_classified_user_functions(Arc::new(ClassifiedUserFunctions::default()));
-    }
-    fn register(ctx: &mut ParseContext<'_>, name: String, function: UserFunction) {
-        let mut functions = ctx
-            .classified_user_functions()
-            .map(Arc::as_ref)
-            .cloned()
-            .expect("classified resolution has a classified function scope");
-        functions.0.insert(name, ClassifiedUserFunction(function));
-        ctx.replace_classified_user_functions(Arc::new(functions));
-    }
-    fn finish(functions: IndexMap<String, UserFunction>) -> Self::Functions {
-        ClassifiedUserFunctions(
-            functions
-                .into_iter()
-                .map(|(name, function)| (name, ClassifiedUserFunction(function)))
-                .collect(),
-        )
-    }
-}
 
 #[derive(Clone, Copy)]
 pub(crate) struct BindingSeed<'a> {
@@ -568,7 +283,9 @@ pub fn parse_file(
     path: &std::path::Path,
     config: &ProviderContext,
 ) -> Result<ParsedFile, ParseError> {
-    let parsed = parse_with_function_heads(input, path, config, &[])?;
+    let user_functions = resolve_top_level_user_functions(&[(path, input)], config)?;
+    let parsed = parse_with_seeded_bindings_inner(input, config, &[], &user_functions, true, path)
+        .map_err(super::resolve::RootInputFailure::into_parse_error)?;
     super::resolve::reject_cyclic_let_bindings(&parsed)?;
     Ok(parsed)
 }
@@ -1033,87 +750,14 @@ pub(crate) fn parse_with_seeded_bindings(
     config: &ProviderContext,
     seeds: &[BindingSeed<'_>],
 ) -> Result<ParsedFile, ParseError> {
-    parse_with_function_heads(input, Path::new("test.crn"), config, seeds)
-}
-
-/// A file-only parse needs the same classified function heads as a directory
-/// parse. Bootstrap only when a declaration actually contains free dot heads;
-/// typed seeds then let functions be stored canonically before any final call
-/// captures their lexical definition, including forward-declared loops.
-fn parse_with_function_heads(
-    input: &str,
-    path: &Path,
-    config: &ProviderContext,
-    seeds: &[BindingSeed<'_>],
-) -> Result<ParsedFile, ParseError> {
-    let sources = [(path, input)];
-    let may_have_loop_heads = seeds
-        .iter()
-        .any(|seed| matches!(seed.kind, SeedKind::Provisional))
-        || super::preprocess_file(input)
-            .map_err(|error| locate_function_error(error, path))?
-            .parse()
-            .map_err(|error| locate_function_error(error, path))?
-            .flatten()
-            .any(|pair| pair.as_rule() == Rule::for_expr);
-    if !may_have_loop_heads {
-        let functions = resolve_top_level_user_functions::<ClassifiedFunctionResolution>(
-            &sources, config, seeds,
-        )?;
-        return parse_with_seeded_bindings_inner(
-            input,
-            config,
-            seeds,
-            DirectoryParsePhase::Classified(&functions),
-            path,
-        )
-        .map_err(super::resolve::RootInputFailure::into_parse_error);
-    }
-    let functions =
-        resolve_top_level_user_functions::<ProvisionalFunctionResolution>(&sources, config, seeds)?;
-    if !functions
-        .values()
-        .any(UserFunction::has_provisional_reference_heads)
-    {
-        let functions = resolve_top_level_user_functions::<ClassifiedFunctionResolution>(
-            &sources, config, seeds,
-        )?;
-        return parse_with_seeded_bindings_inner(
-            input,
-            config,
-            seeds,
-            DirectoryParsePhase::Classified(&functions),
-            path,
-        )
-        .map_err(super::resolve::RootInputFailure::into_parse_error);
-    }
-    let bootstrap = discover_directory_declarations(input, path, config, seeds, &functions)
-        .map_err(super::resolve::RootInputFailure::into_parse_error)?;
-    let mut classified = seeds.to_vec();
-    // Only For authority is needed here. Do not seed ordinary values into a
-    // file-only parse or change its existing forward-value behavior.
-    classified.extend(
-        bootstrap
-            .metadata
-            .structural_handles()
-            .iter()
-            .filter(|(_, handle)| handle.is_for_binding())
-            .map(|(name, handle)| BindingSeed {
-                name: name.as_str(),
-                kind: SeedKind::TypedStructural(handle),
-            }),
-    );
-    let functions = resolve_top_level_user_functions::<ClassifiedFunctionResolution>(
-        &sources,
-        config,
-        &classified,
-    )?;
+    let user_functions = top_level_user_functions(input, config)?;
     parse_with_seeded_bindings_inner(
         input,
         config,
-        &classified,
-        DirectoryParsePhase::Classified(&functions),
-        path,
+        seeds,
+        &user_functions,
+        true,
+        std::path::Path::new("test.crn"),
     )
     .map_err(super::resolve::RootInputFailure::into_parse_error)
 }
@@ -1126,12 +770,8 @@ fn parse_with_function_heads(
 pub(crate) fn top_level_user_functions(
     input: &str,
     config: &ProviderContext,
-) -> Result<ProvisionalUserFunctions, ParseError> {
-    resolve_top_level_user_functions::<ProvisionalFunctionResolution>(
-        &[(Path::new("test.crn"), input)],
-        config,
-        &[],
-    )
+) -> Result<IndexMap<String, UserFunction>, ParseError> {
+    resolve_top_level_user_functions(&[(Path::new("test.crn"), input)], config)
 }
 
 /// Parse the directory's function declarations as one lexical scope.
@@ -1142,47 +782,27 @@ pub(crate) fn top_level_user_functions(
 pub(crate) fn top_level_user_functions_in_files(
     files: &[(PathBuf, String)],
     config: &ProviderContext,
-) -> Result<ProvisionalUserFunctions, ParseError> {
+) -> Result<IndexMap<String, UserFunction>, ParseError> {
     let sources = files
         .iter()
         .map(|(path, input)| (path.as_path(), input.as_str()))
         .collect::<Vec<_>>();
-    resolve_top_level_user_functions::<ProvisionalFunctionResolution>(&sources, config, &[])
+    resolve_top_level_user_functions(&sources, config)
 }
 
-pub(crate) fn top_level_user_functions_with_bindings(
-    files: &[(PathBuf, String)],
-    config: &ProviderContext,
-    seeds: &[BindingSeed<'_>],
-) -> Result<ClassifiedUserFunctions, ParseError> {
-    let sources = files
-        .iter()
-        .map(|(path, input)| (path.as_path(), input.as_str()))
-        .collect::<Vec<_>>();
-    resolve_top_level_user_functions::<ClassifiedFunctionResolution>(&sources, config, seeds)
-}
-
-fn resolve_top_level_user_functions<Phase: FunctionResolution>(
+fn resolve_top_level_user_functions(
     sources: &[(&Path, &str)],
     config: &ProviderContext,
-    seeds: &[BindingSeed<'_>],
-) -> Result<Phase::Functions, ParseError> {
+) -> Result<IndexMap<String, UserFunction>, ParseError> {
     // Preserve the old directory behavior for duplicate names: a later file
     // owns the seed, while two declarations in the same file are an error.
     let mut owners = IndexMap::<String, usize>::new();
-    let mut may_have_loop_heads = seeds
-        .iter()
-        .any(|seed| matches!(seed.kind, SeedKind::Provisional));
     for (source_index, (path, input)) in sources.iter().enumerate() {
         let preprocessed_file =
             super::preprocess_file(input).map_err(|error| locate_function_error(error, path))?;
         let pairs = preprocessed_file
             .parse()
             .map_err(|error| locate_function_error(error, path))?;
-        may_have_loop_heads |= pairs
-            .clone()
-            .flatten()
-            .any(|pair| pair.as_rule() == Rule::for_expr);
         let mut local_names = HashSet::new();
         for pair in pairs {
             if pair.as_rule() != Rule::file {
@@ -1217,19 +837,13 @@ fn resolve_top_level_user_functions<Phase: FunctionResolution>(
 
     let mut pending = owners.keys().cloned().collect::<HashSet<_>>();
     let Some((initial_path, initial_input)) = sources.first() else {
-        return Ok(Phase::finish(IndexMap::new()));
+        return Ok(IndexMap::new());
     };
     let initial_file = Arc::new(
         super::preprocess_file(initial_input)
             .map_err(|error| locate_function_error(error, initial_path))?,
     );
     let mut ctx = ParseContext::new(config, initial_path, initial_file);
-    seed_bindings(&mut ctx, seeds);
-    Phase::prepare(&mut ctx, may_have_loop_heads);
-    for (_, input) in sources {
-        ctx.function_head_names
-            .extend(top_level_let_binding_names(input)?);
-    }
     let mut functions = HashMap::new();
 
     while !pending.is_empty() {
@@ -1270,7 +884,7 @@ fn resolve_top_level_user_functions<Phase: FunctionResolution>(
                     match parse_fn_def(statement, &ctx, &mut warnings, &preprocessed_file) {
                         Ok(mut function) => {
                             function.body.source_file = Some((*path).to_path_buf());
-                            Phase::register(&mut ctx, name.clone(), function.clone());
+                            ctx.insert_user_function(name.clone(), function.clone());
                             // Calls made while parsing another declaration must
                             // remain deferred until the complete table exists.
                             ctx.seeded_user_functions.insert(name.clone());
@@ -1307,15 +921,13 @@ fn resolve_top_level_user_functions<Phase: FunctionResolution>(
 
     // Resolution follows dependencies. Each name keeps its first declaration's
     // slot in sorted-file order; duplicates use the later file's definition.
-    Ok(Phase::finish(
-        owners
-            .into_keys()
-            .map(|name| {
-                let function = functions.remove(&name).expect("resolved function");
-                (name, function)
-            })
-            .collect(),
-    ))
+    Ok(owners
+        .into_keys()
+        .map(|name| {
+            let function = functions.remove(&name).expect("resolved function");
+            (name, function)
+        })
+        .collect())
 }
 
 fn locate_function_error(error: ParseError, path: &Path) -> ParseError {
@@ -1355,46 +967,15 @@ pub(crate) fn parse_with_directory_context(
     source_file: &std::path::Path,
     config: &ProviderContext,
     seeds: &[BindingSeed<'_>],
-    user_functions: &ClassifiedUserFunctions,
+    user_functions: &IndexMap<String, UserFunction>,
+    bindings_fully_classified: bool,
 ) -> Result<ParsedFile, super::resolve::RootInputFailure> {
     parse_with_seeded_bindings_inner(
         input,
         config,
         seeds,
-        DirectoryParsePhase::Classified(user_functions),
-        source_file,
-    )
-}
-
-pub(crate) fn discover_directory_declarations(
-    input: &str,
-    source_file: &Path,
-    config: &ProviderContext,
-    seeds: &[BindingSeed<'_>],
-    functions: &ProvisionalUserFunctions,
-) -> Result<DiscoveredDeclarations, super::resolve::RootInputFailure> {
-    parse_with_seeded_bindings_inner(
-        input,
-        config,
-        seeds,
-        DirectoryParsePhase::Provisional(functions),
-        source_file,
-    )
-    .map(DiscoveredDeclarations::from_provisional)
-}
-
-pub(crate) fn parse_with_refining_directory_context(
-    input: &str,
-    source_file: &Path,
-    config: &ProviderContext,
-    seeds: &[BindingSeed<'_>],
-    functions: &ClassifiedUserFunctions,
-) -> Result<ParsedFile, super::resolve::RootInputFailure> {
-    parse_with_seeded_bindings_inner(
-        input,
-        config,
-        seeds,
-        DirectoryParsePhase::Refining(functions),
+        user_functions,
+        bindings_fully_classified,
         source_file,
     )
 }
@@ -1403,7 +984,8 @@ fn parse_with_seeded_bindings_inner(
     input: &str,
     config: &ProviderContext,
     seeds: &[BindingSeed<'_>],
-    phase: DirectoryParsePhase<'_>,
+    seeded_user_functions: &IndexMap<String, UserFunction>,
+    bindings_fully_classified: bool,
     source_file: &std::path::Path,
 ) -> Result<ParsedFile, super::resolve::RootInputFailure> {
     let preprocessed_file = Arc::new(super::preprocess_file(input)?);
@@ -1413,7 +995,7 @@ fn parse_with_seeded_bindings_inner(
     // Bootstrap passes use provisional sibling names and exist only to
     // classify declarations. The final pass both emits source warnings and
     // evaluates static conditions against the now-typed seed table.
-    let single_quote_warnings = if matches!(phase, DirectoryParsePhase::Classified(_)) {
+    let single_quote_warnings = if bindings_fully_classified {
         collect_single_quoted_interpolation_warnings(pairs.clone(), &preprocessed_file)
     } else {
         Vec::new()
@@ -1421,20 +1003,12 @@ fn parse_with_seeded_bindings_inner(
 
     let mut ctx = ParseContext::new(config, source_file, Arc::clone(&preprocessed_file));
     ctx.set_authored_nodes(syntax.expressions().captured_nodes());
-    ctx.defer_provisional_static_conditions = !matches!(phase, DirectoryParsePhase::Classified(_));
-    if let DirectoryParsePhase::Provisional(functions) = &phase
-        && functions
-            .values()
-            .any(UserFunction::has_provisional_reference_heads)
-    {
-        ctx.function_head_names
-            .extend(top_level_let_binding_names(input)?);
-        ctx.function_head_names
-            .extend(seeds.iter().map(|seed| seed.name.to_owned()));
-    }
+    ctx.defer_provisional_static_conditions = !bindings_fully_classified;
     ctx.extend_warnings(single_quote_warnings);
     seed_bindings(&mut ctx, seeds);
-    phase.prepare(&mut ctx);
+    ctx.extend_user_functions(seeded_user_functions.clone());
+    ctx.seeded_user_functions
+        .extend(seeded_user_functions.keys().cloned());
     let mut providers = Vec::new();
     let mut resources = Vec::new();
     let mut data_sources: Vec<DataSource> = Vec::new();
@@ -1610,15 +1184,7 @@ fn parse_with_seeded_bindings_inner(
                                     )))
                                     .into());
                                 }
-                                if ctx.is_provisional() {
-                                    ctx.insert_user_function(fn_name, user_fn);
-                                } else if !ctx.user_functions.contains_key(&fn_name) {
-                                    return Err(ParseError::InternalError {
-                                        expected: format!("classified user function '{fn_name}'"),
-                                        context: "local function declaration".to_owned(),
-                                    }
-                                    .into());
-                                }
+                                ctx.insert_user_function(fn_name, user_fn);
                             }
                             Rule::let_binding => {
                                 let (line, _) = stmt.as_span().start_pos().line_col();
@@ -1896,12 +1462,8 @@ fn parse_with_seeded_bindings_inner(
 
     let parsed_binding_uses = ctx.take_parsed_binding_uses();
     let warnings = ctx.take_warnings();
-    let mut user_functions = ctx
-        .classified_user_functions()
-        .map(Arc::as_ref)
-        .cloned()
-        .unwrap_or_default();
-    user_functions.retain(|name| !ctx.seeded_user_functions.contains(name));
+    let mut user_functions = Arc::unwrap_or_clone(ctx.user_functions);
+    user_functions.retain(|name, _| !ctx.seeded_user_functions.contains(name));
 
     let mut parsed = ParsedFile::empty_with_parsed_binding_uses(parsed_binding_uses);
     parsed.providers = providers;
@@ -2195,16 +1757,6 @@ pub(crate) fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn classified_function_resolution_clears_provisional_heads() {
-        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let source = Arc::new(super::super::preprocess_file("").unwrap());
-        let mut context = ParseContext::new(&config, Path::new("test.crn"), source);
-        context.provisional_function_heads = true;
-        ClassifiedFunctionResolution::prepare(&mut context, true);
-        assert!(!context.provisional_function_heads);
-    }
 
     #[test]
     fn top_level_let_binding_spans_exclude_locals_and_restore_heredoc_positions() {

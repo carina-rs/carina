@@ -424,7 +424,6 @@ pub enum ExpressionKind {
     FunctionCall,
     Unavailable,
     ResolvedFunctionCall,
-
     Access,
     /// Generic expression-edge adapter; no conversion variant is assumed.
     Evidence,

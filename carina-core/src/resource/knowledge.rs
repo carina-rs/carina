@@ -493,7 +493,6 @@ pub enum EvaluationKind {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubstitutionKind {
-    FunctionHead,
     ModuleArgument,
     FnParam,
     FnLocal,
@@ -2605,7 +2604,6 @@ impl<B: BindingAddress> Position<'_, B> {
 impl SubstitutionKind {
     fn reason(self) -> PendingReason {
         match self {
-            Self::FunctionHead => PendingReason::BindingSelection,
             Self::ModuleArgument => PendingReason::ModuleArgument,
             Self::FnParam => PendingReason::FunctionParameter,
             Self::FnLocal => PendingReason::FunctionLocal,
@@ -2632,7 +2630,6 @@ impl super::evaluable_leaf::Sealed for ParserPlaceholder {
 
     fn substitution_kind(&self) -> SubstitutionKind {
         match self {
-            Self::FunctionHead(_) => SubstitutionKind::FunctionHead,
             Self::ModuleArgument { .. } => SubstitutionKind::ModuleArgument,
             Self::FnParam { .. } => SubstitutionKind::FnParam,
             Self::FnLocal { .. } => SubstitutionKind::FnLocal,
@@ -2794,19 +2791,12 @@ fn expression<'a, P: PlaceholderKind, B: BindingAddress>(
         wait_on: WaitOn::Evaluation(kind),
     })
 }
-fn classify_function<
-    'a,
-    P: PlaceholderKind,
-    B: BindingAddress,
-    S: ClassificationStage,
-    F: AsRef<crate::parser::UserFunction<B>>,
->(
-    function: &'a Arc<F>,
+fn classify_function<'a, P: PlaceholderKind, B: BindingAddress, S: ClassificationStage>(
+    function: &'a Arc<crate::parser::UserFunction<B>>,
     cx: &KnowledgeContext<'_, P, B, S>,
     pos: &mut Position<'a, B>,
 ) -> Result<Arc<kernel::FunctionAnalysis<'a, B>>, KnowledgeError<B>> {
     let id = Arc::as_ptr(function) as usize;
-    let function = function.as_ref().as_ref();
     if pos.functions.contains(&id) {
         return Err(KnowledgeError::Cycle {
             operation: "user function",
@@ -3191,7 +3181,6 @@ fn classify_value<
             }
             Ok(expression(value, EvaluationKind::Builtin, inputs))
         }
-
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions: _,

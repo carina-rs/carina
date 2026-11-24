@@ -1,0 +1,1265 @@
+{
+  "main_commit": "2ab61c021",
+  "cases": {
+    "map-function-body": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "unknown binding 'children' in reference children.a",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 2,
+                "column": 49
+              },
+              "end": {
+                "line": 2,
+                "column": 56
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "map-parameter-default": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "unknown binding 'children' in reference children.a",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 2,
+                "column": 49
+              },
+              "end": {
+                "line": 2,
+                "column": 56
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "map-unused-function-body": {
+      "status": 0,
+      "errors": [],
+      "lsp": []
+    },
+    "map-unused-parameter-default": {
+      "status": 0,
+      "errors": [],
+      "lsp": []
+    },
+    "map-deferred-function-body": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "cannot apply access .a to keyed loop group",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 1,
+                "column": 34
+              },
+              "end": {
+                "line": 1,
+                "column": 59
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "cannot apply access .a to keyed loop group",
+          "range": {
+            "end": {
+              "character": 58,
+              "line": 0
+            },
+            "start": {
+              "character": 33,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "source": "carina"
+        },
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "map-deferred-parameter-default": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "mock.test.resource.other: unknown binding 'children' in reference children.a.name",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 2,
+                "column": 49
+              },
+              "end": {
+                "line": 2,
+                "column": 56
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "map-function-body-coalesce": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "cannot apply access .a to keyed loop group",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 1,
+                "column": 44
+              },
+              "end": {
+                "line": 1,
+                "column": 47
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "cannot apply access .a to keyed loop group",
+          "range": {
+            "end": {
+              "character": 46,
+              "line": 0
+            },
+            "start": {
+              "character": 43,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "source": "carina"
+        },
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "map-parameter-default-coalesce": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "cannot apply access .a to keyed loop group",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 1,
+                "column": 48
+              },
+              "end": {
+                "line": 1,
+                "column": 51
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "cannot apply access .a to keyed loop group",
+          "range": {
+            "end": {
+              "character": 50,
+              "line": 0
+            },
+            "start": {
+              "character": 47,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "source": "carina"
+        },
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "value-keyed-function-body": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "unknown binding 'children' in reference children.a",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 2,
+                "column": 49
+              },
+              "end": {
+                "line": 2,
+                "column": 56
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "value-keyed-parameter-default": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "unknown binding 'children' in reference children.a",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 2,
+                "column": 49
+              },
+              "end": {
+                "line": 2,
+                "column": 56
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "value-keyed-unused-function-body": {
+      "status": 0,
+      "errors": [],
+      "lsp": []
+    },
+    "value-keyed-unused-parameter-default": {
+      "status": 0,
+      "errors": [],
+      "lsp": []
+    },
+    "value-keyed-deferred-function-body": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "cannot apply access .a to keyed loop group",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 1,
+                "column": 34
+              },
+              "end": {
+                "line": 1,
+                "column": 59
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "cannot apply access .a to keyed loop group",
+          "range": {
+            "end": {
+              "character": 58,
+              "line": 0
+            },
+            "start": {
+              "character": 33,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "source": "carina"
+        },
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "value-keyed-deferred-parameter-default": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "mock.test.resource.other: unknown binding 'children' in reference children.a.name",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 2,
+                "column": 49
+              },
+              "end": {
+                "line": 2,
+                "column": 56
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "value-keyed-function-body-coalesce": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "cannot apply access .a to keyed loop group",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 1,
+                "column": 44
+              },
+              "end": {
+                "line": 1,
+                "column": 47
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "cannot apply access .a to keyed loop group",
+          "range": {
+            "end": {
+              "character": 46,
+              "line": 0
+            },
+            "start": {
+              "character": 43,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "source": "carina"
+        },
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "value-keyed-parameter-default-coalesce": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "cannot apply access .a to keyed loop group",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 1,
+                "column": 48
+              },
+              "end": {
+                "line": 1,
+                "column": 51
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "cannot apply access .a to keyed loop group",
+          "range": {
+            "end": {
+              "character": 50,
+              "line": 0
+            },
+            "start": {
+              "character": 47,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "source": "carina"
+        },
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "indexed-function-body": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "unknown binding 'children' in reference children.a",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 2,
+                "column": 49
+              },
+              "end": {
+                "line": 2,
+                "column": 56
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "indexed-parameter-default": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "unknown binding 'children' in reference children.a",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 2,
+                "column": 49
+              },
+              "end": {
+                "line": 2,
+                "column": 56
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "indexed-unused-function-body": {
+      "status": 0,
+      "errors": [],
+      "lsp": []
+    },
+    "indexed-unused-parameter-default": {
+      "status": 0,
+      "errors": [],
+      "lsp": []
+    },
+    "indexed-deferred-function-body": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "cannot apply access .a to list(mock.test.resource)",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 1,
+                "column": 34
+              },
+              "end": {
+                "line": 1,
+                "column": 59
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "cannot apply access .a to list(mock.test.resource)",
+          "range": {
+            "end": {
+              "character": 58,
+              "line": 0
+            },
+            "start": {
+              "character": 33,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "source": "carina"
+        },
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "indexed-deferred-parameter-default": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "mock.test.resource.other: unknown binding 'children' in reference children.a.name",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 2,
+                "column": 49
+              },
+              "end": {
+                "line": 2,
+                "column": 56
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "indexed-function-body-coalesce": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "cannot apply access .a to list(mock.test.resource)",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 1,
+                "column": 44
+              },
+              "end": {
+                "line": 1,
+                "column": 47
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "cannot apply access .a to list(mock.test.resource)",
+          "range": {
+            "end": {
+              "character": 46,
+              "line": 0
+            },
+            "start": {
+              "character": 43,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "source": "carina"
+        },
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "indexed-parameter-default-coalesce": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "cannot apply access .a to list(mock.test.resource)",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "other.crn",
+            "range": {
+              "start": {
+                "line": 1,
+                "column": 48
+              },
+              "end": {
+                "line": 1,
+                "column": 51
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "cannot apply access .a to list(mock.test.resource)",
+          "range": {
+            "end": {
+              "character": 50,
+              "line": 0
+            },
+            "start": {
+              "character": 47,
+              "line": 0
+            }
+          },
+          "severity": 1,
+          "source": "carina"
+        },
+        {
+          "message": "Unused let binding 'other'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 9,
+              "line": 1
+            },
+            "start": {
+              "character": 4,
+              "line": 1
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "whole-group-uncalled": {
+      "status": 0,
+      "errors": [],
+      "lsp": [
+        {
+          "message": "for-loop binding 'v' is unused. Rename to '_' to suppress this warning.",
+          "range": {
+            "end": {
+              "character": 23,
+              "line": 0
+            },
+            "start": {
+              "character": 22,
+              "line": 0
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ]
+    },
+    "whole-group-called": {
+      "status": 1,
+      "errors": [
+        {
+          "message": "length() argument must be a List, Map, or String, got EnumIdentifier",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "main.crn",
+            "range": {
+              "start": {
+                "line": 2,
+                "column": 15
+              },
+              "end": {
+                "line": 2,
+                "column": 31
+              }
+            }
+          }
+        }
+      ],
+      "lsp": [
+        {
+          "message": "length() argument must be a List, Map, or String, got EnumIdentifier",
+          "range": {
+            "end": {
+              "character": 30,
+              "line": 1
+            },
+            "start": {
+              "character": 14,
+              "line": 1
+            }
+          },
+          "severity": 1,
+          "source": "carina"
+        }
+      ]
+    }
+  },
+  "direct_calls": {
+    "indexed-default-false": {
+      "lsp": [
+        {
+          "message": "Unused let binding 'r'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 5,
+              "line": 2
+            },
+            "start": {
+              "character": 4,
+              "line": 2
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        },
+        {
+          "message": "for-loop binding 'i' is unused. Rename to '_' to suppress this warning.",
+          "range": {
+            "end": {
+              "character": 7,
+              "line": 0
+            },
+            "start": {
+              "character": 6,
+              "line": 0
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ],
+      "source": "let children = for (i, v) in ['a'] { mock.test.resource { name = v } }\nfn pick(): String { children.a.name }\nlet r = mock.test.resource { name = pick() }\n",
+      "status": 1,
+      "errors": [
+        {
+          "message": "unknown binding 'children' in reference children.a",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "main.crn",
+            "range": {
+              "start": {
+                "line": 3,
+                "column": 30
+              },
+              "end": {
+                "line": 3,
+                "column": 34
+              }
+            }
+          }
+        }
+      ],
+      "text": "Validating...\n  \u26a0 ./main.crn:1: for-loop binding 'i' is unused. Rename to '_' to suppress this warning.\nError: mock.test.resource.r: unknown binding 'children' in reference children.a\n"
+    },
+    "indexed-default-true": {
+      "lsp": [
+        {
+          "message": "Unused let binding 'r'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 5,
+              "line": 2
+            },
+            "start": {
+              "character": 4,
+              "line": 2
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        },
+        {
+          "message": "for-loop binding 'i' is unused. Rename to '_' to suppress this warning.",
+          "range": {
+            "end": {
+              "character": 7,
+              "line": 0
+            },
+            "start": {
+              "character": 6,
+              "line": 0
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ],
+      "source": "let children = for (i, v) in ['a'] { mock.test.resource { name = v } }\nfn pick(x: String = children.a.name): String { x }\nlet r = mock.test.resource { name = pick() }\n",
+      "status": 1,
+      "errors": [
+        {
+          "message": "unknown binding 'children' in reference children.a",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "main.crn",
+            "range": {
+              "start": {
+                "line": 3,
+                "column": 30
+              },
+              "end": {
+                "line": 3,
+                "column": 34
+              }
+            }
+          }
+        }
+      ],
+      "text": "Validating...\n  \u26a0 ./main.crn:1: for-loop binding 'i' is unused. Rename to '_' to suppress this warning.\nError: mock.test.resource.r: unknown binding 'children' in reference children.a\n"
+    },
+    "map-default-false": {
+      "lsp": [
+        {
+          "message": "Unused let binding 'r'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 5,
+              "line": 2
+            },
+            "start": {
+              "character": 4,
+              "line": 2
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        },
+        {
+          "message": "for-loop binding 'k' is unused. Rename to '_' to suppress this warning.",
+          "range": {
+            "end": {
+              "character": 20,
+              "line": 0
+            },
+            "start": {
+              "character": 19,
+              "line": 0
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ],
+      "source": "let children = for k, v in ({ a = 'x' }) { mock.test.resource { name = v } }\nfn pick(): String { children.a.name }\nlet r = mock.test.resource { name = pick() }\n",
+      "status": 1,
+      "errors": [
+        {
+          "message": "unknown binding 'children' in reference children.a",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "main.crn",
+            "range": {
+              "start": {
+                "line": 3,
+                "column": 30
+              },
+              "end": {
+                "line": 3,
+                "column": 34
+              }
+            }
+          }
+        }
+      ],
+      "text": "Validating...\n  \u26a0 ./main.crn:1: for-loop binding 'k' is unused. Rename to '_' to suppress this warning.\nError: mock.test.resource.r: unknown binding 'children' in reference children.a\n"
+    },
+    "map-default-true": {
+      "lsp": [
+        {
+          "message": "Unused let binding 'r'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 5,
+              "line": 2
+            },
+            "start": {
+              "character": 4,
+              "line": 2
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        },
+        {
+          "message": "for-loop binding 'k' is unused. Rename to '_' to suppress this warning.",
+          "range": {
+            "end": {
+              "character": 20,
+              "line": 0
+            },
+            "start": {
+              "character": 19,
+              "line": 0
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ],
+      "source": "let children = for k, v in ({ a = 'x' }) { mock.test.resource { name = v } }\nfn pick(x: String = children.a.name): String { x }\nlet r = mock.test.resource { name = pick() }\n",
+      "status": 1,
+      "errors": [
+        {
+          "message": "unknown binding 'children' in reference children.a",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "main.crn",
+            "range": {
+              "start": {
+                "line": 3,
+                "column": 30
+              },
+              "end": {
+                "line": 3,
+                "column": 34
+              }
+            }
+          }
+        }
+      ],
+      "text": "Validating...\n  \u26a0 ./main.crn:1: for-loop binding 'k' is unused. Rename to '_' to suppress this warning.\nError: mock.test.resource.r: unknown binding 'children' in reference children.a\n"
+    },
+    "value-keyed-default-false": {
+      "lsp": [
+        {
+          "message": "Unused let binding 'r'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 5,
+              "line": 2
+            },
+            "start": {
+              "character": 4,
+              "line": 2
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ],
+      "source": "let children = for v in ['a'] { mock.test.resource { name = v } }\nfn pick(): String { children.a.name }\nlet r = mock.test.resource { name = pick() }\n",
+      "status": 1,
+      "errors": [
+        {
+          "message": "unknown binding 'children' in reference children.a",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "main.crn",
+            "range": {
+              "start": {
+                "line": 3,
+                "column": 30
+              },
+              "end": {
+                "line": 3,
+                "column": 34
+              }
+            }
+          }
+        }
+      ],
+      "text": "Validating...\nError: mock.test.resource.r: unknown binding 'children' in reference children.a\n"
+    },
+    "value-keyed-default-true": {
+      "lsp": [
+        {
+          "message": "Unused let binding 'r'. Consider using an anonymous resource instead.",
+          "range": {
+            "end": {
+              "character": 5,
+              "line": 2
+            },
+            "start": {
+              "character": 4,
+              "line": 2
+            }
+          },
+          "severity": 2,
+          "source": "carina"
+        }
+      ],
+      "source": "let children = for v in ['a'] { mock.test.resource { name = v } }\nfn pick(x: String = children.a.name): String { x }\nlet r = mock.test.resource { name = pick() }\n",
+      "status": 1,
+      "errors": [
+        {
+          "message": "unknown binding 'children' in reference children.a",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "main.crn",
+            "range": {
+              "start": {
+                "line": 3,
+                "column": 30
+              },
+              "end": {
+                "line": 3,
+                "column": 34
+              }
+            }
+          }
+        }
+      ],
+      "text": "Validating...\nError: mock.test.resource.r: unknown binding 'children' in reference children.a\n"
+    }
+  }
+}

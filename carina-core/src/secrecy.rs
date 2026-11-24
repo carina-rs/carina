@@ -763,7 +763,7 @@ struct Environment<B: BindingAddress> {
     id: usize,
     nodes: Arc<HashMap<(ExpressionInstance, NodeId), Thunk<B>>>,
     names: Arc<HashMap<String, Thunk<B>>>,
-    functions: Option<Arc<crate::parser::ClassifiedUserFunctions<B>>>,
+    functions: Option<Arc<IndexMap<String, crate::parser::UserFunction<B>>>>,
     conditions: Option<crate::parser::retained::ConditionSnapshot>,
     in_function: bool,
     module: Option<B>,
@@ -1210,8 +1210,8 @@ impl<B: BindingAddress> Owner<'_, B> {
     fn value_function_observations(
         &self,
         identity: &FunctionIdentity<B>,
-        function: &Arc<crate::parser::ClassifiedUserFunction<B>>,
-        functions: &crate::parser::ClassifiedUserFunctions<B>,
+        function: &Arc<crate::parser::UserFunction<B>>,
+        functions: &IndexMap<String, crate::parser::UserFunction<B>>,
     ) -> ArgumentDependencies {
         if let Some(uses) = self.function_observations.borrow().get(identity) {
             return *uses;
@@ -1891,8 +1891,8 @@ enum Work<B: BindingAddress> {
         depth: usize,
     },
     ValueCall {
-        function: Arc<crate::parser::ClassifiedUserFunction<B>>,
-        functions: Arc<crate::parser::ClassifiedUserFunctions<B>>,
+        function: Arc<crate::parser::UserFunction<B>>,
+        functions: Arc<IndexMap<String, crate::parser::UserFunction<B>>>,
         count: usize,
         observations: Vec<ArgumentObservations>,
         arguments: Vec<Thunk<B>>,
@@ -3767,8 +3767,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                             values.push(None);
                         }
                     }
-                    ParserPlaceholder::FunctionHead(_)
-                    | ParserPlaceholder::Loop(_)
+                    ParserPlaceholder::Loop(_)
                     | ParserPlaceholder::EmptyInterpolation { source: _ } => values.push(None),
                 },
                 DeferredValue::ModuleIf(conditional) => {
@@ -3793,8 +3792,8 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
     }
     fn begin_value_function(
         &mut self,
-        function: Arc<crate::parser::ClassifiedUserFunction<B>>,
-        functions: Arc<crate::parser::ClassifiedUserFunctions<B>>,
+        function: Arc<crate::parser::UserFunction<B>>,
+        functions: Arc<IndexMap<String, crate::parser::UserFunction<B>>>,
         args: Vec<Option<Evidence>>,
         observations: Vec<ArgumentObservations>,
         authored_arguments: Vec<Thunk<B>>,

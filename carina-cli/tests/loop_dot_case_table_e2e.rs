@@ -29,6 +29,29 @@ fn diagnostics(root: &Path) -> (bool, Vec<String>) {
     (output.status.success(), errors)
 }
 
+// Measured on main 2ab61c021 with the same shared fixtures. Keep the complete
+// error records so function-body/default locations cannot move to the selector.
+fn assert_main_function_diagnostics(root: &Path, row: &cases::Row, position: &str) {
+    let expected = cases::main_function_record(row, position);
+    let label = format!("{}, {:?}, {position}, {}", row.id, row.kind, row.reader);
+    let output = run(root, &["validate", ".", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&output.stderr)));
+    assert_eq!(
+        output.status.code().map(i64::from),
+        expected["status"].as_i64(),
+        "{label}"
+    );
+    assert_eq!(
+        report
+            .get("errors")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        expected["errors"],
+        "{label}"
+    );
+}
+
 fn plan(root: &Path) -> serde_json::Value {
     let output = run(root, &["plan", "--json", "--refresh=false", "."]);
     assert!(
@@ -59,6 +82,41 @@ fn loop_dot_review_round3_whole_group_function() {
 #[test]
 fn loop_dot_review_round1_function_contexts() {
     run_case_table(|row| row.id == "2-19");
+}
+
+#[test]
+fn loop_dot_function_body_and_default_keep_main_call_site_error() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    cases::write(root, "providers.crn", "provider mock {}\n");
+    cases::write(
+        root,
+        "backend.crn",
+        "backend local { path = 'carina.state.json' }\n",
+    );
+    let main: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/loop_dot_function_main.json")).unwrap();
+    for (label, case) in main["direct_calls"].as_object().unwrap() {
+        cases::write(root, "main.crn", case["source"].as_str().unwrap());
+        let output = run(root, &["validate", "."]);
+        assert_eq!(
+            output.status.code().map(i64::from),
+            case["status"].as_i64(),
+            "{label}"
+        );
+        assert_eq!(
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            case["text"].as_str().unwrap(),
+            "{label}"
+        );
+        let output = run(root, &["validate", ".", "--json"]);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["errors"], case["errors"], "{label}");
+    }
 }
 
 #[test]
@@ -130,9 +188,14 @@ fn run_case_table(include: impl Fn(&cases::Row) -> bool) {
         cases::fixture(root, &row);
         for &position in row.positions {
             cases::reader(root, position, row.reader);
+            if matches!(row.expected, cases::Outcome::MainFunction) {
+                assert_main_function_diagnostics(root, &row, position);
+                continue;
+            }
             let mut dot = diagnostics(root);
             let label = format!("{}, {:?}, {position}, {}", row.id, row.kind, row.reader);
             match row.expected {
+                cases::Outcome::MainFunction => unreachable!("main records checked above"),
                 cases::Outcome::Validates if !dot.0 => failures.push(format!("{label}: {dot:?}")),
                 cases::Outcome::Validates => {}
                 cases::Outcome::Error(expected) => {
@@ -162,14 +225,7 @@ fn run_case_table(include: impl Fn(&cases::Row) -> bool) {
                             observed.1[0] = observed.1[0].replace(reader, "<reader>");
                         }
                     }
-                    if row.id == "2-22" && position == "deferred function body" {
-                        assert_eq!(
-                            bracket.1,
-                            ["missing dependency edge to children.a provenance in ./other.crn"; 2],
-                            "#4597 remains the subscript control"
-                        );
-                    }
-                    if dot != bracket || (!matches!(row.id, "2-4" | "2-6a" | "2-22") && !dot.0) {
+                    if dot != bracket || (!matches!(row.id, "2-4" | "2-6a") && !dot.0) {
                         failures.push(format!("{label}: dot {dot:?}, subscript {bracket:?}"));
                     } else if row.id == "2-6a" && dot.0 {
                         failures.push(format!("{label}: simple map iteration must be rejected"));

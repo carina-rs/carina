@@ -274,7 +274,6 @@ fn public_json_value(value: &SnapshotValue) -> Result<serde_json::Value, &'stati
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function: _function,
             functions: _functions,
-
             args: _args,
             source_line: _source_line,
         }) => Err("the value contains an unresolved user function call"),

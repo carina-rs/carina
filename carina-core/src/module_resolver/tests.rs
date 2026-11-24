@@ -2482,7 +2482,7 @@ fn create_test_module() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -2709,7 +2709,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -2932,7 +2932,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -3146,7 +3146,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -3316,7 +3316,7 @@ fn create_module_with_attributes() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -3685,7 +3685,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -5184,7 +5184,7 @@ fn create_module_with_interpolation() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -5941,7 +5941,7 @@ fn create_module_with_port_validation() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -6140,7 +6140,7 @@ let root = outer { outer_port = producer.port }
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -6375,7 +6375,7 @@ fn test_argument_validation_no_message_uses_default() {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -6454,7 +6454,7 @@ fn test_argument_validation_len_with_list() {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -6550,7 +6550,7 @@ fn test_require_block_passes() {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![RequireBlock::dummy(
@@ -6642,7 +6642,7 @@ fn test_require_block_fails_with_not_expr() {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![RequireBlock::dummy(
@@ -6727,7 +6727,7 @@ fn test_require_block_len_function() {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![RequireBlock::dummy(
@@ -6835,7 +6835,7 @@ fn test_require_block_multiple_constraints() {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![RequireBlock::dummy(
@@ -8929,7 +8929,7 @@ fn create_module_with_environment_union() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: Default::default(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -11795,15 +11795,13 @@ fn module_if_audit_checks_functions_in_sibling_declaration_order() {
                 ExpandedValue::Concrete(ExpandedConcreteValue::String("no".into())),
             ),
         )));
-        expanded.user_functions.get_mut("zebra").unwrap().body.value = conditional.clone();
-        expanded.user_functions.get_mut("mango").unwrap().params[0].default = Some(conditional);
+        expanded.user_functions["zebra"].body.value = conditional.clone();
+        expanded.user_functions["mango"].params[0].default = Some(conditional);
         let error = crate::module_resolver::ensure_expanded_root_graph(&expanded).unwrap_err();
         assert!(
             matches!(error, ModuleError::UnexpandedModuleTemplate { context } if context == "function body")
         );
-        let mut functions: Vec<_> = expanded.user_functions.into_iter().collect();
-        functions.swap(0, 1);
-        expanded.user_functions = functions.into_iter().collect();
+        expanded.user_functions.move_index(0, 1);
         let error = crate::module_resolver::ensure_expanded_root_graph(&expanded).unwrap_err();
         assert!(
             matches!(error, ModuleError::UnexpandedModuleTemplate { context } if context == "function parameter default")

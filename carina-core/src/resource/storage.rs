@@ -376,9 +376,6 @@ fn same_span(a: &DiagnosticSourceSpan, b: &DiagnosticSourceSpan) -> bool {
 }
 fn same_placeholder(a: &ParserPlaceholder, b: &ParserPlaceholder) -> bool {
     match a {
-        ParserPlaceholder::FunctionHead(a) => {
-            matches!(b, ParserPlaceholder::FunctionHead(b) if a == b)
-        }
         ParserPlaceholder::FnParam { name: a } => {
             matches!(b,ParserPlaceholder::FnParam {name:b} if a==b)
         }
@@ -672,7 +669,6 @@ fn same_deferred<B: BindingAddress>(
         } => {
             matches!(b,DeferredValue::Unavailable {name:b,args:ba,source_line:bl,reason:br} if a==b && al.get()==bl.get() && ar==br && same_slice(aa,ba,same_argument))
         }
-
         DeferredValue::ResolvedFunctionCall {
             function: a,
             functions: af,

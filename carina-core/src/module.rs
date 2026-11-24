@@ -1430,8 +1430,7 @@ impl ModuleSignature {
                 );
             }
             Value::Deferred(DeferredValue::Placeholder(
-                crate::resource::ParserPlaceholder::FunctionHead(_)
-                | crate::resource::ParserPlaceholder::FnParam { .. }
+                crate::resource::ParserPlaceholder::FnParam { .. }
                 | crate::resource::ParserPlaceholder::FnLocal { .. }
                 | crate::resource::ParserPlaceholder::Loop(_)
                 | crate::resource::ParserPlaceholder::EmptyInterpolation { .. },

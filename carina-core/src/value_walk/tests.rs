@@ -151,9 +151,10 @@ fn every_edge_fixture() -> crate::resource::AuthoredValue {
         }),
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function: function.clone(),
-            functions: std::sync::Arc::new(
-                indexmap::IndexMap::from([("captured".into(), (*function).clone())]).into(),
-            ),
+            functions: std::sync::Arc::new(indexmap::IndexMap::from([(
+                "captured".into(),
+                (*function).clone(),
+            )])),
             args: vec![FunctionArgument::from_value(atom(11))],
             source_line,
         }),
@@ -2623,7 +2624,10 @@ fn unavailable_search_ignores_captured_code_and_checks_call_arguments() {
     function.body.value = unavailable_candidate().into_secret();
     let mut scope_function = function.clone();
     scope_function.name = "unused".into();
-    let functions = Arc::new(indexmap::IndexMap::from([("unused".into(), scope_function)]).into());
+    let functions = Arc::new(indexmap::IndexMap::from([(
+        "unused".into(),
+        scope_function,
+    )]));
     let mut value = Value::Deferred(DeferredValue::ResolvedFunctionCall {
         function: Arc::new(function),
         functions,

@@ -16,6 +16,7 @@ pub enum Kind {
 #[derive(Clone, Copy, Debug)]
 pub enum Outcome {
     Validates,
+    MainFunction,
     SameAsSubscript(&'static str),
     Error(&'static [&'static str]),
     SurfaceErrors {
@@ -69,7 +70,7 @@ pub fn rows() -> Vec<Row> {
         key: "a",
         reader: "children",
         positions: &["unused whole group function", "whole group function"],
-        expected: Error(&["'children' is a for binding, not a value; reference an instance attribute, e.g. 'children['key'].<attribute>'"]),
+        expected: MainFunction,
     });
     for kind in [Map, ValueKeyed] {
         for (id, key, reader, positions, expected) in [
@@ -125,7 +126,7 @@ pub fn rows() -> Vec<Row> {
                     "unused function body",
                     "unused parameter default",
                 ][..],
-                SameAsSubscript("children['a'].name"),
+                MainFunction,
             ),
             (
                 "2-7",
@@ -258,7 +259,7 @@ pub fn rows() -> Vec<Row> {
             "unused function body",
             "unused parameter default",
         ],
-        expected: Error(&["cannot apply access .a to list(mock.test.resource)"]),
+        expected: MainFunction,
     });
     for kind in [Map, ValueKeyed, Indexed] {
         rows.push(Row {
@@ -267,11 +268,7 @@ pub fn rows() -> Vec<Row> {
             key: "a",
             reader: "children.a.name",
             positions: &["deferred function body", "deferred parameter default"],
-            expected: if kind == Indexed {
-                Error(&["cannot apply access .a to list(mock.test.resource)"])
-            } else {
-                SameAsSubscript("children['a'].name")
-            },
+            expected: MainFunction,
         });
         rows.push(Row {
             id: "2-20",
@@ -326,11 +323,7 @@ pub fn rows() -> Vec<Row> {
             key: "a",
             reader: "children.a.name ?? 'p'",
             positions: &["function body", "parameter default"],
-            expected: if kind == Indexed {
-                Error(&["cannot apply access .a to list(mock.test.resource)"])
-            } else {
-                SameAsSubscript("children['a'].name ?? 'p'")
-            },
+            expected: MainFunction,
         });
     }
     rows.push(Row {
@@ -360,6 +353,43 @@ pub fn rows() -> Vec<Row> {
         expected: Error(&["cannot apply access .a to list(value-dependent expression)"]),
     });
     rows
+}
+
+/// Full records measured on main 2ab61c021, including each surface's locations.
+pub fn main_function_record(row: &Row, position: &str) -> &'static serde_json::Value {
+    static RECORDED: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    let recorded = RECORDED.get_or_init(|| {
+        serde_json::from_str(include_str!("../fixtures/loop_dot_function_main.json")).unwrap()
+    });
+    let key = if row.id == "2-24" {
+        format!(
+            "whole-group-{}",
+            if position == "whole group function" {
+                "called"
+            } else {
+                "uncalled"
+            }
+        )
+    } else {
+        let kind = match row.kind {
+            Kind::Map => "map",
+            Kind::ValueKeyed => "value-keyed",
+            Kind::Indexed => "indexed",
+            _ => unreachable!("function case loop kind"),
+        };
+        format!(
+            "{kind}-{}{}",
+            position.replace(' ', "-"),
+            if row.reader.ends_with("?? 'p'") {
+                "-coalesce"
+            } else {
+                ""
+            }
+        )
+    };
+    let expected = &recorded["cases"][&key];
+    assert!(!expected.is_null(), "missing main measurement for {key}");
+    expected
 }
 
 pub fn write(root: &Path, name: &str, source: &str) {

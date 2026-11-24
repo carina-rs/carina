@@ -1226,8 +1226,8 @@ fn function_annotation_site<B: BindingAddress>(
     ProviderTypeCheckSite::new(location.clone(), context)
 }
 
-fn evaluate_captured_user_function<B: BindingAddress>(
-    function: &crate::parser::ClassifiedUserFunction<B>,
+fn evaluate_runtime_user_function<B: BindingAddress>(
+    function: &crate::parser::UserFunction<B>,
     args: &[crate::resource::FunctionArgument<crate::resource::ParserPlaceholder, B>],
     bindings: &ResolvedBindings<crate::resource::ParserPlaceholder, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
@@ -1394,7 +1394,7 @@ fn evaluate_captured_user_function<B: BindingAddress>(
 }
 
 pub(crate) fn evaluate_module_resolved_user_function(
-    function: &crate::parser::ClassifiedUserFunction<AbsoluteBindingAddress>,
+    function: &crate::parser::UserFunction<AbsoluteBindingAddress>,
     arguments: &[crate::resource::FunctionArgument<
         crate::resource::ParserPlaceholder,
         AbsoluteBindingAddress,
@@ -1405,7 +1405,7 @@ pub(crate) fn evaluate_module_resolved_user_function(
     Value<crate::resource::ParserPlaceholder, AbsoluteBindingAddress>,
     crate::parser::ParseError,
 > {
-    evaluate_captured_user_function(
+    evaluate_runtime_user_function(
         function,
         arguments,
         &ResolvedBindings::default(),
@@ -1590,7 +1590,6 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
         Value::Deferred(DeferredValue::Unavailable { name, reason, .. }) => {
             Err(format!("{name}(): {reason}").into())
         }
-
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,
@@ -1636,7 +1635,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                     source_line: *source_line,
                 }));
             };
-            let evaluated = evaluate_captured_user_function(
+            let evaluated = evaluate_runtime_user_function(
                 function,
                 &parser_args,
                 &ResolvedBindings::default(),
@@ -5008,7 +5007,7 @@ mod runtime_provider_type_tests {
             };
             let error =
                 crate::validation::deferred_types::with_session_for_test(&loaded, |session| {
-                    evaluate_captured_user_function(&function, &arguments, &bindings, session, 8)
+                    evaluate_runtime_user_function(&function, &arguments, &bindings, session, 8)
                 })
                 .unwrap_err();
             assert!(error.to_string().contains("rejected by ready"), "{error}");
@@ -5020,7 +5019,7 @@ mod runtime_provider_type_tests {
             };
             let error =
                 crate::validation::deferred_types::with_session_for_test(&partial, |session| {
-                    evaluate_captured_user_function(&function, &arguments, &bindings, session, 8)
+                    evaluate_runtime_user_function(&function, &arguments, &bindings, session, 8)
                 })
                 .unwrap_err();
             assert!(error.to_string().contains("rejected by ready"), "{error}");
@@ -5028,7 +5027,7 @@ mod runtime_provider_type_tests {
             let result = crate::validation::deferred_types::TypeCheckSession::run(
                 &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 |unloaded| {
-                    evaluate_captured_user_function(&function, &arguments, &bindings, unloaded, 8)
+                    evaluate_runtime_user_function(&function, &arguments, &bindings, unloaded, 8)
                         .unwrap();
                 },
             );

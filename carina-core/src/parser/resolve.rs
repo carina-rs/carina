@@ -211,8 +211,8 @@ fn provider_analysis_failure(
 
 trait ProviderAttributeBindingPhase: BindingAddress {
     fn evaluate_resolved_user_function(
-        function: &super::ClassifiedUserFunction<Self>,
-        functions: &std::sync::Arc<super::ClassifiedUserFunctions<Self>>,
+        function: &super::UserFunction<Self>,
+        functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
         arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
         config: &ProviderContext,
         session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
@@ -222,8 +222,8 @@ trait ProviderAttributeBindingPhase: BindingAddress {
 
 impl ProviderAttributeBindingPhase for RelativeBindingName {
     fn evaluate_resolved_user_function(
-        function: &super::ClassifiedUserFunction<Self>,
-        functions: &std::sync::Arc<super::ClassifiedUserFunctions<Self>>,
+        function: &super::UserFunction<Self>,
+        functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
         arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
         config: &ProviderContext,
         session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
@@ -237,8 +237,8 @@ impl ProviderAttributeBindingPhase for RelativeBindingName {
 
 impl ProviderAttributeBindingPhase for AbsoluteBindingAddress {
     fn evaluate_resolved_user_function(
-        function: &super::ClassifiedUserFunction<Self>,
-        functions: &std::sync::Arc<super::ClassifiedUserFunctions<Self>>,
+        function: &super::UserFunction<Self>,
+        functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
         arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
         _config: &ProviderContext,
         session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
@@ -1471,12 +1471,28 @@ pub(crate) fn resolve_snapshot_function_calls_in_context(
         }
     }
 
+    let mut fn_ctx = super::ParseContext::for_evaluation(config);
+    fn_ctx.replace_user_functions(parsed.user_functions.clone());
+
+    // This snapshot preserves authored references for identity/dependency
+    // provenance; it is not a second validation surface. Provider-backed
+    // annotations cannot be classified in the bootstrap context, and the
+    // resolved tree runs their authoritative checks after schemas load.
+    // Evaluate the same function bodies here without annotations so the raw
+    // snapshot does not retain a user-function call that plan-time value
+    // resolution would later mistake for an unknown builtin.
+    for function in fn_ctx.user_functions_mut().values_mut() {
+        for parameter in &mut function.params {
+            parameter.param_type = None;
+        }
+        function.return_type = None;
+    }
     for resource in iter_pre_apply_resources_mut(parsed) {
         for value in resource.attributes_mut().values_mut() {
             *value = resolve_function_calls_only::<ParserPlaceholder, _>(
                 value,
                 &binding_map,
-                config,
+                fn_ctx.config,
                 None,
                 resolution,
             )?;
@@ -1693,7 +1709,7 @@ fn resolve_resource_refs_output<P: ResolveKind, E: ExportParamLike>(
     // path (would need to restore on every `?` exit), so we accept a
     // single map clone per call.
     let mut fn_ctx = super::ParseContext::for_evaluation(config);
-    fn_ctx.replace_classified_user_functions(std::sync::Arc::new(parsed.user_functions.clone()));
+    fn_ctx.replace_user_functions(parsed.user_functions.clone());
 
     let resource_source_files: HashMap<crate::resource::ResourceId, std::path::PathBuf> = parsed
         .resources

@@ -96,7 +96,7 @@ fn unused_function_argument_keeps_main_cycle_diagnostic() {
 }
 
 #[test]
-fn whole_loop_group_in_called_and_uncalled_function_is_located() {
+fn whole_loop_group_in_function_keeps_main_called_and_uncalled_behavior() {
     for called in [false, true] {
         let fixture = loop_reader_fixture("");
         let call = if called {
@@ -112,10 +112,13 @@ fn whole_loop_group_in_called_and_uncalled_function_is_located() {
             ),
         );
         let output = run(fixture.path(), &["validate", "."]);
-        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.status.success(), !called, "{}", output_text(&output));
+        if !called {
+            continue;
+        }
         assert_eq!(
             output_text(&output),
-            "Error: ./main.crn:2:15: Invalid expression at line 2: 'children' is a for binding, not a value; reference an instance attribute, e.g. 'children['key'].<attribute>'\n",
+            "Error: ./main.crn:2:15: Invalid expression at line 2: length() argument must be a List, Map, or String, got EnumIdentifier\n",
             "called: {called}",
         );
         let output = run(fixture.path(), &["validate", ".", "--json"]);
@@ -551,10 +554,20 @@ fn indexed_loop_dot_reader_is_list_access_error_in_every_position() {
 }
 
 #[test]
-fn deferred_loop_function_value_chain_dot_matches_subscript() {
+fn deferred_loop_function_value_chain_keeps_main_dot_and_subscript_errors() {
     let fixture = loop_reader_fixture("");
-    let mut observations = Vec::new();
-    for reader in ["children.a.name", "children['a'].name"] {
+    for (reader, expected, planning_error) in [
+        (
+            "children.a.name",
+            vec!["cannot apply access .a to keyed loop group"],
+            "Error: ./main.crn at line 3\nError: cannot apply access .a to keyed loop group\n",
+        ),
+        (
+            "children['a'].name",
+            vec!["missing dependency edge to children.a provenance in ./main.crn"; 2],
+            "Error: missing dependency edge to children.a provenance in ./main.crn\n",
+        ),
+    ] {
         write_file(
             fixture.path(),
             "main.crn",
@@ -568,31 +581,13 @@ fn deferred_loop_function_value_chain_dot_matches_subscript() {
                  let r = mock.test.resource {{ name = c comment = \"${{b}}\" }}\n"
             ),
         );
-        let validate = run(fixture.path(), &["validate", "."]);
-        assert_eq!(
-            validate.status.code(),
-            Some(1),
-            "{}",
-            output_text(&validate)
-        );
-        let validation = output_text(&validate);
-        assert_eq!(
-            validation
-                .matches("missing dependency edge to children.a provenance")
-                .count(),
-            2,
-            "{reader}: {validation}",
-        );
+        let (errors, _) = validate_diagnostic_messages(fixture.path());
+        assert_eq!(errors, expected, "{reader}");
         let plan = run(fixture.path(), &["plan", "--json", "."]);
         assert_eq!(plan.status.code(), Some(1), "{}", output_text(&plan));
         let planning = output_text(&plan);
-        assert_eq!(
-            planning, "Error: missing dependency edge to children.a provenance in ./main.crn\n",
-            "{reader}",
-        );
-        observations.push((validation, planning));
+        assert_eq!(planning, planning_error, "{reader}",);
     }
-    assert_eq!(observations[0], observations[1]);
 }
 
 #[test]

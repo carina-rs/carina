@@ -243,7 +243,6 @@ pub(crate) fn evaluate_static_value(
                 .into_value()
                 .map_err(|error| ParseError::from_eval_value(error, 0))
         }
-
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             ref function,
             ref functions,

@@ -102,27 +102,6 @@ pub(super) enum ParseBindingRef<'a> {
     Unbound,
 }
 
-/// Raw declarations exist only during discovery. Classified scopes never
-/// expose a raw table that could become a deferred call's lexical scope.
-#[derive(Clone)]
-pub(super) enum UserFunctionScope {
-    Provisional(Arc<IndexMap<String, UserFunction>>),
-    Classified(Arc<super::ClassifiedUserFunctions>),
-}
-
-impl UserFunctionScope {
-    pub(super) fn get(&self, name: &str) -> Option<&UserFunction> {
-        match self {
-            Self::Provisional(functions) => functions.get(name),
-            Self::Classified(functions) => functions.get(name).map(AsRef::as_ref),
-        }
-    }
-
-    pub(super) fn contains_key(&self, name: &str) -> bool {
-        self.get(name).is_some()
-    }
-}
-
 /// Parse context (variable scope)
 #[derive(Clone)]
 pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
@@ -136,11 +115,10 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     /// Imported modules (alias -> path)
     pub(super) imported_modules: HashMap<String, String>,
     /// User-defined functions
-    pub(super) user_functions: UserFunctionScope,
-    pub(super) function_declaration: Option<super::DeclarationLocation>,
-    captured_user_functions: RefCell<HashMap<String, Arc<super::ClassifiedUserFunction>>>,
-    /// Interned parser-local lookup definitions. Deferred calls capture only
-    /// from the classified scope, independently of this cache.
+    pub(super) user_functions: Arc<IndexMap<String, UserFunction>>,
+    /// Interned user-function definitions used by deferred call nodes.
+    /// Invalidated together with `user_function_scope` whenever the mutable
+    /// parser table changes.
     resolved_user_functions: RefCell<HashMap<String, Arc<UserFunction>>>,
     /// Function names injected from sibling files for this directory parse.
     /// A local definition may replace its seed once; a second local
@@ -188,10 +166,6 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     /// control-flow expressions defer only that provisional case; the final
     /// parse runs with this disabled and reports the classified error.
     pub(super) defer_provisional_static_conditions: bool,
-    /// Function prepasses have no classified binding scope yet. Dotted free
-    /// heads remain parser slots until declarations are compiled with seeds.
-    pub(super) provisional_function_heads: bool,
-    pub(super) function_head_names: HashSet<String>,
     /// Shared parser-side provenance recorder. Real lexical child contexts
     /// share it; expression parsing never clones the context merely to change
     /// sink behavior.
@@ -276,55 +250,6 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         context.authored_nodes = self.authored_nodes.clone();
         context.evaluation_scopes = self.evaluation_scopes.clone();
         context
-    }
-
-    /// Keep function evaluation isolated while retaining For-handle authority
-    /// for selection at the point bodies and defaults are stored.
-    pub(super) fn function_scope(&self, declaration: super::DeclarationLocation) -> Self {
-        let mut context = self.isolated();
-        context.user_functions = self.user_functions.clone();
-        context.function_declaration = Some(declaration);
-        context.provisional_function_heads = self.provisional_function_heads
-            || (self.defer_provisional_static_conditions && !self.function_head_names.is_empty());
-        context
-            .function_head_names
-            .extend(self.function_head_names.iter().cloned());
-        for (name, binding) in &self.bindings {
-            match binding {
-                ParseBinding::Structural { handle, .. } if handle.is_for_binding() => {
-                    context.function_head_names.remove(name);
-                    context.bindings.insert(name.clone(), binding.clone());
-                }
-                ParseBinding::Value { value, .. }
-                    if matches!(value.as_ref(), EvalValue::ProvisionalReference { .. }) =>
-                {
-                    context.function_head_names.insert(name.clone());
-                }
-                ParseBinding::Structural { .. } | ParseBinding::Value { .. } => {
-                    // A typed ordinary binding needs no provisional loop head.
-                    // Preserve the isolated function's existing value semantics.
-                    context.function_head_names.remove(name);
-                }
-            }
-        }
-        context
-    }
-
-    pub(super) fn provisional_function_head(&self, name: &str) -> Option<EvalValue> {
-        (self.provisional_function_heads
-            && self.function_head_names.contains(name)
-            && matches!(self.lookup_binding(name), ParseBindingRef::Unbound))
-        .then(|| {
-            EvalValue::from_value(Value::Deferred(
-                crate::resource::DeferredValue::Placeholder(
-                    crate::resource::ParserPlaceholder::FunctionHead(
-                        crate::resource::ProvisionalFunctionHead {
-                            name: name.to_owned(),
-                        },
-                    ),
-                ),
-            ))
-        })
     }
 
     pub(super) fn set_preprocessed_file(&mut self, file: &super::PreprocessedFile) {
@@ -572,9 +497,7 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
             bindings: IndexMap::new(),
             resource_bindings: Arc::default(),
             imported_modules: HashMap::new(),
-            user_functions: UserFunctionScope::Classified(Arc::default()),
-            function_declaration: None,
-            captured_user_functions: RefCell::new(HashMap::new()),
+            user_functions: Arc::new(IndexMap::new()),
             resolved_user_functions: RefCell::new(HashMap::new()),
             seeded_user_functions: HashSet::new(),
             evaluating_functions: Vec::new(),
@@ -590,8 +513,6 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
             seeded_bindings: HashSet::new(),
             pending_function_type_checks: Rc::new(RefCell::new(Vec::new())),
             defer_provisional_static_conditions: false,
-            provisional_function_heads: false,
-            function_head_names: HashSet::new(),
             parsed_binding_uses: Rc::new(RefCell::new(ParsedBindingUses::default())),
             binding_scope: BindingScopeId::root(&source_file),
             binding_scope_source_file: source_file,
@@ -663,34 +584,34 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
 
     fn invalidate_user_function_cache(&self) {
         self.resolved_user_functions.borrow_mut().clear();
-        self.captured_user_functions.borrow_mut().clear();
     }
 
-    pub(super) fn replace_provisional_user_functions(
+    pub(super) fn replace_user_functions(&mut self, functions: IndexMap<String, UserFunction>) {
+        self.user_functions = Arc::new(functions);
+        self.invalidate_user_function_cache();
+    }
+
+    pub(super) fn replace_shared_user_functions(
         &mut self,
         functions: Arc<IndexMap<String, UserFunction>>,
     ) {
-        self.user_functions = UserFunctionScope::Provisional(functions);
+        self.user_functions = functions;
+        self.invalidate_user_function_cache();
+    }
+
+    pub(super) fn extend_user_functions(&mut self, functions: IndexMap<String, UserFunction>) {
+        Arc::make_mut(&mut self.user_functions).extend(functions);
         self.invalidate_user_function_cache();
     }
 
     pub(super) fn insert_user_function(&mut self, name: String, function: UserFunction) {
-        let UserFunctionScope::Provisional(functions) = &mut self.user_functions else {
-            unreachable!("only discovery registers raw function declarations");
-        };
-        Arc::make_mut(functions).insert(name, function);
+        Arc::make_mut(&mut self.user_functions).insert(name, function);
         self.invalidate_user_function_cache();
     }
 
-    pub(super) fn is_provisional(&self) -> bool {
-        matches!(self.user_functions, UserFunctionScope::Provisional(_))
-    }
-
-    pub(super) fn classified_user_functions(&self) -> Option<&Arc<super::ClassifiedUserFunctions>> {
-        match &self.user_functions {
-            UserFunctionScope::Provisional(_) => None,
-            UserFunctionScope::Classified(functions) => Some(functions),
-        }
+    pub(super) fn user_functions_mut(&mut self) -> &mut IndexMap<String, UserFunction> {
+        self.invalidate_user_function_cache();
+        Arc::make_mut(&mut self.user_functions)
     }
 
     pub(super) fn resolved_user_function(&self, name: &str) -> Option<Arc<UserFunction>> {
@@ -704,37 +625,8 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
         Some(function)
     }
 
-    pub(super) fn replace_classified_user_functions(
-        &mut self,
-        functions: Arc<super::ClassifiedUserFunctions>,
-    ) {
-        self.user_functions = UserFunctionScope::Classified(functions);
-        self.invalidate_user_function_cache();
-    }
-
-    pub(super) fn capture_user_function(
-        &self,
-        name: &str,
-    ) -> Result<
-        (
-            Arc<super::ClassifiedUserFunction>,
-            Arc<super::ClassifiedUserFunctions>,
-        ),
-        super::ParseError,
-    > {
-        let missing = || super::ParseError::InternalError {
-            expected: format!("classified user function '{name}'"),
-            context: "deferred user-function capture".to_owned(),
-        };
-        let functions = self.classified_user_functions().ok_or_else(missing)?;
-        if let Some(function) = self.captured_user_functions.borrow().get(name) {
-            return Ok((Arc::clone(function), Arc::clone(functions)));
-        }
-        let function = Arc::new(functions.get(name).ok_or_else(missing)?.clone());
-        self.captured_user_functions
-            .borrow_mut()
-            .insert(name.to_owned(), Arc::clone(&function));
-        Ok((function, Arc::clone(functions)))
+    pub(super) fn shared_user_function_scope(&self) -> Arc<IndexMap<String, UserFunction>> {
+        Arc::clone(&self.user_functions)
     }
 
     /// True if `name` was pre-registered via the directory-aware seed

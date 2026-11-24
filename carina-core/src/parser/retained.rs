@@ -1489,13 +1489,26 @@ impl Expressions<crate::resource::AbsoluteBindingAddress> {
                             } => Value::Deferred(crate::resource::DeferredValue::BindingRef {
                                 binding: resolve(RelativeBindingName::new(name)),
                             }),
-                            placeholder @ (ParserPlaceholder::FunctionHead(_)
-                            | ParserPlaceholder::FnParam { .. }
-                            | ParserPlaceholder::FnLocal { .. }
-                            | ParserPlaceholder::Loop(_)
-                            | ParserPlaceholder::EmptyInterpolation { .. }) => Value::Deferred(
-                                crate::resource::DeferredValue::Placeholder(placeholder),
-                            ),
+                            ParserPlaceholder::FnParam { name } => {
+                                Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                                    ParserPlaceholder::FnParam { name },
+                                ))
+                            }
+                            ParserPlaceholder::FnLocal { name } => {
+                                Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                                    ParserPlaceholder::FnLocal { name },
+                                ))
+                            }
+                            ParserPlaceholder::Loop(slot) => {
+                                Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                                    ParserPlaceholder::Loop(slot),
+                                ))
+                            }
+                            ParserPlaceholder::EmptyInterpolation { source } => {
+                                Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                                    ParserPlaceholder::EmptyInterpolation { source },
+                                ))
+                            }
                         })
                     },
                 )
@@ -5824,6 +5837,7 @@ mod judgement {
             index_authored(expression, &mut authored, &mut visited, &mut pending);
         }
         let mut functions = HashMap::new();
+        let mut function_nodes = std::collections::HashSet::new();
         for expression in authored.values() {
             if let ExprKind::Function {
                 name, signature, ..
@@ -5833,6 +5847,14 @@ mod judgement {
                 functions
                     .entry((expression.authored.location.instance.clone(), name.clone()))
                     .or_insert_with(|| signature.clone());
+                pending.extend(expression.authored.children.iter());
+                while let Some(child) = pending.pop() {
+                    if function_nodes
+                        .insert((child.authored.location.instance.clone(), child.node_id()))
+                    {
+                        pending.extend(child.authored.children.iter());
+                    }
+                }
             }
         }
         let authority = Arc::new(config.clone());
@@ -5858,6 +5880,7 @@ mod judgement {
                 })
                 .collect(),
             functions,
+            function_nodes,
             schemas,
             config,
             memo: HashMap::new(),
@@ -6046,8 +6069,8 @@ mod judgement {
         },
     }
 
-    /// Minted only by head resolution's non-loop arms. Ordinary reference
-    /// inference requires this proof instead of accepting an arbitrary name.
+    /// Minted by head resolution's non-loop arms. Isolated function expressions
+    /// retain their stored references without consulting loop-head resolution.
     struct NonLoopHead<B: BindingAddress> {
         binding: B,
     }
@@ -6069,6 +6092,8 @@ mod judgement {
             &'a crate::eval_value::UnexpandedStructuralHandle<B>,
         >,
         functions: HashMap<(ExpressionInstance, String), Arc<FunctionSignature>>,
+        // Function bodies and defaults retain main's ordinary reference rules.
+        function_nodes: std::collections::HashSet<(ExpressionInstance, NodeId)>,
         schemas: &'a crate::schema::SchemaRegistry,
         config: &'a super::super::ProviderContext,
         memo: HashMap<(usize, DiagnosticScope, JudgementDemand), JudgedExpr>,
@@ -6935,6 +6960,12 @@ mod judgement {
         ) -> Option<ResolvedHead<'a, B>> {
             use crate::resource::binding_address::BindingLookup;
             let root = &expression.authored;
+            if self
+                .function_nodes
+                .contains(&(root.location.instance.clone(), root.id))
+            {
+                return None;
+            }
             if let Some(group) = self
                 .structural_definitions
                 .get(&(root.location.instance.clone(), root.id))
@@ -7024,34 +7055,41 @@ mod judgement {
 
         fn reference(
             &mut self,
+            expression: &ExprValue<ParserPlaceholder, B>,
             binding: &B,
             attribute: &str,
             segments: &[PathSegment],
         ) -> InferredExpr {
-            let head = self.resolve_head(binding);
-            match head {
-                head @ ResolvedHead::LoopGroup(_) => {
-                    self.reference_from_head(binding, head, attribute, segments)
-                }
-                head @ ResolvedHead::Binding { .. } => {
-                    let mut result = self.reference_from_head(binding, head, attribute, segments);
-                    if matches!(
-                        result.judgement,
-                        ExprJudgement::Typed {
-                            kind: InferredKind::Ordinary(_),
-                            ..
-                        }
-                    ) {
-                        result.set_kind(InferredKind::Reference);
+            let mut result = if self.function_nodes.contains(&(
+                expression.authored.location.instance.clone(),
+                expression.node_id(),
+            )) {
+                self.unselected_reference(binding, attribute, segments)
+            } else {
+                match self.resolve_head(binding) {
+                    head @ ResolvedHead::LoopGroup(_) => {
+                        return self.reference_from_head(binding, head, attribute, segments);
                     }
-                    // Binding-index ownership belongs to authored ordinary
-                    // references. Selected children keep subscript ownership.
-                    if !result.is_enum_identifier() {
-                        result.report_at(FailureOwner::BindingIndex);
+                    head @ ResolvedHead::Binding { .. } => {
+                        self.reference_from_head(binding, head, attribute, segments)
                     }
-                    result
                 }
+            };
+            if matches!(
+                result.judgement,
+                ExprJudgement::Typed {
+                    kind: InferredKind::Ordinary(_),
+                    ..
+                }
+            ) {
+                result.set_kind(InferredKind::Reference);
             }
+            // Binding-index ownership belongs to authored ordinary references,
+            // including the references stored in isolated functions.
+            if !result.is_enum_identifier() {
+                result.report_at(FailureOwner::BindingIndex);
+            }
+            result
         }
 
         fn reference_from_head(
@@ -7064,7 +7102,7 @@ mod judgement {
             let group = match head {
                 ResolvedHead::LoopGroup(group) => group,
                 ResolvedHead::Binding { reference, .. } => {
-                    return self.binding_reference(reference, attribute, segments);
+                    return self.unselected_reference(&reference.binding, attribute, segments);
                 }
             };
             let selection = crate::eval_value::select_dot(group, attribute);
@@ -7103,13 +7141,12 @@ mod judgement {
             self.access_path(selected, segments, child.binding().as_str())
         }
 
-        fn binding_reference(
+        fn unselected_reference(
             &mut self,
-            head: NonLoopHead<B>,
+            binding: &B,
             attribute: &str,
             segments: &[PathSegment],
         ) -> InferredExpr {
-            let binding = &head.binding;
             let steps = std::iter::once(PathSegment::Field {
                 name: attribute.to_owned(),
             })
@@ -7233,7 +7270,7 @@ mod judgement {
                     attribute,
                     segments,
                     ..
-                } => self.reference(binding, attribute, segments),
+                } => self.reference(expression, binding, attribute, segments),
                 ExprKind::EmptyInterpolation => ordinary(Ok(TypeExpr::String), false),
                 ExprKind::Interpolation {
                     single_reference: true,

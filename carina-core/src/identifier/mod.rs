@@ -2012,7 +2012,6 @@ fn deterministic_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
                 .collect();
             format!("FunctionCall({}({}))", name, arg_strs.join(", "))
         }
-
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
             let arg_strs: Vec<String> = args
                 .iter()

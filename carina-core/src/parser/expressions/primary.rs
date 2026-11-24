@@ -363,13 +363,8 @@ pub(crate) fn parse_postfix_eval_with_mode(
             // must retain the established bare-handle rejection instead of treating
             // the resource as an enum candidate merely because the final expression
             // occurs in a typed attribute.
-            let value = if !steps.is_empty()
-                && let Some(head) = provisional_access_head(base.clone(), ctx)
-            {
-                head
-            } else {
-                parse_primary_eval_with_mode(base, ctx, untyped_mode.as_ref().unwrap_or(mode))?
-            };
+            let value =
+                parse_primary_eval_with_mode(base, ctx, untyped_mode.as_ref().unwrap_or(mode))?;
             let has_steps = !steps.is_empty();
             let result = apply_postfix_steps(value, steps, ctx)?;
             if converted {
@@ -385,42 +380,6 @@ pub(crate) fn parse_postfix_eval_with_mode(
             })
         })
         .map_err(Into::into)
-}
-
-/// Parentheses do not make an accessed head bare. Only peel single-operand
-/// wrappers, and only call this when the enclosing postfix has access steps.
-fn provisional_access_head(
-    mut pair: pest::iterators::Pair<'_, Rule>,
-    ctx: &ParseContext,
-) -> Option<EvalValue> {
-    loop {
-        match pair.as_rule() {
-            Rule::primary
-            | Rule::expression
-            | Rule::coalesce_expr
-            | Rule::pipe_expr
-            | Rule::compose_expr
-            | Rule::additive_expr
-            | Rule::multiplicative_expr
-            | Rule::postfix_expr => {
-                let mut inner = pair.into_inner();
-                pair = inner.next()?;
-                if inner.next().is_some() {
-                    return None;
-                }
-            }
-            Rule::variable_ref => {
-                let mut inner = pair.into_inner();
-                let name = inner.next()?;
-                return if inner.next().is_none() {
-                    ctx.provisional_function_head(name.as_str())
-                } else {
-                    None
-                };
-            }
-            _ => return None,
-        }
-    }
 }
 
 /// Lower a `namespaced_id` pair to its `EvalValue`, attaching any
@@ -534,22 +493,6 @@ fn parse_namespaced_id_value(
             return Ok(value);
         }
         ParseBindingRef::Unbound => {}
-    }
-
-    if let Some(mut value) = ctx.provisional_function_head(parts[0]) {
-        // Classified parsing resolves the typed head through For authority
-        // before any resource attribute can be formed.
-        let location = ctx.declaration_location(&pair);
-        for step in parts[1..]
-            .iter()
-            .map(|name| PathSegment::Field {
-                name: (*name).to_owned(),
-            })
-            .chain(trailing_segments)
-        {
-            value = apply_postfix_path_segment(value, step, &location)?;
-        }
-        return Ok(value);
     }
 
     // Trailing segments (`a.b['k']`, `a.b[0]`, `a.b.c[0].d`)
@@ -895,11 +838,7 @@ fn parse_primary_eval_with_mode_inner(
             }
 
             if builtin.is_some() {
-                reject_builtin_handle_arguments(
-                    &eval_args,
-                    line,
-                    ctx.function_declaration.as_ref().map(|_| &location),
-                )?;
+                reject_builtin_handle_arguments(&eval_args, line)?;
             }
 
             // User functions own the lowering contract for their parameters:
@@ -935,10 +874,14 @@ fn parse_primary_eval_with_mode_inner(
                     Some(column),
                     location,
                 );
-                return crate::parser::functions::defer_user_function_call(
-                    &user_fn, args, ctx, line,
-                )
-                .map(EvalValue::from_value);
+                return Ok(EvalValue::from_value(Value::Deferred(
+                    DeferredValue::ResolvedFunctionCall {
+                        function: user_fn,
+                        functions: ctx.shared_user_function_scope(),
+                        args,
+                        source_line: (line).into(),
+                    },
+                )));
             }
 
             // Eagerly evaluate partial application (fewer args than arity → Closure)
@@ -1005,9 +948,6 @@ fn parse_primary_eval_with_mode_inner(
                     ))),
                 }
             } else {
-                if let Some(head) = ctx.provisional_function_head(first_ident) {
-                    return apply_postfix_steps(head, access_steps, ctx);
-                }
                 match ctx.lookup_binding(first_ident) {
                     ParseBindingRef::Value { value: bound, .. } => {
                         return apply_postfix_steps(

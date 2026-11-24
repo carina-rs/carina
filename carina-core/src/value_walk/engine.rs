@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     builtins::BuiltinFunction,
     integer_arithmetic::ValidatedIntegerExpr,
-    parser::{ClassifiedUserFunction, DeferredIfCondition, DeferredValueIf},
+    parser::{DeferredIfCondition, DeferredValueIf},
     resource::{AccessExpr, DiagnosticSourceLine, UnavailableReason},
 };
 
@@ -123,8 +123,8 @@ pub(super) enum Parts<'v, M: WalkMode, P: ValueKind + 'v, B: BindingAddress> {
         source_line: M::Input<'v, DiagnosticSourceLine>,
     },
     ResolvedCall {
-        function: M::Input<'v, Arc<ClassifiedUserFunction<B>>>,
-        functions: M::Input<'v, Arc<crate::parser::ClassifiedUserFunctions<B>>>,
+        function: M::Input<'v, Arc<UserFunction<B>>>,
+        functions: M::Input<'v, Arc<indexmap::IndexMap<String, UserFunction<B>>>>,
         args: M::Input<'v, Vec<FunctionArgument<P, B>>>,
         source_line: M::Input<'v, DiagnosticSourceLine>,
     },
@@ -154,7 +154,7 @@ impl<M: WalkMode, P: ValueKind, B: BindingAddress> Parts<'_, M, P, B> {
                 args,
                 ..
             } => {
-                function_values(M::borrow::<Arc<ClassifiedUserFunction<B>>>(function)).count()
+                function_values(M::borrow::<Arc<UserFunction<B>>>(function)).count()
                     + M::borrow(functions)
                         .values()
                         .map(|function| function_values(function).count())
@@ -707,18 +707,55 @@ impl<O: WalkOutput> TransformFold<O> {
             })
             .collect()
     }
+    fn function<
+        B: BindingAddress,
+        A: BoundTransform<crate::resource::ParserPlaceholder, B> + TransformOutput<Output = O>,
+    >(
+        &mut self,
+        mut function: UserFunction<B>,
+        at: At<'_>,
+        algebra: &mut A,
+    ) -> Result<UserFunction<B>, WalkError> {
+        for (index, param) in function.params.iter_mut().enumerate() {
+            if let Some(value) = param.default.take() {
+                param.default = Some(self.value(
+                    value,
+                    at.operand(ExpressionEdge::FunctionDefault(index)),
+                    algebra,
+                )?);
+            }
+        }
+        function.local_lets = function
+            .local_lets
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, value, line))| {
+                self.value(
+                    value,
+                    at.operand(ExpressionEdge::FunctionLocal(index)),
+                    algebra,
+                )
+                .map(|value| (name, value, line))
+            })
+            .collect::<Result<_, _>>()?;
+        function.body.value = self.value(
+            function.body.value,
+            at.operand(ExpressionEdge::FunctionBody),
+            algebra,
+        )?;
+        Ok(function)
+    }
     fn function_candidate<
         B: BindingAddress,
         A: BoundTransform<crate::resource::ParserPlaceholder, B> + TransformOutput<Output = O>,
     >(
         &mut self,
-        function: &ClassifiedUserFunction<B>,
+        function: &UserFunction<B>,
         at: At<'_>,
         algebra: &mut A,
-    ) -> Result<Option<ClassifiedUserFunction<B>>, WalkError> {
+    ) -> Result<Option<UserFunction<B>>, WalkError> {
         let mut nested = Self::new();
-        let candidate = function
-            .try_map_values(|value, edge| nested.value(value, at.operand(edge), algebra))?;
+        let candidate = nested.function(function.clone(), at, algebra)?;
         self.output.extend(nested.output);
         self.changed |= nested.changed;
         Ok(nested.changed.then_some(candidate))

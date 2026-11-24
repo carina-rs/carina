@@ -520,7 +520,6 @@ fn rewrite_handle_output_refs<P: PlaceholderKind>(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rewritten)
         }
-
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,

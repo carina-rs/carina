@@ -3967,48 +3967,7 @@ pub struct UserFunction<B: BindingAddress = RelativeBindingName> {
     pub body: UserFunctionBody<B>,
 }
 
-impl<B: BindingAddress> AsRef<UserFunction<B>> for UserFunction<B> {
-    fn as_ref(&self) -> &UserFunction<B> {
-        self
-    }
-}
-
 impl<B: BindingAddress> UserFunction<B> {
-    pub(crate) fn try_map_values<E>(
-        self,
-        mut map: impl FnMut(
-            Value<ParserPlaceholder, B>,
-            crate::value_walk::ExpressionEdge,
-        ) -> Result<Value<ParserPlaceholder, B>, E>,
-    ) -> Result<Self, E> {
-        use crate::value_walk::ExpressionEdge;
-        let mut function = self;
-        for (index, parameter) in function.params.iter_mut().enumerate() {
-            if let Some(value) = parameter.default.take() {
-                parameter.default = Some(map(value, ExpressionEdge::FunctionDefault(index))?);
-            }
-        }
-        function.local_lets = function
-            .local_lets
-            .into_iter()
-            .enumerate()
-            .map(|(index, (name, value, line))| {
-                map(value, ExpressionEdge::FunctionLocal(index)).map(|value| (name, value, line))
-            })
-            .collect::<Result<_, _>>()?;
-        function.body.value = map(function.body.value, ExpressionEdge::FunctionBody)?;
-        Ok(function)
-    }
-
-    pub(crate) fn has_provisional_reference_heads(&self) -> bool {
-        self.params
-            .iter()
-            .filter_map(|parameter| parameter.default.as_ref())
-            .chain(self.local_lets.iter().map(|(_, value, _)| value))
-            .chain(std::iter::once(&self.body.value))
-            .any(super::functions::contains_provisional_function_head)
-    }
-
     pub(crate) fn map_bindings<T: BindingAddress>(
         self,
         map: &mut impl FnMut(B) -> T,
@@ -7036,7 +6995,7 @@ pub struct File<
     pub export_params: Vec<E>,
     pub backend: Option<BackendConfig<P, B>>,
     pub state_blocks: Vec<StateBlock<P, B>>,
-    pub user_functions: super::ClassifiedUserFunctions<B>,
+    pub user_functions: IndexMap<String, UserFunction<B>>,
     pub upstream_states: Vec<UpstreamState<B>>,
     pub wait_bindings: Vec<WaitBinding<B>>,
     pub requires: Vec<RequireBlock<P, B>>,
@@ -7141,7 +7100,7 @@ where
             export_params: Vec::new(),
             backend: None,
             state_blocks: Vec::new(),
-            user_functions: super::ClassifiedUserFunctions::default(),
+            user_functions: IndexMap::new(),
             upstream_states: Vec::new(),
             wait_bindings: Vec::new(),
             requires: Vec::new(),
@@ -10293,17 +10252,23 @@ mod substitute_placeholder_tests {
         ));
         parsed.user_functions.insert(
             "function_name".to_string(),
-            super::super::entry::top_level_user_functions_with_bindings(
-                &[(
-                    PathBuf::from("test.crn"),
-                    "fn function_name() { 1 }".to_owned(),
-                )],
-                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-                &[],
-            )
-            .unwrap()
-            .shift_remove("function_name")
-            .unwrap(),
+            UserFunction {
+                type_annotations: Vec::new(),
+                name: "function_name".to_string(),
+                params: Vec::new(),
+                return_type: None,
+                return_type_span: None,
+                annotation_source_file: None,
+                local_lets: Vec::new(),
+                body: UserFunctionBody {
+                    location: ModuleCallId::test_dummy_in("test.crn")
+                        .declaration_location()
+                        .clone(),
+                    value: Value::Concrete(ConcreteValue::Int(1)),
+                    source_line: 1,
+                    source_file: None,
+                },
+            },
         );
         parsed.providers.push(ProviderConfig {
             name: "mock".to_string(),

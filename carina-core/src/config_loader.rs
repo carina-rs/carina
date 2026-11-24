@@ -2090,49 +2090,37 @@ pub(crate) fn parse_directory_files_located_from_root(
     // Deferred-loop body errors are explicitly retryable while sibling
     // bindings are provisional; every other error propagates here, and the
     // final pass reparses those bodies with fully classified bindings.
-    let mut value_names = indexmap::IndexSet::new();
-    let mut structural_names = HashSet::new();
-    let mut parameter_types = HashMap::new();
-    let mut stable_structural_metadata = parser::ParserSeedMetadata::default();
+    let mut pass1_union = ParsedFile::default();
     let mut pass_1a_local_variables = Vec::with_capacity(files.len());
     for (path, content) in files {
-        let declarations = parser::discover_directory_declarations(
+        let parsed = parser::parse_with_directory_context(
             content,
             path,
             config,
             &provisional_seeds,
             &directory_functions,
+            false,
         )
         .map_err(|error| LocatedParseError::in_input_file(path, error))?;
-        pass_1a_local_variables.push(declarations.local_names);
-        value_names.extend(declarations.value_names);
-        structural_names.extend(declarations.structural_names);
-        parameter_types.extend(declarations.parameter_types);
-        stable_structural_metadata.extend(declarations.metadata);
+        pass_1a_local_variables.push(local_variable_names(&parsed));
+        merge_parsed_file(&mut pass1_union, parsed);
     }
-    let structural: HashSet<&str> = structural_names.iter().map(String::as_str).collect();
-    let module_parameters: HashMap<&str, &parser::TypeExpr> = parameter_types
+    let structural = pass1_union.structural_binding_names();
+    let module_parameters: HashMap<&str, &parser::TypeExpr> = pass1_union
+        .arguments
         .iter()
-        .map(|(name, ty)| (name.as_str(), ty))
+        .map(|argument| (argument.name.as_str(), &argument.static_type))
         .collect();
-    stable_structural_metadata.retain(|name| !value_names.contains(name.as_str()));
-    // Discovery cannot export expression values. Start with fresh name
-    // references, then let classified calls alone build the fixed point.
-    // Its first iteration also retains unused arguments for cycle detection.
-    let iteration_cap = value_names.len() + 1;
+    parser::reject_cyclic_let_bindings_in_variables(&pass1_union.variables, &structural)
+        .map_err(LocatedParseError::directory_wide)?;
+    let seed_metadata = pass1_union.parser_binding_metadata.binding_seed_snapshot();
+    let mut stable_structural_metadata = seed_metadata.clone();
+    stable_structural_metadata.retain(|name| !pass1_union.variables.contains_key(name.as_str()));
     let mut bindings_current = DirectorySeedState {
-        variables: value_names
-            .into_iter()
-            .map(|name| {
-                let value =
-                    parser::ParsedValue::Deferred(crate::resource::DeferredValue::BindingRef {
-                        binding: name.clone().into(),
-                    });
-                (name, value)
-            })
-            .collect(),
-        metadata: stable_structural_metadata.clone(),
+        variables: pass1_union.variables.clone(),
+        metadata: seed_metadata,
     };
+    let iteration_cap = pass1_union.variables.len() + 1;
     let mut converged = false;
 
     for _ in 0..iteration_cap {
@@ -2142,17 +2130,12 @@ pub(crate) fn parse_directory_files_located_from_root(
             &bindings_current.variables,
             &bindings_current.metadata,
         );
-        // Compile declarations with the typed structural scope before calls
-        // can capture their bodies. The bootstrap table contains only typed
-        // provisional heads where a For handle was not yet available.
-        let functions = parser::top_level_user_functions_with_bindings(files, config, &seeds)
-            .map_err(LocatedParseError::directory_wide)?;
         let mut bindings_next = parse_local_variable_union(
             files,
             config,
             &seeds,
             &pass_1a_local_variables,
-            &functions,
+            &directory_functions,
         )?;
         // The fixed point recomputes value-shaped `let` bindings only.
         // Resource handles, Ref-typed module arguments, and structural aliases
@@ -2165,14 +2148,11 @@ pub(crate) fn parse_directory_files_located_from_root(
         parser::reject_cyclic_let_bindings_in_variables(&bindings_next.variables, &structural)
             .map_err(LocatedParseError::directory_wide)?;
 
-        let reached_fixed_point = bindings_next == bindings_current;
-        // Deferred-call equality ignores captured definitions. Keep the newest
-        // classified function payload even when value identity is unchanged.
-        bindings_current = bindings_next;
-        if reached_fixed_point {
+        if bindings_next == bindings_current {
             converged = true;
             break;
         }
+        bindings_current = bindings_next;
     }
 
     // Paranoid backstop only. The fixed-point sequence is monotone for
@@ -2199,10 +2179,6 @@ pub(crate) fn parse_directory_files_located_from_root(
         &bindings_current.metadata,
     );
 
-    let directory_functions =
-        parser::top_level_user_functions_with_bindings(files, config, &final_seeds)
-            .map_err(LocatedParseError::directory_wide)?;
-
     // Pass 2: re-parse each file with the sibling-aware union seeded into `ctx`.
     let mut out = Vec::with_capacity(files.len());
     for ((path, content), local_variable_names) in files.iter().zip(pass_1a_local_variables) {
@@ -2212,6 +2188,7 @@ pub(crate) fn parse_directory_files_located_from_root(
             config,
             &final_seeds,
             &directory_functions,
+            true,
         )
         .map_err(|error| LocatedParseError::in_input_file(path, error))?;
         record_parsed_file_source_metadata(&mut parsed, path, display_root);
@@ -2283,7 +2260,7 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
             .insert_resource_source_file(id, path.to_path_buf());
     }
     for function in parsed.user_functions.values_mut() {
-        function.set_source_file(path);
+        function.body.source_file = Some(path.to_path_buf());
     }
     let display_file = path
         .strip_prefix(display_root)
@@ -2334,22 +2311,39 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
     }
 }
 
+fn local_variable_names(parsed: &ParsedFile) -> HashSet<String> {
+    parsed
+        .variables
+        .keys()
+        .map(String::as_str)
+        .chain(
+            parsed
+                .parser_binding_metadata
+                .structural_handles()
+                .keys()
+                .map(crate::resource::BindingAddress::as_str),
+        )
+        .map(str::to_owned)
+        .collect()
+}
+
 fn parse_local_variable_union(
     files: &[(PathBuf, String)],
     config: &ProviderContext,
     seeds: &[parser::BindingSeed<'_>],
     local_variables_by_file: &[HashSet<String>],
-    user_functions: &parser::ClassifiedUserFunctions,
+    user_functions: &IndexMap<String, parser::UserFunction>,
 ) -> Result<DirectorySeedState, LocatedParseError> {
     let mut variables = IndexMap::new();
     let mut metadata = crate::parser::ParserSeedMetadata::default();
     for ((path, content), local_variables) in files.iter().zip(local_variables_by_file.iter()) {
-        let mut parsed = parser::parse_with_refining_directory_context(
+        let mut parsed = parser::parse_with_directory_context(
             content,
             path,
             config,
             seeds,
             user_functions,
+            false,
         )
         .map_err(|error| LocatedParseError::in_input_file(path, error))?;
         parsed
