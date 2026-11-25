@@ -1,11 +1,14 @@
 //! One variant declaration dispatches borrowed and owned inputs into typed fields.
 use super::*;
+mod definitions;
 use crate::{
     builtins::BuiltinFunction,
     integer_arithmetic::ValidatedIntegerExpr,
     parser::{DeferredIfCondition, DeferredValueIf},
     resource::{AccessExpr, DiagnosticSourceLine, UnavailableReason},
 };
+pub(crate) use definitions::DefinitionMemo;
+use definitions::FunctionSource;
 
 /// Scalar fields retain their variant in the type carrying their payload. No
 /// cursor stores a separate tag plus a raw Value that needs projecting again.
@@ -707,61 +710,6 @@ impl<O: WalkOutput> TransformFold<O> {
             })
             .collect()
     }
-    fn function<
-        B: BindingAddress,
-        A: BoundTransform<crate::resource::ParserPlaceholder, B> + TransformOutput<Output = O>,
-    >(
-        &mut self,
-        mut function: UserFunction<B>,
-        at: At<'_>,
-        algebra: &mut A,
-    ) -> Result<UserFunction<B>, WalkError> {
-        for (index, param) in function.params.iter_mut().enumerate() {
-            if let Some(value) = param.default.take() {
-                param.default = Some(self.value(
-                    value,
-                    at.operand(ExpressionEdge::FunctionDefault(index)),
-                    algebra,
-                )?);
-            }
-        }
-        function.local_lets = function
-            .local_lets
-            .into_iter()
-            .enumerate()
-            .map(|(index, (name, value, line))| {
-                self.value(
-                    value,
-                    at.operand(ExpressionEdge::FunctionLocal(index)),
-                    algebra,
-                )
-                .map(|value| (name, value, line))
-            })
-            .collect::<Result<_, _>>()?;
-        function.body.value = self.value(
-            function.body.value,
-            at.operand(ExpressionEdge::FunctionBody),
-            algebra,
-        )?;
-        Ok(function)
-    }
-    fn function_candidate<
-        B: BindingAddress,
-        A: BoundTransform<crate::resource::ParserPlaceholder, B> + TransformOutput<Output = O>,
-    >(
-        &mut self,
-        function: &UserFunction<B>,
-        at: At<'_>,
-        algebra: &mut A,
-    ) -> Result<Option<UserFunction<B>>, WalkError> {
-        #[cfg(test)]
-        super::FUNCTION_DEFINITION_WALK_COUNT.with(|count| count.set(count.get() + 1));
-        let mut nested = Self::new();
-        let candidate = nested.function(function.clone(), at, algebra)?;
-        self.output.extend(nested.output);
-        self.changed |= nested.changed;
-        Ok(nested.changed.then_some(candidate))
-    }
 }
 /// Transform one typed argument through the same fold used by call operands.
 /// Whole-argument replacement still inventories every original Secret operand.
@@ -904,8 +852,8 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Transform, P, B> {
                 source_line,
             } => {
                 let candidate = walked.function_candidate(
-                    &function,
-                    at.operand(ExpressionEdge::FunctionDefinition),
+                    FunctionSource::Definition(function.clone()),
+                    &at,
                     algebra,
                 )?;
                 let function = match candidate {
@@ -917,10 +865,14 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Transform, P, B> {
                 let mut scope: Vec<_> = functions.iter().collect();
                 scope.sort_by(|left, right| left.0.cmp(right.0));
                 let mut updates = Vec::new();
-                for (index, (name, function)) in scope.into_iter().enumerate() {
+                for (index, (name, _function)) in scope.into_iter().enumerate() {
                     if let Some(candidate) = walked.function_candidate(
-                        function,
-                        at.operand(ExpressionEdge::FunctionScope(index)),
+                        FunctionSource::Scope {
+                            functions: functions.clone(),
+                            name: name.clone(),
+                            index,
+                        },
+                        &at,
                         algebra,
                     )? {
                         updates.push((name.clone(), candidate));

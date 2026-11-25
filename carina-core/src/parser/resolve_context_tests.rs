@@ -63,6 +63,17 @@ fn share_fn_counts(shape: ShareFnShape, depth: usize, directory: bool) -> (usize
 }
 
 fn share_fn_assert_polynomial(shape: ShareFnShape, directory: bool) {
+    // Deep debug parser/evaluator frames exceed libtest's default thread stack.
+    // Keep the full depth and count assertions on an explicitly sized stack.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || share_fn_assert_polynomial_on_thread(shape, directory))
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn share_fn_assert_polynomial_on_thread(shape: ShareFnShape, directory: bool) {
     let mut previous = None;
     for depth in [2, 4, 8, 12] {
         let counts = share_fn_counts(shape, depth, directory);
@@ -86,8 +97,11 @@ fn share_fn_assert_polynomial(shape: ShareFnShape, directory: bool) {
                 );
             }
         }
+        // At depth 8 the fixed code maps at most 51,985 definitions and walks
+        // 124. These caps allow cubic/quadratic growth to depth 12 with room;
+        // the doubling-depth checks above reject the exponential regression.
         assert!(
-            counts.0 < 1_000_000 && counts.1 < 1_000_000,
+            counts.0 < 250_000 && counts.1 < 1_024,
             "{shape:?} definition walks at depth {depth} must stay bounded: {counts:?}"
         );
         previous = Some((depth, counts));
@@ -117,6 +131,80 @@ fn share_fn_join_definition_walks_grow_polynomially() {
 #[test]
 fn share_fn_directory_sibling_definition_walks_grow_polynomially() {
     share_fn_assert_polynomial(ShareFnShape::Interpolation, true);
+}
+
+#[test]
+fn share_fn_crosscheck_nested_chains() {
+    let (_, bindings, transforms) = crate::function_memo_test::verify(|| {
+        for shape in [
+            ShareFnShape::Coalesce,
+            ShareFnShape::Conditional,
+            ShareFnShape::Interpolation,
+            ShareFnShape::Join,
+        ] {
+            for depth in [2, 3] {
+                share_fn_counts(shape, depth, false);
+            }
+        }
+        share_fn_counts(ShareFnShape::Interpolation, 3, true);
+    });
+    assert!(bindings > 0, "binding memo hits must be cross-checked");
+    assert!(transforms > 0, "transform memo hits must be cross-checked");
+}
+
+#[test]
+fn share_fn_crosscheck_outer_bindings_defaults_locals_and_secrets() {
+    let (_, bindings, transforms) = crate::function_memo_test::verify(|| {
+        let parsed = crate::parser::parse(
+            r#"arguments { input: String }
+let outer = secret('protected-4495')
+fn leaf(x: String, suffix: String = 'default'): String { secret("${x}-${outer}-${suffix}") }
+fn middle(x: String): String {
+  let local = leaf(x)
+  "${local}${leaf(x)}"
+}
+fn top(x: String): String { middle(x) ?? middle(x) }
+let result = top(input)
+"#,
+            &context(),
+        )
+        .unwrap();
+        assert!(crate::value::contains_secret(
+            &parsed.user_functions["leaf"].body.value
+        ));
+        // The unknown module argument defers evaluation before substitution.
+        // Exercise the captured definitions through fresh rewrites explicitly.
+        let definitions = crate::value_walk::DefinitionMemo::default();
+        for line in [1, 99] {
+            let rewritten = crate::value_walk::substitute_function_parameters(
+                &parsed.variables["result"],
+                &std::collections::HashMap::new(),
+                line,
+                crate::value_walk::RewritePosition::Value,
+                &definitions,
+            )
+            .unwrap();
+            assert!(same_plain_representation(
+                &parsed.variables["result"],
+                &rewritten
+            ));
+        }
+        let mut resolved = parsed.resolve_root_for_test();
+        resolved
+            .variables
+            .get_mut("result")
+            .unwrap()
+            .map_absolute_bindings(&mut |binding| binding.clone());
+        assert!(crate::value::contains_secret(
+            &resolved.user_functions["leaf"].body.value
+        ));
+        assert!(!format!("{:?}", resolved.variables["result"]).contains("protected-4495"));
+
+        share_fn_forward_file_function_body_captures_bootstrap_callee_and_scope();
+        share_fn_forward_directory_function_body_captures_bootstrap_callee_and_scope();
+    });
+    assert!(bindings > 0, "binding memo hits must be cross-checked");
+    assert!(transforms > 0, "transform memo hits must be cross-checked");
 }
 
 #[test]

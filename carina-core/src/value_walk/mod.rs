@@ -25,6 +25,7 @@ use crate::{
 };
 
 mod engine;
+pub(crate) use engine::DefinitionMemo;
 use engine::{LeafInput, Parts, ScalarInput, dispatch};
 mod bound_transform;
 use bound_transform::{BoundTransform, PublicTransform, TransformOutput};

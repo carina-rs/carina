@@ -45,6 +45,61 @@ fn resolver_context() -> crate::config_loader::ModuleResolutionContext {
 }
 
 #[test]
+fn share_fn_crosscheck_sibling_module_instances() {
+    let (_, bindings, transforms) = crate::function_memo_test::verify(|| {
+        let directory = tempfile::tempdir().unwrap();
+        let module = directory.path().join("child");
+        let caller = directory.path().join("caller");
+        fs::create_dir_all(&module).unwrap();
+        fs::create_dir_all(&caller).unwrap();
+        fs::write(
+            module.join("arguments.crn"),
+            "arguments { input: String }\n",
+        )
+        .unwrap();
+        fs::write(
+            module.join("functions.crn"),
+            "fn leaf(x: String): String { x }\nfn twice(x: String): String { join('', [leaf(x), leaf(x)]) }\n",
+        )
+        .unwrap();
+        fs::write(
+            module.join("attributes.crn"),
+            "attributes { output: String = twice(input) }\n",
+        )
+        .unwrap();
+        fs::write(
+            caller.join("main.crn"),
+            "let child = use { source = '../child' }\nlet first = child { input = 'one' }\nlet second = child { input = 'two' }\n",
+        )
+        .unwrap();
+        let parsed = crate::config_loader::parse_directory(
+            &crate::paths::ResolvedPath::new(&caller).unwrap(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let resolved = resolve_modules(parsed.into_parsed(), &caller).unwrap();
+        for (binding, expected) in [("first", "oneone"), ("second", "twotwo")] {
+            let output = resolved
+                .compositions
+                .iter()
+                .find(|composition| {
+                    composition.binding.as_ref().map(|value| value.as_str()) == Some(binding)
+                })
+                .and_then(|composition| composition.signature.attributes.get("output"))
+                .and_then(crate::resource::LiveCompositionAttribute::value);
+            assert_eq!(
+                output,
+                Some(ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                    expected.into()
+                )))
+            );
+        }
+    });
+    assert!(bindings > 0, "binding memo hits must be cross-checked");
+    assert!(transforms > 0, "transform memo hits must be cross-checked");
+}
+
+#[test]
 fn issue4398_direct_require_in_all_resolver_entry_points() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(

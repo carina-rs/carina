@@ -2711,6 +2711,7 @@ fn parser_substitution_keeps_nested_call_error_location_and_protection() {
         &substitutions,
         1,
         crate::value_walk::RewritePosition::Value,
+        &Default::default(),
     )
     .unwrap_err();
     assert!(
@@ -2722,6 +2723,7 @@ fn parser_substitution_keeps_nested_call_error_location_and_protection() {
         &substitutions,
         1,
         crate::value_walk::RewritePosition::Value,
+        &Default::default(),
     )
     .unwrap_err();
     assert!(
@@ -2766,6 +2768,7 @@ fn parser_substitution_preserves_captured_lexical_scopes_and_arc_identity() {
         &substitutions,
         1,
         crate::value_walk::RewritePosition::Value,
+        &Default::default(),
     )
     .unwrap();
     assert!(!format!("{rewritten:?}").contains("private-lexical-input"));
@@ -2929,6 +2932,7 @@ fn substitution_if_branches_inside_access_bases_remain_value_positions() {
         &substitutions,
         7,
         crate::value_walk::RewritePosition::Value,
+        &Default::default(),
     )
     .unwrap_err();
     assert_eq!(
@@ -2969,6 +2973,7 @@ fn r5_function_path_substitution_preserves_authored_reference_locations() {
             &substitutions,
             2,
             crate::value_walk::RewritePosition::Value,
+            &Default::default(),
         )
         .unwrap();
         assert!(

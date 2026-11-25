@@ -288,3 +288,6 @@ pub(crate) mod test_support {
         )
     }
 }
+
+#[cfg(test)]
+mod function_memo_test;

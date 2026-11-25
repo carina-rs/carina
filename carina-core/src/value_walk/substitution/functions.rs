@@ -13,26 +13,29 @@ pub(crate) fn substitute_function_parameters<B: BindingAddress>(
     substitutions: &HashMap<String, ParserStageFunctionArgument<B>>,
     source_line: usize,
     position: RewritePosition,
+    definitions: &DefinitionMemo<B>,
 ) -> Result<ParserStageValue<B>, ParseError> {
-    rewrite_parser_value(
+    rewrite_parser_value_in(
         value,
         position,
         &mut FunctionParameterRewrite {
             substitutions,
             source_line,
         },
+        definitions,
     )
 }
 pub(crate) fn substitute_function_call_argument<B: BindingAddress>(
     argument: &ParserStageFunctionArgument<B>,
     substitutions: &HashMap<String, ParserStageFunctionArgument<B>>,
     source_line: usize,
+    definitions: &DefinitionMemo<B>,
 ) -> Result<ParserStageFunctionArgument<B>, ParseError> {
     let mut policy = FunctionParameterRewrite {
         substitutions,
         source_line,
     };
-    let mut algebra = ParserTransform::new(&mut policy, RewritePosition::Value);
+    let mut algebra = ParserTransform::new(&mut policy, RewritePosition::Value, definitions);
     algebra.argument_line = source_line.into();
     engine::transform_argument_bound(argument.clone(), WalkRoot::syntactic().at(), &mut algebra)
         .map_err(|error| algebra.take_error(error))
@@ -142,6 +145,49 @@ mod tests {
     use crate::resource::{AuthoredValue, RelativeBindingName};
 
     #[test]
+    fn share_fn_definition_memo_replays_secret_discovery_across_rewrites()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let file = crate::parser::parse(
+            "fn leaf(input: String): String { secret('protected-4495') }",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )?;
+        let value = AuthoredValue::Deferred(DeferredValue::ResolvedFunctionCall {
+            function: Arc::new(file.user_functions["leaf"].clone()),
+            functions: Arc::new(file.user_functions),
+            args: vec![FunctionArgument::from_value(AuthoredValue::Concrete(
+                ConcreteValue::String("input".into()),
+            ))],
+            source_line: 3.into(),
+        });
+        let definitions = DefinitionMemo::default();
+        let substitutions = HashMap::new();
+        let mut counts = Vec::new();
+        for _ in 0..2 {
+            let mut policy = FunctionParameterRewrite::<RelativeBindingName> {
+                substitutions: &substitutions,
+                source_line: 3,
+            };
+            let mut algebra =
+                ParserTransform::new(&mut policy, RewritePosition::Value, &definitions);
+            let at = WalkRoot::syntactic().at();
+            let discovered = at.encountered_secret.clone();
+            assert!(!discovered.get());
+            let (product, count) = crate::value_walk::with_function_definition_walk_count(|| {
+                engine::dispatch_bound(value.clone(), at, &mut algebra)
+            });
+            assert!(!product?.changed);
+            assert!(
+                discovered.get(),
+                "each fresh rewrite must discover the secret"
+            );
+            counts.push(count);
+        }
+        assert!(counts[0] > 0);
+        assert_eq!(counts[1], 0, "the second rewrite must use cached discovery");
+        Ok(())
+    }
+
+    #[test]
     fn substitution_without_placeholders_keeps_arcs_and_reports_unchanged()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut file = crate::parser::parse(
@@ -175,8 +221,13 @@ mod tests {
             source_line: 3.into(),
         });
         let substitutions = HashMap::new();
-        let rewritten =
-            substitute_function_parameters(&value, &substitutions, 3, RewritePosition::Value)?;
+        let rewritten = substitute_function_parameters(
+            &value,
+            &substitutions,
+            3,
+            RewritePosition::Value,
+            &Default::default(),
+        )?;
         assert!(matches!(
             &rewritten,
             AuthoredValue::Deferred(DeferredValue::ResolvedFunctionCall { .. })
@@ -194,7 +245,11 @@ mod tests {
             substitutions: &substitutions,
             source_line: 3,
         };
-        let mut algebra = ParserTransform::new(&mut policy, RewritePosition::Value);
+        let mut algebra = ParserTransform::new(
+            &mut policy,
+            RewritePosition::Value,
+            &DefinitionMemo::default(),
+        );
         let product = engine::dispatch_bound(value, WalkRoot::syntactic().at(), &mut algebra)?;
         assert!(
             !product.changed,
@@ -220,12 +275,14 @@ mod tests {
             &FunctionArgument::from_value(parameter.clone()),
             &substitutions,
             7,
+            &Default::default(),
         )?;
         assert!(plain.handle().is_some());
         let protected = substitute_function_call_argument(
             &FunctionArgument::from_value(parameter.into_secret()),
             &substitutions,
             7,
+            &Default::default(),
         )
         .unwrap_err();
         assert!(

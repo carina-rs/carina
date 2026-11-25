@@ -830,6 +830,56 @@ fn binding_access_miss_policy<P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
+// All recursive resolution uses this context, so nested function evaluations
+// cannot silently start a fresh definition memo for each call occurrence.
+struct ResolutionContext<'a, B: BindingAddress> {
+    runtime: RuntimeContext<'a>,
+    definitions: &'a crate::value_walk::DefinitionMemo<B>,
+}
+impl<B: BindingAddress> Copy for ResolutionContext<'_, B> {}
+impl<B: BindingAddress> Clone for ResolutionContext<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'a, B: BindingAddress> ResolutionContext<'a, B> {
+    fn catalog(self) -> &'a crate::parser::ProviderContext {
+        self.runtime.catalog()
+    }
+}
+
+fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    bindings: &ResolvedBindings<P, B>,
+    config: RuntimeContext<'_>,
+) -> Result<Value<P, B>, ResolutionError> {
+    resolve_ref_value_in(
+        value,
+        bindings,
+        ResolutionContext {
+            runtime: config,
+            definitions: &Default::default(),
+        },
+    )
+}
+
+fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    bindings: &ResolvedBindings<P, B>,
+    config: RuntimeContext<'_>,
+    allow_absent_default: bool,
+) -> Result<ValueResolution<P, B>, ResolutionError> {
+    resolve_ref_value_status_in(
+        value,
+        bindings,
+        ResolutionContext {
+            runtime: config,
+            definitions: &Default::default(),
+        },
+        allow_absent_default,
+    )
+}
+
 enum HistoricalSelectionError {
     Access(ValueAccessError),
     Resolution(ResolutionError),
@@ -842,7 +892,7 @@ fn resolve_historical_selection<P: PlaceholderKind, B: BindingAddress>(
     attribute: &crate::resource::SnapshotValue<P, B>,
     path: &crate::resource::AccessPath<B>,
     bindings: &ResolvedBindings<P, B>,
-    config: RuntimeContext<'_>,
+    config: ResolutionContext<'_, B>,
     policy: AccessMissPolicy,
 ) -> Result<Option<Value<P, B>>, HistoricalSelectionError> {
     let root_path = format!("{}.{}", path.binding(), path.attribute());
@@ -868,13 +918,13 @@ fn resolve_historical_selection<P: PlaceholderKind, B: BindingAddress>(
             Err(crate::resource::SnapshotSelectionError::DeferredMiss(_)) => return Ok(None),
         }
     };
-    let mut resolved = resolve_ref_value_inner(&selected, bindings, config)
+    let mut resolved = resolve_ref_value_in(&selected, bindings, config)
         .map_err(HistoricalSelectionError::Resolution)?;
     for segment in &path.segments()[selected_segments..] {
         resolved =
             match crate::resource::apply_value_path_segment(resolved, segment.clone(), 0, policy) {
                 Ok(ValuePathSegmentResult::Resolved(next)) => {
-                    resolve_ref_value_inner(&next, bindings, config)
+                    resolve_ref_value_in(&next, bindings, config)
                         .map_err(HistoricalSelectionError::Resolution)?
                 }
                 Ok(
@@ -893,12 +943,12 @@ fn resolve_plan_reference<P: PlaceholderKind, B: BindingAddress>(
     binding: &B,
     selection: Option<&crate::resource::AccessPath<B>>,
     bindings: &ResolvedBindings<P, B>,
-    config: RuntimeContext<'_>,
+    config: ResolutionContext<'_, B>,
 ) -> Result<ValueResolution<P, B>, ResolutionError> {
     use crate::resource::knowledge::{Classification, KnowledgeContext, Phase};
     let status = plan_reference_status(binding, selection, bindings, |value, resolve| {
         let value = if resolve {
-            resolve_ref_value_inner(&value, bindings, config)?
+            resolve_ref_value_in(&value, bindings, config)?
         } else {
             value
         };
@@ -945,10 +995,10 @@ fn resolve_plan_reference<P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
-fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
+fn resolve_ref_value_status_in<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
-    config: RuntimeContext<'_>,
+    config: ResolutionContext<'_, B>,
     allow_absent_default: bool,
 ) -> Result<ValueResolution<P, B>, ResolutionError> {
     match value {
@@ -962,7 +1012,7 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
             default,
         }) => {
             let left_resolution = if let Some(operand) = left.optional_operand() {
-                resolve_ref_value_status_inner(operand.value(), bindings, config, true)?
+                resolve_ref_value_status_in(operand.value(), bindings, config, true)?
             } else {
                 resolve_required_value_status(left, bindings, config)?
             };
@@ -995,7 +1045,7 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
                 ValueResolution::Absent(_witness)
                     if allow_absent_default && default.optional_operand().is_some() =>
                 {
-                    resolve_ref_value_status_inner(default, bindings, config, true)
+                    resolve_ref_value_status_in(default, bindings, config, true)
                 }
                 ValueResolution::Absent(witness) => {
                     crate::resource::knowledge::take_fallback(witness, || {
@@ -1042,7 +1092,7 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
                                 path.attribute(),
                             ) =>
                         {
-                            let selected = resolve_ref_value_inner(left, bindings, config)?;
+                            let selected = resolve_ref_value_in(left, bindings, config)?;
                             match selected
                                 .knowledge(&crate::resource::knowledge::KnowledgeContext::plan(
                                     bindings,
@@ -1102,7 +1152,7 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
             resolve_plan_reference(value, binding, None, bindings, config)
         }
         Value::Deferred(DeferredValue::Access(access)) => {
-            let resolved_base = match resolve_ref_value_status_inner(
+            let resolved_base = match resolve_ref_value_status_in(
                 access.base(),
                 bindings,
                 config,
@@ -1120,7 +1170,7 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
                 AccessMissPolicy::Error,
             ) {
                 Ok(ValuePathSegmentResult::Resolved(value)) => {
-                    resolve_ref_value_status_inner(&value, bindings, config, allow_absent_default)
+                    resolve_ref_value_status_in(&value, bindings, config, allow_absent_default)
                 }
                 Ok(
                     ValuePathSegmentResult::Deferred(_) | ValuePathSegmentResult::DeferredMiss(_),
@@ -1147,7 +1197,7 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Secret(_),
         ) => {
-            let resolved = resolve_ref_value_inner(value, bindings, config)?;
+            let resolved = resolve_ref_value_in(value, bindings, config)?;
             if !resolved
                 .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
                 .map(|proof| proof.into_classification())
@@ -1175,9 +1225,9 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
 fn resolve_required_value_status<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
-    config: RuntimeContext<'_>,
+    config: ResolutionContext<'_, B>,
 ) -> Result<ValueResolution<P, B>, ResolutionError> {
-    let resolved = resolve_ref_value_inner(value, bindings, config)?;
+    let resolved = resolve_ref_value_in(value, bindings, config)?;
     if resolved
         .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
         .map(|proof| proof.into_classification())
@@ -1233,6 +1283,28 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     call_line: usize,
 ) -> Result<Value<crate::resource::ParserPlaceholder, B>, crate::parser::ParseError> {
+    evaluate_runtime_user_function_in(
+        function,
+        args,
+        bindings,
+        config,
+        call_line,
+        &Default::default(),
+    )
+}
+
+fn evaluate_runtime_user_function_in<B: BindingAddress>(
+    function: &crate::parser::UserFunction<B>,
+    args: &[crate::resource::FunctionArgument<crate::resource::ParserPlaceholder, B>],
+    bindings: &ResolvedBindings<crate::resource::ParserPlaceholder, B>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    call_line: usize,
+    definitions: &crate::value_walk::DefinitionMemo<B>,
+) -> Result<Value<crate::resource::ParserPlaceholder, B>, crate::parser::ParseError> {
+    let runtime = ResolutionContext {
+        runtime: RuntimeContext::Session(config),
+        definitions,
+    };
     let required = function
         .params
         .iter()
@@ -1264,9 +1336,7 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
             ),
         };
         let argument = argument
-            .try_map_value(|value| {
-                resolve_ref_value_inner(value, bindings, RuntimeContext::Session(config))
-            })
+            .try_map_value(|value| resolve_ref_value_in(value, bindings, runtime))
             .map_err(|message| user_function_runtime_error(call_line, message))?;
         if let Some(expected) = &parameter.param_type {
             let resolved_parameter = crate::validation::resolve_parameter_type_for_check(
@@ -1341,12 +1411,12 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
             &substitutions,
             *source_line,
             crate::value_walk::RewritePosition::Value,
+            definitions,
         )
         .map_err(|error| locate_user_function_error(function, error))?;
-        let resolved =
-            resolve_ref_value_inner(&substituted, bindings, RuntimeContext::Session(config))
-                .map_err(|message| user_function_runtime_error(*source_line, message))
-                .map_err(|error| locate_user_function_error(function, error))?;
+        let resolved = resolve_ref_value_in(&substituted, bindings, runtime)
+            .map_err(|message| user_function_runtime_error(*source_line, message))
+            .map_err(|error| locate_user_function_error(function, error))?;
         substitutions.insert(
             name.clone(),
             crate::resource::FunctionArgument::from_value(resolved),
@@ -1358,9 +1428,10 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
         &substitutions,
         function.body.source_line,
         crate::value_walk::RewritePosition::Value,
+        definitions,
     )
     .map_err(|error| locate_user_function_error(function, error))?;
-    let result = resolve_ref_value_inner(&substituted, bindings, RuntimeContext::Session(config))
+    let result = resolve_ref_value_in(&substituted, bindings, runtime)
         .map_err(|message| user_function_runtime_error(function.body.source_line, message))
         .map_err(|error| locate_user_function_error(function, error))?;
     if let Some(expected) = &function.return_type
@@ -1434,19 +1505,19 @@ fn parser_stage_function_arguments<P: PlaceholderKind, B: BindingAddress>(
 fn resolve_function_arguments<P: PlaceholderKind, B: BindingAddress>(
     args: &[crate::resource::FunctionArgument<P, B>],
     bindings: &ResolvedBindings<P, B>,
-    config: RuntimeContext<'_>,
+    config: ResolutionContext<'_, B>,
 ) -> Result<Vec<crate::resource::FunctionArgument<P, B>>, ResolutionError> {
     args.iter()
         .map(|argument| {
-            argument.try_map_value(|value| resolve_ref_value_inner(value, bindings, config))
+            argument.try_map_value(|value| resolve_ref_value_in(value, bindings, config))
         })
         .collect()
 }
 
-fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
+fn resolve_ref_value_in<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
-    config: RuntimeContext<'_>,
+    config: ResolutionContext<'_, B>,
 ) -> Result<Value<P, B>, ResolutionError> {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(_)) => Err(
@@ -1455,7 +1526,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 .into(),
         ),
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
-            match resolve_ref_value_status_inner(value, bindings, config, false)? {
+            match resolve_ref_value_status_in(value, bindings, config, false)? {
                 ValueResolution::Present(value) | ValueResolution::Unknown(value) => Ok(value),
                 // Keep the original expression if a future resolver adds an
                 // absent default form. Residual coalesces are rejected at
@@ -1490,8 +1561,8 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
             Ok(value.clone())
         }
         Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            let lhs = resolve_ref_value_inner(expression.lhs(), bindings, config)?;
-            let rhs = resolve_ref_value_inner(expression.rhs(), bindings, config)?;
+            let lhs = resolve_ref_value_in(expression.lhs(), bindings, config)?;
+            let rhs = resolve_ref_value_in(expression.rhs(), bindings, config)?;
             expression
                 .evaluate_with_operands(lhs, rhs)
                 .map_err(|error| {
@@ -1508,14 +1579,14 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
         Value::Concrete(ConcreteValue::List(items)) => {
             let resolved: Result<Vec<Value<P, B>>, ResolutionError> = items
                 .iter()
-                .map(|v| resolve_ref_value_inner(v, bindings, config))
+                .map(|v| resolve_ref_value_in(v, bindings, config))
                 .collect();
             Ok(Value::Concrete(ConcreteValue::List(resolved?)))
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
             let mut resolved: IndexMap<String, Value<P, B>> = IndexMap::new();
             for (k, v) in map {
-                resolved.insert(k.clone(), resolve_ref_value_inner(v, bindings, config)?);
+                resolved.insert(k.clone(), resolve_ref_value_in(v, bindings, config)?);
             }
             Ok(Value::Concrete(ConcreteValue::Map(resolved)))
         }
@@ -1524,7 +1595,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 .iter()
                 .map(|p| match p {
                     InterpolationPart::Expr(v) => Ok(InterpolationPart::Expr(
-                        resolve_ref_value_inner(v, bindings, config)?,
+                        resolve_ref_value_in(v, bindings, config)?,
                     )),
                     other => Ok(other.clone()),
                 })
@@ -1596,7 +1667,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
             args,
             source_line,
         }) => {
-            let session = match config {
+            let session = match config.runtime {
                 RuntimeContext::Session(session) => session,
                 RuntimeContext::Projection(_context) => return Ok(value.clone()),
             };
@@ -1635,23 +1706,24 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                     source_line: *source_line,
                 }));
             };
-            let evaluated = evaluate_runtime_user_function(
+            let evaluated = evaluate_runtime_user_function_in(
                 function,
                 &parser_args,
                 &ResolvedBindings::default(),
                 session,
                 source_line.get().unwrap_or(function.body.source_line),
+                config.definitions,
             )
             .map_err(ResolutionError::from)?;
             let evaluated = evaluated
                 .into_expanded()
                 .map(Value::into_placeholder_type)
                 .map_err(|error| error.to_string())?;
-            resolve_ref_value_inner(&evaluated, bindings, config)
+            resolve_ref_value_in(&evaluated, bindings, config)
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let access_expression = crate::value::format_value(value);
-            let resolved_base = resolve_ref_value_inner(access.base(), bindings, config)?;
+            let resolved_base = resolve_ref_value_in(access.base(), bindings, config)?;
             // Construction canonicalizes reference-rooted access into a
             // ResourceRef/BindingRef. Every surviving Access therefore has a
             // computed container, whose missing element is a final error.
@@ -1667,7 +1739,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 })
         }
         Value::Deferred(DeferredValue::Secret(inner)) => inner
-            .try_map(|value| resolve_ref_value_inner(value, bindings, config))
+            .try_map(|value| resolve_ref_value_in(value, bindings, config))
             .map(|inner| Value::Deferred(DeferredValue::Secret(inner))),
         // `Value::Unknown` is the result of stamping a previously-
         // unresolved upstream ref; it cannot be resolved further.

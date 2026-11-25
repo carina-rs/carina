@@ -3969,7 +3969,7 @@ pub struct UserFunction<B: BindingAddress = RelativeBindingName> {
 
 #[cfg(test)]
 thread_local! {
-    static USER_FUNCTION_BINDING_MAP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static USER_FUNCTION_BINDING_MAP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -3986,37 +3986,7 @@ impl<B: BindingAddress> UserFunction<B> {
         self,
         map: &mut impl FnMut(B) -> T,
     ) -> UserFunction<T> {
-        #[cfg(test)]
-        USER_FUNCTION_BINDING_MAP_COUNT.with(|count| count.set(count.get() + 1));
-
-        UserFunction {
-            type_annotations: self.type_annotations,
-            name: self.name,
-            params: self
-                .params
-                .into_iter()
-                .map(|param| FnParam {
-                    name: param.name,
-                    param_type: param.param_type,
-                    type_span: param.type_span,
-                    default: param.default.map(|value| value.map_bindings(map)),
-                })
-                .collect(),
-            return_type: self.return_type,
-            return_type_span: self.return_type_span,
-            annotation_source_file: self.annotation_source_file,
-            local_lets: self
-                .local_lets
-                .into_iter()
-                .map(|(name, value, line)| (name, value.map_bindings(map), line))
-                .collect(),
-            body: UserFunctionBody {
-                location: self.body.location,
-                value: self.body.value.map_bindings(map),
-                source_line: self.body.source_line,
-                source_file: self.body.source_file,
-            },
-        }
+        crate::resource::BindingMapper::new(map).function_body(self)
     }
 }
 
