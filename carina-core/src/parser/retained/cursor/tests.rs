@@ -573,6 +573,97 @@ fn round1_seam_children_are_fallible_instead_of_panicking() {
 }
 
 #[test]
+fn reported_loop_selector_prescan_preserves_missing_child_evidence() {
+    use crate::schema::value_validation::{
+        AssignmentCallbacks, validate_authored_value_for_admission,
+    };
+    use crate::schema::{AttributeSchema, AttributeType, FieldAncestry, ResourceSchema};
+
+    for selector in ["'valid'", "children.a.name"] {
+        // The failed call keeps the first error independent of the selector,
+        // without needing provider schemas in this fixture.
+        let mut slot = slot(&format!(
+            "arguments {{ value: String }}\n\
+             fn choose(n: Int): String {{ 'selected' }}\n\
+             let children = for (_, item) in ['a'] {{ mock.test.resource {{ name = item }} }}\n\
+             let input = {{ a = choose(value), b = {selector} }}",
+        ));
+        let missing = {
+            let mut usage = slot.cursor().unwrap();
+            while usage.form() != AuthoredForm::Map {
+                assert!(!usage.node().judgement().reported_loop_selector_failure());
+                usage = usage.child(usage.child_count() - 1, usage.edge()).unwrap();
+            }
+            assert!(!usage.node().judgement().reported_loop_selector_failure());
+            assert!(usage.node().judgement().no_conversion().is_some());
+            assert_eq!(
+                usage
+                    .map_child(&"b".into(), EdgeRole::MapValue)
+                    .unwrap()
+                    .node()
+                    .judgement()
+                    .reported_loop_selector_failure(),
+                selector == "children.a.name",
+            );
+            usage.node().children().next().unwrap().unwrap().node_id()
+        };
+        let snapshot = Arc::make_mut(slot.snapshot.as_mut().unwrap());
+        let instance = snapshot.instance.clone();
+        assert!(
+            Arc::make_mut(&mut snapshot.nodes)
+                .remove(&(instance, missing))
+                .is_some()
+        );
+
+        let schema = ResourceSchema::new("Test")
+            .attribute(
+                AttributeSchema::optional("input", AttributeType::map(AttributeType::string()))
+                    .build(),
+            )
+            .validate()
+            .unwrap();
+        let proof = slot
+            .projection()
+            .unwrap()
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .unwrap()
+            .into_classification();
+        assert!(
+            matches!(
+                &proof,
+                crate::resource::knowledge::Classification::Known(_)
+                    | crate::resource::knowledge::Classification::ShapeKnown(_)
+            ),
+            "{selector}: {proof:?}",
+        );
+        let findings = validate_authored_value_for_admission(
+            &schema.as_schema().attributes()["input"].attr_type,
+            &proof,
+            schema.as_schema().defs(),
+            FieldAncestry::WRITABLE,
+            &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
+            AuthoredCursor::authored(slot.cursor().unwrap()),
+            AssignmentCallbacks {
+                ordinary: &|_, _, _, _| Ok(Default::default()),
+                authored: None,
+            },
+            &mut Default::default(),
+        );
+        let expected = crate::schema::TypeError::MapValueError {
+            key: "a".into(),
+            inner: Box::new(crate::validation::admission::assignment_seam_error(
+                MissingEvidence::new(format!("authored node {missing:?}")),
+            )),
+        };
+        assert_eq!(
+            findings.local_errors().collect::<Vec<_>>(),
+            [&expected],
+            "{selector}: {findings:?}",
+        );
+    }
+}
+
+#[test]
 fn round1_seam_expansion_records_a_decision_without_a_parse_projection() {
     let mut slot = slot("arguments { flag: Bool }\nlet input = if flag { 'yes' } else { 'no' }");
     let mut usage = slot.cursor().unwrap();

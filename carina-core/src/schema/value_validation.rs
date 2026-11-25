@@ -2686,7 +2686,10 @@ fn validate_authored_value_with_callbacks<
                 return ValueValidationFindings::default().retained_failure();
             }
             // Unjudged children remain owned by the ordinary walk below.
-            pending.extend(node.children().flatten());
+            let Ok(children) = node.children().collect::<Result<Vec<_>, _>>() else {
+                break;
+            };
+            pending.extend(children);
         }
     }
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
