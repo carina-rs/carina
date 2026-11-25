@@ -3,6 +3,9 @@
 #[path = "common/loop_dot_cases.rs"]
 mod cases;
 
+#[path = "common/reported_loop_selector_cases.rs"]
+mod reported_selector_cases;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -67,6 +70,30 @@ fn plan(root: &Path) -> serde_json::Value {
 #[test]
 fn loop_dot_case_table() {
     run_case_table(|_| true);
+}
+
+#[test]
+fn loop_dot_reported_selector_preserves_sibling_errors() {
+    let mut failures = Vec::new();
+    for case in reported_selector_cases::cases() {
+        for module in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path();
+            reported_selector_cases::fixture(root, &case, module);
+            assert!(run(root, &["init", "."]).status.success());
+            let (success, mut errors) = diagnostics(root);
+            let mut expected = case.errors.to_vec();
+            errors.sort();
+            expected.sort();
+            if success || errors != expected {
+                failures.push(format!(
+                    "{}, module={module}: {errors:?}, expected exactly {expected:?}",
+                    case.id,
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]

@@ -4,6 +4,65 @@ use super::*;
 #[path = "../../../../carina-cli/tests/common/loop_dot_cases.rs"]
 mod loop_dot_cases;
 
+#[path = "../../../../carina-cli/tests/common/reported_loop_selector_cases.rs"]
+mod reported_selector_cases;
+
+#[test]
+fn loop_dot_reported_selector_preserves_sibling_diagnostics() {
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let mut failures = Vec::new();
+    for case in reported_selector_cases::cases() {
+        for module in [false, true] {
+            let directory = Directory::new(&[]);
+            let root = directory.root.path();
+            let owner = reported_selector_cases::fixture(root, &case, module);
+            let path = root.join(owner);
+            let source = std::fs::read_to_string(&path).unwrap();
+            let diagnostics =
+                engine.analyze(&create_document_at(&source, path.clone()), Some(&path));
+            let mut errors = diagnostics
+                .iter()
+                .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|finding| finding.message.clone())
+                .collect::<Vec<_>>();
+            let mut expected = case.errors[..1].to_vec();
+            errors.sort();
+            expected.sort();
+            // The ordinary LSP typo pass owns this warning and its attribute-token range.
+            let siblings = diagnostics
+                .iter()
+                .filter(|finding| finding.message.contains("'nope'"))
+                .map(|finding| (finding.severity, finding.message.as_str(), finding.range))
+                .collect::<Vec<_>>();
+            let expected_siblings = if case.errors.len() > 1 {
+                let column = source.find("r.nope").unwrap() as u32 + 2;
+                vec![(
+                    Some(DiagnosticSeverity::WARNING),
+                    "Unknown attribute 'nope' on 'r' (type 'test.resource') Did you mean 'name'?",
+                    Range::new(Position::new(0, column), Position::new(0, column + 4)),
+                )]
+            } else {
+                Vec::new()
+            };
+            if errors != expected || siblings != expected_siblings {
+                failures.push(format!(
+                    "{}, module={module}: {errors:?}, expected exactly {expected:?}; all diagnostics: {diagnostics:?}",
+                    case.id,
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[test]
 fn loop_dot_case_table_diagnostics_match_validate() {
     run_loop_dot_case_table(|_| true);
