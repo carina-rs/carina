@@ -2676,21 +2676,14 @@ fn validate_authored_value_with_callbacks<
     reference: Option<ReferenceCheck<'_, B>>,
     coverage: &mut WalkCoverage,
 ) -> ValueValidationFindings {
-    if let CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) = &cursor.kind {
-        let mut pending = vec![usage.node().clone()];
-        while let Some(node) = pending.pop() {
-            if node.judgement().reported_loop_selector_failure() {
-                // The retained judge owns the selector diagnostic, including
-                // when another failure is the containing expression's first.
-                coverage.record(usage);
-                return ValueValidationFindings::default().retained_failure();
-            }
-            // Unjudged children remain owned by the ordinary walk below.
-            let Ok(children) = node.children().collect::<Result<Vec<_>, _>>() else {
-                break;
-            };
-            pending.extend(children);
-        }
+    if let CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) = &cursor.kind
+        && usage.node().judgement().reported_loop_selector_failure()
+    {
+        // A rejected loop operand is terminal. The retained judge owns its
+        // diagnostic; admitting its provisional projection would create a
+        // second computed/reference error (notably in module preflight).
+        coverage.record(usage);
+        return ValueValidationFindings::default().retained_failure();
     }
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
     let callbacks = callbacks.into();
