@@ -73,9 +73,18 @@ fn loop_dot_case_table() {
 }
 
 #[test]
-fn loop_dot_reported_selector_preserves_sibling_errors() {
+fn loop_dot_reported_selector_stops_expression_errors() {
+    assert_reported_selector_errors(reported_selector_cases::cases());
+}
+
+#[test]
+fn loop_dot_reported_selector_after_another_failure_is_reported_once() {
+    assert_reported_selector_errors([reported_selector_cases::input_i()]);
+}
+
+fn assert_reported_selector_errors(cases: impl IntoIterator<Item = reported_selector_cases::Case>) {
     let mut failures = Vec::new();
-    for case in reported_selector_cases::cases() {
+    for case in cases {
         for module in [false, true] {
             let fixture = tempfile::tempdir().unwrap();
             let root = fixture.path();
@@ -85,6 +94,7 @@ fn loop_dot_reported_selector_preserves_sibling_errors() {
             let mut expected = case.errors.to_vec();
             errors.sort();
             expected.sort();
+            eprintln!("{}, module={module}: {errors:?}", case.id);
             if success || errors != expected {
                 failures.push(format!(
                     "{}, module={module}: {errors:?}, expected exactly {expected:?}",

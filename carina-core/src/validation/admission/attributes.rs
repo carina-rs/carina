@@ -8,14 +8,11 @@ use crate::schema::LeafPathSegment;
 use crate::schema::SchemaRegistry;
 
 mod inputs;
-mod reported_selector;
 use inputs::{AttributeInput, with_classified_inputs};
 pub use inputs::{
     ClassificationDiagnostics, ResourceAdmissionOutcome, ResourceAttributeInputs, SlotPrechecks,
     ValidationEvaluation, classification_preflight,
 };
-use reported_selector::ReportedSelector;
-pub use reported_selector::sibling_findings as reported_loop_selector_sibling_findings;
 
 pub(crate) fn declaration_identity(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
@@ -594,19 +591,6 @@ fn admit_validation_attributes_with_input<
             provider: session,
             declaration: None,
         };
-        let reported_selector = match ReportedSelector::from_cursor(&boundary.cursor) {
-            Ok(selector) => selector,
-            Err(error) => {
-                return crate::schema::value_validation::untyped_symbolic_errors(vec![
-                    assignment_seam_error(error),
-                ])
-                .retained_failure();
-            }
-        };
-        if let Some(selector) = &reported_selector {
-            let ValidationInput::Resource { coverage, .. } = &input;
-            selector.record(&mut coverage.borrow_mut());
-        }
         let assignment = destination.contract.as_deref().map(|contract| {
             move |attr: &CompiledAttributeType,
                   value: &Value<P, B>,
@@ -630,14 +614,6 @@ fn admit_validation_attributes_with_input<
             let Some(bindings) = bindings else {
                 return Vec::new();
             };
-            if let Some(selector) = &reported_selector {
-                return selector.errors(
-                    crate::resource::knowledge::ClassifiedRef::from(proof).diagnostic_value(),
-                    id,
-                    name,
-                    bindings,
-                );
-            }
             let interpolation_sink =
                 crate::validation::lift_type_expr(&crate::validation::INTERPOLATION_REF_SINK)
                     .expect("built-in interpolation sink");
@@ -665,18 +641,6 @@ fn admit_validation_attributes_with_input<
             })
             .collect()
         };
-        if reported_selector.is_some() {
-            // The retained judge already produced the selector finding. Walk
-            // the remaining references with the ordinary sibling policy.
-            let errors = if boundary.scope == crate::schema::value_validation::AssignmentScope::Full
-            {
-                untyped()
-            } else {
-                Vec::new()
-            };
-            return crate::schema::value_validation::untyped_symbolic_errors(errors)
-                .retained_failure();
-        }
         let boundary = boundary.with_checks(
             super::AssignmentChecks {
                 #[cfg(test)]

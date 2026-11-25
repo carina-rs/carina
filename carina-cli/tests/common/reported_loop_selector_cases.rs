@@ -1,4 +1,4 @@
-//! Resource attributes whose rejected selector must not hide other references.
+//! Resource attributes whose rejected selector stops expression validation.
 
 use std::path::Path;
 
@@ -13,23 +13,18 @@ pub fn cases() -> Vec<Case> {
     const INDEXED: &str =
         "let children = for (_, item) in ['a'] { mock.test.resource { name = item } }\n";
     const INDEX_ERROR: &str = "cannot apply access .a to list(mock.test.resource)";
-    const SIBLING: &str =
-        "unknown attribute 'nope' on 'r' in reference r.nope Did you mean 'name'?";
     vec![
         Case {
             id: "msib6",
             declaration: INDEXED,
             attributes: "name = \"${children.a.name}-${r.nope}\"",
-            errors: &[
-                INDEX_ERROR,
-                "mock.test.resource.o: unknown attribute 'nope' on 'r' in reference r.nope Did you mean 'name'?",
-            ],
+            errors: &[INDEX_ERROR],
         },
         Case {
             id: "msib7-dot",
             declaration: INDEXED,
             attributes: "name = 'y' tags = { a = children.a.name, b = r.nope }",
-            errors: &[INDEX_ERROR, SIBLING],
+            errors: &[INDEX_ERROR],
         },
         Case {
             id: "modcoal",
@@ -56,6 +51,16 @@ pub fn cases() -> Vec<Case> {
             errors: &[INDEX_ERROR],
         },
     ]
+}
+
+/// The map's first failed child has a different marker from its rejected selector.
+pub fn input_i() -> Case {
+    Case {
+        id: "input-i",
+        declaration: "let children = for (_, item) in ['a'] { mock.test.resource { name = item } }\n",
+        attributes: "name = 'y' tags = { a = children[0].nope.x, b = children.a.name, c = r.nope }",
+        errors: &["cannot apply access .a to list(mock.test.resource)"],
+    }
 }
 
 /// Keep declarations and readers in separate files in both directory contexts.

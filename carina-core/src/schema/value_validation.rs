@@ -2676,6 +2676,19 @@ fn validate_authored_value_with_callbacks<
     reference: Option<ReferenceCheck<'_, B>>,
     coverage: &mut WalkCoverage,
 ) -> ValueValidationFindings {
+    if let CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) = &cursor.kind {
+        let mut pending = vec![usage.node().clone()];
+        while let Some(node) = pending.pop() {
+            if node.judgement().reported_loop_selector_failure() {
+                // The retained judge owns the selector diagnostic, including
+                // when another failure is the containing expression's first.
+                coverage.record(usage);
+                return ValueValidationFindings::default().retained_failure();
+            }
+            // Unjudged children remain owned by the ordinary walk below.
+            pending.extend(node.children().flatten());
+        }
+    }
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
     let callbacks = callbacks.into();
     let policy = reference.map(|reference| ReferencePolicy::new(callbacks.ordinary, reference));

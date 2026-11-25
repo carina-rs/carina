@@ -1049,14 +1049,6 @@ fn validate_and_resolve_configuration<'s>(
             carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
                 parsed.parsed(), ctx.schemas(), None, &imported_module_signatures, enriched_context,
             );
-        if mode.checks_resources() {
-            match carina_core::validation::admission::attributes::reported_loop_selector_sibling_findings(
-                binding_configuration.judged(), &module_call_bindings,
-            ) {
-                Ok(findings) => errors.extend(findings.into_iter().map(|finding| AppError::ResourceAdmission(Box::new(finding)))),
-                Err(error) => errors.push(AppError::Validation(error.to_string())),
-            }
-        }
         let reference_checks = if !mode.checks_resources() {
             carina_core::validation::ModuleCallReferenceChecks::Skipped
         } else {

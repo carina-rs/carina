@@ -239,13 +239,6 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
         let Some(bindings) = context.bindings else {
             return Ok(ReferenceSource::Unchecked);
         };
-        self.source_in(bindings)
-    }
-
-    pub(super) fn source_in(
-        &self,
-        bindings: &BindingIndex<'_, B>,
-    ) -> Result<ReferenceSource, TypeError> {
         let source = match self.reference.as_ref() {
             crate::resource::ReferencePathRef::Access(path) => bindings.postfix_ref_type(path),
             crate::resource::ReferencePathRef::Binding(binding) => bindings.ref_type(binding),

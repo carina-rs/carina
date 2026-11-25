@@ -8,7 +8,69 @@ mod loop_dot_cases;
 mod reported_selector_cases;
 
 #[test]
-fn loop_dot_reported_selector_preserves_sibling_diagnostics() {
+fn loop_dot_reported_selector_after_another_failure_is_reported_once() {
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let case = reported_selector_cases::input_i();
+    let mut failures = Vec::new();
+    for module in [false, true] {
+        let directory = Directory::new(&[]);
+        let root = directory.root.path();
+        let owner = reported_selector_cases::fixture(root, &case, module);
+        let path = root.join(owner);
+        let source = std::fs::read_to_string(&path).unwrap();
+        let direct = engine
+            .analyze(&create_document_at(&source, path.clone()), Some(&path))
+            .into_iter()
+            .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|finding| finding.message)
+            .collect::<Vec<_>>();
+        eprintln!("input (i), module={module}, direct: {direct:?}");
+        if direct != case.errors {
+            failures.push(format!(
+                "module={module}, direct: {direct:?}, expected exactly {:?}",
+                case.errors,
+            ));
+        }
+        if !module {
+            continue;
+        }
+        let path = root.join("main.crn");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let diagnostics = engine.analyze_document_set(
+            &create_document_at(&source, path.clone()),
+            Some(&path),
+            &[],
+        );
+        let imported = diagnostics
+            .values()
+            .flatten()
+            .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|finding| finding.message.as_str())
+            .collect::<Vec<_>>();
+        eprintln!("input (i), importing: {imported:?}");
+        if imported.len() != 1
+            || !imported[0].ends_with(case.errors[0])
+            || imported[0].matches(case.errors[0]).count() != 1
+        {
+            failures.push(format!(
+                "importing: {imported:?}, expected exactly one {:?}",
+                case.errors,
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn loop_dot_reported_selector_keeps_existing_warnings() {
     let engine = DiagnosticEngine::new(
         loaded_providers_from_factories(vec![Box::new(
             carina_provider_mock::ConfiguredBuiltinMock::new(
@@ -33,7 +95,7 @@ fn loop_dot_reported_selector_preserves_sibling_diagnostics() {
                 .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
                 .map(|finding| finding.message.clone())
                 .collect::<Vec<_>>();
-            let mut expected = case.errors[..1].to_vec();
+            let mut expected = case.errors.to_vec();
             errors.sort();
             expected.sort();
             // The ordinary LSP typo pass owns this warning and its attribute-token range.
@@ -42,8 +104,8 @@ fn loop_dot_reported_selector_preserves_sibling_diagnostics() {
                 .filter(|finding| finding.message.contains("'nope'"))
                 .map(|finding| (finding.severity, finding.message.as_str(), finding.range))
                 .collect::<Vec<_>>();
-            let expected_siblings = if case.errors.len() > 1 {
-                let column = source.find("r.nope").unwrap() as u32 + 2;
+            let expected_siblings = if let Some(column) = source.find("r.nope") {
+                let column = column as u32 + 2;
                 vec![(
                     Some(DiagnosticSeverity::WARNING),
                     "Unknown attribute 'nope' on 'r' (type 'test.resource') Did you mean 'name'?",
