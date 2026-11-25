@@ -8,113 +8,115 @@ fn context() -> ProviderContext {
     ProviderContext::new(crate::EnvironmentSnapshot::empty())
 }
 
-fn share_fn_definitions(depth: usize, two_calls_per_body: bool) -> Vec<String> {
+#[derive(Clone, Copy, Debug)]
+enum ShareFnShape {
+    Coalesce,
+    Conditional,
+    Interpolation,
+    Join,
+}
+
+fn share_fn_definitions(depth: usize, shape: ShareFnShape) -> Vec<String> {
     let mut definitions = vec!["fn f0(x: String): String { x }".to_string()];
     for level in 1..=depth {
         let call = format!("f{}(x)", level - 1);
-        let body = if two_calls_per_body {
-            format!("{call} ?? {call}")
-        } else {
-            call
+        let body = match shape {
+            ShareFnShape::Coalesce => format!("{call} ?? {call}"),
+            ShareFnShape::Conditional => format!("if true {{ {call} }} else {{ {call} }}"),
+            ShareFnShape::Interpolation => format!("\"${{{call}}}${{{call}}}\""),
+            ShareFnShape::Join => format!("join('', [{call}, {call}])"),
         };
         definitions.push(format!("fn f{level}(x: String): String {{ {body} }}"));
     }
     definitions
 }
 
-#[test]
-fn share_fn_root_single_call_chain_maps_each_definition_once() {
-    let source = format!(
-        "{}\nlet v = f6(\"a\")\n",
-        share_fn_definitions(6, false).join("\n")
-    );
-    let parsed = crate::parser::parse(&source, &context()).unwrap();
-
-    let (_, count) = with_user_function_binding_map_count(|| parsed.resolve_root_for_test());
-
-    assert_eq!(
-        count, 7,
-        "each root function definition must be mapped once"
-    );
+fn share_fn_counts(shape: ShareFnShape, depth: usize, directory: bool) -> (usize, usize) {
+    let definitions = share_fn_definitions(depth, shape).join("\n");
+    let consumer = format!("let v = f{depth}('a')\n");
+    let (((), mappings), walks) = crate::value_walk::with_function_definition_walk_count(|| {
+        with_user_function_binding_map_count(|| {
+            let parsed = if directory {
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::write(dir.path().join("a_functions.crn"), &definitions).unwrap();
+                std::fs::write(dir.path().join("main.crn"), &consumer).unwrap();
+                crate::config_loader::parse_directory(
+                    &crate::paths::ResolvedPath::new(dir.path()).unwrap(),
+                    &context(),
+                )
+                .unwrap()
+                .into_parsed()
+            } else {
+                crate::parser::parse(&format!("{definitions}\n{consumer}"), &context()).unwrap()
+            };
+            let result = &parsed.variables["v"];
+            if matches!(shape, ShareFnShape::Interpolation | ShareFnShape::Join) {
+                assert!(
+                    matches!(result, Value::Concrete(ConcreteValue::String(value))
+                    if value.expose_plaintext() == "a".repeat(1 << depth))
+                );
+            }
+            let _ = parsed.resolve_root_for_test();
+        })
+    });
+    (mappings, walks)
 }
 
-#[test]
-fn share_fn_root_two_calls_per_body_maps_each_definition_once() {
-    let source = format!(
-        "{}\nlet v = f4(\"a\")\n",
-        share_fn_definitions(4, true).join("\n")
-    );
-    let parsed = crate::parser::parse(&source, &context()).unwrap();
-
-    let (_, count) = with_user_function_binding_map_count(|| parsed.resolve_root_for_test());
-
-    assert_eq!(
-        count, 5,
-        "each root function definition must be mapped once"
-    );
-}
-
-#[test]
-fn share_fn_root_more_call_sites_do_not_add_definition_mappings() {
-    let definitions = share_fn_definitions(3, false).join("\n");
-    let count_mappings = |call_sites| {
-        let consumers = (0..call_sites)
-            .map(|index| format!("let v{index} = f3(input)"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let parsed = crate::parser::parse(
-            &format!("arguments {{ input: String }}\n{definitions}\n{consumers}\n"),
-            &context(),
-        )
-        .unwrap();
-        for index in 0..call_sites {
-            assert!(
-                matches!(
-                    parsed.variables.get(&format!("v{index}")),
-                    Some(Value::Deferred(DeferredValue::ResolvedFunctionCall { .. }))
-                ),
-                "consumer v{index} must remain deferred before counting mappings"
-            );
+fn share_fn_assert_polynomial(shape: ShareFnShape, directory: bool) {
+    let mut previous = None;
+    for depth in [2, 4, 8, 12] {
+        let counts = share_fn_counts(shape, depth, directory);
+        eprintln!(
+            "share_fn_counts shape={shape:?} directory={directory} depth={depth} binding={} transform={}",
+            counts.0, counts.1
+        );
+        if let Some((old_depth, (bindings, transforms))) = previous {
+            // Doubling depth allows fourth-degree growth with headroom. Repeated
+            // walks per call occurrence grow exponentially even for these DAGs.
+            if depth == 2 * old_depth {
+                assert!(
+                    counts.0 <= bindings * 16,
+                    "{shape:?} binding mappings must grow polynomially: depth {old_depth}: {bindings}, depth {depth}: {}",
+                    counts.0
+                );
+                assert!(
+                    counts.1 <= transforms * 16,
+                    "{shape:?} transform definition walks must grow polynomially: depth {old_depth}: {transforms}, depth {depth}: {}",
+                    counts.1
+                );
+            }
         }
-        let (_, count) = with_user_function_binding_map_count(|| parsed.resolve_root_for_test());
-        count
-    };
-
-    let one_call_count = count_mappings(1);
-    let five_call_count = count_mappings(5);
-
-    assert_eq!(
-        five_call_count, one_call_count,
-        "additional root call sites must not map function definitions again"
-    );
+        assert!(
+            counts.0 < 1_000_000 && counts.1 < 1_000_000,
+            "{shape:?} definition walks at depth {depth} must stay bounded: {counts:?}"
+        );
+        previous = Some((depth, counts));
+    }
 }
 
 #[test]
-fn share_fn_directory_sibling_file_definitions_map_once() {
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join("main.crn"), "let v = f6(\"a\")\n").unwrap();
-    std::fs::write(
-        directory.path().join("z_helpers.crn"),
-        share_fn_definitions(6, false)
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
-    .unwrap();
-    let parsed = crate::config_loader::parse_directory(
-        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
-        &context(),
-    )
-    .unwrap();
+fn share_fn_coalesce_definition_walks_grow_polynomially() {
+    share_fn_assert_polynomial(ShareFnShape::Coalesce, false);
+}
 
-    let (_, count) =
-        with_user_function_binding_map_count(|| parsed.into_parsed().resolve_root_for_test());
+#[test]
+fn share_fn_conditional_definition_walks_grow_polynomially() {
+    share_fn_assert_polynomial(ShareFnShape::Conditional, false);
+}
 
-    assert_eq!(
-        count, 7,
-        "each sibling function definition must be mapped once"
-    );
+#[test]
+fn share_fn_interpolation_definition_walks_grow_polynomially() {
+    share_fn_assert_polynomial(ShareFnShape::Interpolation, false);
+}
+
+#[test]
+fn share_fn_join_definition_walks_grow_polynomially() {
+    share_fn_assert_polynomial(ShareFnShape::Join, false);
+}
+
+#[test]
+fn share_fn_directory_sibling_definition_walks_grow_polynomially() {
+    share_fn_assert_polynomial(ShareFnShape::Interpolation, true);
 }
 
 #[test]

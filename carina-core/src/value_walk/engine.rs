@@ -754,6 +754,8 @@ impl<O: WalkOutput> TransformFold<O> {
         at: At<'_>,
         algebra: &mut A,
     ) -> Result<Option<UserFunction<B>>, WalkError> {
+        #[cfg(test)]
+        super::FUNCTION_DEFINITION_WALK_COUNT.with(|count| count.set(count.get() + 1));
         let mut nested = Self::new();
         let candidate = nested.function(function.clone(), at, algebra)?;
         self.output.extend(nested.output);

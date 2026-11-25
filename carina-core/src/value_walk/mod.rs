@@ -1212,3 +1212,17 @@ impl<P: ValueKind, B: BindingAddress> SecretChild<'_, Transform, P, B> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+thread_local! {
+    static FUNCTION_DEFINITION_WALK_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_function_definition_walk_count<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    FUNCTION_DEFINITION_WALK_COUNT.with(|count| {
+        count.set(0);
+        let result = run();
+        (result, count.replace(0))
+    })
+}
