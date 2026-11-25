@@ -1631,7 +1631,19 @@ pub(crate) fn judge_configuration<
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     prepare_slots(file, schemas);
-    let mut report = judgement::judge_expressions(file, schemas, config);
+    let inferred_exports = file
+        .export_params
+        .iter()
+        .filter(|parameter| parameter.type_expr_opt().is_none())
+        .filter_map(|parameter| parameter.value_location().cloned())
+        .collect::<Vec<_>>();
+    let mut report = judgement::judge_expressions_with_export_owners(
+        file,
+        schemas,
+        config,
+        None,
+        &inferred_exports,
+    );
     for parameter in &file.export_params {
         if let (Some(sink), Some(location)) =
             (parameter.type_expr_opt(), parameter.value_location())
@@ -4261,6 +4273,16 @@ mod judgement {
         pub(crate) fn loop_selector_owns_failure(&self) -> bool {
             self.selector_failure.is_some()
         }
+        pub(crate) fn reported_loop_selector_failure(&self) -> bool {
+            self.loop_selector_owns_failure()
+                && self.check_owner() == ExpressionCheckOwner::Reported
+        }
+        /// The unannotated export owns this selector rejection. Other
+        /// boundary checks must not resolve its provisional value again.
+        pub fn export_inference_owns_failure(&self) -> bool {
+            self.loop_selector_owns_failure()
+                && matches!(self.failure(), Some((_, FailureOwner::Boundary)))
+        }
         pub fn check_owner(&self) -> ExpressionCheckOwner {
             match &self.judgement {
                 ExprJudgement::Failed { owner, .. }
@@ -5864,6 +5886,25 @@ mod judgement {
     where
         D: super::super::DeferredForPhaseTraversal<P, T, B>,
     {
+        judge_expressions_with_export_owners(file, schemas, config, upstream, &[])
+    }
+
+    pub(super) fn judge_expressions_with_export_owners<
+        E,
+        P: crate::resource::PlaceholderKind,
+        T: crate::resource::PlaceholderKind,
+        D,
+        B: BindingAddress,
+    >(
+        file: &super::super::File<E, P, T, D, B>,
+        schemas: &crate::schema::SchemaRegistry,
+        config: &super::super::ProviderContext,
+        upstream: Option<&crate::upstream_exports::UpstreamExports<B>>,
+        inferred_exports: &[DeclarationLocation],
+    ) -> ExpressionReport<B>
+    where
+        D: super::super::DeferredForPhaseTraversal<P, T, B>,
+    {
         let expressions = file.parser_binding_metadata.syntax().expressions();
         let mut bindings = inference::bindings_from_parsed(file);
         for wait in &file.wait_bindings {
@@ -5897,6 +5938,39 @@ mod judgement {
             .chain(expressions.definitions.values())
         {
             index_authored(expression, &mut authored, &mut visited, &mut pending);
+        }
+        // An unannotated export owns failures of its inline loop selectors,
+        // just as it owns subscript inference failures. Follow authored nodes
+        // only; a referenced definition keeps its own diagnostic producer.
+        let definition_nodes = expressions
+            .definitions
+            .values()
+            .map(|expression| {
+                (
+                    expression.authored.location.instance.clone(),
+                    expression.node_id(),
+                )
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let mut inferred_export_nodes = std::collections::HashSet::new();
+        for location in inferred_exports {
+            if let Some(expression) = authored.get(&ExpressionLocation::new(
+                expressions.instance.clone(),
+                location,
+            )) {
+                pending.push(*expression);
+            }
+            while let Some(expression) = pending.pop() {
+                if inferred_export_nodes.insert((
+                    expression.authored.location.instance.clone(),
+                    expression.node_id(),
+                )) {
+                    pending.extend(expression.authored.children.iter().filter(|child| {
+                        !definition_nodes
+                            .contains(&(child.authored.location.instance.clone(), child.node_id()))
+                    }));
+                }
+            }
         }
         let mut functions = HashMap::new();
         let mut function_nodes = std::collections::HashSet::new();
@@ -5943,6 +6017,7 @@ mod judgement {
                 .collect(),
             functions,
             function_nodes,
+            inferred_export_nodes,
             schemas,
             config,
             memo: HashMap::new(),
@@ -6156,6 +6231,7 @@ mod judgement {
         functions: HashMap<(ExpressionInstance, String), Arc<FunctionSignature>>,
         // Function bodies and defaults retain main's ordinary reference rules.
         function_nodes: std::collections::HashSet<(ExpressionInstance, NodeId)>,
+        inferred_export_nodes: std::collections::HashSet<(ExpressionInstance, NodeId)>,
         schemas: &'a crate::schema::SchemaRegistry,
         config: &'a super::super::ProviderContext,
         memo: HashMap<(usize, DiagnosticScope, JudgementDemand), JudgedExpr>,
@@ -6661,7 +6737,22 @@ mod judgement {
                 result.data_mut().boundary_owner = failed.boundary_owner.clone();
                 result.data_mut().selector_failure = failed.selector_failure;
             }
-            if let ExprJudgement::Failed {
+            if result.loop_selector_owns_failure()
+                && self
+                    .inferred_export_nodes
+                    .contains(&(root.location.instance.clone(), root.id))
+                && matches!(
+                    result.judgement,
+                    ExprJudgement::Failed {
+                        owner: FailureOwner::Expression,
+                        ..
+                    }
+                )
+            {
+                // Keep the failed type for inference, without producing an
+                // expression diagnostic alongside the export-owned failure.
+                result.report_at(FailureOwner::Boundary);
+            } else if let ExprJudgement::Failed {
                 error,
                 owner: FailureOwner::Expression,
             } = &result.judgement

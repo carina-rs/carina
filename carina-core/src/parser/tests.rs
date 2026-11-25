@@ -22657,6 +22657,51 @@ fn loop_dot_functions_keep_main_unselected_references() {
 }
 
 #[test]
+fn loop_dot_non_loop_namespaced_references_keep_main_dependency_origins() {
+    for expression in [
+        "r.name",
+        "r.tags['k']",
+        "\"${r.name}\"",
+        "r.name ?? 'fallback'",
+    ] {
+        let source = format!(
+            "let r = mock.test.Source {{ name = 'source' tags = {{ k = 'tag' }} }}\nlet other = mock.test.Source {{ name = {expression} }}"
+        );
+        let parsed = parse(
+            &source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let other = parsed
+            .resources
+            .iter()
+            .find(|resource| {
+                resource
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.as_str() == "other")
+            })
+            .unwrap();
+        // Ordinary attribute references have reference origins. Bare-binding
+        // origins belong to structural values, not namespaced attribute reads.
+        assert!(
+            other
+                .dependencies
+                .depends_on
+                .binding_reference_origins()
+                .is_empty(),
+            "{expression}: {:?}",
+            other.dependencies.depends_on.binding_reference_origins()
+        );
+        assert_eq!(
+            other.dependencies.depends_on.reference_origins().len(),
+            1,
+            "{expression}"
+        );
+    }
+}
+
+#[test]
 fn loop_dot_selects_the_key_before_the_resource_attribute() {
     for (pattern, iterable) in [("k, item", "({ name = 'x' })"), ("item", "['name']")] {
         for reader in ["children.name.name", "children['name'].name"] {

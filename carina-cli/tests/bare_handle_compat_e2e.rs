@@ -537,12 +537,15 @@ fn indexed_loop_dot_reader_is_list_access_error_in_every_position() {
     let mut failures = Vec::new();
     for key in ["a", "zzz"] {
         let reader = format!("children.{key}.name");
-        let expected = vec![format!(
-            "cannot apply access .{key} to list(mock.test.resource)"
-        )];
+        let error = format!("cannot apply access .{key} to list(mock.test.resource)");
         for (position, expression) in keyed_loop_reader_positions(&reader) {
             write_keyed_loop_reader(fixture.path(), position, &expression);
             let (errors, _) = validate_diagnostic_messages(fixture.path());
+            let expected = vec![if position == "export plain" {
+                format!("./exports.crn:1:11: export 'out': type annotation required: {error}")
+            } else {
+                error.clone()
+            }];
             if errors != expected {
                 failures.push(format!(
                     "indexed, {position}, {reader}: errors {errors:?}, expected {expected:?}"

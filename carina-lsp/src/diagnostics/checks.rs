@@ -1622,6 +1622,11 @@ impl DiagnosticRun<'_> {
                 continue;
             }
 
+            if expression.export_inference_owns_failure() {
+                // Inference owns the terminal selector error. Resolving its
+                // provisional value here would create another export finding.
+                continue;
+            }
             let message = match expanded_values.as_ref() {
                 Some((graph, bindings)) => graph
                     .export_params

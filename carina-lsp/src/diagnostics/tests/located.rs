@@ -10,6 +10,125 @@ fn loop_dot_case_table_diagnostics_match_validate() {
 }
 
 #[test]
+fn loop_dot_case_table_module_internal_rejections_are_reported_once() {
+    let directory = Directory::new(&[]);
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let root = directory.root.path();
+    let mut failures = Vec::new();
+    for row in loop_dot_cases::rows()
+        .into_iter()
+        .filter(|row| matches!(row.id, "2-3" | "2-11" | "2-13"))
+    {
+        loop_dot_cases::module_fixture(root, &row);
+        let loop_dot_cases::Outcome::Error(expected) = row.expected else {
+            unreachable!("rejected selector row");
+        };
+        for &position in &loop_dot_cases::POSITIONS[..7] {
+            let owner = loop_dot_cases::module_reader(root, position, row.reader);
+            let path = root.join(&owner);
+            let source = std::fs::read_to_string(&path).unwrap();
+            let direct = engine
+                .analyze(&create_document_at(&source, path.clone()), Some(&path))
+                .into_iter()
+                .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|finding| finding.message)
+                .collect::<Vec<_>>();
+            if direct != expected {
+                failures.push(format!("{}, {:?}, module-internal {position}, {}: {direct:?}, expected exactly {expected:?}", row.id, row.kind, row.reader));
+            }
+            let path = root.join("main.crn");
+            let source = std::fs::read_to_string(&path).unwrap();
+            let diagnostics = engine.analyze_document_set(
+                &create_document_at(&source, path.clone()),
+                Some(&path),
+                &[],
+            );
+            let errors = diagnostics
+                .iter()
+                .flat_map(|(path, findings)| {
+                    findings
+                        .iter()
+                        .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
+                        .map(move |finding| (path.clone(), finding.message.clone()))
+                })
+                .collect::<Vec<_>>();
+            // Import resolution already reports one wrapped parse error at
+            // the caller. Preserve that path as well as the direct module view.
+            if errors.len() != 1 || !errors[0].1.ends_with(expected[0]) {
+                failures.push(format!("{}, {:?}, imported module-internal {position}, {}: {errors:?}, expected exactly one {expected:?}", row.id, row.kind, row.reader));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn loop_dot_case_table_export_rejection_diagnostics() {
+    let directory = Directory::new(&[]);
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let root = directory.root.path();
+    let mut rows = loop_dot_cases::rows()
+        .into_iter()
+        .filter(|row| matches!(row.id, "2-3" | "2-10" | "2-11" | "2-12" | "2-13"))
+        .collect::<Vec<_>>();
+    rows.push(loop_dot_cases::Row {
+        id: "subscript",
+        kind: loop_dot_cases::Kind::Map,
+        key: "0",
+        reader: "children[0].name",
+        positions: &["export plain"],
+        expected: loop_dot_cases::Outcome::Error(&["cannot apply access [0] to keyed loop group"]),
+    });
+    for row in rows {
+        loop_dot_cases::fixture(root, &row);
+        let owner = loop_dot_cases::reader(root, "export plain", row.reader);
+        let loop_dot_cases::Outcome::Error([error]) = row.expected else {
+            unreachable!("one rejected selector");
+        };
+        let mut expected = vec![serde_json::json!({
+            "range": { "start": { "line": 0, "character": 10 }, "end": { "line": 0, "character": 13 } },
+            "severity": 2,
+            "source": "carina",
+            "message": format!("export 'out': type annotation required: {error}"),
+        })];
+        if row.id == "subscript" {
+            // Main's invalid map subscript also has an independent scope
+            // error. Keep that existing behavior while pinning its export record.
+            expected.insert(0, serde_json::json!({
+                "range": { "start": { "line": 0, "character": 16 }, "end": { "line": 0, "character": 32 } },
+                "severity": 1,
+                "source": "carina",
+                "message": "Undefined resource: 'children[0]'. Define it with 'let children[0] = aws...'",
+            }));
+        }
+        assert_eq!(
+            observe_complete_diagnostics(&engine, root, owner),
+            serde_json::Value::Array(expected),
+            "{}, {:?}, {}",
+            row.id,
+            row.kind,
+            row.reader,
+        );
+    }
+}
+
+#[test]
 fn loop_dot_review_round3_function_diagnostics() {
     run_loop_dot_case_table(|row| matches!(row.id, "2-24" | "2-25"));
 }
@@ -340,13 +459,23 @@ fn run_loop_dot_case_table(include: impl Fn(&loop_dot_cases::Row) -> bool) {
                 );
                 continue;
             }
-            let dot = observe(owner, row.id == "2-23");
+            let dot = observe(
+                owner,
+                row.id == "2-23" || loop_dot_cases::inferred_selector_export(&row, position),
+            );
             let expected = match row.expected {
                 loop_dot_cases::Outcome::MainFunction => unreachable!("main records checked above"),
                 loop_dot_cases::Outcome::Validates => Vec::new(),
-                loop_dot_cases::Outcome::Error(errors) => {
-                    errors.iter().map(|error| (*error).to_owned()).collect()
-                }
+                loop_dot_cases::Outcome::Error(errors) => errors
+                    .iter()
+                    .map(|error| {
+                        if loop_dot_cases::inferred_selector_export(&row, position) {
+                            format!("export 'out': type annotation required: {error}")
+                        } else {
+                            (*error).to_owned()
+                        }
+                    })
+                    .collect(),
                 loop_dot_cases::Outcome::SurfaceErrors { cli, lsp } => {
                     assert_ne!(cli, lsp, "each surface preserves main's wording");
                     lsp.iter().map(|error| (*error).to_owned()).collect()

@@ -70,6 +70,157 @@ fn loop_dot_case_table() {
 }
 
 #[test]
+fn loop_dot_case_table_module_internal_rejections_are_reported_once() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let mut failures = Vec::new();
+    for row in cases::rows()
+        .into_iter()
+        .filter(|row| matches!(row.id, "2-3" | "2-11" | "2-13"))
+    {
+        cases::module_fixture(root, &row);
+        assert!(run(root, &["init", "."]).status.success());
+        let cases::Outcome::Error(expected) = row.expected else {
+            unreachable!("rejected selector row");
+        };
+        for &position in &cases::POSITIONS[..7] {
+            let owner = cases::module_reader(root, position, row.reader);
+            let source = std::fs::read_to_string(root.join(&owner)).unwrap();
+            let column = source.find(row.reader).unwrap() + 1;
+            let output = run(root, &["validate", ".", "--json"]);
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let expected = serde_json::json!([{
+                "message": expected[0],
+                "severity": "error",
+                "code": null,
+                "location": {
+                    "file": owner,
+                    "range": {
+                        "start": { "line": 1, "column": column },
+                        "end": { "line": 1, "column": column + row.reader.len() },
+                    },
+                },
+            }]);
+            if output.status.code() != Some(1) || report["errors"] != expected {
+                failures.push(format!(
+                    "{}, {:?}, module-internal {position}, {}: {}, expected exactly {expected}",
+                    row.id, row.kind, row.reader, report["errors"]
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn loop_dot_case_table_export_rejection_rendering() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let mut failures = Vec::new();
+    for row in cases::rows()
+        .into_iter()
+        .filter(|row| matches!(row.id, "2-3" | "2-10" | "2-11" | "2-12" | "2-13"))
+    {
+        cases::fixture(root, &row);
+        let source = std::fs::read_to_string(root.join("main.crn")).unwrap();
+        cases::write(
+            root,
+            "main.crn",
+            &source
+                .replace("k, v in", "_, v in")
+                .replace("(i, v) in", "(_, v) in"),
+        );
+        assert!(run(root, &["init", "."]).status.success());
+        let cases::Outcome::Error([error]) = row.expected else {
+            unreachable!("one rejected selector");
+        };
+        cases::reader(root, "export plain", row.reader);
+        let expected_message =
+            format!("./exports.crn:1:11: export 'out': type annotation required: {error}");
+        let output = run(root, &["validate", ".", "--json"]);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let expected = serde_json::json!([{
+            "message": expected_message,
+            "severity": "error",
+            "code": null,
+            "location": null,
+        }]);
+        if report["errors"] != expected {
+            failures.push(format!(
+                "{}, {:?}, {}: JSON {} != {expected}",
+                row.id, row.kind, row.reader, report["errors"]
+            ));
+        }
+        let output = run(root, &["validate", "."]);
+        let expected_text = format!("Validating...\nError: {expected_message}\n");
+        let actual_text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if actual_text != expected_text {
+            failures.push(format!(
+                "{}, {:?}, {}: text {actual_text:?} != {expected_text:?}",
+                row.id, row.kind, row.reader
+            ));
+        }
+    }
+    // The established subscript rejection uses the same export inference path.
+    let row = cases::rows()
+        .into_iter()
+        .find(|row| row.id == "2-11" && row.kind == cases::Kind::Map)
+        .unwrap();
+    cases::fixture(root, &row);
+    let source = std::fs::read_to_string(root.join("main.crn")).unwrap();
+    cases::write(root, "main.crn", &source.replace("k, v in", "_, v in"));
+    cases::reader(root, "export plain", "children[0].name");
+    let message = "./exports.crn:1:11: export 'out': type annotation required: cannot apply access [0] to keyed loop group";
+    let output = run(root, &["validate", ".", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["errors"],
+        serde_json::json!([{
+            "message": message,
+            "severity": "error",
+            "code": null,
+            "location": null,
+        }])
+    );
+    let output = run(root, &["validate", "."]);
+    assert_eq!(
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        format!("Validating...\nError: {message}\n")
+    );
+    // Other rejected export rows already share their producer with bracket
+    // spelling. Compare the complete terminal records to prevent a shape split.
+    for row in cases::rows()
+        .into_iter()
+        .filter(|row| matches!(row.id, "2-2" | "2-4" | "2-15"))
+    {
+        cases::fixture(root, &row);
+        let subscript = match row.id {
+            "2-2" => "children['zzz'].name",
+            "2-4" => "children['a']",
+            "2-15" => "children['a'].b.name",
+            _ => unreachable!(),
+        };
+        let mut rendered = Vec::new();
+        for reader in [row.reader, subscript] {
+            cases::reader(root, "export plain", reader);
+            let output = run(root, &["validate", "."]);
+            assert_eq!(output.status.code(), Some(1), "{row:?}, {reader}");
+            rendered.push((output.stdout, output.stderr));
+        }
+        assert_eq!(rendered[0], rendered[1], "{row:?}");
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
 fn loop_dot_review_round3_bare_function_condition() {
     run_case_table(|row| row.id == "2-25");
 }
@@ -199,6 +350,13 @@ fn run_case_table(include: impl Fn(&cases::Row) -> bool) {
                 cases::Outcome::Validates if !dot.0 => failures.push(format!("{label}: {dot:?}")),
                 cases::Outcome::Validates => {}
                 cases::Outcome::Error(expected) => {
+                    let expected = expected.iter().map(|message| {
+                        if cases::inferred_selector_export(&row, position) {
+                            format!("./exports.crn:1:11: export 'out': type annotation required: {message}")
+                        } else {
+                            (*message).to_owned()
+                        }
+                    }).collect::<Vec<_>>();
                     if dot.0 || dot.1 != expected {
                         failures.push(format!("{label}: {dot:?}, expected {expected:?}"));
                     }

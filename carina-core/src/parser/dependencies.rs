@@ -276,6 +276,11 @@ impl UnexpandedDependencies<RelativeBindingName> {
                     (RelativeBindingName::new(name), None)
                 }
             };
+            // Namespaced syntax was added for loop selection only. Ordinary
+            // variable_ref origins retain their existing main-branch path.
+            if reference.as_rule() == super::Rule::namespaced_id && group.is_none() {
+                continue;
+            }
             if !bindings.contains(&crate::resource::DependencyKey::new(binding.clone()))
                 && !bindings
                     .iter()

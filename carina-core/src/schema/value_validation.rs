@@ -2676,6 +2676,15 @@ fn validate_authored_value_with_callbacks<
     reference: Option<ReferenceCheck<'_, B>>,
     coverage: &mut WalkCoverage,
 ) -> ValueValidationFindings {
+    if let CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) = &cursor.kind
+        && usage.node().judgement().reported_loop_selector_failure()
+    {
+        // A rejected loop operand is terminal. The retained judge owns its
+        // diagnostic; admitting its provisional projection would create a
+        // second computed/reference error (notably in module preflight).
+        coverage.record(usage);
+        return ValueValidationFindings::default().retained_failure();
+    }
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
     let callbacks = callbacks.into();
     let policy = reference.map(|reference| ReferencePolicy::new(callbacks.ordinary, reference));

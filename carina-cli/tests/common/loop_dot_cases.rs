@@ -48,6 +48,10 @@ pub const POSITIONS: &[&str] = &[
     "module argument",
 ];
 
+pub fn inferred_selector_export(row: &Row, position: &str) -> bool {
+    position == "export plain" && matches!(row.id, "2-3" | "2-10" | "2-11" | "2-12" | "2-13")
+}
+
 pub fn rows() -> Vec<Row> {
     use Kind::*;
     use Outcome::*;
@@ -396,6 +400,31 @@ pub fn write(root: &Path, name: &str, source: &str) {
     let path = root.join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, source).unwrap();
+}
+
+/// Instantiate the same loop in a module with declarations and readers in
+/// separate files, so validation also visits the expanded resource values.
+pub fn module_fixture(root: &Path, row: &Row) {
+    fixture(root, row);
+    let declarations = std::fs::read_to_string(root.join("main.crn")).unwrap();
+    write(root, "internal/loops.crn", &declarations);
+    write(
+        root,
+        "internal/arguments.crn",
+        "arguments { value: String }\n",
+    );
+    write(
+        root,
+        "main.crn",
+        "let internal = use { source = './internal' }\nlet instance = internal { value = 'x' }\n",
+    );
+}
+
+pub fn module_reader(root: &Path, position: &str, expression: &str) -> String {
+    let module = root.join("internal");
+    let owner = reader(&module, position, expression);
+    write(&module, "exports.crn", "");
+    format!("internal/{owner}")
 }
 
 pub fn fixture(root: &Path, row: &Row) {
