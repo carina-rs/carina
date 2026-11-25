@@ -26,6 +26,8 @@ use crate::{
 
 mod engine;
 pub(crate) use engine::DefinitionMemo;
+#[cfg(test)]
+pub(crate) use engine::with_function_definition_inspect_count;
 use engine::{LeafInput, Parts, ScalarInput, dispatch};
 mod bound_transform;
 use bound_transform::{BoundTransform, PublicTransform, TransformOutput};

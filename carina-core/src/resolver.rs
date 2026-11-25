@@ -17,6 +17,22 @@ use crate::resource::{
     PlanInputCurrent, Resource, ResourceId, Value, ValueAccessError, ValuePathSegmentResult,
 };
 
+#[cfg(test)]
+thread_local! {
+    static RUNTIME_FUNCTION_DEFINITION_WALK_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_runtime_function_definition_walk_count<T>(
+    run: impl FnOnce() -> T,
+) -> (T, usize) {
+    RUNTIME_FUNCTION_DEFINITION_WALK_COUNT.with(|count| {
+        count.set(0);
+        let result = run();
+        (result, count.replace(0))
+    })
+}
+
 /// Failure to evaluate a reference after selecting its historical input.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ResolutionError {
@@ -1301,6 +1317,8 @@ fn evaluate_runtime_user_function_in<B: BindingAddress>(
     call_line: usize,
     definitions: &crate::value_walk::DefinitionMemo<B>,
 ) -> Result<Value<crate::resource::ParserPlaceholder, B>, crate::parser::ParseError> {
+    #[cfg(test)]
+    RUNTIME_FUNCTION_DEFINITION_WALK_COUNT.with(|count| count.set(count.get() + 1));
     let runtime = ResolutionContext {
         runtime: RuntimeContext::Session(config),
         definitions,

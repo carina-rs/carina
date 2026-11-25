@@ -10,6 +10,20 @@ use crate::{
 pub(crate) use definitions::DefinitionMemo;
 use definitions::FunctionSource;
 
+#[cfg(test)]
+thread_local! {
+    static FUNCTION_DEFINITION_INSPECT_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_function_definition_inspect_count<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    FUNCTION_DEFINITION_INSPECT_COUNT.with(|count| {
+        count.set(0);
+        let result = run();
+        (result, count.replace(0))
+    })
+}
+
 /// Scalar fields retain their variant in the type carrying their payload. No
 /// cursor stores a separate tag plus a raw Value that needs projecting again.
 pub(super) enum ScalarInput<'v, M: WalkMode> {
@@ -478,6 +492,8 @@ fn inspect_function<'v, B: BindingAddress, A: Algebra<Inspect>>(
     algebra: &mut A,
     output: &mut Vec<A::Output>,
 ) -> Result<(), WalkError> {
+    #[cfg(test)]
+    FUNCTION_DEFINITION_INSPECT_COUNT.with(|count| count.set(count.get() + 1));
     for (edge, value) in function_values(function) {
         inspect_value(value, at.operand(edge), algebra, output)?;
     }

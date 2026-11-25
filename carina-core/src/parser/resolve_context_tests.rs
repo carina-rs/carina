@@ -77,32 +77,27 @@ fn share_fn_assert_polynomial_on_thread(shape: ShareFnShape, directory: bool) {
     let mut previous = None;
     for depth in [2, 4, 8, 12] {
         let counts = share_fn_counts(shape, depth, directory);
-        eprintln!(
-            "share_fn_counts shape={shape:?} directory={directory} depth={depth} binding={} transform={}",
-            counts.0, counts.1
-        );
         if let Some((old_depth, (bindings, transforms))) = previous {
-            // Doubling depth allows fourth-degree growth with headroom. Repeated
-            // walks per call occurrence grow exponentially even for these DAGs.
+            // Measured doubling ratios stay below 6.2, leaving headroom at 8.
+            // Pure c*2^depth growth has a ratio of 16 from depth 4 to 8 and fails.
             if depth == 2 * old_depth {
                 assert!(
-                    counts.0 <= bindings * 16,
-                    "{shape:?} binding mappings must grow polynomially: depth {old_depth}: {bindings}, depth {depth}: {}",
+                    counts.0 <= bindings * 8,
+                    "{shape:?} directory={directory} binding mappings must grow polynomially: depth {old_depth}: {bindings}, depth {depth}: {}",
                     counts.0
                 );
                 assert!(
-                    counts.1 <= transforms * 16,
-                    "{shape:?} transform definition walks must grow polynomially: depth {old_depth}: {transforms}, depth {depth}: {}",
+                    counts.1 <= transforms * 8,
+                    "{shape:?} directory={directory} transform definition walks must grow polynomially: depth {old_depth}: {transforms}, depth {depth}: {}",
                     counts.1
                 );
             }
         }
-        // At depth 8 the fixed code maps at most 51,985 definitions and walks
-        // 124. These caps allow cubic/quadratic growth to depth 12 with room;
-        // the doubling-depth checks above reject the exponential regression.
+        // At depth 12 the fixed code maps at most 158,569 definitions and walks
+        // 258. These caps leave at least 1.5x headroom over those measured maxima.
         assert!(
             counts.0 < 250_000 && counts.1 < 1_024,
-            "{shape:?} definition walks at depth {depth} must stay bounded: {counts:?}"
+            "{shape:?} directory={directory} definition walks at depth {depth} must stay bounded: {counts:?}"
         );
         previous = Some((depth, counts));
     }
@@ -131,6 +126,180 @@ fn share_fn_join_definition_walks_grow_polynomially() {
 #[test]
 fn share_fn_directory_sibling_definition_walks_grow_polynomially() {
     share_fn_assert_polynomial(ShareFnShape::Interpolation, true);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ShareFnWalkCounts {
+    bindings: usize,
+    transforms: usize,
+    inspections: usize,
+    runtime: usize,
+    knowledge: usize,
+}
+
+fn share_fn_walk_counts(run: impl FnOnce()) -> ShareFnWalkCounts {
+    let ((((((), bindings), transforms), inspections), runtime), knowledge) =
+        crate::resource::knowledge::with_function_definition_knowledge_count(|| {
+            crate::resolver::with_runtime_function_definition_walk_count(|| {
+                crate::value_walk::with_function_definition_inspect_count(|| {
+                    crate::value_walk::with_function_definition_walk_count(|| {
+                        with_user_function_binding_map_count(run)
+                    })
+                })
+            })
+        });
+    ShareFnWalkCounts {
+        bindings,
+        transforms,
+        inspections,
+        runtime,
+        knowledge,
+    }
+}
+
+fn share_fn_retained_counts(shape: ShareFnShape, depth: usize) -> ShareFnWalkCounts {
+    use crate::binding_index::BindingIndex;
+    use crate::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, SchemaRegistry,
+    };
+
+    let definitions = share_fn_definitions(depth, shape).join("\n");
+    let source = format!(
+        "arguments {{ input: String }}\n{definitions}\nlet v = f{depth}(input)\nlet sink = mock.test.Sink {{ value = \"prefix-${{v}}\" }}\n"
+    );
+    let config = context();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Sink")
+            .attribute(
+                PatternAttributeSchema::optional("value", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    share_fn_walk_counts(|| {
+        let mut parsed = crate::parser::parse(&source, &config).unwrap();
+        assert!(
+            matches!(
+                &parsed.variables["v"],
+                Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. })
+                    if function.name == format!("f{depth}")
+                    && args[0].pending_parameter() == Some("input")
+            ),
+            "{shape:?} depth {depth}: the unknown module argument must retain the call"
+        );
+        let mut call = &parsed.variables["v"];
+        for level in (0..=depth).rev() {
+            let Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) = call else {
+                panic!("{shape:?} depth {depth}: f{level} must remain in the captured call chain")
+            };
+            assert_eq!(function.name, format!("f{level}"));
+            call = match &function.body.value {
+                Value::Deferred(DeferredValue::Coalesce { value, .. }) => value,
+                Value::Deferred(DeferredValue::ModuleIf(conditional)) => conditional.then_value(),
+                body => body,
+            };
+        }
+
+        crate::validation::deferred_types::with_session_for_test(&config, |session| {
+            let report =
+                crate::validation::resolve_file_type_exprs_report(&mut parsed, session, None)
+                    .unwrap();
+            assert!(
+                report.diagnostics().is_empty(),
+                "{shape:?} depth {depth}: {:?}",
+                report.diagnostics()
+            );
+            crate::parser::resolve_resource_refs_in_session(&mut parsed, session).unwrap();
+        });
+        let bindings = BindingIndex::from_parsed(&parsed, &schemas, &config);
+        crate::validation::validate_user_function_ref_types_with_bindings(&parsed, &bindings)
+            .unwrap();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config);
+        assert!(
+            configuration.judged().report().findings().is_empty(),
+            "{shape:?} depth {depth}: {:?}",
+            configuration.judged().report().findings()
+        );
+        let findings = configuration
+            .judged()
+            .function_type_promise_findings(&bindings);
+        assert!(findings.is_empty(), "{shape:?} depth {depth}: {findings:?}");
+
+        let resolved = parsed.resolve_root_for_test();
+        crate::test_utils::legacy_validate_resources(
+            &resolved,
+            &schemas,
+            &std::collections::HashSet::from(["mock".to_string()]),
+            &config,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &resolved.variables["v"],
+                GenericValue::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+            ),
+            "{shape:?} depth {depth}: validation must keep the unknown call deferred"
+        );
+    })
+}
+
+fn share_fn_assert_retained_polynomial(shape: ShareFnShape) {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let mut counts = Vec::new();
+            // The coalesce DAG needs a smaller first sample to expose a
+            // regression by count before reaching its much larger depth 8.
+            let depths: &[usize] = if matches!(shape, ShareFnShape::Coalesce) {
+                &[2, 4, 8, 12]
+            } else {
+                &[4, 8, 12]
+            };
+            for &depth in depths {
+                let current = share_fn_retained_counts(shape, depth);
+                counts.push((depth, current));
+                if counts.len() > 1 {
+                    let (old_depth, old) = counts[counts.len() - 2];
+                    // These intervals allow cubic growth up to 8x, while pure
+                    // c*2^depth growth gives 16x from depth 4 to 8.
+                    for (traversal, old_count, count) in [
+                        ("binding", old.bindings, current.bindings),
+                        ("transform", old.transforms, current.transforms),
+                        ("Inspect", old.inspections, current.inspections),
+                        ("runtime", old.runtime, current.runtime),
+                        ("knowledge", old.knowledge, current.knowledge),
+                    ] {
+                        assert!(
+                            count <= old_count * 8,
+                            "{shape:?} retained {traversal} definition walks must grow polynomially: depth {old_depth}: {old_count}, depth {depth}: {count}; all counts: {counts:?}"
+                        );
+                    }
+                }
+                assert!(
+                    current.inspections > 0,
+                    "{shape:?} retained calls must exercise Inspect: {counts:?}"
+                );
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+#[ignore = "#4495 retained chain: Inspect grows exponentially"]
+fn share_fn_retained_coalesce_definition_walks_grow_polynomially() {
+    share_fn_assert_retained_polynomial(ShareFnShape::Coalesce);
+}
+
+#[test]
+#[ignore = "#4495 retained chain: Inspect grows exponentially"]
+fn share_fn_retained_conditional_definition_walks_grow_polynomially() {
+    share_fn_assert_retained_polynomial(ShareFnShape::Conditional);
 }
 
 #[test]
