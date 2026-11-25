@@ -32,7 +32,6 @@ fn loop_dot_reported_selector_after_another_failure_is_reported_once() {
             .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
             .map(|finding| finding.message)
             .collect::<Vec<_>>();
-        eprintln!("input (i), module={module}, direct: {direct:?}");
         if direct != case.errors {
             failures.push(format!(
                 "module={module}, direct: {direct:?}, expected exactly {:?}",
@@ -55,7 +54,6 @@ fn loop_dot_reported_selector_after_another_failure_is_reported_once() {
             .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
             .map(|finding| finding.message.as_str())
             .collect::<Vec<_>>();
-        eprintln!("input (i), importing: {imported:?}");
         if imported.len() != 1
             || !imported[0].ends_with(case.errors[0])
             || imported[0].matches(case.errors[0]).count() != 1

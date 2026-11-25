@@ -82,6 +82,39 @@ fn loop_dot_reported_selector_after_another_failure_is_reported_once() {
     assert_reported_selector_errors([reported_selector_cases::input_i()]);
 }
 
+#[test]
+fn loop_dot_reported_selector_stops_type_mismatch_in_same_attribute() {
+    for case in [
+        reported_selector_cases::Case {
+            id: "selector-stops-type-mismatch",
+            declaration: "let children = for (_, item) in ['a'] { mock.test.resource { name = item } }\n",
+            attributes: "name = 'y' tags = { a = children.a.name, d = 1 }",
+            errors: &["cannot apply access .a to list(mock.test.resource)"],
+        },
+        reported_selector_cases::Case {
+            id: "fixed-selector-reveals-type-mismatch",
+            declaration: "let children = for (_, item) in ['a'] { mock.test.resource { name = item } }\n",
+            attributes: "name = 'y' tags = { a = children[0].name, d = 1 }",
+            errors: &["expected String, got Int"],
+        },
+    ] {
+        for module in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path();
+            let owner = reported_selector_cases::fixture(root, &case, module);
+            cases::write(
+                root,
+                owner,
+                &format!("mock.test.resource {{ {} }}\n", case.attributes),
+            );
+            assert!(run(root, &["init", "."]).status.success());
+            let (success, errors) = diagnostics(root);
+            assert!(!success, "{}, module={module}", case.id);
+            assert_eq!(errors, case.errors, "{}, module={module}", case.id);
+        }
+    }
+}
+
 fn assert_reported_selector_errors(cases: impl IntoIterator<Item = reported_selector_cases::Case>) {
     let mut failures = Vec::new();
     for case in cases {
@@ -94,7 +127,6 @@ fn assert_reported_selector_errors(cases: impl IntoIterator<Item = reported_sele
             let mut expected = case.errors.to_vec();
             errors.sort();
             expected.sort();
-            eprintln!("{}, module={module}: {errors:?}", case.id);
             if success || errors != expected {
                 failures.push(format!(
                     "{}, module={module}: {errors:?}, expected exactly {expected:?}",
