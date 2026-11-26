@@ -47,6 +47,8 @@ pub mod executor;
 pub mod explicit;
 pub mod finding;
 pub mod formatter;
+#[cfg(test)]
+mod function_memo_test;
 pub mod github_auth;
 pub mod heredoc;
 pub mod hint;
