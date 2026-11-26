@@ -128,13 +128,23 @@ pub(super) fn rewrite_parser_value<B: BindingAddress, R: ParserRewrite<B>>(
     position: RewritePosition,
     policy: &mut R,
 ) -> Result<Value<ParserPlaceholder, B>, R::Error> {
-    let mut algebra = ParserTransform::new(policy, position);
+    rewrite_parser_value_in(value, position, policy, &DefinitionMemo::default())
+}
+
+fn rewrite_parser_value_in<B: BindingAddress, R: ParserRewrite<B>>(
+    value: &Value<ParserPlaceholder, B>,
+    position: RewritePosition,
+    policy: &mut R,
+    definitions: &DefinitionMemo<B>,
+) -> Result<Value<ParserPlaceholder, B>, R::Error> {
+    let mut algebra = ParserTransform::new(policy, position, definitions);
     engine::dispatch_bound(value.clone(), WalkRoot::syntactic().at(), &mut algebra)
         .map(|product| product.value)
         .map_err(|error| algebra.take_error(error))
 }
 
 struct ParserTransform<'a, R, E, B: BindingAddress> {
+    function_memo: DefinitionMemo<B>,
     binding: PhantomData<B>,
     policy: &'a mut R,
     error: Option<E>,
@@ -178,8 +188,9 @@ impl<R, E: InsideSecret, B: BindingAddress> ParserTransform<'_, R, E, B> {
 }
 
 impl<'a, B: BindingAddress, R: ParserRewrite<B>> ParserTransform<'a, R, R::Error, B> {
-    fn new(policy: &'a mut R, position: RewritePosition) -> Self {
+    fn new(policy: &'a mut R, position: RewritePosition, definitions: &DefinitionMemo<B>) -> Self {
         Self {
+            function_memo: definitions.clone(),
             policy,
             error: None,
             position,
@@ -396,6 +407,13 @@ impl<'a, B: BindingAddress, R: ParserRewrite<B>> ParserTransform<'a, R, R::Error
 impl<B: BindingAddress, R: ParserRewrite<B>> BoundTransform<ParserPlaceholder, B>
     for ParserTransform<'_, R, R::Error, B>
 {
+    fn function_memo(&self) -> Option<DefinitionMemo<B>> {
+        // The engine installs definition edges before this memo is consulted.
+        // Under those edges every semantic hook is suppressed, output is (),
+        // and the unchanged definition's secret discovery is the only fact.
+        Some(self.function_memo.clone())
+    }
+
     fn scalar(
         &mut self,
         _: &At<'_>,
@@ -645,7 +663,11 @@ mod argument_tests {
         let at = WalkRoot::syntactic().at();
         let encountered = at.encountered_secret.clone();
         let mut policy = ReplaceArgument;
-        let mut algebra = ParserTransform::new(&mut policy, RewritePosition::Value);
+        let mut algebra = ParserTransform::new(
+            &mut policy,
+            RewritePosition::Value,
+            &DefinitionMemo::default(),
+        );
         assert!(engine::dispatch_bound(value, at, &mut algebra).is_ok());
         assert!(encountered.get());
     }

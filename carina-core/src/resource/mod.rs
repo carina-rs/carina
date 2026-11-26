@@ -10,6 +10,8 @@
 //! public live resource identities.
 
 pub(crate) mod binding_address;
+mod binding_map;
+pub(crate) use binding_map::BindingMapper;
 mod dependencies;
 pub use dependencies::{
     DeferredDependencyPhase, DeferredDependencyTemplate, NotAManagedRow,
@@ -6755,9 +6757,16 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         self,
         map: &mut impl FnMut(B) -> T,
     ) -> Value<P, T> {
+        self.map_bindings_in(&mut BindingMapper::new(map))
+    }
+
+    pub(crate) fn map_bindings_in<T: BindingAddress>(
+        self,
+        map: &mut BindingMapper<'_, B, T>,
+    ) -> Value<P, T> {
         match self {
-            Value::Concrete(value) => Value::Concrete(value.map_bindings(map)),
-            Value::Deferred(value) => Value::Deferred(value.map_bindings(map)),
+            Value::Concrete(value) => Value::Concrete(value.map_bindings_in(map)),
+            Value::Deferred(value) => Value::Deferred(value.map_bindings_in(map)),
             crate::resource::Value::Reference(never) => {
                 match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(&never) {}
             }
@@ -6769,7 +6778,10 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
 }
 
 impl<P: ValueKind, B: BindingAddress> ConcreteValue<P, B> {
-    fn map_bindings<T: BindingAddress>(self, map: &mut impl FnMut(B) -> T) -> ConcreteValue<P, T> {
+    fn map_bindings_in<T: BindingAddress>(
+        self,
+        map: &mut BindingMapper<'_, B, T>,
+    ) -> ConcreteValue<P, T> {
         match self {
             ConcreteValue::String(value) => ConcreteValue::String(value),
             ConcreteValue::EnumIdentifier(value) => ConcreteValue::EnumIdentifier(value),
@@ -6781,14 +6793,14 @@ impl<P: ValueKind, B: BindingAddress> ConcreteValue<P, B> {
             ConcreteValue::List(values) => ConcreteValue::List(
                 values
                     .into_iter()
-                    .map(|value| value.map_bindings(map))
+                    .map(|value| value.map_bindings_in(map))
                     .collect(),
             ),
             ConcreteValue::StringList(values) => ConcreteValue::StringList(values),
             ConcreteValue::Map(values) => ConcreteValue::Map(
                 values
                     .into_iter()
-                    .map(|(name, value)| (name, value.map_bindings(map)))
+                    .map(|(name, value)| (name, value.map_bindings_in(map)))
                     .collect(),
             ),
         }
@@ -6818,9 +6830,16 @@ impl<P: ValueKind, B: BindingAddress> FunctionArgument<P, B> {
         self,
         map: &mut impl FnMut(B) -> T,
     ) -> FunctionArgument<P, T> {
+        self.map_bindings_in(&mut BindingMapper::new(map))
+    }
+
+    fn map_bindings_in<T: BindingAddress>(
+        self,
+        map: &mut BindingMapper<'_, B, T>,
+    ) -> FunctionArgument<P, T> {
         let Self { operand } = self;
         FunctionArgument {
-            operand: operand.map_bindings(map),
+            operand: operand.map_bindings_in(map),
         }
     }
 }
@@ -6830,21 +6849,28 @@ impl<P: ValueKind, B: BindingAddress> StructuralOperand<P, B> {
         self,
         map: &mut impl FnMut(B) -> T,
     ) -> StructuralOperand<P, T> {
+        self.map_bindings_in(&mut BindingMapper::new(map))
+    }
+
+    pub(crate) fn map_bindings_in<T: BindingAddress>(
+        self,
+        map: &mut BindingMapper<'_, B, T>,
+    ) -> StructuralOperand<P, T> {
         match self {
             StructuralOperand::Value { value, access_base } => StructuralOperand::Value {
-                value: value.map_bindings(map),
-                access_base: access_base.map(|value| value.map_bindings(map)),
+                value: value.map_bindings_in(map),
+                access_base: access_base.map(|value| value.map_bindings_in(map)),
             },
             StructuralOperand::Handle {
                 handle,
                 access_base,
             } => StructuralOperand::Handle {
-                handle: handle.map_bindings(map),
-                access_base: access_base.map_bindings(map),
+                handle: handle.map_bindings(&mut |binding| map.binding(binding)),
+                access_base: access_base.map_bindings_in(map),
             },
             StructuralOperand::Parameter { name, access_base } => StructuralOperand::Parameter {
                 name,
-                access_base: access_base.map_bindings(map),
+                access_base: access_base.map_bindings_in(map),
             },
         }
     }
@@ -6860,23 +6886,26 @@ impl<P: ValueKind> StructuralOperand<P, AbsoluteBindingAddress> {
 }
 
 impl<P: ValueKind, B: BindingAddress> DeferredValue<P, B> {
-    fn map_bindings<T: BindingAddress>(self, map: &mut impl FnMut(B) -> T) -> DeferredValue<P, T> {
+    fn map_bindings_in<T: BindingAddress>(
+        self,
+        map: &mut BindingMapper<'_, B, T>,
+    ) -> DeferredValue<P, T> {
         match self {
             DeferredValue::ModuleIf(deferred) => {
-                DeferredValue::ModuleIf(Box::new(deferred.map_bindings(map)))
+                DeferredValue::ModuleIf(Box::new(deferred.map_bindings_in(map)))
             }
             DeferredValue::ResourceRef { path } => DeferredValue::ResourceRef {
-                path: path.map_bindings(map),
+                path: path.map_bindings(&mut |binding| map.binding(binding)),
             },
             DeferredValue::BindingRef { binding } => DeferredValue::BindingRef {
-                binding: map(binding),
+                binding: map.binding(binding),
             },
             DeferredValue::Coalesce { value, default } => DeferredValue::Coalesce {
-                value: Box::new(value.map_bindings(map)),
-                default: Box::new(default.map_bindings(map)),
+                value: Box::new(value.map_bindings_in(map)),
+                default: Box::new(default.map_bindings_in(map)),
             },
             DeferredValue::IntegerArithmetic(expression) => {
-                DeferredValue::IntegerArithmetic(expression.map_bindings(map))
+                DeferredValue::IntegerArithmetic(expression.map_bindings_in(map))
             }
             DeferredValue::Interpolation(parts) => DeferredValue::Interpolation(
                 parts
@@ -6884,7 +6913,7 @@ impl<P: ValueKind, B: BindingAddress> DeferredValue<P, B> {
                     .map(|part| match part {
                         InterpolationPart::Literal(value) => InterpolationPart::Literal(value),
                         InterpolationPart::Expr(value) => {
-                            InterpolationPart::Expr(value.map_bindings(map))
+                            InterpolationPart::Expr(value.map_bindings_in(map))
                         }
                     })
                     .collect(),
@@ -6897,7 +6926,7 @@ impl<P: ValueKind, B: BindingAddress> DeferredValue<P, B> {
                 name,
                 args: args
                     .into_iter()
-                    .map(|argument| argument.map_bindings(map))
+                    .map(|argument| argument.map_bindings_in(map))
                     .collect(),
                 source_line,
             },
@@ -6910,7 +6939,7 @@ impl<P: ValueKind, B: BindingAddress> DeferredValue<P, B> {
                 name,
                 args: args
                     .into_iter()
-                    .map(|argument| argument.map_bindings(map))
+                    .map(|argument| argument.map_bindings_in(map))
                     .collect(),
                 reason,
                 source_line,
@@ -6921,17 +6950,14 @@ impl<P: ValueKind, B: BindingAddress> DeferredValue<P, B> {
                 args,
                 source_line,
             } => {
-                let function = (*function).clone().map_bindings(map);
-                let functions = functions
-                    .iter()
-                    .map(|(name, function)| (name.clone(), function.clone().map_bindings(map)))
-                    .collect();
+                let function = map.definition(function);
+                let functions = map.scope(functions);
                 DeferredValue::ResolvedFunctionCall {
-                    function: Arc::new(function),
-                    functions: Arc::new(functions),
+                    function,
+                    functions,
                     args: args
                         .into_iter()
-                        .map(|argument| argument.map_bindings(map))
+                        .map(|argument| argument.map_bindings_in(map))
                         .collect(),
                     source_line,
                 }
@@ -6945,7 +6971,7 @@ impl<P: ValueKind, B: BindingAddress> DeferredValue<P, B> {
                     reference,
                 } = access;
                 DeferredValue::Access(AccessExpr {
-                    base: Box::new(base.map_bindings(map)),
+                    base: Box::new(base.map_bindings_in(map)),
                     step,
                     source_line,
                     display_root,
@@ -6955,11 +6981,13 @@ impl<P: ValueKind, B: BindingAddress> DeferredValue<P, B> {
             DeferredValue::Secret(value) => DeferredValue::Secret(
                 value
                     .try_map(|value| {
-                        Ok::<_, std::convert::Infallible>(value.clone().map_bindings(map))
+                        Ok::<_, std::convert::Infallible>(value.clone().map_bindings_in(map))
                     })
                     .unwrap(),
             ),
-            DeferredValue::Unknown(reason) => DeferredValue::Unknown(reason.map_bindings(map)),
+            DeferredValue::Unknown(reason) => {
+                DeferredValue::Unknown(reason.map_bindings(&mut |binding| map.binding(binding)))
+            }
             DeferredValue::Placeholder(placeholder) => DeferredValue::Placeholder(placeholder),
         }
     }
@@ -11561,7 +11589,7 @@ impl<P: ValueKind, B: BindingAddress> PartialEq for InterpolationPart<P, B> {
     }
 }
 
-#[cfg(feature = "test-utils")]
-mod storage;
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) mod storage;
 #[cfg(feature = "test-utils")]
 pub(crate) use storage::{copy_storage, same_plain_representation};

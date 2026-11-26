@@ -486,7 +486,7 @@ fn same_argument<B: BindingAddress>(
         }
     }
 }
-fn same_function<B: BindingAddress>(
+pub(crate) fn same_function<B: BindingAddress>(
     a: &crate::parser::UserFunction<B>,
     b: &crate::parser::UserFunction<B>,
 ) -> bool {

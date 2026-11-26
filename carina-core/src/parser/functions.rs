@@ -333,6 +333,7 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
             &FunctionArgument::from_value(let_expr.clone()),
             &substitutions,
             *source_line,
+            &ctx.function_definitions,
         )
         .map_err(|error| locate_function_body_error(func, error))?
         .try_map_value(|value| {
@@ -1348,6 +1349,7 @@ pub(crate) fn evaluate_user_function<Source: super::context::EvaluationSource>(
         &substitutions,
         func.body.source_line,
         crate::value_walk::RewritePosition::Value,
+        &ctx.function_definitions,
     )
     .map_err(|error| locate_function_body_error(func, error))?;
     let result = try_evaluate_fn_value(substituted_body, &child_ctx, func.body.source_line)
@@ -1418,10 +1420,31 @@ pub(crate) fn evaluate_resolved_user_function(
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     call_line: usize,
 ) -> Result<Value, ParseError> {
+    evaluate_resolved_user_function_in(
+        function,
+        functions,
+        arguments,
+        config,
+        session,
+        call_line,
+        &Default::default(),
+    )
+}
+
+fn evaluate_resolved_user_function_in(
+    function: &UserFunction,
+    functions: &Arc<IndexMap<String, UserFunction>>,
+    arguments: &[FunctionArgument],
+    config: &ProviderContext,
+    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    call_line: usize,
+    definitions: &crate::value_walk::DefinitionMemo<crate::resource::RelativeBindingName>,
+) -> Result<Value, ParseError> {
     let mut context = match session {
         Some(session) => ParseContext::for_evaluation_in_session(session),
         None => ParseContext::for_evaluation(config),
     };
+    context.function_definitions = definitions.clone();
     context.replace_shared_user_functions(Arc::clone(functions));
     if !context.user_functions.contains_key(&function.name) {
         context.insert_user_function(function.name.clone(), function.clone());
@@ -1587,13 +1610,14 @@ pub(super) fn try_evaluate_fn_value<Source: super::context::EvaluationSource>(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            evaluate_resolved_user_function(
+            evaluate_resolved_user_function_in(
                 &function,
                 &functions,
                 &evaluated_args,
                 ctx.config,
                 ctx.session,
                 source_line,
+                &ctx.function_definitions,
             )
         }
         Value::Deferred(DeferredValue::FunctionCall {

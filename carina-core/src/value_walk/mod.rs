@@ -25,6 +25,9 @@ use crate::{
 };
 
 mod engine;
+pub(crate) use engine::DefinitionMemo;
+#[cfg(test)]
+pub(crate) use engine::with_function_definition_inspect_count;
 use engine::{LeafInput, Parts, ScalarInput, dispatch};
 mod bound_transform;
 use bound_transform::{BoundTransform, PublicTransform, TransformOutput};
@@ -1212,3 +1215,17 @@ impl<P: ValueKind, B: BindingAddress> SecretChild<'_, Transform, P, B> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+thread_local! {
+    static FUNCTION_DEFINITION_WALK_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_function_definition_walk_count<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    FUNCTION_DEFINITION_WALK_COUNT.with(|count| {
+        count.set(0);
+        let result = run();
+        (result, count.replace(0))
+    })
+}

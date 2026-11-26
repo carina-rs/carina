@@ -2564,6 +2564,20 @@ impl<P: PlaceholderKind, B: BindingAddress, T: fmt::Debug> fmt::Debug
 #[cfg(test)]
 thread_local! { static CLASSIFICATION_BUDGET: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
+thread_local! {
+    static FUNCTION_DEFINITION_KNOWLEDGE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_function_definition_knowledge_count<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    FUNCTION_DEFINITION_KNOWLEDGE_COUNT.with(|count| {
+        count.set(0);
+        let result = run();
+        (result, count.replace(0))
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn with_classification_budget<R>(limit: usize, operation: impl FnOnce() -> R) -> R {
     struct Reset;
     impl Drop for Reset {
@@ -2805,6 +2819,8 @@ fn classify_function<'a, P: PlaceholderKind, B: BindingAddress, S: Classificatio
     if let Some(analysis) = pos.analyses.get(&id) {
         return Ok(Arc::clone(analysis));
     }
+    #[cfg(test)]
+    FUNCTION_DEFINITION_KNOWLEDGE_COUNT.with(|count| count.set(count.get() + 1));
     pos.functions.push(id);
     let previous = pos.lexical_body;
     pos.lexical_body = true;

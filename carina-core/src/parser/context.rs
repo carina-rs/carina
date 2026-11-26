@@ -116,6 +116,9 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     pub(super) imported_modules: HashMap<String, String>,
     /// User-defined functions
     pub(super) user_functions: Arc<IndexMap<String, UserFunction>>,
+    /// Structural definition results shared across rewrites and fresh contexts
+    /// for captured lexical calls. They do not depend on substitutions.
+    pub(super) function_definitions: crate::value_walk::DefinitionMemo<RelativeBindingName>,
     /// Interned user-function definitions used by deferred call nodes.
     /// Invalidated together with `user_function_scope` whenever the mutable
     /// parser table changes.
@@ -499,6 +502,7 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
             imported_modules: HashMap::new(),
             user_functions: Arc::new(IndexMap::new()),
             resolved_user_functions: RefCell::new(HashMap::new()),
+            function_definitions: Default::default(),
             seeded_user_functions: HashSet::new(),
             evaluating_functions: Vec::new(),
             config,

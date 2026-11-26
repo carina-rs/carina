@@ -334,14 +334,14 @@ impl<P: ValueKind, B: BindingAddress> ValidatedIntegerExpr<P, B> {
         })
     }
 
-    pub(crate) fn map_bindings<T: BindingAddress>(
+    pub(crate) fn map_bindings_in<T: BindingAddress>(
         self,
-        map: &mut impl FnMut(B) -> T,
+        map: &mut crate::resource::BindingMapper<'_, B, T>,
     ) -> ValidatedIntegerExpr<P, T> {
         ValidatedIntegerExpr {
-            lhs: Box::new(self.lhs.map_bindings(map)),
+            lhs: Box::new(self.lhs.map_bindings_in(map)),
             op: self.op,
-            rhs: Box::new(self.rhs.map_bindings(map)),
+            rhs: Box::new(self.rhs.map_bindings_in(map)),
             operator_span: self.operator_span,
         }
     }

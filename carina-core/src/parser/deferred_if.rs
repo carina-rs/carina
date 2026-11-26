@@ -207,20 +207,20 @@ impl<P: ValueKind, B: BindingAddress> DeferredValueIf<P, B> {
         ))
     }
 
-    pub(crate) fn map_bindings<T: BindingAddress>(
+    pub(crate) fn map_bindings_in<T: BindingAddress>(
         self,
-        map: &mut impl FnMut(B) -> T,
+        map: &mut crate::resource::BindingMapper<'_, B, T>,
     ) -> DeferredValueIf<P, T> {
         DeferredValueIf::new(
             DeferredIfCondition::new_with_source_expression(
-                self.condition.value.map_bindings(map),
+                self.condition.value.map_bindings_in(map),
                 self.condition.source_file,
                 self.condition.source_line,
                 self.condition.source_expression,
             )
             .with_node_id(self.condition.node_id),
-            self.then_value.map_bindings(map),
-            self.else_value.map_bindings(map),
+            self.then_value.map_bindings_in(map),
+            self.else_value.map_bindings_in(map),
         )
     }
 }

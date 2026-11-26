@@ -414,6 +414,7 @@ fn function_body_access_occurrence_survives_argument_substitution()
         &substitutions,
         function.body.source_line,
         crate::value_walk::RewritePosition::Value,
+        &Default::default(),
     )
     .unwrap();
     let mut parsed = files

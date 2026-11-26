@@ -9,6 +9,8 @@ pub(super) trait TransformOutput {
 }
 
 pub(super) trait BoundTransform<P: ValueKind, B: BindingAddress>: TransformOutput {
+    fn function_memo(&self) -> Option<engine::DefinitionMemo<B, Self::Output>>;
+
     fn scalar(
         &mut self,
         at: &At<'_>,
@@ -90,6 +92,12 @@ impl<A: Algebra<Transform>> TransformOutput for PublicTransform<'_, A> {
 impl<P: ValueKind, B: BindingAddress, A: Algebra<Transform>> BoundTransform<P, B>
     for PublicTransform<'_, A>
 {
+    fn function_memo(&self) -> Option<engine::DefinitionMemo<B, Self::Output>> {
+        // Public algebras can depend on per-occurrence state, positions and IDs.
+        // Pointer identity cannot capture those inputs, so they stay uncached.
+        None
+    }
+
     fn scalar(
         &mut self,
         at: &At<'_>,
