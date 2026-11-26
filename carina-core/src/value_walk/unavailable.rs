@@ -60,8 +60,7 @@ fn find_unavailable<P: ValueKind, B: BindingAddress>(
         policy,
         errors: Vec::new(),
     };
-    let result =
-        inspect(WalkRoot::syntactic(), value, &mut search).map(|located| located.into_output());
+    let result = inspect(WalkRoot::syntactic(), value, &mut search);
     finish_unavailable_search(result, search.errors)
 }
 
@@ -299,9 +298,7 @@ mod tests {
             policy,
             errors: Vec::new(),
         };
-        let evidence = inspect(WalkRoot::syntactic(), value, &mut search)
-            .unwrap()
-            .into_output();
+        let evidence = inspect(WalkRoot::syntactic(), value, &mut search).unwrap();
         // Excluded code/provenance must allocate neither handles nor errors.
         assert_eq!(
             search

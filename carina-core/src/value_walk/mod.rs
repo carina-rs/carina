@@ -484,16 +484,6 @@ impl<O: WalkOutput, P: ValueKind, B: BindingAddress> SecretStep<Inspect, O, P, B
     }
 }
 
-/// A completed inspection summary. Protection remains on individual sites.
-pub struct Located<O: WalkOutput> {
-    output: O,
-}
-impl<O: WalkOutput> Located<O> {
-    pub fn into_output(self) -> O {
-        self.output
-    }
-}
-
 /// Internal completion product. Only kernel cursor operations construct it.
 #[doc(hidden)]
 pub struct RewriteProduct<O: WalkOutput, P: ValueKind, B: BindingAddress> {
@@ -662,8 +652,8 @@ pub fn inspect<'v, P: ValueKind, B: BindingAddress, A: Algebra<Inspect>>(
     root: WalkRoot<'v>,
     value: &'v Value<P, B>,
     algebra: &mut A,
-) -> Result<Located<A::Output>, WalkError> {
-    dispatch(value, root.at(), algebra).map(|output| Located { output })
+) -> Result<A::Output, WalkError> {
+    dispatch(value, root.at(), algebra)
 }
 
 pub struct ScopedScalar<'v, M: WalkMode, P: ValueKind, B: BindingAddress> {

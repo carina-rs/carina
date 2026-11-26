@@ -393,8 +393,7 @@ pub fn fixture_value_type<P: crate::resource::ValueKind, B: crate::resource::Bin
     }
     let mut shape = Shape::default();
     let mut tokens = value_walk::inspect(value_walk::WalkRoot::syntactic(), value, &mut shape)
-        .expect("fixture value walk")
-        .into_output();
+        .expect("fixture value walk");
     declaration(&mut tokens, &shape.keys).1
 }
 

@@ -145,7 +145,7 @@ mod tests {
     use crate::resource::{AuthoredValue, RelativeBindingName};
 
     #[test]
-    fn share_fn_definition_memo_preserves_secret_bodies_across_rewrites()
+    fn share_fn_definition_memo_shares_completion_across_rewrites()
     -> Result<(), Box<dyn std::error::Error>> {
         let file = crate::parser::parse(
             "fn leaf(input: String): String { secret('protected-4495') }",

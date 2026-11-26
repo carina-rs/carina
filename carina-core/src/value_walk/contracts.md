@@ -46,7 +46,7 @@ and side effects still allow independent walkers outside this kernel.
 
 Locations retain LeafPath's StructField, MapKey and ListIndex segments. Secret
 adds protection ancestry without a path segment. At and Scoped expose a public
-path only outside Secret. Protection belongs to each site; Located returns only
+path only outside Secret. Protection belongs to each site; inspect returns only
 the folded output, and there is no walk-wide secret flag or locator emission.
 ReferenceRef exposes only nonrecursive reference identity. The kernel does not
 follow bindings or provide detached re-entry or expression-edge roots.
@@ -163,7 +163,7 @@ retaining StructField paths through a list.
 ## Retained entry points
 
 The public borrowed entry point is inspect(root, &value, &mut algebra), used by
-availability and test_utils. Located::into_output returns the summary. Cursors
+availability and test_utils. It returns the algebra's output directly. Cursors
 provide inspect, finish, reject and evidence operations for Algebra<Inspect>.
 Owned dispatch and definition traversal are internal to the kernel; parser and
 module owners call concrete substitution/evaluation functions.
@@ -211,7 +211,7 @@ impl Algebra<Inspect> for Count {
     fn secret<P: ValueKind, B: BindingAddress>(&mut self, _: &SecretAt<'_>, v: SecretChild<'_, Inspect, P, B>) -> SecretStep<Inspect, usize, P, B> { v.inspect(self) }
 }
 let value: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::Int(5))).into()));
-assert_eq!(inspect(WalkRoot::syntactic(), &value, &mut Count)?.into_output(), 1);
+assert_eq!(inspect(WalkRoot::syntactic(), &value, &mut Count)?, 1);
 # Ok::<(), WalkError>(())
 ```
 
@@ -421,24 +421,8 @@ fn change_names(mut root: WalkRoot<'_>) {
 ```
 
 An Inspect call cursor has no callee or captured scope handle. Its sealed
-projection stores only arguments, regardless of the algebra or root:
-
-```compile_fail,E0609
-use carina_core::{resource::{BindingAddress, ValueKind}, value_walk::{ExprChildren, Inspect}};
-fn callee<P: ValueKind, B: BindingAddress>(call: ExprChildren<'_, Inspect, P, B>) {
-    let _ = call.function;
-}
-```
-
-```compile_fail,E0609
-use carina_core::{resource::{BindingAddress, ValueKind}, value_walk::{ExprChildren, Inspect}};
-fn scope<P: ValueKind, B: BindingAddress>(call: ExprChildren<'_, Inspect, P, B>) {
-    let _ = call.functions;
-}
-```
-
-The deleted locator type cannot be named, including through an alias:
-
-```compile_fail,E0432
-use carina_core::value_walk::ProtectedLocator;
-```
+projection stores only arguments, regardless of the algebra or root. The seal
+is the pub(super) Parts type and InspectCall, which has no callee or captured
+scope fields. The types enforce this restriction; it is not pinned by a
+compile-fail doctest. The public cursor already hid these fields before the
+operand-only projection, so accessing them would also fail at the base revision.

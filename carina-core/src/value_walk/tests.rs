@@ -195,9 +195,7 @@ fn kernel_covers_every_value_bearing_edge() {
     let value = every_edge_fixture();
     let mut count = Count::default();
     assert_eq!(
-        inspect(WalkRoot::syntactic(), &value, &mut count)
-            .unwrap()
-            .into_output(),
+        inspect(WalkRoot::syntactic(), &value, &mut count).unwrap(),
         29
     );
     // 12 numbered operand leaves and the condition; definitions are not operands.
@@ -317,8 +315,7 @@ fn every_concrete_variant_is_visited_once() {
         &Value::Concrete(ConcreteValue::List(values)),
         &mut count,
     )
-    .unwrap()
-    .into_output();
+    .unwrap();
     assert_eq!(visited, 13);
     assert_eq!(count.scalars, 10); // StringList is one Value, not two child Values.
     assert_eq!(
@@ -403,9 +400,7 @@ fn kernel_requires_secret_reentry() {
     let value = Value::Concrete(ConcreteValue::List(vec![int(1), secret(int(2))]));
     let mut count = Count::default();
     assert_eq!(
-        inspect(WalkRoot::syntactic(), &value, &mut count)
-            .unwrap()
-            .into_output(),
+        inspect(WalkRoot::syntactic(), &value, &mut count).unwrap(),
         4
     );
     assert_eq!((count.scalars, count.secrets), (2, 1));
@@ -695,9 +690,7 @@ fn operand_snapshot(items: &[Scoped<usize>]) -> Vec<(LeafPath, Vec<ExpressionEdg
 #[test]
 fn transform_preserves_evidence_on_every_container_argument_and_expression_edge() {
     let value = every_edge_fixture();
-    let inspected = inspect(WalkRoot::syntactic(), &value, &mut Carry::default())
-        .unwrap()
-        .into_output();
+    let inspected = inspect(WalkRoot::syntactic(), &value, &mut Carry::default()).unwrap();
     let result =
         rewrite_owned(WalkRoot::syntactic(), value.clone(), &mut Carry::default()).unwrap();
     let RewriteProduct {
@@ -745,9 +738,7 @@ fn authored_evidence_visits_unselected_branches_and_fallback_without_evaluation(
         int(12),
     ))));
     let mut carry = Carry::default();
-    let output = inspect(WalkRoot::syntactic(), &value, &mut carry)
-        .unwrap()
-        .into_output();
+    let output = inspect(WalkRoot::syntactic(), &value, &mut carry).unwrap();
     assert_eq!(
         carry.expressions,
         [
@@ -972,7 +963,6 @@ fn typed_interpolation_and_container_parts_preserve_empty_and_mixed_shapes() {
             ..
         } = rewrite_owned(WalkRoot::syntactic(), value.clone(), &mut Carry::default()).unwrap();
         assert_eq!(format!("{rewritten:?}"), format!("{value:?}"));
-        let inspected = inspected.into_output();
         assert_eq!(
             evidence_snapshot(inspected.obligations()),
             evidence_snapshot(transformed.obligations())
@@ -1120,8 +1110,7 @@ fn lookup_reroots_only_selected_receipts_and_never_removes_secret_provenance() {
         &value,
         &mut LookupReceipts::default(),
     )
-    .unwrap()
-    .into_output();
+    .unwrap();
     let rewritten = rewrite_owned(
         WalkRoot::syntactic(),
         value.clone(),
@@ -1566,9 +1555,8 @@ fn inspect_4495_resolved_call_child_length_and_roots_are_operand_only() {
         WalkRoot::rootless(&rootless),
     ] {
         let mut count = Count::default();
-        let (visits, definitions) = with_function_definition_inspect_count(|| {
-            inspect(root, &value, &mut count).unwrap().into_output()
-        });
+        let (visits, definitions) =
+            with_function_definition_inspect_count(|| inspect(root, &value, &mut count).unwrap());
         eprintln!(
             "retained root: visits={visits}, definition entries={definitions}, lengths={:?}",
             count.expression_lengths

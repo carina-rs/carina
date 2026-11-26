@@ -385,7 +385,11 @@ pub(super) fn dispatch<'v, P: ValueKind + 'v, B: BindingAddress, A: Algebra<Insp
     if at.expression_edges().iter().any(|edge| {
         matches!(
             edge,
-            ExpressionEdge::FunctionDefinition | ExpressionEdge::FunctionScope(_)
+            ExpressionEdge::FunctionDefinition
+                | ExpressionEdge::FunctionScope(_)
+                | ExpressionEdge::FunctionBody
+                | ExpressionEdge::FunctionDefault(_)
+                | ExpressionEdge::FunctionLocal(_)
         )
     }) {
         FUNCTION_DEFINITION_INSPECT_COUNT.with(|count| count.set(count.get() + 1));

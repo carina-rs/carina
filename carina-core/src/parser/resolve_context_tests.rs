@@ -359,8 +359,7 @@ fn share_fn_retained_counts(shape: ShareFnShape, depth: usize) -> ShareFnWalkCou
             &resolved.variables["v"],
             &mut OperandVisits,
         )
-        .unwrap()
-        .into_output();
+        .unwrap();
         eprintln!("{shape:?} depth {depth}: operand visits={visits}");
         assert!(
             visits > 0,
@@ -507,8 +506,7 @@ fn share_fn_retained_module_counts(
             &loaded_module.variables["v"],
             &mut OperandVisits,
         )
-        .unwrap()
-        .into_output();
+        .unwrap();
         eprintln!("{shape:?} module split={split} depth {depth}: loaded operand visits={visits}");
         assert!(visits > 0, "loaded module must visit operands");
 
@@ -604,8 +602,7 @@ fn share_fn_retained_module_counts(
             &call,
             &mut OperandVisits,
         )
-        .unwrap()
-        .into_output();
+        .unwrap();
         eprintln!("{shape:?} module split={split} depth {depth}: parent operand visits={visits}");
         assert!(visits > 0, "expanded parent must visit operands");
         crate::test_utils::legacy_validate_resources(
