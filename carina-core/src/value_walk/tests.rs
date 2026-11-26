@@ -9,6 +9,7 @@ struct Count {
     numbers: std::collections::BTreeMap<i64, usize>,
     leaves: Vec<LeafKind>,
     expressions: Vec<ExpressionKind>,
+    expression_lengths: Vec<(ExpressionKind, usize)>,
     scalar_kinds: Vec<ScalarKind>,
     reject_secret: bool,
     placeholder_count: usize,
@@ -50,6 +51,8 @@ impl Algebra<Inspect> for Count {
         expr: ExprChildren<'_, Inspect, P, B>,
     ) -> Step<Inspect, usize, P, B> {
         self.expressions.push(expr.kind());
+        self.expression_lengths
+            .push((expr.kind(), expr.children.len()));
         expr.inspect(self, |children| 1 + children.into_iter().sum::<usize>())
     }
     fn placeholder<P: ValueKind, B: BindingAddress>(
@@ -1878,6 +1881,44 @@ fn r4_resolved_fixture() -> crate::resource::AuthoredValue {
         )],
         source_line: crate::resource::DiagnosticSourceLine::authored(9),
     })
+}
+
+#[test]
+fn inspect_4495_resolved_call_child_length_and_roots_are_operand_only() {
+    use crate::schema::{AttributeType, ValidatedConfigSchema};
+    let value = r4_resolved_fixture();
+    let schema = ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
+        "value".into(),
+        AttributeType::int(),
+    )]))
+    .unwrap();
+    let rootless = schema.rootless_type("value").unwrap();
+    for root in [
+        WalkRoot::syntactic(),
+        WalkRoot::config_attribute(&schema, "value").unwrap(),
+        WalkRoot::typed(schema.effective_type("value").unwrap()),
+        WalkRoot::rootless(&rootless),
+    ] {
+        let mut count = Count::default();
+        let (visits, definitions) = with_function_definition_inspect_count(|| {
+            inspect(root, &value, &mut count).unwrap().into_output()
+        });
+        eprintln!(
+            "retained root: visits={visits}, definition entries={definitions}, lengths={:?}",
+            count.expression_lengths
+        );
+        assert!(count.numbers.get(&1).is_some_and(|visits| *visits > 0));
+        assert_eq!(
+            definitions, 0,
+            "Inspect must never enter the callee or captured scope"
+        );
+        assert_eq!(
+            count.expression_lengths,
+            [(ExpressionKind::ResolvedFunctionCall, 1)]
+        );
+        assert_eq!(count.scalars, 1);
+        assert_eq!(visits, 2, "one call and one argument operand");
+    }
 }
 
 #[test]

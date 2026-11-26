@@ -137,6 +137,115 @@ struct ShareFnWalkCounts {
     knowledge: usize,
 }
 
+// Count argument operands on the surface available to Inspect's callers.
+// A positive result prevents the zero-definition assertion from passing because
+// a validation path stopped inspecting retained calls altogether.
+#[derive(Default)]
+struct OperandVisits;
+
+impl crate::value_walk::Algebra<crate::value_walk::Inspect> for OperandVisits {
+    type Output = usize;
+
+    fn scalar<P: crate::resource::ValueKind, B: crate::resource::BindingAddress>(
+        &mut self,
+        at: &crate::value_walk::At<'_>,
+        value: crate::value_walk::ScopedScalar<'_, crate::value_walk::Inspect, P, B>,
+    ) -> crate::value_walk::Step<crate::value_walk::Inspect, usize, P, B> {
+        value.finish(operand_visit(at))
+    }
+
+    fn list<P: crate::resource::ValueKind, B: crate::resource::BindingAddress>(
+        &mut self,
+        at: &crate::value_walk::At<'_>,
+        items: crate::value_walk::Children<'_, crate::value_walk::Inspect, P, B>,
+    ) -> crate::value_walk::Step<crate::value_walk::Inspect, usize, P, B> {
+        let own = operand_visit(at);
+        items.inspect(self, |children| own + children.into_iter().sum::<usize>())
+    }
+
+    fn map<P: crate::resource::ValueKind, B: crate::resource::BindingAddress>(
+        &mut self,
+        at: &crate::value_walk::At<'_>,
+        items: crate::value_walk::Children<'_, crate::value_walk::Inspect, P, B>,
+    ) -> crate::value_walk::Step<crate::value_walk::Inspect, usize, P, B> {
+        let own = operand_visit(at);
+        items.inspect(self, |children| own + children.into_iter().sum::<usize>())
+    }
+
+    fn expression<P: crate::resource::ValueKind, B: crate::resource::BindingAddress>(
+        &mut self,
+        at: &crate::value_walk::At<'_>,
+        expr: crate::value_walk::ExprChildren<'_, crate::value_walk::Inspect, P, B>,
+    ) -> crate::value_walk::Step<crate::value_walk::Inspect, usize, P, B> {
+        let own = operand_visit(at);
+        expr.inspect(self, |children| own + children.into_iter().sum::<usize>())
+    }
+
+    fn placeholder<P: crate::resource::ValueKind, B: crate::resource::BindingAddress>(
+        &mut self,
+        at: &crate::value_walk::At<'_>,
+        value: crate::value_walk::ScopedLeaf<'_, crate::value_walk::Inspect, P, B>,
+    ) -> crate::value_walk::Step<crate::value_walk::Inspect, usize, P, B> {
+        value.finish(operand_visit(at))
+    }
+
+    fn secret<P: crate::resource::ValueKind, B: crate::resource::BindingAddress>(
+        &mut self,
+        _: &crate::value_walk::SecretAt<'_>,
+        child: crate::value_walk::SecretChild<'_, crate::value_walk::Inspect, P, B>,
+    ) -> crate::value_walk::SecretStep<crate::value_walk::Inspect, usize, P, B> {
+        child.inspect(self)
+    }
+}
+
+fn operand_visit(at: &crate::value_walk::At<'_>) -> usize {
+    use crate::value_walk::ExpressionEdge;
+    let edges = at.expression_edges();
+    usize::from(
+        edges
+            .iter()
+            .any(|edge| matches!(edge, ExpressionEdge::ArgumentValue(_)))
+            && !edges.iter().any(|edge| {
+                matches!(
+                    edge,
+                    ExpressionEdge::FunctionDefinition | ExpressionEdge::FunctionScope(_)
+                )
+            }),
+    )
+}
+
+fn assert_retained_chain<P: crate::resource::ValueKind, B: crate::resource::BindingAddress>(
+    call: &GenericValue<P, B>,
+    depth: usize,
+) {
+    let GenericValue::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) = call else {
+        panic!("depth {depth}: validation must retain the outer call")
+    };
+    let mut function = function.as_ref();
+    for level in (0..=depth).rev() {
+        assert_eq!(function.name, format!("f{level}"));
+        if level == 0 {
+            break;
+        }
+        let body = match &function.body.value {
+            GenericValue::Deferred(DeferredValue::Coalesce { value, .. }) => value.as_ref(),
+            GenericValue::Deferred(DeferredValue::ModuleIf(conditional)) => {
+                conditional.then_value()
+            }
+            body => body,
+        };
+        let GenericValue::Deferred(DeferredValue::ResolvedFunctionCall { function: next, .. }) =
+            body
+        else {
+            panic!(
+                "depth {depth}: f{} must remain in the captured call chain",
+                level - 1
+            )
+        };
+        function = next;
+    }
+}
+
 fn share_fn_walk_counts(run: impl FnOnce()) -> ShareFnWalkCounts {
     let ((((((), bindings), transforms), inspections), runtime), knowledge) =
         crate::resource::knowledge::with_function_definition_knowledge_count(|| {
@@ -244,6 +353,19 @@ fn share_fn_retained_counts(shape: ShareFnShape, depth: usize) -> ShareFnWalkCou
             ),
             "{shape:?} depth {depth}: validation must keep the unknown call deferred"
         );
+        assert_retained_chain(&resolved.variables["v"], depth);
+        let visits = crate::value_walk::inspect(
+            crate::value_walk::WalkRoot::syntactic(),
+            &resolved.variables["v"],
+            &mut OperandVisits,
+        )
+        .unwrap()
+        .into_output();
+        eprintln!("{shape:?} depth {depth}: operand visits={visits}");
+        assert!(
+            visits > 0,
+            "{shape:?} depth {depth}: operand visits: {visits}"
+        );
     })
 }
 
@@ -252,16 +374,14 @@ fn share_fn_assert_retained_polynomial(shape: ShareFnShape) {
         .stack_size(16 * 1024 * 1024)
         .spawn(move || {
             let mut counts = Vec::new();
-            // The coalesce DAG needs a smaller first sample to expose a
-            // regression by count before reaching its much larger depth 8.
-            let depths: &[usize] = if matches!(shape, ShareFnShape::Coalesce) {
-                &[2, 4, 8, 12]
-            } else {
-                &[4, 8, 12]
-            };
-            for &depth in depths {
+            for depth in [2, 4, 8, 12] {
                 let current = share_fn_retained_counts(shape, depth);
                 counts.push((depth, current));
+                eprintln!("{shape:?} retained depth {depth}: {current:?}");
+                assert_eq!(
+                    current.inspections, 0,
+                    "{shape:?} retained Inspect must never enter definitions: {counts:?}"
+                );
                 if counts.len() > 1 {
                     let (old_depth, old) = counts[counts.len() - 2];
                     // These intervals allow cubic growth up to 8x, while pure
@@ -269,7 +389,6 @@ fn share_fn_assert_retained_polynomial(shape: ShareFnShape) {
                     for (traversal, old_count, count) in [
                         ("binding", old.bindings, current.bindings),
                         ("transform", old.transforms, current.transforms),
-                        ("Inspect", old.inspections, current.inspections),
                         ("runtime", old.runtime, current.runtime),
                         ("knowledge", old.knowledge, current.knowledge),
                     ] {
@@ -279,10 +398,6 @@ fn share_fn_assert_retained_polynomial(shape: ShareFnShape) {
                         );
                     }
                 }
-                assert!(
-                    current.inspections > 0,
-                    "{shape:?} retained calls must exercise Inspect: {counts:?}"
-                );
             }
         })
         .unwrap()
@@ -291,15 +406,260 @@ fn share_fn_assert_retained_polynomial(shape: ShareFnShape) {
 }
 
 #[test]
-#[ignore = "#4495 retained chain: Inspect grows exponentially"]
 fn share_fn_retained_coalesce_definition_walks_grow_polynomially() {
     share_fn_assert_retained_polynomial(ShareFnShape::Coalesce);
 }
 
 #[test]
-#[ignore = "#4495 retained chain: Inspect grows exponentially"]
 fn share_fn_retained_conditional_definition_walks_grow_polynomially() {
     share_fn_assert_retained_polynomial(ShareFnShape::Conditional);
+}
+
+fn share_fn_retained_module_counts(
+    shape: ShareFnShape,
+    depth: usize,
+    split: bool,
+) -> ShareFnWalkCounts {
+    use crate::binding_index::BindingIndex;
+    use crate::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, SchemaRegistry,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    let definitions = share_fn_definitions(depth, shape).join("\n");
+    let consumer = format!(
+        "let v = f{depth}(input)\nlet module_sink = mock.test.Sink {{ value = \"prefix-${{v}}\" }}\n"
+    );
+    for (path, source) in [
+        (directory.path().join("providers.crn"), "provider mock {}\n".to_string()),
+        (directory.path().join("main.crn"), "let origin = mock.test.Source { name = 'origin' }\nlet child = use { source = './module' }\nlet instance = child { input = origin.identifier }\nlet sink = mock.test.Sink { value = \"prefix-${instance.output}\" }\n".to_string()),
+        (directory.path().join("exports.crn"), "attributes { output: String = instance.output }\n".to_string()),
+        (module.join("main.crn"), format!("arguments {{ input: String }}\n{}\n{consumer}", if split { "" } else { &definitions })),
+        (module.join("functions.crn"), if split { definitions } else { String::new() }),
+        (module.join("exports.crn"), "attributes { output: String = v }\n".to_string()),
+    ] {
+        std::fs::write(path, source).unwrap();
+    }
+    let config = context();
+    let mut schemas = SchemaRegistry::new();
+    for (name, attribute) in [("test.Source", "name"), ("test.Sink", "value")] {
+        let schema = PatternResourceSchema::new(name).attribute(
+            PatternAttributeSchema::optional(attribute, PatternAttributeType::string()).build(),
+        );
+        let schema = if name == "test.Source" {
+            schema.attribute(
+                PatternAttributeSchema::provider_populated(
+                    "identifier",
+                    PatternAttributeType::string(),
+                )
+                .build(),
+            )
+        } else {
+            schema
+        };
+        schemas.insert("mock", schema.validate().unwrap());
+    }
+    share_fn_walk_counts(|| {
+        let mut loaded_module = crate::config_loader::parse_directory(
+            &crate::paths::ResolvedPath::new(&module).unwrap(),
+            &config,
+        )
+        .unwrap()
+        .into_parsed();
+        crate::validation::deferred_types::with_session_for_test(&config, |session| {
+            let report = crate::validation::resolve_file_type_exprs_report(
+                &mut loaded_module,
+                session,
+                None,
+            )
+            .unwrap();
+            assert!(
+                report.diagnostics().is_empty(),
+                "{:?}",
+                report.diagnostics()
+            );
+            crate::parser::resolve_resource_refs_in_session(&mut loaded_module, session).unwrap();
+        });
+        let bindings = BindingIndex::from_parsed(&loaded_module, &schemas, &config);
+        crate::validation::validate_user_function_ref_types_with_bindings(
+            &loaded_module,
+            &bindings,
+        )
+        .unwrap();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&loaded_module, &schemas, &config);
+        assert!(
+            configuration.judged().report().findings().is_empty(),
+            "{:?}",
+            configuration.judged().report().findings()
+        );
+        assert!(
+            configuration
+                .judged()
+                .function_type_promise_findings(&bindings)
+                .is_empty()
+        );
+        assert_retained_chain(&loaded_module.variables["v"], depth);
+        let visits = crate::value_walk::inspect(
+            crate::value_walk::WalkRoot::syntactic(),
+            &loaded_module.variables["v"],
+            &mut OperandVisits,
+        )
+        .unwrap()
+        .into_output();
+        eprintln!("{shape:?} module split={split} depth {depth}: loaded operand visits={visits}");
+        assert!(visits > 0, "loaded module must visit operands");
+
+        let root = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let loaded = crate::config_loader::load_configuration(&root, &config).unwrap();
+        let expanded =
+            crate::validation::deferred_types::with_session_for_test(&config, |session| {
+                crate::module_resolver::resolve_modules_with_providerless_config(
+                    loaded.parsed,
+                    &root,
+                    session,
+                    &schemas,
+                )
+                .unwrap()
+            });
+        let bindings = BindingIndex::from_parsed(&expanded, &schemas, &config);
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&expanded, &schemas, &config);
+        assert!(
+            configuration.judged().report().findings().is_empty(),
+            "{:?}",
+            configuration.judged().report().findings()
+        );
+        assert!(
+            configuration
+                .judged()
+                .function_type_promise_findings(&bindings)
+                .is_empty()
+        );
+        let sink = expanded
+            .resources
+            .iter()
+            .find(|resource| {
+                resource
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.as_str() == "sink")
+            })
+            .expect("parent sink");
+        let value = sink.get_attr("value").unwrap();
+        let GenericValue::Deferred(DeferredValue::Interpolation(parts)) = value else {
+            panic!("parent sink must retain its interpolation: {value:?}")
+        };
+        let operand = parts
+            .iter()
+            .find_map(|part| match part {
+                InterpolationPart::Expr(value) => Some(value),
+                _ => None,
+            })
+            .expect("parent output operand");
+        // Expansion keeps the parent's reference to the composition output.
+        // Follow the same binding view used by validation to its retained call.
+        let GenericValue::Deferred(DeferredValue::ResourceRef { path }) = operand else {
+            panic!("parent must reference the module output: {operand:?}")
+        };
+        let values = crate::binding_index::ResolvedBindings::for_expanded_validation(&expanded);
+        let call = values
+            .get(path.binding())
+            .expect("module output binding")
+            .get(path.attribute())
+            .expect("module output attribute")
+            .to_value_at("parent output")
+            .unwrap();
+        // Substituting a resource reference evaluates fN's outer body once.
+        // Its f(N-1)..f0 chain must still be deferred after validation.
+        let first_call = match (&call, shape) {
+            (
+                GenericValue::Deferred(DeferredValue::Coalesce { value, default }),
+                ShareFnShape::Coalesce,
+            ) => {
+                assert_retained_chain(value, depth - 1);
+                assert_retained_chain(default, depth - 1);
+                value.as_ref()
+            }
+            (
+                GenericValue::Deferred(DeferredValue::ResolvedFunctionCall { .. }),
+                ShareFnShape::Conditional,
+            ) => {
+                assert_retained_chain(&call, depth - 1);
+                &call
+            }
+            _ => panic!("{shape:?} depth {depth}: expansion must retain the deferred expression"),
+        };
+        let GenericValue::Deferred(DeferredValue::ResolvedFunctionCall { args, .. }) = first_call
+        else {
+            unreachable!()
+        };
+        assert!(
+            matches!(args[0].value(), Some(GenericValue::Deferred(DeferredValue::ResourceRef { path })) if path.binding() == "origin" && path.attribute() == "identifier")
+        );
+        let visits = crate::value_walk::inspect(
+            crate::value_walk::WalkRoot::syntactic(),
+            &call,
+            &mut OperandVisits,
+        )
+        .unwrap()
+        .into_output();
+        eprintln!("{shape:?} module split={split} depth {depth}: parent operand visits={visits}");
+        assert!(visits > 0, "expanded parent must visit operands");
+        crate::test_utils::legacy_validate_resources(
+            &expanded,
+            &schemas,
+            &std::collections::HashSet::from(["mock".to_string()]),
+            &config,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_retained_chain(first_call, depth - 1);
+    })
+}
+
+fn share_fn_assert_retained_module_polynomial(shape: ShareFnShape, split: bool) {
+    std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+        let mut previous: Option<(usize, ShareFnWalkCounts)> = None;
+        for depth in [2, 4, 8, 12] {
+            let current = share_fn_retained_module_counts(shape, depth, split);
+            eprintln!("{shape:?} module split={split} depth {depth}: {current:?}");
+            assert_eq!(current.inspections, 0, "{shape:?} module split={split} depth {depth}: Inspect must never enter definitions: {current:?}");
+            if let Some((old_depth, old)) = previous {
+                for (traversal, old_count, count) in [
+                    ("binding", old.bindings, current.bindings),
+                    ("transform", old.transforms, current.transforms),
+                    ("runtime", old.runtime, current.runtime),
+                    ("knowledge", old.knowledge, current.knowledge),
+                ] {
+                    assert!(count <= old_count * 8, "{shape:?} module split={split} {traversal}: depth {old_depth}: {old_count}, depth {depth}: {count}; {current:?}");
+                }
+            }
+            previous = Some((depth, current));
+        }
+    }).unwrap().join().unwrap();
+}
+
+#[test]
+fn share_fn_retained_module_compact_coalesce_definition_walks_grow_polynomially() {
+    share_fn_assert_retained_module_polynomial(ShareFnShape::Coalesce, false);
+}
+
+#[test]
+fn share_fn_retained_module_split_coalesce_definition_walks_grow_polynomially() {
+    share_fn_assert_retained_module_polynomial(ShareFnShape::Coalesce, true);
+}
+
+#[test]
+fn share_fn_retained_module_compact_conditional_definition_walks_grow_polynomially() {
+    share_fn_assert_retained_module_polynomial(ShareFnShape::Conditional, false);
+}
+
+#[test]
+fn share_fn_retained_module_split_conditional_definition_walks_grow_polynomially() {
+    share_fn_assert_retained_module_polynomial(ShareFnShape::Conditional, true);
 }
 
 #[test]
@@ -1082,5 +1442,309 @@ fn retained_snapshot_does_not_require_failed_user_calls() {
     assert!(matches!(
         file.resources[0].get_attr("comment"),
         Some(Value::Deferred(DeferredValue::ResolvedFunctionCall { .. }))
+    ));
+}
+
+fn inspect_4495_parser_missing(line: usize, reason: &str) -> Value {
+    Value::Deferred(DeferredValue::Unavailable {
+        name: BuiltinFunction::env,
+        args: vec![],
+        reason: UnavailableReason::from_builtin_error(reason.into()),
+        source_line: line.into(),
+    })
+}
+
+fn inspect_4495_assert_required(value: Value, expected: Option<(usize, &str, bool)>) {
+    // Call the production interpolation guard; the policy's Evidence/error
+    // inventory and ordinal checks live beside UnavailableSearch's tests.
+    let result = reject_required_interpolation_unavailable(
+        &[
+            InterpolationPart::Literal("prefix".into()),
+            InterpolationPart::Expr(value),
+        ],
+        strict_resolution_context(),
+    );
+    if let Some((line, message, secret)) = expected {
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("Invalid expression at line {line}: {message}")
+        );
+        if secret {
+            assert!(matches!(error, ParseError::InsideSecret { line: actual } if actual == line));
+            assert!(!format!("{error:?}").contains("private-4495"));
+        } else {
+            assert!(
+                matches!(error, ParseError::InvalidExpression { line: actual, .. } if actual == line)
+            );
+        }
+    } else {
+        result.unwrap();
+    }
+}
+
+#[test]
+fn inspect_4495_required_interpolation_directory_definition_and_primary_pins() {
+    let directory = tempfile::tempdir().unwrap();
+    for (name, source) in [
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "main.crn",
+            "arguments { input: String }\nlet result = retained(input)\n",
+        ),
+        ("exports.crn", "attributes { output: String = result }\n"),
+        (
+            "functions.crn",
+            "fn unused(): String { 'unused' }\nfn retained(x: String, fallback: String = 'default'): String {\n let local = 'local'\n x\n}\n",
+        ),
+    ] {
+        std::fs::write(directory.path().join(name), source).unwrap();
+    }
+    let parsed = crate::config_loader::parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &context(),
+    )
+    .unwrap()
+    .into_parsed();
+    for location in ["default", "local", "body", "captured"] {
+        let mut call = parsed.variables["result"].clone();
+        let Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            ..
+        }) = &mut call
+        else {
+            panic!("directory fixture must retain its call")
+        };
+        assert!(functions.contains_key("unused"));
+        let failure = || inspect_4495_parser_missing(5, "private-4495 definition").into_secret();
+        match location {
+            "default" => std::sync::Arc::make_mut(function).params[1].default = Some(failure()),
+            "local" => std::sync::Arc::make_mut(function).local_lets[0].1 = failure(),
+            "body" => std::sync::Arc::make_mut(function).body.value = failure(),
+            "captured" => {
+                std::sync::Arc::make_mut(functions)
+                    .get_mut("unused")
+                    .unwrap()
+                    .body
+                    .value = failure()
+            }
+            _ => unreachable!(),
+        }
+        inspect_4495_assert_required(call.clone(), None);
+        let Value::Deferred(DeferredValue::ResolvedFunctionCall { args, .. }) = &mut call else {
+            unreachable!()
+        };
+        args.clear();
+        args.push(FunctionArgument::from_value(inspect_4495_parser_missing(
+            17,
+            "first primary",
+        )));
+        args.push(FunctionArgument::from_value(
+            inspect_4495_parser_missing(19, "private-4495 second").into_secret(),
+        ));
+        inspect_4495_assert_required(call, Some((17, "env(): first primary", false)));
+    }
+}
+
+#[test]
+fn inspect_4495_required_interpolation_order_masking_auxiliary_and_coalesce_pins() {
+    for reversed in [false, true] {
+        let nested = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("private-4495 prefix".into()),
+            InterpolationPart::Expr(Value::Deferred(DeferredValue::Secret(
+                Box::new(inspect_4495_parser_missing(31, "private-4495 first").into_secret())
+                    .into(),
+            ))),
+            InterpolationPart::Expr(inspect_4495_parser_missing(32, "second")),
+        ]));
+        let mut entries = vec![
+            ("a".into(), nested),
+            (
+                "z".into(),
+                inspect_4495_parser_missing(9, "earlier line, later key"),
+            ),
+        ];
+        if reversed {
+            entries.reverse();
+        }
+        // map_entries restores insertion order (value_walk/engine.rs:409); errors follow map visits, not source lines.
+        let expected = if reversed {
+            (9, "env(): earlier line, later key", false)
+        } else {
+            (31, "invalid value inside secret(...)", true)
+        };
+        inspect_4495_assert_required(
+            Value::Concrete(ConcreteValue::Map(entries.into_iter().collect())),
+            Some(expected),
+        );
+    }
+    let protected = inspect_4495_parser_missing(41, "private-4495 fallback").into_secret();
+    for primary in [
+        Value::Concrete(ConcreteValue::String("selected".into())),
+        Value::resource_ref("origin", "identifier", vec![]),
+    ] {
+        inspect_4495_assert_required(
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(primary),
+                default: Box::new(protected.clone()),
+            }),
+            None,
+        );
+    }
+    inspect_4495_assert_required(
+        protected,
+        Some((41, "invalid value inside secret(...)", true)),
+    );
+    let auxiliary = Value::Deferred(DeferredValue::FunctionCall {
+        name: BuiltinFunction::upper,
+        args: vec![FunctionArgument::with_auxiliary_for_inspect_test(
+            Value::Concrete(ConcreteValue::String("selected operand".into())),
+            inspect_4495_parser_missing(3, "private-4495 auxiliary").into_secret(),
+        )],
+        source_line: 1.into(),
+    });
+    inspect_4495_assert_required(auxiliary, None);
+    // Interpolation-part order outranks the source line of a later part.
+    let error = reject_required_interpolation_unavailable(
+        &[
+            InterpolationPart::Expr(inspect_4495_parser_missing(51, "first part")),
+            InterpolationPart::Expr(inspect_4495_parser_missing(2, "later part")),
+        ],
+        strict_resolution_context(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Invalid expression at line 51: env(): first part"
+    );
+    assert!(matches!(
+        error,
+        ParseError::InvalidExpression { line: 51, .. }
+    ));
+}
+
+#[test]
+fn inspect_4495_evaluated_body_failure_and_secret_result_pins() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("functions.crn");
+    let source = "fn fail(x: String): String {\n  env(x)\n}\nfn protect(x: String): String {\n  secret(\"${x}-suffix\")\n}\n";
+    std::fs::write(&file, source).unwrap();
+    let parsed = crate::parser::parse_file(source, &file, &context()).unwrap();
+    let scope = std::sync::Arc::new(parsed.user_functions.clone());
+    let error = super::super::functions::evaluate_resolved_user_function(
+        &parsed.user_functions["fail"],
+        &scope,
+        &[FunctionArgument::from_value(Value::Concrete(
+            ConcreteValue::String("CARINA_INSPECT_4495_MISSING".into()),
+        ))],
+        &context(),
+        None,
+        99,
+    )
+    .unwrap_err();
+    let diagnostic = error.element_diagnostic().expect("body owns its failure");
+    assert_eq!(diagnostic.location().file().path(), file);
+    assert_eq!(diagnostic.location().span().start_line(), 2);
+    assert_eq!(
+        diagnostic.detail().to_string(),
+        "Invalid expression at line 2: environment variable 'CARINA_INSPECT_4495_MISSING' is not set"
+    );
+    assert!(matches!(
+        diagnostic.detail(),
+        ParseError::InvalidExpression { line: 2, .. }
+    ));
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "{}:2:3: Invalid expression at line 2: environment variable 'CARINA_INSPECT_4495_MISSING' is not set",
+            file.display()
+        )
+    );
+
+    let protected = super::super::functions::evaluate_resolved_user_function(
+        &parsed.user_functions["protect"],
+        &scope,
+        &[FunctionArgument::from_value(Value::Concrete(
+            ConcreteValue::String("private-4495".into()),
+        ))],
+        &context(),
+        None,
+        99,
+    )
+    .unwrap();
+    let Value::Deferred(DeferredValue::Secret(inner)) = &protected else {
+        panic!("evaluated Secret result lost protection")
+    };
+    assert!(
+        matches!(inner.expose_plaintext(), Value::Concrete(ConcreteValue::String(text)) if text == "private-4495-suffix")
+    );
+    assert!(!format!("{protected:?}").contains("private-4495"));
+    // Binding expansion and saved verification must preserve the evaluated
+    // Secret too; use the normal root resolver to cross that phase boundary.
+    let mut parsed = parsed;
+    parsed.variables.insert("protected".into(), protected);
+    let runtime = parsed.resolve_root_for_test().variables["protected"]
+        .clone()
+        .into_expanded()
+        .unwrap();
+    let saved = crate::value::redact_secrets_in_value(&runtime).unwrap();
+    assert!(
+        !serde_json::to_string(&saved)
+            .unwrap()
+            .contains("private-4495")
+    );
+    let restored = crate::value::rehydrate_redacted_secrets(&saved, &runtime).unwrap();
+    assert!(matches!(
+        restored,
+        GenericValue::Deferred(DeferredValue::Secret(_))
+    ));
+    assert!(!format!("{restored:?}").contains("private-4495"));
+}
+
+#[test]
+fn inspect_4495_required_directory_attempted_input_pin() {
+    let directory = tempfile::tempdir().unwrap();
+    for (name, source) in [
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "functions.crn",
+            "fn unused(): String { secret(env('PRIVATE_UNUSED_4495')) }\n",
+        ),
+        (
+            "main.crn",
+            "// directory input fixture\nlet result = \"prefix-${env('CARINA_INSPECT_4495_MISSING')}\"\n",
+        ),
+        ("exports.crn", "attributes { output: String = result }\n"),
+    ] {
+        std::fs::write(directory.path().join(name), source).unwrap();
+    }
+    let failure = crate::config_loader::load_configuration_report(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &context(),
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .err()
+    .expect("a demanded input must fail");
+    assert_eq!(failure.diagnostics().len(), 1);
+    let crate::config_loader::ConfigurationLoadDiagnostic::Parse { file, error } =
+        &failure.diagnostics()[0]
+    else {
+        panic!("expected the original ParseError")
+    };
+    assert_eq!(
+        file.as_deref().or_else(|| error.source_file()),
+        Some(directory.path().join("main.crn").as_path())
+    );
+    let first = error
+        .element_diagnostic()
+        .map_or(error.as_ref(), |finding| finding.detail());
+    assert_eq!(
+        first.to_string(),
+        "Invalid expression at line 2: env(): environment variable 'CARINA_INSPECT_4495_MISSING' is not set"
+    );
+    assert!(matches!(
+        first,
+        ParseError::InvalidExpression { line: 2, .. }
     ));
 }
