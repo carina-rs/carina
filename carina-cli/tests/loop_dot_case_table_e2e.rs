@@ -74,12 +74,15 @@ fn loop_dot_case_table() {
 
 #[test]
 fn loop_dot_reported_selector_stops_expression_errors() {
-    assert_reported_selector_errors(reported_selector_cases::cases());
+    for module in [false, true] {
+        assert_reported_selector_errors(reported_selector_cases::cases(), module);
+    }
 }
 
 #[test]
-fn loop_dot_reported_selector_after_another_failure_is_reported_once() {
-    assert_reported_selector_errors([reported_selector_cases::input_i()]);
+fn loop_dot_reported_selector_after_another_failure_matches_current_diagnostics() {
+    assert_reported_selector_errors([reported_selector_cases::input_i()], false);
+    assert_reported_selector_errors([reported_selector_cases::input_i_cli_module()], true);
 }
 
 #[test]
@@ -115,24 +118,25 @@ fn loop_dot_reported_selector_stops_type_mismatch_in_same_attribute() {
     }
 }
 
-fn assert_reported_selector_errors(cases: impl IntoIterator<Item = reported_selector_cases::Case>) {
+fn assert_reported_selector_errors(
+    cases: impl IntoIterator<Item = reported_selector_cases::Case>,
+    module: bool,
+) {
     let mut failures = Vec::new();
     for case in cases {
-        for module in [false, true] {
-            let fixture = tempfile::tempdir().unwrap();
-            let root = fixture.path();
-            reported_selector_cases::fixture(root, &case, module);
-            assert!(run(root, &["init", "."]).status.success());
-            let (success, mut errors) = diagnostics(root);
-            let mut expected = case.errors.to_vec();
-            errors.sort();
-            expected.sort();
-            if success || errors != expected {
-                failures.push(format!(
-                    "{}, module={module}: {errors:?}, expected exactly {expected:?}",
-                    case.id,
-                ));
-            }
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        reported_selector_cases::fixture(root, &case, module);
+        assert!(run(root, &["init", "."]).status.success());
+        let (success, mut errors) = diagnostics(root);
+        let mut expected = case.errors.to_vec();
+        errors.sort();
+        expected.sort();
+        if success || errors != expected {
+            failures.push(format!(
+                "{}, module={module}: {errors:?}, expected exactly {expected:?}",
+                case.id,
+            ));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

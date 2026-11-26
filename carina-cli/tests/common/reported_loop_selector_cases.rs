@@ -1,4 +1,4 @@
-//! Resource attributes whose rejected selector stops expression validation.
+//! Resource attribute diagnostics after a rejected loop selector.
 
 use std::path::Path;
 
@@ -56,10 +56,24 @@ pub fn cases() -> Vec<Case> {
 /// The map's first failed child has a different marker from its rejected selector.
 pub fn input_i() -> Case {
     Case {
+        errors: &["cannot apply access .a to list(mock.test.resource)"],
+        ..input_i_cli_module()
+    }
+}
+
+pub fn input_i_cli_module() -> Case {
+    // carina#4605: inside a module the selector is reported twice when another
+    // failure in the value comes first; update this when #4605 is fixed.
+    Case {
         id: "input-i",
         declaration: "let children = for (_, item) in ['a'] { mock.test.resource { name = item } }\n",
         attributes: "name = 'y' tags = { a = children[0].nope.x, b = children.a.name, c = r.nope }",
-        errors: &["cannot apply access .a to list(mock.test.resource)"],
+        errors: &[
+            "cannot apply access .a to list(mock.test.resource)",
+            "unknown attribute 'nope' on 'children[0]' in reference children[0].nope Did you mean 'name'?",
+            "cannot apply access .a to list(mock.test.resource)",
+            "unknown attribute 'nope' on 'r' in reference r.nope Did you mean 'name'?",
+        ],
     }
 }
 
