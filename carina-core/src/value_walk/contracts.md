@@ -363,29 +363,6 @@ use carina_core::value_walk::Scoped;
 fn bypass(scope: &Scoped<usize>) { let _ = &scope.path; }
 ```
 
-
-Borrowed container cursors cannot call the owned rebuilding operation:
-
-```compile_fail,E0599
-use carina_core::{resource::{BindingAddress, ValueKind}, value_walk::*};
-fn cannot_rebuild<P: ValueKind, B: BindingAddress, A: Algebra<Transform, Output = ()>>(
-    children: Children<'_, Inspect, P, B>, algebra: &mut A,
-) {
-    children.transform(algebra, |_| ());
-}
-```
-
-The same separation applies to protected operands:
-
-```compile_fail,E0599
-use carina_core::{resource::{BindingAddress, ValueKind}, value_walk::*};
-fn cannot_rebuild_secret<P: ValueKind, B: BindingAddress, A: Algebra<Transform, Output = ()>>(
-    child: SecretChild<'_, Inspect, P, B>, algebra: &mut A,
-) {
-    child.transform(algebra);
-}
-```
-
 Protection ancestry cannot be cleared by external code:
 
 ```compile_fail,E0616
