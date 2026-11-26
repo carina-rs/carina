@@ -1,6 +1,671 @@
 //! Directory acceptance tests for parser-owned diagnostic locations (#4220).
 use super::*;
 
+#[path = "../../../../carina-cli/tests/common/loop_dot_cases.rs"]
+mod loop_dot_cases;
+
+#[path = "../../../../carina-cli/tests/common/reported_loop_selector_cases.rs"]
+mod reported_selector_cases;
+
+#[test]
+fn loop_dot_reported_selector_after_another_failure_is_reported_once() {
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let case = reported_selector_cases::input_i();
+    let mut failures = Vec::new();
+    for module in [false, true] {
+        let directory = Directory::new(&[]);
+        let root = directory.root.path();
+        let owner = reported_selector_cases::fixture(root, &case, module);
+        let path = root.join(owner);
+        let source = std::fs::read_to_string(&path).unwrap();
+        let direct = engine
+            .analyze(&create_document_at(&source, path.clone()), Some(&path))
+            .into_iter()
+            .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|finding| finding.message)
+            .collect::<Vec<_>>();
+        if direct != case.errors {
+            failures.push(format!(
+                "module={module}, direct: {direct:?}, expected exactly {:?}",
+                case.errors,
+            ));
+        }
+        if !module {
+            continue;
+        }
+        let path = root.join("main.crn");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let diagnostics = engine.analyze_document_set(
+            &create_document_at(&source, path.clone()),
+            Some(&path),
+            &[],
+        );
+        let imported = diagnostics
+            .values()
+            .flatten()
+            .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|finding| finding.message.as_str())
+            .collect::<Vec<_>>();
+        if imported.len() != 1
+            || !imported[0].ends_with(case.errors[0])
+            || imported[0].matches(case.errors[0]).count() != 1
+        {
+            failures.push(format!(
+                "importing: {imported:?}, expected exactly one {:?}",
+                case.errors,
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn loop_dot_reported_selector_keeps_existing_warnings() {
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let mut failures = Vec::new();
+    for case in reported_selector_cases::cases() {
+        for module in [false, true] {
+            let directory = Directory::new(&[]);
+            let root = directory.root.path();
+            let owner = reported_selector_cases::fixture(root, &case, module);
+            let path = root.join(owner);
+            let source = std::fs::read_to_string(&path).unwrap();
+            let diagnostics =
+                engine.analyze(&create_document_at(&source, path.clone()), Some(&path));
+            let mut errors = diagnostics
+                .iter()
+                .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|finding| finding.message.clone())
+                .collect::<Vec<_>>();
+            let mut expected = case.errors.to_vec();
+            errors.sort();
+            expected.sort();
+            // The ordinary LSP typo pass owns this warning and its attribute-token range.
+            let siblings = diagnostics
+                .iter()
+                .filter(|finding| finding.message.contains("'nope'"))
+                .map(|finding| (finding.severity, finding.message.as_str(), finding.range))
+                .collect::<Vec<_>>();
+            let expected_siblings = if let Some(column) = source.find("r.nope") {
+                let column = column as u32 + 2;
+                vec![(
+                    Some(DiagnosticSeverity::WARNING),
+                    "Unknown attribute 'nope' on 'r' (type 'test.resource') Did you mean 'name'?",
+                    Range::new(Position::new(0, column), Position::new(0, column + 4)),
+                )]
+            } else {
+                Vec::new()
+            };
+            if errors != expected || siblings != expected_siblings {
+                failures.push(format!(
+                    "{}, module={module}: {errors:?}, expected exactly {expected:?}; all diagnostics: {diagnostics:?}",
+                    case.id,
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn loop_dot_case_table_diagnostics_match_validate() {
+    run_loop_dot_case_table(|_| true);
+}
+
+#[test]
+fn loop_dot_case_table_module_internal_rejections_are_reported_once() {
+    let directory = Directory::new(&[]);
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let root = directory.root.path();
+    let mut failures = Vec::new();
+    for row in loop_dot_cases::rows()
+        .into_iter()
+        .filter(|row| matches!(row.id, "2-3" | "2-11" | "2-13"))
+    {
+        loop_dot_cases::module_fixture(root, &row);
+        let loop_dot_cases::Outcome::Error(expected) = row.expected else {
+            unreachable!("rejected selector row");
+        };
+        for &position in &loop_dot_cases::POSITIONS[..7] {
+            let owner = loop_dot_cases::module_reader(root, position, row.reader);
+            let path = root.join(&owner);
+            let source = std::fs::read_to_string(&path).unwrap();
+            let direct = engine
+                .analyze(&create_document_at(&source, path.clone()), Some(&path))
+                .into_iter()
+                .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|finding| finding.message)
+                .collect::<Vec<_>>();
+            if direct != expected {
+                failures.push(format!("{}, {:?}, module-internal {position}, {}: {direct:?}, expected exactly {expected:?}", row.id, row.kind, row.reader));
+            }
+            let path = root.join("main.crn");
+            let source = std::fs::read_to_string(&path).unwrap();
+            let diagnostics = engine.analyze_document_set(
+                &create_document_at(&source, path.clone()),
+                Some(&path),
+                &[],
+            );
+            let errors = diagnostics
+                .iter()
+                .flat_map(|(path, findings)| {
+                    findings
+                        .iter()
+                        .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
+                        .map(move |finding| (path.clone(), finding.message.clone()))
+                })
+                .collect::<Vec<_>>();
+            // Import resolution already reports one wrapped parse error at
+            // the caller. Preserve that path as well as the direct module view.
+            if errors.len() != 1 || !errors[0].1.ends_with(expected[0]) {
+                failures.push(format!("{}, {:?}, imported module-internal {position}, {}: {errors:?}, expected exactly one {expected:?}", row.id, row.kind, row.reader));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn loop_dot_case_table_export_rejection_diagnostics() {
+    let directory = Directory::new(&[]);
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let root = directory.root.path();
+    let mut rows = loop_dot_cases::rows()
+        .into_iter()
+        .filter(|row| matches!(row.id, "2-3" | "2-10" | "2-11" | "2-12" | "2-13"))
+        .collect::<Vec<_>>();
+    rows.push(loop_dot_cases::Row {
+        id: "subscript",
+        kind: loop_dot_cases::Kind::Map,
+        key: "0",
+        reader: "children[0].name",
+        positions: &["export plain"],
+        expected: loop_dot_cases::Outcome::Error(&["cannot apply access [0] to keyed loop group"]),
+    });
+    for row in rows {
+        loop_dot_cases::fixture(root, &row);
+        let owner = loop_dot_cases::reader(root, "export plain", row.reader);
+        let loop_dot_cases::Outcome::Error([error]) = row.expected else {
+            unreachable!("one rejected selector");
+        };
+        let mut expected = vec![serde_json::json!({
+            "range": { "start": { "line": 0, "character": 10 }, "end": { "line": 0, "character": 13 } },
+            "severity": 2,
+            "source": "carina",
+            "message": format!("export 'out': type annotation required: {error}"),
+        })];
+        if row.id == "subscript" {
+            // Main's invalid map subscript also has an independent scope
+            // error. Keep that existing behavior while pinning its export record.
+            expected.insert(0, serde_json::json!({
+                "range": { "start": { "line": 0, "character": 16 }, "end": { "line": 0, "character": 32 } },
+                "severity": 1,
+                "source": "carina",
+                "message": "Undefined resource: 'children[0]'. Define it with 'let children[0] = aws...'",
+            }));
+        }
+        assert_eq!(
+            observe_complete_diagnostics(&engine, root, owner),
+            serde_json::Value::Array(expected),
+            "{}, {:?}, {}",
+            row.id,
+            row.kind,
+            row.reader,
+        );
+    }
+}
+
+#[test]
+fn loop_dot_review_round3_function_diagnostics() {
+    run_loop_dot_case_table(|row| matches!(row.id, "2-24" | "2-25"));
+}
+
+#[test]
+fn loop_dot_review_round3_whole_group_function_location() {
+    run_loop_dot_case_table(|row| row.id == "2-24");
+}
+
+#[test]
+fn loop_dot_review_round1_function_contexts() {
+    run_loop_dot_case_table(|row| row.id == "2-19");
+}
+
+#[test]
+fn loop_dot_function_body_and_default_keep_main_call_site_diagnostics() {
+    let directory = Directory::new(&[
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "backend.crn",
+            "backend local { path = 'carina.state.json' }\n",
+        ),
+    ]);
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let main: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../carina-cli/tests/fixtures/loop_dot_function_main.json"
+    ))
+    .unwrap();
+    let root = directory.root.path();
+    for (label, case) in main["direct_calls"].as_object().unwrap() {
+        loop_dot_cases::write(root, "main.crn", case["source"].as_str().unwrap());
+        assert_eq!(
+            observe_complete_diagnostics(&engine, root, "main.crn"),
+            case["lsp"],
+            "{label}"
+        );
+    }
+}
+
+fn observe_complete_diagnostics(
+    engine: &DiagnosticEngine,
+    root: &std::path::Path,
+    owner: &str,
+) -> serde_json::Value {
+    let path = root.join(owner);
+    let source = std::fs::read_to_string(&path).unwrap();
+    let diagnostics = engine.analyze(&create_document_at(&source, path.clone()), Some(&path));
+    let normalized = serde_json::to_string(&diagnostics)
+        .unwrap()
+        .replace(root.to_str().unwrap(), "<fixture>");
+    serde_json::from_str(&normalized).unwrap()
+}
+
+#[test]
+fn loop_dot_review_round2_deferred_function_contexts() {
+    run_loop_dot_case_table(|row| {
+        row.id == "2-22" || row.positions.contains(&"deferred function body")
+    });
+}
+
+#[test]
+fn loop_dot_review_round2_unrelated_export_failure() {
+    run_loop_dot_case_table(|row| row.id == "2-23");
+}
+
+#[test]
+fn loop_dot_review_round2_module_arguments() {
+    run_loop_dot_case_table(|row| matches!(row.id, "2-2" | "2-17"));
+}
+
+#[test]
+fn loop_dot_review_round2_bare_child_diagnostic_locations_match_subscript() {
+    let directory = Directory::new(&[]);
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let root = directory.root.path();
+    for row in loop_dot_cases::rows()
+        .into_iter()
+        .filter(|row| row.id == "2-4")
+    {
+        loop_dot_cases::fixture(root, &row);
+        for &position in row.positions {
+            let mut observations = Vec::new();
+            for reader in ["children.a", "children['a']"] {
+                let owner = loop_dot_cases::reader(root, position, reader);
+                let path = root.join(owner);
+                let source = std::fs::read_to_string(&path).unwrap();
+                let reader_start = source.find(reader).unwrap();
+                let reader_end = reader_start + reader.len();
+                let offset = |point: tower_lsp::lsp_types::Position| {
+                    let line_start: usize = source
+                        .split_inclusive('\n')
+                        .take(point.line as usize)
+                        .map(str::len)
+                        .sum();
+                    let byte = line_start + point.character as usize;
+                    // Remove only the subscript punctuation difference. Keep
+                    // root, key, and whole-expression anchors distinct.
+                    let suffix = reader_start + "children".len();
+                    if reader == "children.a" || byte <= suffix {
+                        byte
+                    } else if byte >= reader_end {
+                        byte - 3
+                    } else {
+                        suffix + if byte - suffix <= 2 { 1 } else { 2 }
+                    }
+                };
+                observations.push(
+                    engine
+                        .analyze(&create_document_at(&source, path.clone()), Some(&path))
+                        .into_iter()
+                        .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+                        .map(|diagnostic| {
+                            (
+                                diagnostic.message,
+                                offset(diagnostic.range.start),
+                                offset(diagnostic.range.end),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            assert_eq!(
+                observations[0], observations[1],
+                "{:?}, {position}",
+                row.kind
+            );
+        }
+    }
+}
+
+#[test]
+fn loop_dot_review_round1_unrelated_lsp_wording_matches_main() {
+    run_loop_dot_case_table(|row| matches!(row.id, "2-20" | "2-21"));
+}
+
+#[test]
+fn loop_dot_review_round1_export_preserves_distinct_boundary_failure() {
+    use carina_core::binding_index::BindingIndex;
+    use carina_core::parser::ExportParamLike;
+
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let source = "provider mock {}\nlet src = mock.test.resource { name = 'source' }\nexports { out: Bool = src.comment ?? 1 }\n";
+    let document = create_document(source);
+    // Keep the authored expression available after its failure, as the LSP
+    // does, then compare the CLI's shared export validation with the LSP pass.
+    let parsed = carina_core::parser::parse_file(
+        source,
+        Path::new("test.crn"),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let configuration = carina_core::test_utils::load_canonical_buffer_configuration(
+        &parsed,
+        &engine.schemas,
+        &engine.provider_context,
+    );
+    let inferred = configuration.inferred_export_params();
+    let expression = inferred.parameters()[0].judgement().unwrap();
+    assert_eq!(
+        expression.check_owner(),
+        carina_core::parser::retained::ExpressionCheckOwner::Reported,
+    );
+    let expression_error = expression.static_type().unwrap_err().to_string();
+    let bindings = BindingIndex::from_parsed(&parsed, &engine.schemas, &engine.provider_context);
+    let mut cli_errors = carina_core::validation::validate_export_param_ref_types_with_bindings(
+        inferred.parameters(),
+        &bindings,
+    )
+    .unwrap_err()
+    .into_iter()
+    .map(|error| error.to_string())
+    .collect::<Vec<_>>();
+    assert_eq!(cli_errors.len(), 1, "{cli_errors:?}");
+    assert!(cli_errors[0].contains("Bool"), "{cli_errors:?}");
+    assert_ne!(cli_errors[0], expression_error);
+    let tree = carina_core::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+    let mut lsp_errors = engine.with_run_for_test(|run| {
+        run.check_inferred_export_types(
+            &document.for_diagnostics().unwrap(),
+            configuration.judged(),
+            &tree,
+        )
+        .into_iter()
+        .map(|diagnostic| diagnostic.message)
+        .collect::<Vec<_>>()
+    });
+    cli_errors.push(expression_error.clone());
+    lsp_errors.push(expression_error);
+    cli_errors.sort();
+    lsp_errors.sort();
+    assert_eq!(lsp_errors, cli_errors);
+}
+
+#[test]
+fn loop_dot_module_call_keeps_independent_type_errors() {
+    let directory = Directory::new(&[]);
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let row = loop_dot_cases::rows()
+        .into_iter()
+        .find(|row| row.id == "2-2" && row.kind == loop_dot_cases::Kind::Map)
+        .unwrap();
+    let root = directory.root.path();
+    loop_dot_cases::fixture(root, &row);
+    loop_dot_cases::write(
+        root,
+        "consumer/main.crn",
+        "mock.test.resource { name = 1 comment = value }\n",
+    );
+    let mut observations = Vec::new();
+    for reader in ["children.a_missing.name", "children['a_missing'].name"] {
+        let owner = loop_dot_cases::reader(root, "module argument", reader);
+        let path = root.join(owner);
+        let source = std::fs::read_to_string(&path).unwrap();
+        let document = create_document_at(&source, path.clone());
+        let merged = engine
+            .with_run_for_test(|run| {
+                run.parse_and_resolve_merged_with_buffer(
+                    &document.for_diagnostics().unwrap(),
+                    &carina_core::paths::ResolvedPath::new(root).unwrap(),
+                )
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                merged.module_resolution,
+                checks::MergedModuleResolution::Expanded { .. }
+            ),
+            "the independent error must be checked after module expansion"
+        );
+        let errors = engine
+            .analyze(&document, Some(&path))
+            .into_iter()
+            .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("Undefined identifier `children.a_missing`")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("expected String") && error.contains("got Int")),
+            "{errors:?}"
+        );
+        observations.push(errors);
+    }
+    assert_eq!(observations[0], observations[1]);
+}
+
+fn run_loop_dot_case_table(include: impl Fn(&loop_dot_cases::Row) -> bool) {
+    let directory = Directory::new(&[]);
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let root = directory.root.path();
+    let observe = |owner: &str, include_inference_warning: bool| {
+        let path = root.join(owner);
+        let source = std::fs::read_to_string(&path).unwrap();
+        engine
+            .analyze(&create_document_at(&source, path.clone()), Some(&path))
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+                    || (include_inference_warning
+                        && diagnostic
+                            .message
+                            .starts_with("export 'out': type annotation required:"))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>()
+    };
+    let mut failures = Vec::new();
+    for row in loop_dot_cases::rows().into_iter().filter(include) {
+        loop_dot_cases::fixture(root, &row);
+        for &position in row.positions {
+            let owner = loop_dot_cases::reader(root, position, row.reader);
+            if matches!(row.expected, loop_dot_cases::Outcome::MainFunction) {
+                let actual = observe_complete_diagnostics(&engine, root, owner);
+                assert_eq!(
+                    actual,
+                    loop_dot_cases::main_function_record(&row, position)["lsp"],
+                    "{}, {:?}, {position}, {}",
+                    row.id,
+                    row.kind,
+                    row.reader
+                );
+                continue;
+            }
+            let dot = observe(
+                owner,
+                row.id == "2-23" || loop_dot_cases::inferred_selector_export(&row, position),
+            );
+            let expected = match row.expected {
+                loop_dot_cases::Outcome::MainFunction => unreachable!("main records checked above"),
+                loop_dot_cases::Outcome::Validates => Vec::new(),
+                loop_dot_cases::Outcome::Error(errors) => errors
+                    .iter()
+                    .map(|error| {
+                        if loop_dot_cases::inferred_selector_export(&row, position) {
+                            format!("export 'out': type annotation required: {error}")
+                        } else {
+                            (*error).to_owned()
+                        }
+                    })
+                    .collect(),
+                loop_dot_cases::Outcome::SurfaceErrors { cli, lsp } => {
+                    assert_ne!(cli, lsp, "each surface preserves main's wording");
+                    lsp.iter().map(|error| (*error).to_owned()).collect()
+                }
+                loop_dot_cases::Outcome::SameAsSubscript(subscript) => {
+                    loop_dot_cases::reader(root, position, subscript);
+                    let bracket = observe(owner, false);
+                    // Bare-child exports retain independent annotation errors
+                    // from the shared core boundary pass, alongside expression errors.
+                    let expected: Vec<String> = if row.id == "2-4" {
+                        match position {
+                            "plain" | "if" => vec![
+                                "expected String, got mock.test.resource",
+                                "expected String, got mock.test.resource",
+                            ],
+                            "single interpolation" | "multipart interpolation" => vec![
+                                "mock.test.resource.other: 'children.a' is a resource handle, not a value",
+                            ],
+                            "coalesce" => vec![
+                                "coalesce default type `String` does not match left type `mock.test.resource`",
+                            ],
+                            "export" => vec![
+                                "coalesce default type `String` does not match left type `mock.test.resource`",
+                                "export 'out': type mismatch for 'children.a': expected String, got mock.test.resource",
+                            ],
+                            "export plain" => vec![
+                                "export 'out': inferred resource handle mock.test.resource cannot cross a state boundary; export an identity value such as mock.test.resource.Id instead",
+                            ],
+                            "module argument" => vec![
+                                "module call 'consume (anonymous call)': argument 'value': cannot assign mock.test.resource to 'value': expected String, got mock.test.resource (from children.a)",
+                            ],
+                            "function argument" | "arithmetic" => Vec::new(),
+                            _ => unreachable!("bare-child position {position}"),
+                        }
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect()
+                    } else if row.id == "2-6a" {
+                        vec![format!(
+                            "deferred-for iterable `{subscript}`: expected list iterable, got map"
+                        )]
+                    } else {
+                        Vec::new()
+                    };
+                    if bracket != expected {
+                        failures.push(format!(
+                            "{}, {:?}, {position}, {subscript}: LSP {bracket:?}, validate {expected:?}",
+                            row.id, row.kind
+                        ));
+                    }
+                    if row.id == "2-6a" {
+                        expected
+                            .into_iter()
+                            .map(|error| error.replace(subscript, row.reader))
+                            .collect()
+                    } else {
+                        expected
+                    }
+                }
+            };
+            if dot != expected {
+                failures.push(format!(
+                    "{}, {:?}, {position}, {}: {dot:?}, expected {expected:?}",
+                    row.id, row.kind, row.reader
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 struct Directory {
     root: tempfile::TempDir,
 }

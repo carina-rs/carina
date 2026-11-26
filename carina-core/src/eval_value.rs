@@ -29,6 +29,113 @@ use indexmap::IndexMap;
 
 type Value<B = RelativeBindingName> = GenericValue<ParserPlaceholder, B>;
 
+/// Evidence that a named structural handle is a loop group. Only a `For`
+/// handle can construct this view; collection shapes are not addressing authority.
+pub(crate) struct LoopGroupRef<'a, B: BindingAddress> {
+    handle: &'a UnexpandedStructuralHandle<B>,
+    pattern: &'a crate::parser::ForBinding,
+}
+
+impl<'a, B: BindingAddress> LoopGroupRef<'a, B> {
+    pub(crate) fn binding(&self) -> &'a B {
+        self.handle.canonical_binding()
+    }
+
+    fn new(handle: &'a UnexpandedStructuralHandle<B>) -> Option<Self> {
+        let UnexpandedStructuralHandleKind::For(pattern) = handle.kind() else {
+            return None;
+        };
+        Some(Self { handle, pattern })
+    }
+}
+
+pub(crate) struct SelectedLoopChild<B: BindingAddress> {
+    lookup: crate::resource::binding_address::BindingLookup<B>,
+    subscript: Subscript,
+}
+
+impl<B: BindingAddress> SelectedLoopChild<B> {
+    pub(crate) fn into_lookup(self) -> crate::resource::binding_address::BindingLookup<B> {
+        self.lookup
+    }
+
+    pub(crate) fn binding(&self) -> &B {
+        self.lookup.binding()
+    }
+
+    pub(crate) fn step(&self) -> PathSegment {
+        PathSegment::Subscript {
+            index: self.subscript.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InvalidLoopDot {
+    field: String,
+    target: InvalidLoopDotTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InvalidLoopDotTarget {
+    Indexed,
+    Keyed,
+}
+
+impl InvalidLoopDot {
+    pub(crate) fn step(&self) -> PathSegment {
+        PathSegment::Field {
+            name: self.field.clone(),
+        }
+    }
+
+    pub(crate) fn error(&self, member_type: &str) -> crate::static_type::InferenceError {
+        crate::static_type::InferenceError::InvalidAccess {
+            base_type: match self.target {
+                InvalidLoopDotTarget::Indexed => format!("list({member_type})"),
+                InvalidLoopDotTarget::Keyed => "keyed loop group".to_owned(),
+            },
+            step: self.step(),
+        }
+    }
+
+    pub(crate) fn preserve<B: BindingAddress>(&self, binding: &B, line: usize) -> Value<B> {
+        crate::resource::parser_rejected_loop_dot_access(binding.clone(), self, line)
+    }
+}
+
+/// The sole dot-selection rule for named loop groups. A successful field is
+/// exactly a String subscript; a rejected field is terminal, never an attribute.
+pub(crate) fn select_dot<B: BindingAddress>(
+    group: LoopGroupRef<'_, B>,
+    field: &str,
+) -> Result<SelectedLoopChild<B>, InvalidLoopDot> {
+    use crate::parser::ForBinding;
+    let target = match group.pattern {
+        ForBinding::Indexed(_, _) => InvalidLoopDotTarget::Indexed,
+        ForBinding::Simple(_) | ForBinding::Map(_, _) => {
+            let mut bytes = field.bytes();
+            if bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+                && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                let subscript = Subscript::Str { key: field.into() };
+                return Ok(SelectedLoopChild {
+                    lookup: crate::resource::binding_address::BindingLookup::new(
+                        group.handle.canonical_binding(),
+                    )
+                    .select(&subscript),
+                    subscript,
+                });
+            }
+            InvalidLoopDotTarget::Keyed
+        }
+    };
+    Err(InvalidLoopDot {
+        field: field.to_owned(),
+        target,
+    })
+}
+
 /// Parser-only representation of a structural binding used as an operand.
 ///
 /// A structural handle is deliberately not part of [`Value`]. It can be
@@ -354,6 +461,10 @@ impl<B: BindingAddress> UnexpandedStructuralHandle<B> {
         matches!(self.kind, UnexpandedStructuralHandleKind::For(_))
     }
 
+    pub(crate) fn loop_group(&self) -> Option<LoopGroupRef<'_, B>> {
+        LoopGroupRef::new(self)
+    }
+
     pub(crate) fn is_parameter_handle(&self) -> bool {
         matches!(
             &self.kind,
@@ -362,7 +473,57 @@ impl<B: BindingAddress> UnexpandedStructuralHandle<B> {
         )
     }
 
-    /// Return the canonical reference operand used only for postfix access.
+    /// Select while structural kind evidence is still available, before the
+    /// generic access primitive can lower a binding field to an attribute.
+    pub(crate) fn select_access(
+        &self,
+        step: PathSegment,
+        location: &crate::parser::DeclarationLocation,
+    ) -> Result<Value<B>, crate::parser::ParseError> {
+        use crate::parser::{ForBinding, ParseError};
+        let line = location.span().start_line();
+        if let Some(group) = self.loop_group()
+            && let PathSegment::Field { name } = &step
+        {
+            return Ok(match select_dot(group, name) {
+                Ok(child) => child.into_lookup().reference(),
+                Err(rejected) => rejected.preserve(self.canonical_binding(), line),
+            });
+        }
+        if let PathSegment::Subscript { index } = &step {
+            if matches!(
+                self.kind(),
+                UnexpandedStructuralHandleKind::For(ForBinding::Simple(_))
+            ) && matches!(index, Subscript::Int { .. })
+            {
+                return Err(ParseError::AtElement(Box::new(
+                    ParseError::ValueKeyedSubscript {
+                        span: location.span(),
+                    }
+                    .into_element_at(location),
+                )));
+            }
+            return Ok(crate::resource::binding_address::BindingLookup::new(
+                self.canonical_binding(),
+            )
+            .select(index)
+            .reference());
+        }
+        crate::resource::apply_value_path_segment(
+            self.access_base_value(),
+            step,
+            line,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .and_then(crate::resource::ValuePathSegmentResult::into_value)
+        .map_err(|error| ParseError::InvalidExpression {
+            line,
+            message: error.to_string(),
+        })
+    }
+
+    /// Traversal/transport projection. Semantic access must use `select_access`
+    /// so a loop group cannot become a resource attribute by generic lowering.
     pub(crate) fn access_base_value(&self) -> Value<B> {
         let binding = self.canonical_binding_name();
         match &self.kind {

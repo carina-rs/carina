@@ -1,7 +1,6 @@
 use super::*;
 
 use crate::module_resolver::ModuleError;
-use crate::resource::knowledge::{Classification, KnowledgeContext};
 use crate::validation::ParameterValueFinding;
 
 #[derive(Debug)]
@@ -112,7 +111,10 @@ fn assert_reader_protected_for_iterable(
         ReaderIterable::Map => ("key, item", "map"),
     };
     // The colliding key selects `name`, so make that attribute secret too.
-    let name = if selector == "children.comment.name" {
+    let name = if matches!(
+        selector,
+        "children.comment.name" | "children['comment'].name"
+    ) {
         "secret('name canary')"
     } else {
         "item"
@@ -208,7 +210,7 @@ fn assert_reader_protected_for_iterable(
                         .expect_ordinary_for_test()
                     })
                     .unwrap_or_else(|errors| {
-                        panic!("{label}: expected the unexpanded list export to pass value validation, got {errors:?}")
+                        panic!("{label}: expected the unexpanded loop export to pass value validation, got {errors:?}")
                     });
                 }
                 Rejected(_) => unreachable!(),
@@ -232,7 +234,13 @@ fn assert_reader_protected_for_iterable(
             );
             if matches!(expected, Admitted) && export {
                 let mut file = resolved.into_file();
-                expand(&mut file, list(&["a", "b"]), &context);
+                let items = match iterable {
+                    ReaderIterable::Map => map(&["a", "b"]),
+                    ReaderIterable::IndexedList | ReaderIterable::ValueKeyedList => {
+                        list(&["a", "b"])
+                    }
+                };
+                expand(&mut file, items, &context);
                 assert!(file.deferred_for_expressions().is_empty(), "{label}");
                 assert_eq!(
                     file.resources.len(),
@@ -260,7 +268,7 @@ fn assert_reader_protected_for_iterable(
                         )
                         .expect_ordinary_for_test()
                     })
-                    .expect_err("list child export must be rejected as SecretExport");
+                    .expect_err("loop child export must be rejected as SecretExport");
                 assert_eq!(errors.len(), 1, "{label}: {errors:?}");
                 assert!(
                     matches!(errors[0].detail(), ParameterValueFinding::SecretExport { name } if name == "output"),
@@ -282,7 +290,7 @@ fn assert_reader_protected_for_iterable(
                             ),
                         )
                     })
-                    .expect_err("list child export must be rejected by the plan export check");
+                    .expect_err("loop child export must be rejected by the plan export check");
                 assert_eq!(
                     error, "export 'output' cannot hold a secret value",
                     "{label}"
@@ -293,6 +301,22 @@ fn assert_reader_protected_for_iterable(
 }
 
 macro_rules! reader_test {
+    ($name:ident, [$($selector:literal),+], $map:literal, $module:literal, $export:literal, $expected:expr) => {
+        #[test]
+        fn $name() {
+            for selector in [$($selector),+] {
+                assert_reader_protected(
+                    &format!("{}: {selector}", stringify!($name)),
+                    selector,
+                    $map,
+                    $module,
+                    $export,
+                    true,
+                    $expected,
+                );
+            }
+        }
+    };
     ($name:ident, $selector:literal, $map:literal, $module:literal, $export:literal, $expected:expr) => {
         #[test]
         fn $name() {
@@ -465,21 +489,8 @@ fn for_value_keys_reader_pending_keeps_runtime_redaction() {
             )
         })
         .unwrap();
-        if selector == "children.comment.name" {
-            assert!(
-                matches!(
-                    value
-                        .knowledge(&KnowledgeContext::plan(&bindings))
-                        .unwrap()
-                        .into_classification(),
-                    Classification::Pending(_)
-                ),
-                "{selector}"
-            );
-        } else {
-            assert!(crate::value::contains_secret(&value), "{selector}");
-            assert!(!crate::value::format_value(&value).contains("canary"));
-        }
+        assert!(crate::value::contains_secret(&value), "{selector}");
+        assert!(!crate::value::format_value(&value).contains("canary"));
         let child = resolved
             .as_file()
             .resources
@@ -523,21 +534,10 @@ fn for_value_keys_reader_pending_keeps_runtime_redaction() {
             )
         })
         .unwrap();
-        if selector == "children.comment.name" {
-            assert!(matches!(
-                value
-                    .knowledge(&KnowledgeContext::apply(&applied))
-                    .unwrap()
-                    .into_classification(),
-                Classification::Pending(_)
-            ));
-            assert!(!crate::value::format_value(&value).contains("canary"));
-        } else {
-            assert!(crate::value::contains_secret(&value));
-            assert!(!crate::value::format_value(&value).contains("canary"));
-            let snapshot = crate::value::redact_secrets_in_value(&value).unwrap();
-            assert!(!serde_json::to_string(&snapshot).unwrap().contains("canary"));
-        }
+        assert!(crate::value::contains_secret(&value));
+        assert!(!crate::value::format_value(&value).contains("canary"));
+        let snapshot = crate::value::redact_secrets_in_value(&value).unwrap();
+        assert!(!serde_json::to_string(&snapshot).unwrap().contains("canary"));
     }
 }
 
@@ -561,17 +561,21 @@ fn for_value_keys_reader_pending_mixed_alternatives_characterization() {
             .is_err()
     );
 
-    // String subscripts select keyed children; field access remains invalid.
-    let (_directory, file, _schemas, _context) = reader_fixture(
+    // Dot and String-subscript spelling select the same keyed child.
+    let (_directory, file, schemas, context) = reader_fixture(
         "let children = for item in ['comment'] { mock.test.Resource { name = secret('name canary') } }\nlet other = mock.test.Resource { comment = children.comment.name ?? 'public' }\n",
         None,
     );
-    let error = file.unwrap_err().to_string();
+    let file = file.unwrap();
+    let pending = report(&file, &schemas, &context);
+    assert!(pending.is_pending(), "{pending:?}");
+    assert!(pending.findings().is_empty(), "{pending:?}");
+    assert!(!format!("{pending:?}").contains("canary"));
     assert!(
-        error.contains("cannot apply access .comment to keyed loop group"),
-        "{error}"
+        resolve_owner(file, &schemas, &context)
+            .validated_secrecy()
+            .is_err()
     );
-    assert!(!error.contains("canary"));
 
     let loop_source = "let children = for item in ['comment'] { mock.test.Resource { comment = secret('canary') name = secret('name canary') } }\nlet other = mock.test.Resource { comment = children.comment.name }\n";
     let (_directory, file, schemas, context) = reader_fixture(loop_source, None);
@@ -654,24 +658,27 @@ reader_test!(
 
 #[test]
 fn for_value_keys_reader_export_list() {
-    assert_reader_protected_for_iterable(
-        "value-keyed list export",
-        "children.a.comment",
-        ReaderIterable::ValueKeyedList,
-        false,
-        true,
-        true,
-        Pending,
-    );
+    // Case-table 2-1: both spellings reach export validation after expansion.
+    for selector in ["children.a.comment", "children['a'].comment"] {
+        assert_reader_protected_for_iterable(
+            &format!("value-keyed list export: {selector}"),
+            selector,
+            ReaderIterable::ValueKeyedList,
+            false,
+            true,
+            true,
+            Admitted,
+        );
+    }
 }
 
 reader_test!(
     issue_4516_reader_export_map,
-    "children.a.comment",
+    ["children.a.comment", "children['a'].comment"],
     true,
     false,
     true,
-    Pending
+    Admitted
 );
 reader_test!(
     issue_4516_reader_module_list,
@@ -683,11 +690,12 @@ reader_test!(
 );
 reader_test!(
     issue_4516_reader_module_map_dot,
-    "children.a.comment",
+    ["children.a.comment", "children['a'].comment"],
     true,
     true,
     false,
-    Pending
+    // Case-table 2-1: dot selection preserves the subscript argument rejection.
+    Rejected(ArgumentValueAccess)
 );
 reader_test!(
     issue_4516_reader_module_map_subscript,
@@ -699,19 +707,19 @@ reader_test!(
 );
 reader_test!(
     issue_4516_reader_module_map_attribute_key,
-    "children.comment.name",
+    ["children.comment.name", "children['comment'].name"],
     true,
     true,
     false,
-    Pending
+    Rejected(ArgumentValueAccess)
 );
 reader_test!(
     issue_4516_reader_module_map_public_attribute_key,
-    "children.name.comment",
+    ["children.name.comment", "children['name'].comment"],
     true,
     true,
     false,
-    Pending
+    Rejected(ArgumentValueAccess)
 );
 reader_test!(
     issue_4516_reader_module_export_list,
@@ -745,15 +753,17 @@ fn issue_4516_reader_export_list_inferred() {
 
 #[test]
 fn issue_4516_reader_export_map_inferred() {
-    assert_reader_protected(
-        "export map without annotation",
-        "children.a.comment",
-        true,
-        false,
-        true,
-        false,
-        Pending,
-    );
+    for selector in ["children.a.comment", "children['a'].comment"] {
+        assert_reader_protected(
+            &format!("export map without annotation: {selector}"),
+            selector,
+            true,
+            false,
+            true,
+            false,
+            Admitted,
+        );
+    }
 }
 
 #[test]

@@ -2995,6 +2995,79 @@ where
     pub fn binding_names(&self) -> &std::collections::HashSet<String> {
         &self.binding_names
     }
+
+    /// Check existence against declarations, including admitted loop children,
+    /// without adding generated names to the authored scope used for suggestions.
+    pub(crate) fn is_defined_binding(&self, binding: &crate::resource::DependencyKey<B>) -> bool {
+        binding.is_in_names(&self.binding_names)
+            || binding.is_in_names(&self.file.structural_binding_names())
+    }
+
+    /// A selected loop child keeps core's identifier-scope diagnostic. Other
+    /// references retain their frontend's wording, regardless of nearby loops.
+    pub fn undefined_loop_child_reference(
+        &self,
+        reference: &AnalysisReference<B>,
+    ) -> Option<crate::resource::SecretDiagnosticError<String>> {
+        let selected = self
+            .file
+            .parser_binding_metadata
+            .structural_handles()
+            .values()
+            .find_map(|handle| {
+                let group = handle.loop_group()?;
+                let prefix = format!("{}.", group.binding());
+                let field = reference.path.binding().strip_prefix(&prefix)?;
+                let child = crate::eval_value::select_dot(group, field).ok()?;
+                (child.binding() == reference.path.binding_address()).then_some(child)
+            })?;
+        let mut known = self.file.structural_binding_names();
+        known.extend(self.file.variables.keys().map(String::as_str));
+        if known.contains(selected.binding().as_str()) {
+            return None;
+        }
+        Some(reference.render(|_| {
+            super::error::undefined_identifier_error(&known, selected.binding().to_string(), 0)
+                .to_string()
+        }))
+    }
+    /// A caller's missing-child diagnostic owns the same lookup failure after
+    /// argument substitution. Other findings from the module remain independent.
+    pub fn loop_child_owns_module_lookup(
+        &self,
+        call: &crate::parser::ModuleCallId,
+        error: &crate::schema::TypeError,
+    ) -> bool {
+        use crate::resource::SecretDiagnosticError;
+        use crate::validation::admission::AdmissionReferenceError;
+        let crate::schema::TypeError::Reference { error, .. } = error else {
+            return false;
+        };
+        let SecretDiagnosticError::Public(AdmissionReferenceError::UnknownBinding {
+            binding, ..
+        }) = error.as_ref()
+        else {
+            return false;
+        };
+        let Some(authored_call) = self.module_calls().find(|authored| authored.id() == call) else {
+            return false;
+        };
+        self.value_references().iter().any(|value| {
+            let reference = value.reference();
+            reference.binding_matches(|key| key.matches_name(binding))
+                && authored_call.arguments().any(|(name, _)| {
+                    let Some(argument) = call.argument_value_location(name) else {
+                        return false;
+                    };
+                    let location = reference.location();
+                    location.file() == argument.file()
+                        && argument.span().start_byte() <= location.span().start_byte()
+                        && location.span().end_byte() <= argument.span().end_byte()
+                })
+                && self.undefined_loop_child_reference(reference).is_some()
+        })
+    }
+
     pub fn upstream_states(&self) -> &[Located<&'a super::UpstreamState<B>>] {
         &self.upstream_states
     }

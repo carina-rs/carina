@@ -347,6 +347,79 @@ fn keyed_loop_addressing_agrees_across_judgement_validation_and_expansion() {
 }
 
 #[test]
+fn loop_dot_review_round2_parenthesized_non_loop_module_keeps_generic_access() {
+    let (_, report) = source_schema_report(
+        "let child = use { source = './child' }\nlet m = child {}\nlet selected = (m).x\nlet missing = (m).missing\n",
+    );
+    let base = report.binding(&RelativeBindingName::new("m")).unwrap();
+    for name in ["selected", "missing"] {
+        let selected = report.binding(&RelativeBindingName::new(name)).unwrap();
+        assert_eq!(selected.static_type(), base.static_type(), "{name}");
+        assert_eq!(selected.check_owner(), base.check_owner(), "{name}");
+    }
+}
+
+#[test]
+fn loop_dot_retained_heads_match_subscript_diagnostics() {
+    for (pattern, iterable) in [("k, v", "({ a = 'x' })"), ("v", "['a']")] {
+        for alias in [false, true] {
+            for suffix in ["name", "missing", "name['bad']"] {
+                let mut observations = Vec::new();
+                for selection in [".a", "['a']"] {
+                    let (alias_source, head) = if alias {
+                        ("let alias = children\n", "alias")
+                    } else {
+                        ("", "children")
+                    };
+                    let (_, report) = source_schema_report(&format!(
+                        "let children = for {pattern} in {iterable} {{ mock.test.Source {{ name = v }} }}\n{alias_source}let selected = {head}{selection}.{suffix}"
+                    ));
+                    let selected = report
+                        .binding(&RelativeBindingName::new("selected"))
+                        .unwrap();
+                    observations.push((
+                        selected.static_type().cloned(),
+                        selected.check_owner(),
+                        report
+                            .findings()
+                            .iter()
+                            .map(|finding| finding.detail().to_string())
+                            .collect::<Vec<_>>(),
+                    ));
+                }
+                assert_eq!(
+                    observations[0], observations[1],
+                    "{pattern}, alias={alias}, {suffix}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn loop_dot_judgement_selects_a_key_and_owns_indexed_rejection() {
+    for (pattern, iterable) in [("k, v", "({ a = 'x' })"), ("v", "['a']")] {
+        let (_, report) = source_schema_report(&format!(
+            "let children = for {pattern} in {iterable} {{ mock.test.Source {{ name = v }} }}\nlet selected = children.a.name"
+        ));
+        let selected = report
+            .binding(&RelativeBindingName::new("selected"))
+            .unwrap();
+        assert_eq!(selected.static_type().unwrap(), &TypeExpr::String);
+        assert!(report.findings().is_empty(), "{:?}", report.findings());
+    }
+    let (_, report) = source_schema_report(
+        "let children = for (i, v) in ['a'] { mock.test.Source { name = v } }\nlet selected = children.a.name",
+    );
+    let errors: Vec<_> = report
+        .findings()
+        .iter()
+        .map(|finding| finding.detail().to_string())
+        .collect();
+    assert_eq!(errors, ["cannot apply access .a to list(mock.test.Source)"]);
+}
+
+#[test]
 fn single_reference_interpolation_preserves_child_judgement_and_literal_folding() {
     for definition in [
         "let x = src.name",

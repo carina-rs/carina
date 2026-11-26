@@ -45,6 +45,116 @@ fn validate_diagnostic_messages(root: &Path) -> (Vec<String>, Vec<String>) {
     (messages("errors"), messages("warnings"))
 }
 
+#[test]
+fn bare_function_condition_matches_main_with_and_without_loop() {
+    for (loop_source, line) in [
+        ("", 2),
+        (
+            "let children = for k, v in ({ a = 'x' }) { mock.test.resource { name = k } }\n",
+            3,
+        ),
+    ] {
+        for condition in ["prod", "(prod)"] {
+            let fixture = loop_reader_fixture("");
+            write_file(
+                fixture.path(),
+                "main.crn",
+                &format!(
+                    "let prod = true\n{loop_source}fn mode(): String {{ if {condition} {{ 'a' }} else {{ 'b' }} }}\n"
+                ),
+            );
+            let output = run(fixture.path(), &["validate", "."]);
+            assert_eq!(output.status.code(), Some(1));
+            assert_eq!(
+                output_text(&output),
+                format!(
+                    "Error: ./main.crn: Invalid expression at line {line}: if condition must be a Bool value, got: enum identifier prod\n"
+                ),
+                "loop present: {}",
+                !loop_source.is_empty(),
+            );
+        }
+    }
+}
+
+#[test]
+fn unused_function_argument_keeps_main_cycle_diagnostic() {
+    let fixture = loop_reader_fixture("");
+    for (name, source) in [
+        ("a.crn", "let A = ignore(B)\n"),
+        ("b.crn", "let B = A\n"),
+        ("helpers.crn", "fn ignore(value) { 'known' }\n"),
+    ] {
+        write_file(fixture.path(), name, source);
+    }
+    let output = run(fixture.path(), &["validate", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        output_text(&output),
+        "Error: .: Cyclic let binding detected: A -> B -> A\n"
+    );
+}
+
+#[test]
+fn whole_loop_group_in_function_keeps_main_called_and_uncalled_behavior() {
+    for called in [false, true] {
+        let fixture = loop_reader_fixture("");
+        let call = if called {
+            "let r = mock.test.resource { name = \"${n()}\" }\n"
+        } else {
+            ""
+        };
+        write_file(
+            fixture.path(),
+            "main.crn",
+            &format!(
+                "let children = for k, v in ({{ a = 'x' }}) {{ mock.test.resource {{ name = k }} }}\nfn n(): Int {{ length(children) }}\n{call}"
+            ),
+        );
+        let output = run(fixture.path(), &["validate", "."]);
+        assert_eq!(output.status.success(), !called, "{}", output_text(&output));
+        if !called {
+            continue;
+        }
+        assert_eq!(
+            output_text(&output),
+            "Error: ./main.crn:2:15: Invalid expression at line 2: length() argument must be a List, Map, or String, got EnumIdentifier\n",
+            "called: {called}",
+        );
+        let output = run(fixture.path(), &["validate", ".", "--json"]);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["errors"][0]["location"]["range"]["start"],
+            serde_json::json!({"line": 2, "column": 15})
+        );
+        assert_eq!(
+            report["errors"][0]["location"]["range"]["end"],
+            serde_json::json!({"line": 2, "column": 31})
+        );
+    }
+}
+
+#[test]
+fn whole_loop_group_outside_functions_keeps_main_diagnostic_location() {
+    for reader in ["let n = length(children)", "exports { out = children }"] {
+        let fixture = loop_reader_fixture("");
+        write_file(
+            fixture.path(),
+            "main.crn",
+            &format!(
+                "let children = for k, v in ({{ a = 'x' }}) {{ mock.test.resource {{ name = k }} }}\n{reader}\n"
+            ),
+        );
+        let output = run(fixture.path(), &["validate", "."]);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            output_text(&output),
+            "Error: ./main.crn: Invalid expression at line 2: 'children' is a for binding, not a value; reference an instance attribute, e.g. 'children['key'].<attribute>'\n",
+            "{reader}",
+        );
+    }
+}
+
 fn assert_success(label: &str, output: &Output) {
     let text = output_text(output);
     assert!(output.status.success(), "{label} failed:\n{text}");
@@ -180,6 +290,9 @@ fn keyed_loop_invalid_reader_spellings_stay_rejected_in_every_position() {
             "children[0].name"
         };
         for reader in ["children.a.name", invalid_subscript] {
+            if reader == "children.a.name" && kind != "indexed" {
+                continue;
+            }
             for (position, expression) in loop_reader_positions(reader) {
                 let expected = match (kind, reader, position) {
                     ("value-keyed", "children[0].name", _) => vec![
@@ -192,16 +305,9 @@ fn keyed_loop_invalid_reader_spellings_stay_rejected_in_every_position() {
                         "Undefined identifier `children.a`. Did you mean `children`?",
                         "cannot apply access ['a'] to list(mock.test.resource)",
                     ],
-                    (_, "children.a.name", "plain") => {
-                        vec!["unknown binding 'children' in reference children.a"]
-                    }
-                    (_, "children.a.name", "single interpolation") => vec![
-                        "mock.test.resource.other: unknown binding 'children' in reference children.a.name",
-                    ],
                     ("indexed", "children.a.name", _) => {
                         vec!["cannot apply access .a to list(mock.test.resource)"]
                     }
-                    (_, "children.a.name", _) => vec!["cannot apply access .a to keyed loop group"],
                     ("map", "children[0].name", "plain") => {
                         vec!["unknown binding 'children[0]' in reference children[0].name"]
                     }
@@ -326,6 +432,206 @@ fn keyed_loop_group_directory_diagnostic_lists() {
         ));
     }
     assert_eq!(actual, expected, "complete CLI diagnostic lists");
+}
+
+fn keyed_loop_reader_positions(reader: &str) -> impl Iterator<Item = (&'static str, String)> {
+    loop_reader_positions(reader).into_iter().chain([
+        ("export plain", reader.to_owned()),
+        ("module argument", reader.to_owned()),
+    ])
+}
+
+fn write_keyed_loop_reader(root: &Path, position: &str, expression: &str) {
+    match position {
+        "export plain" => {
+            write_loop_reader(root, "export", expression);
+            write_file(
+                root,
+                "exports.crn",
+                &format!("exports {{ out = {expression} }}\n"),
+            );
+        }
+        "module argument" => {
+            write_loop_reader(root, "export", "'other'");
+            write_file(
+                root,
+                "other.crn",
+                &format!(
+                    "let consumer = use {{ source = './module' }}\nconsumer {{ value = {expression} }}\n"
+                ),
+            );
+            write_file(
+                root,
+                "module/arguments.crn",
+                "arguments { value: String }\n",
+            );
+            write_file(
+                root,
+                "module/main.crn",
+                "mock.test.resource { name = 'consumer' comment = value }\n",
+            );
+        }
+        _ => write_loop_reader(root, position, expression),
+    }
+}
+
+fn validate_keyed_loop_reader(root: &Path, position: &str, expression: &str) -> Output {
+    match position {
+        "export plain" | "module argument" => {
+            write_keyed_loop_reader(root, position, expression);
+            run(root, &["validate", "."])
+        }
+        _ => validate_loop_reader(root, position, expression),
+    }
+}
+
+#[test]
+fn keyed_loop_dot_readers_match_subscript_in_every_position() {
+    let mut failures = Vec::new();
+    for (kind, source, subscript) in LOOP_READER_CASES.into_iter().take(2) {
+        let fixture = loop_reader_fixture(source);
+        for ((position, dot), (_, bracket)) in keyed_loop_reader_positions("children.a.name")
+            .zip(keyed_loop_reader_positions(subscript))
+        {
+            let bracket_output = validate_keyed_loop_reader(fixture.path(), position, &bracket);
+            assert_success(&format!("{kind}, {position}, {bracket}"), &bracket_output);
+
+            let dot_output = validate_keyed_loop_reader(fixture.path(), position, &dot);
+            if !dot_output.status.success() {
+                failures.push(format!(
+                    "{kind}, {position}, {dot}: {}",
+                    output_text(&dot_output)
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn keyed_loop_dot_missing_key_matches_subscript_error() {
+    let mut failures = Vec::new();
+    for (kind, source, _) in LOOP_READER_CASES.into_iter().take(2) {
+        let fixture = loop_reader_fixture(source);
+        for ((position, dot), (_, bracket)) in keyed_loop_reader_positions("children.zzz.name")
+            .zip(keyed_loop_reader_positions("children['zzz'].name"))
+        {
+            write_keyed_loop_reader(fixture.path(), position, &bracket);
+            let (bracket_errors, _) = validate_diagnostic_messages(fixture.path());
+            write_keyed_loop_reader(fixture.path(), position, &dot);
+            let (dot_errors, _) = validate_diagnostic_messages(fixture.path());
+            if dot_errors != bracket_errors {
+                failures.push(format!(
+                    "{kind}, {position}: dot errors {dot_errors:?}, subscript errors {bracket_errors:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn indexed_loop_dot_reader_is_list_access_error_in_every_position() {
+    let (_, source, _) = LOOP_READER_CASES[2];
+    let fixture = loop_reader_fixture(source);
+    let mut failures = Vec::new();
+    for key in ["a", "zzz"] {
+        let reader = format!("children.{key}.name");
+        let error = format!("cannot apply access .{key} to list(mock.test.resource)");
+        for (position, expression) in keyed_loop_reader_positions(&reader) {
+            write_keyed_loop_reader(fixture.path(), position, &expression);
+            let (errors, _) = validate_diagnostic_messages(fixture.path());
+            let expected = vec![if position == "export plain" {
+                format!("./exports.crn:1:11: export 'out': type annotation required: {error}")
+            } else {
+                error.clone()
+            }];
+            if errors != expected {
+                failures.push(format!(
+                    "indexed, {position}, {reader}: errors {errors:?}, expected {expected:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn deferred_loop_function_value_chain_keeps_main_dot_and_subscript_errors() {
+    let fixture = loop_reader_fixture("");
+    for (reader, expected, planning_error) in [
+        (
+            "children.a.name",
+            vec!["cannot apply access .a to keyed loop group"],
+            "Error: ./main.crn at line 3\nError: cannot apply access .a to keyed loop group\n",
+        ),
+        (
+            "children['a'].name",
+            vec!["missing dependency edge to children.a provenance in ./main.crn"; 2],
+            "Error: missing dependency edge to children.a provenance in ./main.crn\n",
+        ),
+    ] {
+        write_file(
+            fixture.path(),
+            "main.crn",
+            &format!(
+                "let children = for k, v in ({{ a = 'x' }}) {{ mock.test.resource {{ name = k }} }}\n\
+                 let up = mock.test.resource {{ name = 'u' }}\n\
+                 fn sel(x: String): String {{ \"${{x}}-${{{reader}}}\" }}\n\
+                 let a = sel(up.name)\n\
+                 let b = length(a)\n\
+                 let c = \"${{a}}\"\n\
+                 let r = mock.test.resource {{ name = c comment = \"${{b}}\" }}\n"
+            ),
+        );
+        let (errors, _) = validate_diagnostic_messages(fixture.path());
+        assert_eq!(errors, expected, "{reader}");
+        let plan = run(fixture.path(), &["plan", "--json", "."]);
+        assert_eq!(plan.status.code(), Some(1), "{}", output_text(&plan));
+        let planning = output_text(&plan);
+        assert_eq!(planning, planning_error, "{reader}",);
+    }
+}
+
+#[test]
+fn keyed_loop_dot_plan_json_matches_subscript() {
+    let mut failures = Vec::new();
+    for (kind, source, subscript) in LOOP_READER_CASES.into_iter().take(2) {
+        let fixture = loop_reader_fixture(source);
+        write_loop_reader(fixture.path(), "plain", subscript);
+        let bracket_output = run(fixture.path(), &["plan", "--json", "--refresh=false", "."]);
+        assert_success(&format!("{kind}, subscript JSON plan"), &bracket_output);
+        let mut bracket_plan: serde_json::Value =
+            serde_json::from_slice(&bracket_output.stdout).expect("subscript plan JSON");
+
+        write_loop_reader(fixture.path(), "plain", "children.a.name");
+        let dot_output = run(fixture.path(), &["plan", "--json", "--refresh=false", "."]);
+        if !dot_output.status.success() {
+            failures.push(format!(
+                "{kind}, dot JSON plan: {}",
+                output_text(&dot_output)
+            ));
+            continue;
+        }
+        let mut dot_plan: serde_json::Value =
+            serde_json::from_slice(&dot_output.stdout).expect("dot plan JSON");
+        // Reuse the same project directory and ignore only the generation time.
+        for plan in [&mut bracket_plan, &mut dot_plan] {
+            assert!(
+                plan.as_object_mut()
+                    .expect("plan JSON object")
+                    .remove("timestamp")
+                    .is_some(),
+                "{kind}: plan generation timestamp"
+            );
+        }
+        if dot_plan != bracket_plan {
+            failures.push(format!(
+                "{kind}: dot JSON plan {dot_plan:#}, subscript JSON plan {bracket_plan:#}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]

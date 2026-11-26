@@ -151,7 +151,7 @@ fn keyed_loop_compound_reader_directory_diagnostics() {
         std::fs::write(directory.path().join(file), source).unwrap();
     }
     let path = directory.path().join("other.crn");
-    for (reader, accepted) in [("children['a'].name", true), ("children.a.name", false)] {
+    for reader in ["children['a'].name", "children.a.name"] {
         let source = format!(
             "let other = mock.test.resource {{ name = 'other' comment = {reader} ?? 'p' }}\n"
         );
@@ -162,20 +162,9 @@ fn keyed_loop_compound_reader_directory_diagnostics() {
             Arc::new(snapshot.provider_context().as_provider_context().clone()),
         );
         let diagnostics = engine.analyze(&document, Some(&path));
-        if accepted {
-            assert!(diagnostics.is_empty(), "{reader}: {diagnostics:#?}");
-        } else {
-            assert!(
-                diagnostics.iter().any(|diagnostic| {
-                    diagnostic.severity == Some(DiagnosticSeverity::ERROR)
-                        && diagnostic.message.contains("cannot apply access .a")
-                }),
-                "{reader}: {diagnostics:#?}"
-            );
-        }
-        assert_eq!(
+        assert!(diagnostics.is_empty(), "{reader}: {diagnostics:#?}");
+        assert!(
             checked_configuration(directory.path(), &snapshot).is_ok(),
-            accepted,
             "{reader}"
         );
     }

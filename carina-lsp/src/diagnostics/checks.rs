@@ -1622,6 +1622,11 @@ impl DiagnosticRun<'_> {
                 continue;
             }
 
+            if expression.export_inference_owns_failure() {
+                // Inference owns the terminal selector error. Resolving its
+                // provisional value here would create another export finding.
+                continue;
+            }
             let message = match expanded_values.as_ref() {
                 Some((graph, bindings)) => graph
                     .export_params
@@ -1777,6 +1782,9 @@ impl DiagnosticRun<'_> {
         let export_bindings =
             inference_input.binding_index_in_session(None, &signatures, self.provider_context);
         let mut boundary_export_params = inferred_export_params.parameters().to_vec();
+        // The shared core checks suppress an attached failure only when the
+        // expression already reports that same error. Distinct boundary
+        // mismatches still belong to this export.
         for parameter in &mut boundary_export_params {
             let Some(type_expr) = parameter.type_expr_opt_mut() else {
                 continue;
@@ -1843,16 +1851,19 @@ impl DiagnosticRun<'_> {
                 {
                     return None;
                 }
-                let finding = carina_core::parser::Located::new(
-                    reference.prefix_location().clone(),
-                    reference.render(|path| {
-                        format!(
-                            "Undefined resource: '{}'. Define it with 'let {} = aws...'",
-                            path.binding(),
-                            path.binding()
-                        )
-                    }),
-                );
+                let message = tree
+                    .undefined_loop_child_reference(reference)
+                    .unwrap_or_else(|| {
+                        reference.render(|path| {
+                            format!(
+                                "Undefined resource: '{}'. Define it with 'let {} = aws...'",
+                                path.binding(),
+                                path.binding()
+                            )
+                        })
+                    });
+                let finding =
+                    carina_core::parser::Located::new(reference.prefix_location().clone(), message);
                 Some(finding)
             })
             .collect()

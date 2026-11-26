@@ -17166,6 +17166,30 @@ fn parse_directory_files_rejects_function_call_let_cycle() {
 }
 
 #[test]
+fn parse_directory_files_preserves_cycle_through_unused_function_argument() {
+    let files = vec![
+        (
+            std::path::PathBuf::from("a.crn"),
+            "let A = ignore(B)".to_owned(),
+        ),
+        (std::path::PathBuf::from("b.crn"), "let B = A".to_owned()),
+        (
+            std::path::PathBuf::from("helpers.crn"),
+            "fn ignore(value) { 'known' }".to_owned(),
+        ),
+    ];
+    let error = crate::config_loader::parse_directory_files(
+        &files,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("an unused argument still owns its dependency");
+    assert_eq!(
+        error.to_string(),
+        "Cyclic let binding detected: A -> B -> A"
+    );
+}
+
+#[test]
 fn parse_directory_files_rejects_interpolation_let_cycle() {
     let files = vec![
         (
@@ -22573,6 +22597,184 @@ fn for_value_keys_bare_handle_hint() {
         )
         .expect_err("a loop is a structural handle");
         assert!(error.to_string().contains(example), "{error}");
+    }
+}
+
+#[test]
+fn loop_dot_functions_keep_main_unselected_references() {
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for (pattern, iterable) in [
+        ("k, item", "({ a = 'x' })"),
+        ("item", "['a']"),
+        ("(i, item)", "['a']"),
+    ] {
+        for default in [false, true] {
+            let function = if default {
+                "fn selected(value: String = children.a.name): String { value }"
+            } else {
+                "fn selected(): String { children.a.name }"
+            };
+            let source = format!(
+                "let children = for {pattern} in {iterable} {{ mock.test.Source {{ name = item }} }}\n{function}"
+            );
+            let parsed = parse(&source, &config).unwrap();
+            let stored = &parsed.user_functions["selected"];
+            let stored = if default {
+                stored.params[0].default.as_ref().unwrap()
+            } else {
+                &stored.body.value
+            };
+            let called = parse(
+                &format!("{source}\nlet other = mock.test.Source {{ name = selected() }}"),
+                &config,
+            )
+            .unwrap();
+            let other = called
+                .resources
+                .iter()
+                .find(|resource| {
+                    resource
+                        .binding
+                        .as_ref()
+                        .is_some_and(|name| name.as_str() == "other")
+                })
+                .unwrap();
+            for value in [stored, &other.attributes["name"]] {
+                let Value::Deferred(DeferredValue::ResourceRef { path }) = value else {
+                    panic!("{pattern}, default={default}: main's unselected reference");
+                };
+                assert_eq!(path.binding(), "children");
+                assert_eq!(path.attribute(), "a");
+                assert_eq!(
+                    path.segments(),
+                    &[crate::resource::PathSegment::Field {
+                        name: "name".to_owned(),
+                    }]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn loop_dot_non_loop_namespaced_references_keep_main_dependency_origins() {
+    for expression in [
+        "r.name",
+        "r.tags['k']",
+        "\"${r.name}\"",
+        "r.name ?? 'fallback'",
+    ] {
+        let source = format!(
+            "let r = mock.test.Source {{ name = 'source' tags = {{ k = 'tag' }} }}\nlet other = mock.test.Source {{ name = {expression} }}"
+        );
+        let parsed = parse(
+            &source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let other = parsed
+            .resources
+            .iter()
+            .find(|resource| {
+                resource
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.as_str() == "other")
+            })
+            .unwrap();
+        // Ordinary attribute references have reference origins. Bare-binding
+        // origins belong to structural values, not namespaced attribute reads.
+        assert!(
+            other
+                .dependencies
+                .depends_on
+                .binding_reference_origins()
+                .is_empty(),
+            "{expression}: {:?}",
+            other.dependencies.depends_on.binding_reference_origins()
+        );
+        assert_eq!(
+            other.dependencies.depends_on.reference_origins().len(),
+            1,
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn loop_dot_selects_the_key_before_the_resource_attribute() {
+    for (pattern, iterable) in [("k, item", "({ name = 'x' })"), ("item", "['name']")] {
+        for reader in ["children.name.name", "children['name'].name"] {
+            let source = format!(
+                "let children = for {pattern} in {iterable} {{ mock.test.Source {{ name = item }} }}\nlet other = mock.test.Source {{ name = {reader} }}"
+            );
+            let parsed = parse(
+                &source,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap();
+            let other = parsed
+                .resources
+                .iter()
+                .find(|resource| {
+                    resource
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.as_str() == "other")
+                })
+                .unwrap();
+            let Value::Deferred(DeferredValue::ResourceRef { path }) = &other.attributes["name"]
+            else {
+                panic!("{reader}: expected a selected child reference");
+            };
+            assert_eq!(path.binding(), "children.name", "{reader}");
+            assert_eq!(path.attribute(), "name", "{reader}");
+            assert!(path.segments().is_empty(), "{reader}");
+            assert!(
+                path.reference_locations().is_some(),
+                "{reader}: retain authored reference location"
+            );
+            let origins = other.dependencies.depends_on.reference_origins();
+            assert_eq!(origins.len(), 1, "{reader}: dependency origin");
+            let identity = origins[0].as_ref().identity();
+            assert!(
+                identity.binding_key().matches_name("children.name"),
+                "{reader}"
+            );
+            assert_eq!(
+                identity.source(),
+                path.diagnostic_source_owned(),
+                "{reader}: dependency location"
+            );
+        }
+        for reader in ["children.name", "children['name']"] {
+            let source = format!(
+                "let children = for {pattern} in {iterable} {{ mock.test.Source {{ name = item }} }}\nlet other = mock.test.Source {{ name = {reader} }}"
+            );
+            let parsed = parse(
+                &source,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap();
+            let other = parsed
+                .resources
+                .iter()
+                .find(|resource| {
+                    resource
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.as_str() == "other")
+                })
+                .unwrap();
+            let origins = other.dependencies.depends_on.binding_reference_origins();
+            assert_eq!(origins.len(), 1, "{reader}: bare child dependency origin");
+            assert_eq!(origins[0].detail().as_str(), "children.name", "{reader}");
+            assert_eq!(
+                origins[0].location().span().start_line(),
+                2,
+                "{reader}: bare child dependency location"
+            );
+        }
     }
 }
 

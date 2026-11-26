@@ -2872,6 +2872,20 @@ pub(crate) fn parser_deferred_for_access(
     }))
 }
 
+/// Keep a selector rejection as an access until the retained judge has the
+/// loop's member-type evidence. It must not turn into a resource reference.
+pub(crate) fn parser_rejected_loop_dot_access<B: BindingAddress>(
+    binding: B,
+    rejected: &crate::eval_value::InvalidLoopDot,
+    source_line: usize,
+) -> Value<ParserPlaceholder, B> {
+    deferred_access(
+        Value::Deferred(DeferredValue::BindingRef { binding }),
+        rejected.step(),
+        source_line,
+    )
+}
+
 /// Navigate a value tree along an [`AccessPath`]'s `attribute` then
 /// ordered `segments`, returning the value at the leaf.
 ///

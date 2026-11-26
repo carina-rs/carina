@@ -2980,6 +2980,9 @@ impl DiagnosticRun<'_> {
                     };
                     let (values, _prefixes_reported_by_file) = report.values.as_parts();
                     for error in values.errors() {
+                        if preferred_tree.loop_child_owns_module_lookup(call, error) {
+                            continue;
+                        }
                         let finding = carina_core::parser::Located::new(
                             call.declaration_location().clone(),
                             error,

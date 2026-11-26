@@ -908,13 +908,21 @@ pub fn attached_inference_failures<'a, B: BindingAddress>(
             )) => None,
             ExportStaticType::Inferred(StaticType::Unchecked(
                 InferredUncheckedReason::InferenceFailed(error),
-            )) => Some(crate::parser::Located::new(
-                parameter.name_location().clone(),
-                AttachedInferenceFailure {
-                    name: &parameter.name,
-                    error,
-                },
-            )),
+            )) => {
+                // Only the typed loop selector owns this attached duplicate.
+                // Ordinary expressions retain main's independent export error.
+                if parameter.judgement().is_ok_and(|expression| {
+                    expression.loop_selector_owns_failure()
+                        && expression.check_owner() == crate::parser::retained::ExpressionCheckOwner::Reported
+                        && matches!(expression.static_type(), Err(InferenceIssue::Failed(reported)) if &reported == error)
+                }) {
+                    return None;
+                }
+                Some(crate::parser::Located::new(
+                    parameter.name_location().clone(),
+                    AttachedInferenceFailure { name: &parameter.name, error },
+                ))
+            }
         })
 }
 

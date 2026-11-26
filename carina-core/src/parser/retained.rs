@@ -1631,7 +1631,19 @@ pub(crate) fn judge_configuration<
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     prepare_slots(file, schemas);
-    let mut report = judgement::judge_expressions(file, schemas, config);
+    let inferred_exports = file
+        .export_params
+        .iter()
+        .filter(|parameter| parameter.type_expr_opt().is_none())
+        .filter_map(|parameter| parameter.value_location().cloned())
+        .collect::<Vec<_>>();
+    let mut report = judgement::judge_expressions_with_export_owners(
+        file,
+        schemas,
+        config,
+        None,
+        &inferred_exports,
+    );
     for parameter in &file.export_params {
         if let (Some(sink), Some(location)) =
             (parameter.type_expr_opt(), parameter.value_location())
@@ -3736,6 +3748,11 @@ mod judgement {
         }
     }
 
+    /// Minted only by a rejected typed loop selection. This ownership follows
+    /// the failure through containing expressions and shared export checks.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct LoopSelectorFailure;
+
     #[doc(hidden)]
     #[derive(Clone)]
     pub struct JudgedExprData {
@@ -3751,6 +3768,7 @@ mod judgement {
         fields: Arc<crate::parser::ConfigurationAttributes<JudgedExpr>>,
         converted: Option<Arc<conversion::ConversionTypeJudgement>>,
         structural_source: bool,
+        selector_failure: Option<LoopSelectorFailure>,
         static_source: Option<Arc<StaticSourceReceipt>>,
     }
 
@@ -3764,6 +3782,7 @@ mod judgement {
                 .field("origin", &self.origin)
                 .field("boundary_owner", &self.boundary_owner)
                 .field("judgement", &self.judgement)
+                .field("selector_failure", &self.selector_failure)
                 .field("authority", &self.authority)
                 .field("coalesce", &self.coalesce)
                 .field("alternatives", &self.alternatives)
@@ -3780,6 +3799,7 @@ mod judgement {
                 && self.origin == other.origin
                 && self.boundary_owner == other.boundary_owner
                 && self.judgement == other.judgement
+                && self.selector_failure == other.selector_failure
                 && match (&self.authority, &other.authority) {
                     (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                     (None, None) => true,
@@ -4249,6 +4269,19 @@ mod judgement {
                 self.judgement,
                 ExprJudgement::ValueDependent { shape: None, .. }
             )
+        }
+        pub(crate) fn loop_selector_owns_failure(&self) -> bool {
+            self.selector_failure.is_some()
+        }
+        pub(crate) fn reported_loop_selector_failure(&self) -> bool {
+            self.loop_selector_owns_failure()
+                && self.check_owner() == ExpressionCheckOwner::Reported
+        }
+        /// The unannotated export owns this selector rejection. Other
+        /// boundary checks must not resolve its provisional value again.
+        pub fn export_inference_owns_failure(&self) -> bool {
+            self.loop_selector_owns_failure()
+                && matches!(self.failure(), Some((_, FailureOwner::Boundary)))
         }
         pub fn check_owner(&self) -> ExpressionCheckOwner {
             match &self.judgement {
@@ -5853,6 +5886,25 @@ mod judgement {
     where
         D: super::super::DeferredForPhaseTraversal<P, T, B>,
     {
+        judge_expressions_with_export_owners(file, schemas, config, upstream, &[])
+    }
+
+    pub(super) fn judge_expressions_with_export_owners<
+        E,
+        P: crate::resource::PlaceholderKind,
+        T: crate::resource::PlaceholderKind,
+        D,
+        B: BindingAddress,
+    >(
+        file: &super::super::File<E, P, T, D, B>,
+        schemas: &crate::schema::SchemaRegistry,
+        config: &super::super::ProviderContext,
+        upstream: Option<&crate::upstream_exports::UpstreamExports<B>>,
+        inferred_exports: &[DeclarationLocation],
+    ) -> ExpressionReport<B>
+    where
+        D: super::super::DeferredForPhaseTraversal<P, T, B>,
+    {
         let expressions = file.parser_binding_metadata.syntax().expressions();
         let mut bindings = inference::bindings_from_parsed(file);
         for wait in &file.wait_bindings {
@@ -5887,7 +5939,41 @@ mod judgement {
         {
             index_authored(expression, &mut authored, &mut visited, &mut pending);
         }
+        // An unannotated export owns failures of its inline loop selectors,
+        // just as it owns subscript inference failures. Follow authored nodes
+        // only; a referenced definition keeps its own diagnostic producer.
+        let definition_nodes = expressions
+            .definitions
+            .values()
+            .map(|expression| {
+                (
+                    expression.authored.location.instance.clone(),
+                    expression.node_id(),
+                )
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let mut inferred_export_nodes = std::collections::HashSet::new();
+        for location in inferred_exports {
+            if let Some(expression) = authored.get(&ExpressionLocation::new(
+                expressions.instance.clone(),
+                location,
+            )) {
+                pending.push(*expression);
+            }
+            while let Some(expression) = pending.pop() {
+                if inferred_export_nodes.insert((
+                    expression.authored.location.instance.clone(),
+                    expression.node_id(),
+                )) {
+                    pending.extend(expression.authored.children.iter().filter(|child| {
+                        !definition_nodes
+                            .contains(&(child.authored.location.instance.clone(), child.node_id()))
+                    }));
+                }
+            }
+        }
         let mut functions = HashMap::new();
+        let mut function_nodes = std::collections::HashSet::new();
         for expression in authored.values() {
             if let ExprKind::Function {
                 name, signature, ..
@@ -5897,6 +5983,14 @@ mod judgement {
                 functions
                     .entry((expression.authored.location.instance.clone(), name.clone()))
                     .or_insert_with(|| signature.clone());
+                pending.extend(expression.authored.children.iter());
+                while let Some(child) = pending.pop() {
+                    if function_nodes
+                        .insert((child.authored.location.instance.clone(), child.node_id()))
+                    {
+                        pending.extend(child.authored.children.iter());
+                    }
+                }
             }
         }
         let authority = Arc::new(config.clone());
@@ -5905,7 +5999,25 @@ mod judgement {
             authored,
             expressions,
             bindings: &bindings,
+            structural_handles: file.parser_binding_metadata.structural_handles(),
+            structural_definitions: file
+                .parser_binding_metadata
+                .structural_handles()
+                .iter()
+                .filter_map(|(name, handle)| {
+                    let definition = expressions.definitions.get(name)?;
+                    Some((
+                        (
+                            definition.authored.location.instance.clone(),
+                            definition.node_id(),
+                        ),
+                        handle,
+                    ))
+                })
+                .collect(),
             functions,
+            function_nodes,
+            inferred_export_nodes,
             schemas,
             config,
             memo: HashMap::new(),
@@ -6083,12 +6195,43 @@ mod judgement {
         finish: bool,
     }
 
+    /// A structural head is resolved once. Dot consumers must handle the
+    /// loop-group arm through the selector before ordinary attribute lookup.
+    enum ResolvedHead<'a, B: BindingAddress> {
+        LoopGroup(crate::eval_value::LoopGroupRef<'a, B>),
+        Binding {
+            reference: NonLoopHead<B>,
+            lookup: crate::resource::binding_address::BindingLookup<B>,
+            kind: BindingHeadKind,
+        },
+    }
+
+    /// Minted by head resolution's non-loop arms. Isolated function expressions
+    /// retain their stored references without consulting loop-head resolution.
+    struct NonLoopHead<B: BindingAddress> {
+        binding: B,
+    }
+
+    #[derive(Clone, Copy)]
+    enum BindingHeadKind {
+        Structural,
+        Ordinary,
+    }
+
     struct Judge<'a, B: BindingAddress> {
         authority: Arc<super::super::ProviderContext>,
         authored: IndexMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
         expressions: &'a Expressions<B>,
         bindings: &'a InferenceBindings,
+        structural_handles: &'a IndexMap<B, crate::eval_value::UnexpandedStructuralHandle<B>>,
+        structural_definitions: HashMap<
+            (ExpressionInstance, NodeId),
+            &'a crate::eval_value::UnexpandedStructuralHandle<B>,
+        >,
         functions: HashMap<(ExpressionInstance, String), Arc<FunctionSignature>>,
+        // Function bodies and defaults retain main's ordinary reference rules.
+        function_nodes: std::collections::HashSet<(ExpressionInstance, NodeId)>,
+        inferred_export_nodes: std::collections::HashSet<(ExpressionInstance, NodeId)>,
         schemas: &'a crate::schema::SchemaRegistry,
         config: &'a super::super::ProviderContext,
         memo: HashMap<(usize, DiagnosticScope, JudgementDemand), JudgedExpr>,
@@ -6111,7 +6254,7 @@ mod judgement {
         upstream: Option<&'a crate::upstream_exports::UpstreamExports<B>>,
     }
 
-    impl<B: BindingAddress> Judge<'_, B> {
+    impl<'a, B: BindingAddress> Judge<'a, B> {
         fn is_list_literal(mut expression: &ExprValue<ParserPlaceholder, B>) -> bool {
             while matches!(
                 expression.authored.kind,
@@ -6571,22 +6714,6 @@ mod judgement {
             }
             result.data_mut().origin = Some(root.location.clone());
             result.data_mut().authority = Some(self.authority.clone());
-            if matches!(root.kind, ExprKind::Reference { .. }) {
-                if matches!(
-                    result.judgement,
-                    ExprJudgement::Typed {
-                        kind: InferredKind::Ordinary(_),
-                        ..
-                    }
-                ) {
-                    result.set_kind(InferredKind::Reference);
-                }
-                // The binding pass owns reference existence and field errors.
-                // A containing operation preserves that ownership.
-                if !result.is_enum_identifier() {
-                    result.report_at(FailureOwner::BindingIndex);
-                }
-            }
             if let Some(failed) = children
                 .iter()
                 .enumerate()
@@ -6608,8 +6735,24 @@ mod judgement {
                 };
                 result.mark_failed(error.clone(), owner);
                 result.data_mut().boundary_owner = failed.boundary_owner.clone();
+                result.data_mut().selector_failure = failed.selector_failure;
             }
-            if let ExprJudgement::Failed {
+            if result.loop_selector_owns_failure()
+                && self
+                    .inferred_export_nodes
+                    .contains(&(root.location.instance.clone(), root.id))
+                && matches!(
+                    result.judgement,
+                    ExprJudgement::Failed {
+                        owner: FailureOwner::Expression,
+                        ..
+                    }
+                )
+            {
+                // Keep the failed type for inference, without producing an
+                // expression diagnostic alongside the export-owned failure.
+                result.report_at(FailureOwner::Boundary);
+            } else if let ExprJudgement::Failed {
                 error,
                 owner: FailureOwner::Expression,
             } = &result.judgement
@@ -6932,6 +7075,126 @@ mod judgement {
             result
         }
 
+        fn head_for_handle(
+            handle: &'a crate::eval_value::UnexpandedStructuralHandle<B>,
+            binding: &B,
+        ) -> ResolvedHead<'a, B> {
+            use crate::resource::binding_address::BindingLookup;
+            match handle.loop_group() {
+                Some(group) => ResolvedHead::LoopGroup(group),
+                None => ResolvedHead::Binding {
+                    reference: NonLoopHead {
+                        binding: binding.clone(),
+                    },
+                    lookup: BindingLookup::new(handle.canonical_binding()),
+                    kind: BindingHeadKind::Structural,
+                },
+            }
+        }
+
+        fn resolve_head(&self, binding: &B) -> ResolvedHead<'a, B> {
+            self.structural_handles
+                .get(binding)
+                .map(|handle| Self::head_for_handle(handle, binding))
+                .unwrap_or_else(|| ResolvedHead::Binding {
+                    reference: NonLoopHead {
+                        binding: binding.clone(),
+                    },
+                    lookup: crate::resource::binding_address::BindingLookup::new(binding),
+                    kind: BindingHeadKind::Ordinary,
+                })
+        }
+
+        /// Only loop groups and selections descended from them use the
+        /// selector/module-output path. Other heads retain generic access.
+        fn loop_access_head(
+            &self,
+            expression: &ExprValue<ParserPlaceholder, B>,
+        ) -> Option<ResolvedHead<'a, B>> {
+            use crate::resource::binding_address::BindingLookup;
+            let root = &expression.authored;
+            if self
+                .function_nodes
+                .contains(&(root.location.instance.clone(), root.id))
+            {
+                return None;
+            }
+            if let Some(group) = self
+                .structural_definitions
+                .get(&(root.location.instance.clone(), root.id))
+                .and_then(|handle| handle.loop_group())
+            {
+                return Some(ResolvedHead::LoopGroup(group));
+            }
+            match &root.kind {
+                ExprKind::Binding { binding, .. } => match self.resolve_head(binding) {
+                    head @ ResolvedHead::LoopGroup(_) => Some(head),
+                    ResolvedHead::Binding { .. } => None,
+                },
+                ExprKind::Definition | ExprKind::Alias | ExprKind::Parens => {
+                    self.loop_access_head(root.children.first()?)
+                }
+                ExprKind::Access(step) => {
+                    let head = self.loop_access_head(root.children.first()?)?;
+                    match step {
+                        PathSegment::Subscript { index } => {
+                            let lookup = match head {
+                                ResolvedHead::LoopGroup(group) => {
+                                    BindingLookup::new(group.binding())
+                                }
+                                ResolvedHead::Binding { lookup, .. } => lookup,
+                            };
+                            Some(self.resolve_head(lookup.select(index).binding()))
+                        }
+                        PathSegment::Field { name } => {
+                            let ResolvedHead::LoopGroup(group) = head else {
+                                return None;
+                            };
+                            let child = crate::eval_value::select_dot(group, name).ok()?;
+                            Some(self.resolve_head(child.binding()))
+                        }
+                    }
+                }
+                ExprKind::Reference {
+                    binding,
+                    attribute,
+                    segments,
+                    ..
+                } if segments.is_empty() => {
+                    let ResolvedHead::LoopGroup(group) = self.resolve_head(binding) else {
+                        return None;
+                    };
+                    let child = crate::eval_value::select_dot(group, attribute).ok()?;
+                    Some(self.resolve_head(child.binding()))
+                }
+                _ => None,
+            }
+        }
+
+        fn loop_dot(
+            &self,
+            group: crate::eval_value::LoopGroupRef<'_, B>,
+            field: &str,
+            base: &JudgedExprData,
+        ) -> Result<crate::eval_value::SelectedLoopChild<B>, InferredExpr> {
+            crate::eval_value::select_dot(group, field)
+                .map_err(|rejected| Self::loop_dot_failure(rejected, base))
+        }
+
+        fn loop_dot_failure(
+            rejected: crate::eval_value::InvalidLoopDot,
+            base: &JudgedExprData,
+        ) -> InferredExpr {
+            let member_type = base
+                .member
+                .as_deref()
+                .map(|member| member.type_description())
+                .unwrap_or_else(|| "value-dependent expression".into());
+            let mut failure = declared(Err(rejected.error(&member_type).into()), false);
+            failure.data_mut().selector_failure = Some(LoopSelectorFailure);
+            failure
+        }
+
         fn access_path(
             &self,
             base: InferredExpr,
@@ -6941,6 +7204,183 @@ mod judgement {
             steps
                 .iter()
                 .fold(base, |base, step| self.access(&base, Some(step), binding))
+        }
+
+        fn reference(
+            &mut self,
+            expression: &ExprValue<ParserPlaceholder, B>,
+            binding: &B,
+            attribute: &str,
+            segments: &[PathSegment],
+        ) -> InferredExpr {
+            let mut result = if self.function_nodes.contains(&(
+                expression.authored.location.instance.clone(),
+                expression.node_id(),
+            )) {
+                self.unselected_reference(binding, attribute, segments)
+            } else {
+                match self.resolve_head(binding) {
+                    head @ ResolvedHead::LoopGroup(_) => {
+                        return self.reference_from_head(binding, head, attribute, segments);
+                    }
+                    head @ ResolvedHead::Binding { .. } => {
+                        self.reference_from_head(binding, head, attribute, segments)
+                    }
+                }
+            };
+            if matches!(
+                result.judgement,
+                ExprJudgement::Typed {
+                    kind: InferredKind::Ordinary(_),
+                    ..
+                }
+            ) {
+                result.set_kind(InferredKind::Reference);
+            }
+            // Binding-index ownership belongs to authored ordinary references,
+            // including the references stored in isolated functions.
+            if !result.is_enum_identifier() {
+                result.report_at(FailureOwner::BindingIndex);
+            }
+            result
+        }
+
+        fn reference_from_head(
+            &mut self,
+            binding: &B,
+            head: ResolvedHead<'a, B>,
+            attribute: &str,
+            segments: &[PathSegment],
+        ) -> InferredExpr {
+            let group = match head {
+                ResolvedHead::LoopGroup(group) => group,
+                ResolvedHead::Binding { reference, .. } => {
+                    return self.unselected_reference(&reference.binding, attribute, segments);
+                }
+            };
+            let selection = crate::eval_value::select_dot(group, attribute);
+            let base = self
+                .expressions
+                .definitions
+                .get(binding)
+                .map(|definition| self.judge(definition));
+            let Some(base) = base else {
+                return incomplete("authored loop group");
+            };
+            let child = match selection {
+                Ok(child) => child,
+                Err(rejected) => return Self::loop_dot_failure(rejected, &base),
+            };
+            let selected = self.access(&base, Some(&child.step()), binding.as_str());
+            if let Some((PathSegment::Field { name }, rest)) = segments.split_first() {
+                let child_head = self.resolve_head(child.binding());
+                if self.module_attributes.is_some_and(|outputs| {
+                    outputs.contains_key(&(child.binding().clone(), name.clone()))
+                }) || matches!(
+                    self.bindings.get(child.binding().as_str()),
+                    Some(InferenceBinding::ModuleCall)
+                ) || (!self.bindings.contains_key(child.binding().as_str())
+                    && matches!(
+                        &child_head,
+                        ResolvedHead::Binding {
+                            kind: BindingHeadKind::Ordinary,
+                            ..
+                        }
+                    ))
+                {
+                    return self.reference_from_head(child.binding(), child_head, name, rest);
+                }
+            }
+            self.access_path(selected, segments, child.binding().as_str())
+        }
+
+        fn unselected_reference(
+            &mut self,
+            binding: &B,
+            attribute: &str,
+            segments: &[PathSegment],
+        ) -> InferredExpr {
+            let steps = std::iter::once(PathSegment::Field {
+                name: attribute.to_owned(),
+            })
+            .chain(segments.iter().cloned())
+            .collect::<Vec<_>>();
+            if let Some(ty) = self.parameter_type(binding) {
+                return self.access_path(
+                    declared(Ok(ty.clone()), false).owned_by_bindings(),
+                    &steps,
+                    binding.as_str(),
+                );
+            }
+            if let Some(attribute) = self
+                .module_attributes
+                .and_then(|attributes| attributes.get(&(binding.clone(), attribute.to_owned())))
+            {
+                let attribute = self.refresh_module_output(attribute);
+                return self.access_path(
+                    InferredExpr::from(&attribute),
+                    segments,
+                    binding.as_str(),
+                );
+            }
+            if let Some(ty) = self
+                .upstream
+                .and_then(|exports| exports.get(binding))
+                .and_then(|fields| fields.get(attribute))
+                .and_then(|entry| entry.static_type.declared_known())
+            {
+                return self.access_path(
+                    declared(Ok(ty.clone()), false).owned_by_bindings(),
+                    segments,
+                    binding.as_str(),
+                );
+            }
+            if matches!(
+                self.bindings.get(binding.as_str()),
+                Some(InferenceBinding::UpstreamState | InferenceBinding::ModuleCall)
+            ) {
+                let mut result = value_dependent(
+                    "external value is checked at its declared or resolved boundary",
+                );
+                result.data_mut().judgement = ExprJudgement::ValueDependent {
+                    reason: NotInferableReason::NonInferableBinding {
+                        binding: binding.to_string(),
+                    },
+                    shape: None,
+                    owner: FailureOwner::Expression,
+                };
+                return result;
+            }
+            if let Some(InferenceBinding::Virtual { attributes }) =
+                self.bindings.get(binding.as_str())
+                && !attributes.contains(attribute)
+            {
+                return declared(
+                    Err(InferenceError::UnknownAttribute {
+                        binding: binding.to_string(),
+                        attribute: attribute.to_owned(),
+                    }
+                    .into()),
+                    false,
+                );
+            }
+            if self.bindings.contains_key(binding.as_str()) {
+                declared(
+                    inference::infer_declared_reference_type(
+                        binding.as_str(),
+                        attribute,
+                        segments,
+                        self.bindings,
+                        self.schemas,
+                    ),
+                    false,
+                )
+            } else if let Some(definition) = self.expressions.definitions.get(binding) {
+                let base = self.judge(definition);
+                self.access_path(InferredExpr::from(&base), &steps, binding.as_str())
+            } else {
+                declared(Ok(TypeExpr::String), true).with_kind(|_| InferredKind::EnumIdentifier)
+            }
         }
 
         fn infer(
@@ -6982,90 +7422,8 @@ mod judgement {
                     binding,
                     attribute,
                     segments,
-                    authored_binding: _,
-                } => {
-                    let steps = std::iter::once(PathSegment::Field {
-                        name: attribute.clone(),
-                    })
-                    .chain(segments.iter().cloned())
-                    .collect::<Vec<_>>();
-                    if let Some(ty) = self.parameter_type(binding) {
-                        return self.access_path(
-                            ordinary(Ok(ty.clone()), false).owned_by_bindings(),
-                            &steps,
-                            binding.as_str(),
-                        );
-                    }
-                    if let Some(attribute) = self.module_attributes.and_then(|attributes| {
-                        attributes.get(&(binding.clone(), attribute.clone()))
-                    }) {
-                        let attribute = self.refresh_module_output(attribute);
-                        return self.access_path(
-                            InferredExpr::from(&attribute),
-                            segments,
-                            binding.as_str(),
-                        );
-                    }
-                    if let Some(ty) = self
-                        .upstream
-                        .and_then(|exports| exports.get(binding))
-                        .and_then(|fields| fields.get(attribute))
-                        .and_then(|entry| entry.static_type.declared_known())
-                    {
-                        return self.access_path(
-                            ordinary(Ok(ty.clone()), false).owned_by_bindings(),
-                            segments,
-                            binding.as_str(),
-                        );
-                    }
-                    if matches!(
-                        self.bindings.get(binding.as_str()),
-                        Some(InferenceBinding::UpstreamState | InferenceBinding::ModuleCall)
-                    ) {
-                        let mut result = value_dependent(
-                            "external value is checked at its declared or resolved boundary",
-                        );
-                        result.data_mut().judgement = ExprJudgement::ValueDependent {
-                            reason: NotInferableReason::NonInferableBinding {
-                                binding: binding.to_string(),
-                            },
-                            shape: None,
-                            owner: FailureOwner::Expression,
-                        };
-                        return result;
-                    }
-                    if let Some(InferenceBinding::Virtual { attributes }) =
-                        self.bindings.get(binding.as_str())
-                        && !attributes.contains(attribute)
-                    {
-                        return ordinary(
-                            Err(InferenceError::UnknownAttribute {
-                                binding: binding.to_string(),
-                                attribute: attribute.clone(),
-                            }
-                            .into()),
-                            false,
-                        );
-                    }
-                    if self.bindings.contains_key(binding.as_str()) {
-                        ordinary(
-                            inference::infer_declared_reference_type(
-                                binding.as_str(),
-                                attribute,
-                                segments,
-                                self.bindings,
-                                self.schemas,
-                            ),
-                            false,
-                        )
-                    } else if let Some(definition) = self.expressions.definitions.get(binding) {
-                        let base = self.judge(definition);
-                        self.access_path(InferredExpr::from(&base), &steps, binding.as_str())
-                    } else {
-                        ordinary(Ok(TypeExpr::String), true)
-                            .with_kind(|_| InferredKind::EnumIdentifier)
-                    }
-                }
+                    ..
+                } => self.reference(expression, binding, attribute, segments),
                 ExprKind::EmptyInterpolation => ordinary(Ok(TypeExpr::String), false),
                 ExprKind::Interpolation {
                     single_reference: true,
@@ -7290,7 +7648,54 @@ mod judgement {
                         None => incomplete("function declaration or builtin signature"),
                     }
                 }
-                ExprKind::Access(step) => self.access(&children[0], Some(step), "access base"),
+                ExprKind::Access(step) => {
+                    if let Some(head) = self.loop_access_head(&root.children[0])
+                        && let PathSegment::Field { name } = step
+                    {
+                        match head {
+                            ResolvedHead::LoopGroup(group) => {
+                                let binding = group.binding().as_str();
+                                return match self.loop_dot(group, name, &children[0]) {
+                                    Ok(child) => {
+                                        self.access(&children[0], Some(&child.step()), binding)
+                                    }
+                                    Err(failure) => failure,
+                                };
+                            }
+                            ResolvedHead::Binding {
+                                reference,
+                                lookup,
+                                kind,
+                            } => {
+                                if let Some(output) = self.module_attributes.and_then(|outputs| {
+                                    outputs.get(&(lookup.binding().clone(), name.clone()))
+                                }) {
+                                    return InferredExpr::from(&self.refresh_module_output(output));
+                                }
+                                if !children[0].failed()
+                                    && (matches!(
+                                        self.bindings.get(lookup.as_str()),
+                                        Some(InferenceBinding::ModuleCall)
+                                    ) || (!self.bindings.contains_key(lookup.as_str())
+                                        && matches!(kind, BindingHeadKind::Ordinary)))
+                                {
+                                    let binding = lookup.binding().clone();
+                                    return self.reference_from_head(
+                                        &binding,
+                                        ResolvedHead::Binding {
+                                            reference,
+                                            lookup,
+                                            kind,
+                                        },
+                                        name,
+                                        &[],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    self.access(&children[0], Some(step), "access base")
+                }
                 ExprKind::Integer { op, location } => {
                     let operands = [children[0].clone(), children[1].clone()];
                     if self.demand == JudgementDemand::Value {
@@ -7943,6 +8348,7 @@ mod judgement {
                 fields: Arc::default(),
                 converted: None,
                 structural_source: false,
+                selector_failure: None,
                 static_source: None,
             }),
         }

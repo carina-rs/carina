@@ -6243,6 +6243,7 @@ fn resource_admission_report<
     boundary: presentation::AdmissionBoundary,
 ) -> Result<ResourceAdmissionReport<'a>, crate::parser::AnalysisTreeError> {
     let parsed = judged.parsed();
+    let analysis = parsed.analysis_tree()?;
     let mut all_errors = ResourceAdmissionFindings::default();
     let mut attributes = HashMap::new();
 
@@ -6283,6 +6284,16 @@ fn resource_admission_report<
                     let location = resource.diagnostic_label();
                     let (value_report, _prefixes_reported_by_file) = values.as_parts();
                     for (attribute, path, diagnostic) in value_report.symbolic_errors() {
+                        let error = diagnostic.error();
+                        if let Some(crate::resource::ModuleSource::Module(origin)) =
+                            resource.module_source()
+                            && analysis.loop_child_owns_module_lookup(
+                                &origin.module_call_path().root().id,
+                                error,
+                            )
+                        {
+                            continue;
+                        }
                         let located = match resource
                             .locate_schema_diagnostic(diagnostic, |_ordinary| {
                                 resource.attribute_key_location(attribute).clone()
@@ -6293,7 +6304,6 @@ fn resource_admission_report<
                                 continue;
                             }
                         };
-                        let error = diagnostic.error();
                         let start = all_errors.0.len();
                         match error {
                             TypeError::Reference { error, .. } => match error.as_ref() {
@@ -6374,7 +6384,6 @@ fn resource_admission_report<
         diagnostics,
     )?;
 
-    let analysis = parsed.analysis_tree()?;
     all_errors.extend(match bindings.upstream_exports() {
         Some(upstream) => validate_for_iterable_types_with_upstream(
             &analysis,
@@ -6580,7 +6589,7 @@ where
                 record(reference.identity(), reference.diagnostic_path());
             });
         for (root, diagnostic_path) in roots {
-            if root.is_in_names(tree.binding_names()) {
+            if tree.is_defined_binding(&root) {
                 continue;
             }
             let occurrences: Vec<_> = deferred

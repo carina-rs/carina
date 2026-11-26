@@ -249,25 +249,38 @@ impl UnexpandedDependencies<RelativeBindingName> {
         if bindings.is_empty() {
             return Ok(());
         }
-        for reference in syntax
-            .clone()
-            .into_inner()
-            .flatten()
-            .filter(|pair| pair.as_rule() == super::Rule::variable_ref)
-        {
-            let mut parts = reference.clone().into_inner();
-            let Some(name) = parts.next() else {
-                continue;
+        'references: for reference in syntax.clone().into_inner().flatten().filter(|pair| {
+            matches!(
+                pair.as_rule(),
+                super::Rule::variable_ref | super::Rule::namespaced_id
+            )
+        }) {
+            let name = if reference.as_rule() == super::Rule::namespaced_id {
+                reference
+                    .as_str()
+                    .split('.')
+                    .next()
+                    .expect("namespaced root")
+            } else {
+                let Some(name) = reference.clone().into_inner().next() else {
+                    continue;
+                };
+                name.as_str()
             };
-            let binding = match context.lookup_binding(name.as_str()) {
+            let (binding, mut group) = match context.lookup_binding(name) {
                 super::context::ParseBindingRef::Structural(handle) => {
-                    handle.canonical_binding().clone()
+                    (handle.canonical_binding().clone(), handle.loop_group())
                 }
                 super::context::ParseBindingRef::Value { .. }
                 | super::context::ParseBindingRef::Unbound => {
-                    RelativeBindingName::new(name.as_str())
+                    (RelativeBindingName::new(name), None)
                 }
             };
+            // Namespaced syntax was added for loop selection only. Ordinary
+            // variable_ref origins retain their existing main-branch path.
+            if reference.as_rule() == super::Rule::namespaced_id && group.is_none() {
+                continue;
+            }
             if !bindings.contains(&crate::resource::DependencyKey::new(binding.clone()))
                 && !bindings
                     .iter()
@@ -275,11 +288,48 @@ impl UnexpandedDependencies<RelativeBindingName> {
             {
                 continue;
             }
+            let steps = if reference.as_rule() == super::Rule::namespaced_id {
+                reference
+                    .as_str()
+                    .split('.')
+                    .skip(1)
+                    .map(|name| crate::resource::PathSegment::Field {
+                        name: name.to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                reference
+                    .clone()
+                    .into_inner()
+                    .skip(1)
+                    .map(|step| {
+                        super::expressions::primary::parse_postfix_path_segment(step, context)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            };
             let mut lookup = BindingLookup::new(&binding);
-            for step in parts {
-                lookup = lookup.step(&super::expressions::primary::parse_postfix_path_segment(
-                    step, context,
-                )?);
+            for (index, step) in steps.into_iter().enumerate() {
+                if index == 0
+                    && let crate::resource::PathSegment::Field { name } = &step
+                    && let Some(group) = group.take()
+                {
+                    lookup = match crate::eval_value::select_dot(group, name) {
+                        Ok(child) => child.into_lookup(),
+                        Err(_) => {
+                            // The retained rejection still carries its root operand.
+                            // Anchor that operand without inventing a group attribute.
+                            if bindings.contains(&lookup.dependency()) {
+                                lookup.record_origin(
+                                    super::DeclarationLocation::from_pair(&reference, file, source),
+                                    &mut self.binding_reference_origins,
+                                );
+                            }
+                            continue 'references;
+                        }
+                    };
+                } else {
+                    lookup = lookup.step(&step);
+                }
             }
             if bindings.contains(&lookup.dependency()) {
                 lookup.record_origin(
