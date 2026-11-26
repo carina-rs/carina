@@ -383,13 +383,7 @@ impl<'a, B: BindingAddress, R: ParserRewrite<B>> ParserTransform<'a, R, R::Error
                     reason: _,
                     source_line: _,
                 }
-                | Parts::ResolvedCall {
-                    function: _,
-                    functions: _,
-                    args: _,
-                    source_line: _,
-                }
-                | Parts::Evidence { value: _, edge: _ }) => {
+                | Parts::ResolvedCall(_)) => {
                     let replacements = self.replacements;
                     let mut product = parts.transform(at, self, |_| ())?;
                     product.changed |= self.replacements != replacements;
@@ -410,7 +404,7 @@ impl<B: BindingAddress, R: ParserRewrite<B>> BoundTransform<ParserPlaceholder, B
     fn function_memo(&self) -> Option<DefinitionMemo<B>> {
         // The engine installs definition edges before this memo is consulted.
         // Under those edges every semantic hook is suppressed, output is (),
-        // and the unchanged definition's secret discovery is the only fact.
+        // and unchanged stored definitions can share the completion product.
         Some(self.function_memo.clone())
     }
 
@@ -483,13 +477,8 @@ impl<B: BindingAddress, R: ParserRewrite<B>> BoundTransform<ParserPlaceholder, B
                 args: _,
                 reason: _,
                 source_line,
-            }
-            | Parts::ResolvedCall {
-                function: _,
-                functions: _,
-                args: _,
-                source_line,
             } => *source_line,
+            Parts::ResolvedCall(call) => call.source_line,
             Parts::Access(access) => DiagnosticSourceLine::authored(access.source_line()),
             Parts::ModuleIf(conditional) => {
                 DiagnosticSourceLine::authored(conditional.condition().source_line())
@@ -501,8 +490,7 @@ impl<B: BindingAddress, R: ParserRewrite<B>> BoundTransform<ParserPlaceholder, B
                 default: _,
             }
             | Parts::Arithmetic(_)
-            | Parts::Interpolation(_)
-            | Parts::Evidence { value: _, edge: _ } => DiagnosticSourceLine::synthetic(),
+            | Parts::Interpolation(_) => DiagnosticSourceLine::synthetic(),
         };
         self.argument_line = line;
         if let Some(line) = line.get() {
@@ -652,7 +640,7 @@ mod argument_tests {
     }
 
     #[test]
-    fn argument_replacement_enters_original_secret_before_completing() {
+    fn argument_replacement_returns_the_complete_replacement() {
         let value = AuthoredValue::Deferred(DeferredValue::FunctionCall {
             name: crate::builtins::BuiltinFunction::length,
             args: vec![FunctionArgument::from_value(
@@ -661,14 +649,23 @@ mod argument_tests {
             source_line: DiagnosticSourceLine::authored(1),
         });
         let at = WalkRoot::syntactic().at();
-        let encountered = at.encountered_secret.clone();
         let mut policy = ReplaceArgument;
         let mut algebra = ParserTransform::new(
             &mut policy,
             RewritePosition::Value,
             &DefinitionMemo::default(),
         );
-        assert!(engine::dispatch_bound(value, at, &mut algebra).is_ok());
-        assert!(encountered.get());
+        let product = engine::dispatch_bound(value, at, &mut algebra).unwrap();
+        assert!(product.changed);
+        assert!(matches!(
+            &product.value,
+            Value::Deferred(DeferredValue::FunctionCall { .. })
+        ));
+        if let Value::Deferred(DeferredValue::FunctionCall { args, .. }) = product.value {
+            assert_eq!(
+                args[0].value(),
+                Some(&AuthoredValue::Concrete(ConcreteValue::Int(2)))
+            );
+        }
     }
 }

@@ -3,6 +3,19 @@ use crate::explicit::ExplicitFields;
 use crate::parser::{RelativeBindingName, SourceSpan};
 use crate::schema::PatternResourceSchema;
 
+impl<P: ValueKind, B: BindingAddress> FunctionArgument<P, B> {
+    // The public constructor intentionally cannot manufacture auxiliary
+    // provenance. Availability tests need both visitor ordinals on one arg.
+    pub(crate) fn with_auxiliary_for_inspect_test(
+        value: super::Value<P, B>,
+        auxiliary: super::Value<P, B>,
+    ) -> Self {
+        Self {
+            operand: StructuralOperand::from_value_with_access_base(value, Some(auxiliary)),
+        }
+    }
+}
+
 #[test]
 fn resolved_dependency_reads_use_typed_json_entries_and_round_trip() {
     let id = ResolvedResourceId::with_provider_identity(

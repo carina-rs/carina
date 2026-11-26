@@ -37,8 +37,8 @@
 //! Main and candidate must probe the SAME configuration checkout path: preparatory
 //! loop observations include absolute-root bytes. Those production writes are
 //! recorded unchanged, not normalised or re-encoded.
-//! Calls through verify_hash or value_walk::hash_snapshot outside an identity
-//! owner record shared-encoder material as Unattributed and fail the probe closed.
+//! Calls through verify_hash outside an identity owner record shared-encoder
+//! material as Unattributed and fail the probe closed.
 //! Those producer paths are not deliberately driven here.
 //! No provider runtime, backend, state read, plan, or download is involved.
 

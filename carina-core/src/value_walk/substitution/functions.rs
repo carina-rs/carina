@@ -145,7 +145,7 @@ mod tests {
     use crate::resource::{AuthoredValue, RelativeBindingName};
 
     #[test]
-    fn share_fn_definition_memo_replays_secret_discovery_across_rewrites()
+    fn share_fn_definition_memo_shares_completion_across_rewrites()
     -> Result<(), Box<dyn std::error::Error>> {
         let file = crate::parser::parse(
             "fn leaf(input: String): String { secret('protected-4495') }",
@@ -170,20 +170,22 @@ mod tests {
             let mut algebra =
                 ParserTransform::new(&mut policy, RewritePosition::Value, &definitions);
             let at = WalkRoot::syntactic().at();
-            let discovered = at.encountered_secret.clone();
-            assert!(!discovered.get());
             let (product, count) = crate::value_walk::with_function_definition_walk_count(|| {
                 engine::dispatch_bound(value.clone(), at, &mut algebra)
             });
-            assert!(!product?.changed);
-            assert!(
-                discovered.get(),
-                "each fresh rewrite must discover the secret"
-            );
+            let product = product?;
+            assert!(!product.changed);
+            assert!(crate::resource::storage::same_plain_representation(
+                &product.value,
+                &value
+            ));
             counts.push(count);
         }
         assert!(counts[0] > 0);
-        assert_eq!(counts[1], 0, "the second rewrite must use cached discovery");
+        assert_eq!(
+            counts[1], 0,
+            "the second rewrite must use cached completion"
+        );
         Ok(())
     }
 

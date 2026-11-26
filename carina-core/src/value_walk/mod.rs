@@ -4,13 +4,15 @@
 //! substitutions and unavailable searches use it; the remaining public resource
 //! enums and payload callbacks still permit independent walkers elsewhere.
 //!
-//! Inspect borrows its input; Transform consumes it and returns a marked
-//! candidate. Cursors expose engine operations, never raw child values.
+//! Inspect borrows operands only; internal Transform consumes the input and
+//! retains function definitions. Cursors never expose raw child values.
 //! Secret has its own required algebra arm and a separately minted step.
 
 #![doc = include_str!("contracts.md")]
 
-use std::{cell::Cell, collections::HashMap, marker::PhantomData, rc::Rc, sync::Arc};
+#[cfg(test)]
+use std::cell::Cell;
+use std::{collections::HashMap, marker::PhantomData, rc::Rc, sync::Arc};
 
 use crate::{
     parser::UserFunction,
@@ -30,7 +32,7 @@ pub(crate) use engine::DefinitionMemo;
 pub(crate) use engine::with_function_definition_inspect_count;
 use engine::{LeafInput, Parts, ScalarInput, dispatch};
 mod bound_transform;
-use bound_transform::{BoundTransform, PublicTransform, TransformOutput};
+use bound_transform::{BoundTransform, TransformOutput};
 
 mod substitution;
 #[cfg(test)]
@@ -50,21 +52,20 @@ pub(crate) use unavailable::{
 mod sealed {
     pub trait Mode: Sized {
         type Input<'v, T: 'v>: std::borrow::Borrow<T>;
+        type ResolvedCall<'v, P: super::ValueKind + 'v, B: super::BindingAddress>:
+            super::engine::CallProjection;
         fn borrow<'s, 'v, T: 'v>(input: &'s Self::Input<'v, T>) -> &'s T {
             std::borrow::Borrow::borrow(input)
         }
-        fn dispatch<
-            'v,
-            P: super::ValueKind + 'v,
-            B: super::BindingAddress,
-            A: super::Algebra<Self>,
-        >(
-            input: Self::Input<'v, super::Value<P, B>>,
-            at: super::At<'v>,
-            algebra: &mut A,
-        ) -> Result<<Self as super::WalkMode>::Product<A::Output, P, B>, super::WalkError>
-        where
-            Self: super::WalkMode;
+        fn resolved_call<'v, P: super::ValueKind + 'v, B: super::BindingAddress>(
+            function: Self::Input<'v, super::Arc<super::UserFunction<B>>>,
+            functions: Self::Input<
+                'v,
+                super::Arc<indexmap::IndexMap<String, super::UserFunction<B>>>,
+            >,
+            args: Self::Input<'v, Vec<super::FunctionArgument<P, B>>>,
+            source_line: Self::Input<'v, crate::resource::DiagnosticSourceLine>,
+        ) -> Self::ResolvedCall<'v, P, B>;
     }
     pub trait Output {}
     impl Output for () {}
@@ -193,10 +194,7 @@ impl<'g> WalkRoot<'g> {
             path: LeafPath::from_segments([]),
             expressions: Vec::new(),
             secret_depth: 0,
-            encountered_secret: Rc::new(Cell::new(false)),
             position: Vec::new(),
-            secret_anchor: None,
-            locator_root: LocatorRoot::Walk,
         }
     }
 }
@@ -231,10 +229,7 @@ pub struct At<'g> {
     path: LeafPath,
     expressions: Vec<ExpressionEdge>,
     secret_depth: usize,
-    encountered_secret: Rc<Cell<bool>>,
     position: Vec<usize>,
-    secret_anchor: Option<Vec<usize>>,
-    locator_root: LocatorRoot,
 }
 impl<'g> At<'g> {
     pub fn is_secret(&self) -> bool {
@@ -305,19 +300,14 @@ impl<'g> At<'g> {
             | ExpressionEdge::FunctionScope(_)
             | ExpressionEdge::FunctionDefault(_)
             | ExpressionEdge::FunctionLocal(_)
-            | ExpressionEdge::FunctionBody
-            | ExpressionEdge::EvidenceOperand
-            | ExpressionEdge::DirectiveBody(_) => at.effective = None,
+            | ExpressionEdge::FunctionBody => at.effective = None,
         }
         at.expressions.push(edge);
         at
     }
     fn protected(&self) -> Self {
-        self.encountered_secret.set(true);
         let mut at = self.clone();
         at.secret_depth += 1;
-        at.secret_anchor
-            .get_or_insert_with(|| self.position.clone());
         at
     }
     fn secret_child(&self) -> Self {
@@ -356,10 +346,6 @@ pub enum ExpressionEdge {
     FunctionDefault(usize),
     FunctionLocal(usize),
     FunctionBody,
-    /// Operand of a node whose authored evidence is handed off separately.
-    EvidenceOperand,
-    /// An unevaluated directive body, including a per-element loop body.
-    DirectiveBody(crate::resource::LifecycleDirective),
 }
 
 impl ExpressionEdge {
@@ -383,12 +369,6 @@ impl ExpressionEdge {
             Self::FunctionDefault(index) => [13, *index],
             Self::FunctionLocal(index) => [14, *index],
             Self::FunctionBody => [15, 0],
-            Self::EvidenceOperand => [16, 0],
-            Self::DirectiveBody(crate::resource::LifecycleDirective::ForceDelete) => [17, 0],
-            Self::DirectiveBody(crate::resource::LifecycleDirective::CreateBeforeDestroy) => {
-                [18, 0]
-            }
-            Self::DirectiveBody(crate::resource::LifecycleDirective::PreventDestroy) => [19, 0],
         }
     }
 }
@@ -428,8 +408,6 @@ pub enum ExpressionKind {
     Unavailable,
     ResolvedFunctionCall,
     Access,
-    /// Generic expression-edge adapter; no conversion variant is assumed.
-    Evidence,
 }
 
 /// Kernel errors carry no user-controlled text or unprotected payload.
@@ -445,14 +423,6 @@ pub enum WalkError {
     AccessMetadata,
     #[error("value rewrite produced an invalid integer-arithmetic operand")]
     ArithmeticOperand,
-    #[error("secret hashing requires available snapshot material")]
-    SecretHash,
-    #[error("redacted replacement requires a snapshot value stage")]
-    RedactionStage,
-    #[error("protected locator does not resolve on this rehydrated tree")]
-    ProtectedLocator,
-    #[error("protected locator belongs to a re-entered value root")]
-    ReenteredLocator,
     #[error("struct field is absent from the selected naming domain")]
     UnknownStructField,
     #[error("receipt is not from the selected argument of this call")]
@@ -514,111 +484,12 @@ impl<O: WalkOutput, P: ValueKind, B: BindingAddress> SecretStep<Inspect, O, P, B
     }
 }
 
-/// A protected summary at a kernel-issued location.
-pub struct Located<O: WalkOutput> {
-    output: O,
-    secret: bool,
-}
-impl<O: WalkOutput> Located<O> {
-    pub fn into_output(self) -> O {
-        self.output
-    }
-    pub fn is_secret(&self) -> bool {
-        self.secret
-    }
-}
-
 /// Internal completion product. Only kernel cursor operations construct it.
 #[doc(hidden)]
 pub struct RewriteProduct<O: WalkOutput, P: ValueKind, B: BindingAddress> {
     value: Value<P, B>,
     output: O,
     changed: bool,
-}
-
-/// A rewritten candidate and its independent fold output. This conveys no
-/// schema admission, conversion receipt authority, or plan-resolution authority.
-pub struct MarkedTransform<
-    O: WalkOutput,
-    P: ValueKind = NoPlaceholder,
-    B: BindingAddress = AbsoluteBindingAddress,
-> {
-    product: RewriteProduct<O, P, B>,
-    secret: bool,
-}
-impl<O: WalkOutput, P: ValueKind, B: BindingAddress> MarkedTransform<O, P, B> {
-    pub fn into_value(self) -> Value<P, B> {
-        self.product.value
-    }
-    pub fn into_parts(self) -> (Value<P, B>, Located<O>) {
-        (
-            self.product.value,
-            Located {
-                output: self.product.output,
-                secret: self.secret,
-            },
-        )
-    }
-    pub fn is_secret(&self) -> bool {
-        self.secret
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(from = "u8", into = "u8")]
-enum LocatorRoot {
-    Walk,
-    Reentered,
-    Unsupported(u8),
-}
-impl From<u8> for LocatorRoot {
-    fn from(tag: u8) -> Self {
-        match tag {
-            1 => Self::Walk,
-            2 => Self::Reentered,
-            other => Self::Unsupported(other),
-        }
-    }
-}
-impl From<LocatorRoot> for u8 {
-    fn from(root: LocatorRoot) -> Self {
-        match root {
-            LocatorRoot::Walk => 1,
-            LocatorRoot::Reentered => 2,
-            LocatorRoot::Unsupported(tag) => tag,
-        }
-    }
-}
-
-/// Persistable structural coordinates, with no authored keys or values.
-/// Re-entered roots are tagged separately and resolve to ReenteredLocator.
-/// Deserialization conveys no admission authority: verify and rehydrate the
-/// saved value against the same typed root before resolving walk coordinates.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ProtectedLocator(LocatorRoot, Vec<usize>, Vec<usize>);
-impl ProtectedLocator {
-    /// Resolve only through the kernel, retaining protection and a private path.
-    pub fn resolve<P: ValueKind, B: BindingAddress, T: WalkOutput>(
-        &self,
-        root: WalkRoot<'_>,
-        rehydrated: &Value<P, B>,
-        output: T,
-    ) -> Result<Scoped<T>, WalkError> {
-        match self.0 {
-            LocatorRoot::Walk => {}
-            LocatorRoot::Reentered => return Err(WalkError::ReenteredLocator),
-            LocatorRoot::Unsupported(_) => return Err(WalkError::ProtectedLocator),
-        }
-        let site = engine::resolve_protected(self, root, rehydrated)?;
-        Ok(Scoped {
-            output,
-            path: site.path,
-            expressions: site.expressions,
-            secret_depth: site.secret_depth,
-            locator: site.locator,
-            position: site.position,
-        })
-    }
 }
 
 /// A summary handle with a kernel-issued authored/result position and scope.
@@ -631,7 +502,6 @@ pub struct Scoped<T: WalkOutput> {
     path: LeafPath,
     expressions: Vec<ExpressionEdge>,
     secret_depth: usize,
-    locator: Option<ProtectedLocator>,
     position: Vec<usize>,
 }
 impl<T: WalkOutput> Scoped<T> {
@@ -642,13 +512,7 @@ impl<T: WalkOutput> Scoped<T> {
             expressions: at.expressions.clone(),
             secret_depth: at.secret_depth,
             position: at.position.clone(),
-            locator: at.secret_anchor.as_ref().map(|anchor| {
-                ProtectedLocator(at.locator_root, anchor.clone(), at.position.clone())
-            }),
         }
-    }
-    pub fn protected_locator(&self) -> Option<&ProtectedLocator> {
-        self.locator.as_ref()
     }
     pub fn output(&self) -> &T {
         &self.output
@@ -661,32 +525,6 @@ impl<T: WalkOutput> Scoped<T> {
     }
     pub fn expression_edges(&self) -> &[ExpressionEdge] {
         &self.expressions
-    }
-    /// Re-enter the fold for an owner-resolved value at this saved location.
-    /// Binding/cycle policy stays with the caller; Secret ancestry survives
-    /// worklist hops. The referenced value has its own type context.
-    /// Locators from this detached root cannot resolve against a caller's tree.
-    pub fn inspect<P: ValueKind, B: BindingAddress, A: Algebra<Inspect>>(
-        &self,
-        value: &Value<P, B>,
-        algebra: &mut A,
-    ) -> Result<Located<A::Output>, WalkError> {
-        let encountered_secret = Rc::new(Cell::new(self.is_secret()));
-        let at = At {
-            effective: None,
-            field_names: FieldNames::Canonical,
-            path: self.path.clone(),
-            expressions: self.expressions.clone(),
-            secret_depth: self.secret_depth,
-            encountered_secret: encountered_secret.clone(),
-            position: Vec::new(),
-            secret_anchor: self.is_secret().then(Vec::new),
-            locator_root: LocatorRoot::Reentered,
-        };
-        dispatch::<Inspect, _, _, _>(value, at, algebra).map(|output| Located {
-            output,
-            secret: encountered_secret.get(),
-        })
     }
 }
 
@@ -759,12 +597,6 @@ impl<O: WalkOutput, R: WalkOutput> Evidence<O, R> {
                 receipt.position = call.position.clone();
                 receipt.expressions = call.expressions.clone();
                 receipt.secret_depth = receipt.secret_depth.max(call.secret_depth);
-                // A carried receipt's provenance is not a physical Secret
-                // position. Frozen authored obligations keep their locators.
-                receipt.locator = None;
-                if receipt.is_secret() {
-                    call.encountered_secret.set(true);
-                }
             }
         }
         Ok(self)
@@ -780,9 +612,8 @@ impl<O: WalkOutput, R: WalkOutput> Evidence<O, R> {
     }
 }
 
-/// All six arms are required. Methods are generic over stage/binding types
-/// because captured function definitions retain parser-stage values even in
-/// an expanded call.
+/// All six arms are required. Inspect algebras work across value stages and
+/// binding phases, with argument-only cursors for resolved calls.
 pub trait Algebra<M: WalkMode>: Sized {
     type Output: WalkOutput;
     fn scalar<P: ValueKind, B: BindingAddress>(
@@ -821,25 +652,8 @@ pub fn inspect<'v, P: ValueKind, B: BindingAddress, A: Algebra<Inspect>>(
     root: WalkRoot<'v>,
     value: &'v Value<P, B>,
     algebra: &mut A,
-) -> Result<Located<A::Output>, WalkError> {
-    let at = root.at();
-    let encountered_secret = at.encountered_secret.clone();
-    dispatch::<Inspect, _, _, _>(value, at, algebra).map(|output| Located {
-        output,
-        secret: encountered_secret.get(),
-    })
-}
-pub fn transform<'v, P: ValueKind, B: BindingAddress, A: Algebra<Transform>>(
-    root: WalkRoot<'v>,
-    value: Value<P, B>,
-    algebra: &mut A,
-) -> Result<MarkedTransform<A::Output, P, B>, WalkError> {
-    let at = root.at();
-    let encountered_secret = at.encountered_secret.clone();
-    dispatch::<Transform, _, _, _>(value, at, algebra).map(|product| MarkedTransform {
-        product,
-        secret: encountered_secret.get(),
-    })
+) -> Result<A::Output, WalkError> {
+    dispatch(value, root.at(), algebra)
 }
 
 pub struct ScopedScalar<'v, M: WalkMode, P: ValueKind, B: BindingAddress> {
@@ -967,18 +781,6 @@ impl<P: ValueKind, B: BindingAddress> Children<'_, Inspect, P, B> {
         Step::new(self.parts.inspect(self.at, algebra).map(fold))
     }
 }
-impl<P: ValueKind, B: BindingAddress> Children<'_, Transform, P, B> {
-    pub fn transform<A: Algebra<Transform>>(
-        self,
-        algebra: &mut A,
-        fold: impl FnOnce(Vec<A::Output>) -> A::Output,
-    ) -> Step<Transform, A::Output, P, B> {
-        Step::new(
-            self.parts
-                .transform(self.at, &mut PublicTransform(algebra), fold),
-        )
-    }
-}
 impl<P: ValueKind, B: BindingAddress> ExprChildren<'_, Inspect, P, B> {
     pub fn inspect<A: Algebra<Inspect>>(
         self,
@@ -988,16 +790,6 @@ impl<P: ValueKind, B: BindingAddress> ExprChildren<'_, Inspect, P, B> {
         self.children.inspect(algebra, fold)
     }
 }
-impl<P: ValueKind, B: BindingAddress> ExprChildren<'_, Transform, P, B> {
-    pub fn transform<A: Algebra<Transform>>(
-        self,
-        algebra: &mut A,
-        fold: impl FnOnce(Vec<A::Output>) -> A::Output,
-    ) -> Step<Transform, A::Output, P, B> {
-        self.children.transform(algebra, fold)
-    }
-}
-
 /// An expression cursor paired with separate, scoped evidence channels.
 /// Only its operand is recursed into; evidence is transported without evaluation.
 pub struct ExpressionWithEvidence<
@@ -1023,77 +815,6 @@ impl<P: ValueKind, B: BindingAddress, O: WalkOutput, R: WalkOutput>
         })
     }
 }
-impl<P: ValueKind, B: BindingAddress, O: WalkOutput, R: WalkOutput>
-    ExpressionWithEvidence<'_, Transform, P, B, O, R>
-{
-    pub fn transform<A: Algebra<Transform, Output = Evidence<O, R>>>(
-        self,
-        algebra: &mut A,
-    ) -> Step<Transform, Evidence<O, R>, P, B> {
-        self.expression.transform(algebra, |children| {
-            Evidence::merge(std::iter::once(self.evidence).chain(children))
-        })
-    }
-}
-
-/// Fold an externally owned expression edge (for example a retained conversion
-/// operand or a per-element directive body) without evaluating or selecting it.
-pub fn inspect_expression_edge<
-    'v,
-    P: ValueKind,
-    B: BindingAddress,
-    O: WalkOutput,
-    R: WalkOutput,
-    A: Algebra<Inspect, Output = Evidence<O, R>>,
->(
-    root: WalkRoot<'v>,
-    edge: ExpressionEdge,
-    value: &'v Value<P, B>,
-    obligations: impl IntoIterator<Item = O>,
-    receipts: impl IntoIterator<Item = R>,
-    algebra: &mut A,
-) -> Result<Located<Evidence<O, R>>, WalkError> {
-    let at = root.at();
-    let encountered_secret = at.encountered_secret.clone();
-    engine::expression_edge(value, at, edge)
-        .with_evidence(obligations, receipts)
-        .inspect(algebra)
-        .result
-        .map(|output| Located {
-            output,
-            secret: encountered_secret.get(),
-        })
-}
-
-/// Rewrite an externally owned expression edge, returning its value, authored
-/// obligations, result receipts, and encountered protection independently.
-pub fn transform_expression_edge<
-    'v,
-    P: ValueKind,
-    B: BindingAddress,
-    O: WalkOutput,
-    R: WalkOutput,
-    A: Algebra<Transform, Output = Evidence<O, R>>,
->(
-    root: WalkRoot<'v>,
-    edge: ExpressionEdge,
-    value: Value<P, B>,
-    obligations: impl IntoIterator<Item = O>,
-    receipts: impl IntoIterator<Item = R>,
-    algebra: &mut A,
-) -> Result<MarkedTransform<Evidence<O, R>, P, B>, WalkError> {
-    let at = root.at();
-    let encountered_secret = at.encountered_secret.clone();
-    engine::expression_edge(value, at, edge)
-        .with_evidence(obligations, receipts)
-        .transform(algebra)
-        .result
-        .map(|product| MarkedTransform {
-            product,
-            secret: encountered_secret.get(),
-        })
-}
-
 pub struct SecretChild<'v, M: WalkMode, P: ValueKind + 'v, B: BindingAddress> {
     payload: M::Input<'v, SecretPayload<P, B>>,
     at: At<'v>,
@@ -1112,88 +833,11 @@ impl<P: ValueKind, B: BindingAddress> SecretChild<'_, Inspect, P, B> {
     ) -> SecretStep<Inspect, A::Output, P, B> {
         // The payload's crate-private read is confined here. No cursor exposes it.
         SecretStep {
-            step: Step::new(dispatch::<Inspect, _, _, _>(
-                self.payload.expose_plaintext(),
-                self.at,
-                algebra,
-            )),
+            step: Step::new(dispatch(self.payload.expose_plaintext(), self.at, algebra)),
         }
     }
 }
-/// Opaque access to hash material. It has no plaintext projection or Debug.
-pub struct ProtectedSecret<'a, P: ValueKind, B: BindingAddress> {
-    payload: &'a SecretPayload<P, B>,
-}
-impl<P: ValueKind, B: BindingAddress> ProtectedSecret<'_, P, B> {
-    /// Hash a snapshot using its original evaluable leaf stage. The marker
-    /// adapter is fallible and private; it never exposes a Value or key bytes.
-    /// Existing canonical hashing remains the only digest representation.
-    pub fn hash_snapshot<S: crate::resource::PlaceholderKind + serde::de::DeserializeOwned>(
-        &self,
-        previous: Option<&crate::resource::RedactedSecretHash>,
-    ) -> Result<crate::resource::RedactedSecretHash, WalkError> {
-        let value: Value<S, B> = self
-            .payload
-            .expose_plaintext()
-            .clone()
-            .try_map_placeholder(&mut |leaf| {
-                let encoded = serde_json::to_value(leaf).map_err(|_| WalkError::SecretHash)?;
-                let leaf: crate::resource::SnapshotLeaf<S> =
-                    serde_json::from_value(encoded).map_err(|_| WalkError::SecretHash)?;
-                match leaf {
-                    crate::resource::SnapshotLeaf::Expression(leaf) => {
-                        Ok(Value::Deferred(DeferredValue::Placeholder(leaf)))
-                    }
-                    crate::resource::SnapshotLeaf::RedactedSecret { hash: _ } => {
-                        Err(WalkError::SecretHash)
-                    }
-                }
-            })?;
-        let root = crate::resource::RootScope::new();
-        let value = value.map_bindings(&mut |binding| {
-            root.resolve(crate::resource::RelativeBindingName::new(binding.as_str()))
-        });
-        let material = crate::value::canonical_secret_hash_material(&value)
-            .map_err(|_| WalkError::SecretHash)?;
-        Ok(crate::resource::RedactedSecretHash::reuse_or_generate(
-            &material, previous,
-        ))
-    }
-}
-
 impl<P: ValueKind, B: BindingAddress> SecretChild<'_, Transform, P, B> {
-    /// Inspect every child before invoking the owner. Only a typed digest can
-    /// replace the Secret, and inner evidence keeps its protected scope.
-    pub fn redact<A: Algebra<Inspect>>(
-        self,
-        inspector: &mut A,
-        redact: impl FnOnce(
-            ProtectedSecret<'_, P, B>,
-        ) -> Result<crate::resource::RedactedSecretHash, WalkError>,
-    ) -> SecretStep<Transform, A::Output, P, B> {
-        let result = (|| {
-            let output =
-                dispatch::<Inspect, _, _, _>(self.payload.expose_plaintext(), self.at, inspector)?;
-            let hash = redact(ProtectedSecret {
-                payload: &self.payload,
-            })?;
-            let leaf = P::from_redacted_secret(hash).map_err(|_| WalkError::RedactionStage)?;
-            Ok(RewriteProduct {
-                value: Value::Deferred(DeferredValue::Placeholder(leaf)),
-                output,
-                changed: true,
-            })
-        })();
-        SecretStep {
-            step: Step::new(result),
-        }
-    }
-    pub fn transform<A: Algebra<Transform>>(
-        self,
-        algebra: &mut A,
-    ) -> SecretStep<Transform, A::Output, P, B> {
-        self.transform_bound(&mut PublicTransform(algebra))
-    }
     fn transform_bound<A: BoundTransform<P, B>>(
         self,
         algebra: &mut A,

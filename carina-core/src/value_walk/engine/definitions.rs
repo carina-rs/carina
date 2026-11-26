@@ -49,7 +49,6 @@ struct FunctionCandidate<B: BindingAddress, O: WalkOutput> {
     candidate: Option<UserFunction<B>>,
     output: Vec<O>,
     changed: bool,
-    encountered_secret: bool,
 }
 
 impl<B: BindingAddress, O: WalkOutput> FunctionCandidate<B, O> {
@@ -58,7 +57,6 @@ impl<B: BindingAddress, O: WalkOutput> FunctionCandidate<B, O> {
             candidate: self.candidate.clone(),
             output: self.output.iter().map(copy_output).collect(),
             changed: self.changed,
-            encountered_secret: self.encountered_secret,
         }
     }
 }
@@ -71,7 +69,7 @@ struct Memo<B: BindingAddress, O: WalkOutput> {
 }
 
 /// Shared across rewrites within an evaluation. Only structural unit-output
-/// walks can construct a memo; arbitrary public transforms cannot opt in.
+/// walks can construct a memo; position-dependent test walks stay uncached.
 /// Source Arcs keep definition and table-entry addresses stable until it drops.
 pub(crate) struct DefinitionMemo<B: BindingAddress, O: WalkOutput = ()>(Rc<RefCell<Memo<B, O>>>);
 
@@ -146,13 +144,6 @@ impl<O: WalkOutput> TransformFold<O> {
                     );
                 }
                 assert_eq!(hit.changed, checked.changed, "transform memo changed flag");
-                assert_eq!(
-                    hit.encountered_secret, checked.encountered_secret,
-                    "transform memo secret discovery"
-                );
-            }
-            if hit.encountered_secret {
-                at.encountered_secret.set(true);
             }
             self.output.extend(hit.output);
             self.changed |= hit.changed;
@@ -174,26 +165,17 @@ impl<O: WalkOutput> TransformFold<O> {
         A: BoundTransform<crate::resource::ParserPlaceholder, B> + TransformOutput<Output = O>,
     >(
         function: &UserFunction<B>,
-        mut at: At<'_>,
+        at: At<'_>,
         algebra: &mut A,
     ) -> Result<FunctionCandidate<B, O>, WalkError> {
         #[cfg(test)]
         crate::value_walk::FUNCTION_DEFINITION_WALK_COUNT.with(|count| count.set(count.get() + 1));
-        let parent_secret = at.encountered_secret.clone();
-        let encountered_secret = Rc::new(Cell::new(false));
-        at.encountered_secret = encountered_secret.clone();
         let mut nested = Self::new();
-        let candidate = nested.function(function.clone(), at, algebra);
-        // Discovery propagates on failure too, so errors retain protection.
-        if encountered_secret.get() {
-            parent_secret.set(true);
-        }
-        let candidate = candidate?;
+        let candidate = nested.function(function.clone(), at, algebra)?;
         Ok(FunctionCandidate {
             candidate: nested.changed.then_some(candidate),
             output: nested.output,
             changed: nested.changed,
-            encountered_secret: encountered_secret.get(),
         })
     }
     fn function<
