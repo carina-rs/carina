@@ -115,6 +115,44 @@ impl<P: ValueKind, B: BindingAddress> LeafInput<'_, Transform, P, B> {
     }
 }
 
+/// The sealed mode chooses the call projection once, at dispatch. In particular,
+/// Inspect cannot retain either definition Arc or any route into their values.
+pub struct InspectCall<'v, P: ValueKind, B: BindingAddress> {
+    args: &'v Vec<FunctionArgument<P, B>>,
+}
+
+pub struct TransformCall<P: ValueKind, B: BindingAddress> {
+    pub(super) function: Arc<UserFunction<B>>,
+    pub(super) functions: Arc<indexmap::IndexMap<String, UserFunction<B>>>,
+    pub(super) args: Vec<FunctionArgument<P, B>>,
+    pub(super) source_line: DiagnosticSourceLine,
+}
+
+pub trait CallProjection {
+    fn child_len(&self) -> usize;
+}
+impl<P: ValueKind, B: BindingAddress> CallProjection for InspectCall<'_, P, B> {
+    fn child_len(&self) -> usize {
+        argument_values_len(self.args)
+    }
+}
+impl<P: ValueKind, B: BindingAddress> CallProjection for TransformCall<P, B> {
+    fn child_len(&self) -> usize {
+        let definition_len = |function: &UserFunction<B>| {
+            function
+                .params
+                .iter()
+                .filter(|param| param.default.is_some())
+                .count()
+                + function.local_lets.len()
+                + 1
+        };
+        definition_len(&self.function)
+            + self.functions.values().map(definition_len).sum::<usize>()
+            + argument_values_len(&self.args)
+    }
+}
+
 /// Mode-specific fields, including fixed-arity expressions. Inspect instantiates
 /// these fields with references and has no rebuilding method or closure.
 /// Transform owns them and rebuilds directly from typed operation results.
@@ -139,17 +177,8 @@ pub(super) enum Parts<'v, M: WalkMode, P: ValueKind + 'v, B: BindingAddress> {
         reason: M::Input<'v, UnavailableReason>,
         source_line: M::Input<'v, DiagnosticSourceLine>,
     },
-    ResolvedCall {
-        function: M::Input<'v, Arc<UserFunction<B>>>,
-        functions: M::Input<'v, Arc<indexmap::IndexMap<String, UserFunction<B>>>>,
-        args: M::Input<'v, Vec<FunctionArgument<P, B>>>,
-        source_line: M::Input<'v, DiagnosticSourceLine>,
-    },
+    ResolvedCall(M::ResolvedCall<'v, P, B>),
     Access(M::Input<'v, AccessExpr<P, B>>),
-    Evidence {
-        value: M::Input<'v, Value<P, B>>,
-        edge: ExpressionEdge,
-    },
 }
 impl<M: WalkMode, P: ValueKind, B: BindingAddress> Parts<'_, M, P, B> {
     pub(super) fn len(&self) -> usize {
@@ -165,20 +194,8 @@ impl<M: WalkMode, P: ValueKind, B: BindingAddress> Parts<'_, M, P, B> {
             Self::Call { args, .. } | Self::Unavailable { args, .. } => {
                 argument_values_len(M::borrow::<Vec<FunctionArgument<P, B>>>(args))
             }
-            Self::ResolvedCall {
-                function,
-                functions,
-                args,
-                ..
-            } => {
-                function_values(M::borrow::<Arc<UserFunction<B>>>(function)).count()
-                    + M::borrow(functions)
-                        .values()
-                        .map(|function| function_values(function).count())
-                        .sum::<usize>()
-                    + argument_values_len(M::borrow::<Vec<FunctionArgument<P, B>>>(args))
-            }
-            Self::Access(_) | Self::Evidence { .. } => 1,
+            Self::ResolvedCall(call) => call.child_len(),
+            Self::Access(_) => 1,
         }
     }
 }
@@ -312,12 +329,12 @@ macro_rules! dispatch_variants {
                 source_line,
             }) => expr!(
                 ResolvedFunctionCall,
-                Parts::ResolvedCall {
+                Parts::ResolvedCall(<$mode as sealed::Mode>::resolved_call(
                     function,
                     functions,
                     args,
-                    source_line
-                }
+                    source_line,
+                ))
             ),
             Value::Deferred(DeferredValue::Access(access)) => expr!(Access, Parts::Access(access)),
             Value::Reference(never) => {
@@ -332,30 +349,48 @@ macro_rules! dispatch_variants {
 
 impl sealed::Mode for Inspect {
     type Input<'v, T: 'v> = &'v T;
-    fn dispatch<'v, P: ValueKind + 'v, B: BindingAddress, A: Algebra<Self>>(
-        input: Self::Input<'v, Value<P, B>>,
-        at: At<'v>,
-        algebra: &mut A,
-    ) -> Result<<Self as WalkMode>::Product<A::Output, P, B>, WalkError> {
-        dispatch_variants!(Inspect, P, B, input, at, algebra)
+    type ResolvedCall<'v, P: ValueKind + 'v, B: BindingAddress> = InspectCall<'v, P, B>;
+    fn resolved_call<'v, P: ValueKind + 'v, B: BindingAddress>(
+        _function: &'v Arc<UserFunction<B>>,
+        _functions: &'v Arc<indexmap::IndexMap<String, UserFunction<B>>>,
+        args: &'v Vec<FunctionArgument<P, B>>,
+        _source_line: &'v DiagnosticSourceLine,
+    ) -> InspectCall<'v, P, B> {
+        InspectCall { args }
     }
 }
 impl sealed::Mode for Transform {
     type Input<'v, T: 'v> = T;
-    fn dispatch<'v, P: ValueKind + 'v, B: BindingAddress, A: Algebra<Self>>(
-        input: Self::Input<'v, Value<P, B>>,
-        at: At<'v>,
-        algebra: &mut A,
-    ) -> Result<<Self as WalkMode>::Product<A::Output, P, B>, WalkError> {
-        dispatch_variants!(Transform, P, B, input, at, algebra)
+    type ResolvedCall<'v, P: ValueKind + 'v, B: BindingAddress> = TransformCall<P, B>;
+    fn resolved_call<'v, P: ValueKind + 'v, B: BindingAddress>(
+        function: Arc<UserFunction<B>>,
+        functions: Arc<indexmap::IndexMap<String, UserFunction<B>>>,
+        args: Vec<FunctionArgument<P, B>>,
+        source_line: DiagnosticSourceLine,
+    ) -> TransformCall<P, B> {
+        TransformCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }
     }
 }
-pub(super) fn dispatch<'v, M: WalkMode, P: ValueKind + 'v, B: BindingAddress, A: Algebra<M>>(
-    input: M::Input<'v, Value<P, B>>,
+pub(super) fn dispatch<'v, P: ValueKind + 'v, B: BindingAddress, A: Algebra<Inspect>>(
+    input: &'v Value<P, B>,
     at: At<'v>,
     algebra: &mut A,
-) -> Result<M::Product<A::Output, P, B>, WalkError> {
-    M::dispatch(input, at, algebra)
+) -> Result<A::Output, WalkError> {
+    #[cfg(test)]
+    if at.expression_edges().iter().any(|edge| {
+        matches!(
+            edge,
+            ExpressionEdge::FunctionDefinition | ExpressionEdge::FunctionScope(_)
+        )
+    }) {
+        FUNCTION_DEFINITION_INSPECT_COUNT.with(|count| count.set(count.get() + 1));
+    }
+    dispatch_variants!(Inspect, P, B, input, at, algebra)
 }
 
 pub(super) fn dispatch_bound<'v, P: ValueKind + 'v, B: BindingAddress, A: BoundTransform<P, B>>(
@@ -382,18 +417,6 @@ fn expression<'v, M: WalkMode, P: ValueKind + 'v, B: BindingAddress>(
         at,
     }
 }
-pub(super) fn expression_edge<'v, M: WalkMode, P: ValueKind + 'v, B: BindingAddress>(
-    value: M::Input<'v, Value<P, B>>,
-    at: At<'v>,
-    edge: ExpressionEdge,
-) -> ExprChildren<'v, M, P, B> {
-    expression(
-        Parts::Evidence { value, edge },
-        ExpressionKind::Evidence,
-        at,
-    )
-}
-
 fn map_entries<K: AsRef<str>, T>(
     entries: impl IntoIterator<Item = (K, T)>,
 ) -> impl Iterator<Item = (usize, K, T)> {
@@ -418,7 +441,7 @@ fn inspect_value<'v, P: ValueKind, B: BindingAddress, A: Algebra<Inspect>>(
     algebra: &mut A,
     output: &mut Vec<A::Output>,
 ) -> Result<(), WalkError> {
-    output.push(dispatch::<Inspect, _, _, _>(value, at, algebra)?);
+    output.push(dispatch(value, at, algebra)?);
     Ok(())
 }
 fn inspect_arguments<'v, P: ValueKind, B: BindingAddress, A: Algebra<Inspect>>(
@@ -455,49 +478,6 @@ fn argument_values_len<P: ValueKind, B: BindingAddress>(args: &[FunctionArgument
         }
     }
     count
-}
-fn function_values<B: BindingAddress>(
-    function: &UserFunction<B>,
-) -> impl Iterator<
-    Item = (
-        ExpressionEdge,
-        &Value<crate::resource::ParserPlaceholder, B>,
-    ),
-> {
-    function
-        .params
-        .iter()
-        .enumerate()
-        .filter_map(|(index, param)| {
-            param
-                .default
-                .as_ref()
-                .map(|value| (ExpressionEdge::FunctionDefault(index), value))
-        })
-        .chain(
-            function
-                .local_lets
-                .iter()
-                .enumerate()
-                .map(|(index, (_, value, _))| (ExpressionEdge::FunctionLocal(index), value)),
-        )
-        .chain(std::iter::once((
-            ExpressionEdge::FunctionBody,
-            &function.body.value,
-        )))
-}
-fn inspect_function<'v, B: BindingAddress, A: Algebra<Inspect>>(
-    function: &'v UserFunction<B>,
-    at: At<'v>,
-    algebra: &mut A,
-    output: &mut Vec<A::Output>,
-) -> Result<(), WalkError> {
-    #[cfg(test)]
-    FUNCTION_DEFINITION_INSPECT_COUNT.with(|count| count.set(count.get() + 1));
-    for (edge, value) in function_values(function) {
-        inspect_value(value, at.operand(edge), algebra, output)?;
-    }
-    Ok(())
 }
 impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Inspect, P, B> {
     pub(super) fn inspect<A: Algebra<Inspect>>(
@@ -593,28 +573,7 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Inspect, P, B> {
             } => {
                 inspect_arguments(args, &at, algebra, &mut output)?;
             }
-            Self::ResolvedCall {
-                function,
-                functions,
-                args,
-                source_line: _,
-            } => {
-                inspect_function(
-                    function,
-                    at.operand(ExpressionEdge::FunctionDefinition),
-                    algebra,
-                    &mut output,
-                )?;
-                let mut scope: Vec<_> = functions.iter().collect();
-                scope.sort_by(|left, right| left.0.cmp(right.0));
-                for (index, (_name, function)) in scope.into_iter().enumerate() {
-                    inspect_function(
-                        function,
-                        at.operand(ExpressionEdge::FunctionScope(index)),
-                        algebra,
-                        &mut output,
-                    )?;
-                }
+            Self::ResolvedCall(InspectCall { args }) => {
                 inspect_arguments(args, &at, algebra, &mut output)?;
             }
             Self::Access(access) => inspect_value(
@@ -623,9 +582,6 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Inspect, P, B> {
                 algebra,
                 &mut output,
             )?,
-            Self::Evidence { value, edge } => {
-                inspect_value(value, at.operand(edge), algebra, &mut output)?
-            }
         }
         Ok(output)
     }
@@ -670,23 +626,6 @@ impl<O: WalkOutput> TransformFold<O> {
         algebra: &mut A,
     ) -> Result<FunctionArgument<P, B>, WalkError> {
         if let Some(replacement) = algebra.argument(&at, &argument)? {
-            // Replacement must not bypass Secret in an auxiliary access base
-            // or in the original argument. Inventory it before completing the
-            // replacement; inserted values follow leaf-replacement semantics.
-            let mut inspector = StructuralInspector {
-                locator: None,
-                found: None,
-            };
-            let mut index = 0;
-            argument.try_visit_values(&mut |value| {
-                dispatch::<Inspect, _, _, _>(
-                    value,
-                    at.operand(ExpressionEdge::ArgumentValue(index)),
-                    &mut inspector,
-                )?;
-                index += 1;
-                Ok::<_, WalkError>(())
-            })?;
             self.changed = true;
             return Ok(replacement);
         }
@@ -728,7 +667,7 @@ impl<O: WalkOutput> TransformFold<O> {
     }
 }
 /// Transform one typed argument through the same fold used by call operands.
-/// Whole-argument replacement still inventories every original Secret operand.
+/// A whole-argument replacement returns directly, as with leaf replacement.
 pub(super) fn transform_argument_bound<
     P: ValueKind,
     B: BindingAddress,
@@ -861,12 +800,12 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Transform, P, B> {
                 reason,
                 source_line,
             }),
-            Self::ResolvedCall {
+            Self::ResolvedCall(TransformCall {
                 function,
                 functions,
                 args,
                 source_line,
-            } => {
+            }) => {
                 let candidate = walked.function_candidate(
                     FunctionSource::Definition(function.clone()),
                     &at,
@@ -926,7 +865,6 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Transform, P, B> {
                 walked.changed |= base_walk.changed;
                 result
             }
-            Self::Evidence { value, edge } => walked.value(value, at.operand(edge), algebra)?,
         };
         Ok(RewriteProduct {
             value,
@@ -934,84 +872,4 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Transform, P, B> {
             changed: walked.changed,
         })
     }
-}
-
-/// Locating a saved protected position is another algebra over the one fold,
-/// never a second representation walker. No payload leaves this resolver.
-struct StructuralInspector<'a> {
-    locator: Option<&'a ProtectedLocator>,
-    found: Option<Scoped<()>>,
-}
-impl StructuralInspector<'_> {
-    fn record(&mut self, at: &At<'_>) {
-        let Some(ProtectedLocator(_, anchor, node)) = self.locator else {
-            return;
-        };
-        if at.is_secret() && at.secret_anchor.as_ref() == Some(anchor) && &at.position == node {
-            self.found = Some(Scoped::new(at, ()));
-        }
-    }
-}
-impl Algebra<Inspect> for StructuralInspector<'_> {
-    type Output = ();
-    fn scalar<P: ValueKind, B: BindingAddress>(
-        &mut self,
-        at: &At<'_>,
-        value: ScopedScalar<'_, Inspect, P, B>,
-    ) -> Step<Inspect, (), P, B> {
-        self.record(at);
-        value.finish(())
-    }
-    fn list<P: ValueKind, B: BindingAddress>(
-        &mut self,
-        at: &At<'_>,
-        children: Children<'_, Inspect, P, B>,
-    ) -> Step<Inspect, (), P, B> {
-        self.record(at);
-        children.inspect(self, |_| ())
-    }
-    fn map<P: ValueKind, B: BindingAddress>(
-        &mut self,
-        at: &At<'_>,
-        children: Children<'_, Inspect, P, B>,
-    ) -> Step<Inspect, (), P, B> {
-        self.record(at);
-        children.inspect(self, |_| ())
-    }
-    fn expression<P: ValueKind, B: BindingAddress>(
-        &mut self,
-        at: &At<'_>,
-        expression: ExprChildren<'_, Inspect, P, B>,
-    ) -> Step<Inspect, (), P, B> {
-        self.record(at);
-        expression.inspect(self, |_| ())
-    }
-    fn placeholder<P: ValueKind, B: BindingAddress>(
-        &mut self,
-        at: &At<'_>,
-        leaf: ScopedLeaf<'_, Inspect, P, B>,
-    ) -> Step<Inspect, (), P, B> {
-        self.record(at);
-        leaf.finish(())
-    }
-    fn secret<P: ValueKind, B: BindingAddress>(
-        &mut self,
-        at: &SecretAt<'_>,
-        child: SecretChild<'_, Inspect, P, B>,
-    ) -> SecretStep<Inspect, (), P, B> {
-        self.record(at.at());
-        child.inspect(self)
-    }
-}
-pub(super) fn resolve_protected<P: ValueKind, B: BindingAddress>(
-    locator: &ProtectedLocator,
-    root: WalkRoot<'_>,
-    value: &Value<P, B>,
-) -> Result<Scoped<()>, WalkError> {
-    let mut resolver = StructuralInspector {
-        locator: Some(locator),
-        found: None,
-    };
-    inspect(root, value, &mut resolver)?;
-    resolver.found.ok_or(WalkError::ProtectedLocator)
 }

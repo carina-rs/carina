@@ -26,15 +26,13 @@ pub(crate) enum UnavailableSearchPolicy {
 
 impl UnavailableSearchPolicy {
     fn includes(self, at: &At<'_>) -> bool {
-        // The former search inspected call arguments, not captured function
-        // definitions/scopes or auxiliary access provenance. Keep that exact
-        // expression surface while the kernel still inventories every edge.
-        if at.expression_edges().iter().any(|edge| {
-            matches!(
-                edge,
-                ExpressionEdge::FunctionDefinition | ExpressionEdge::FunctionScope(_)
-            ) || matches!(edge, ExpressionEdge::ArgumentValue(index) if *index != 0)
-        }) {
+        // The Inspect projection cannot reach definitions. Auxiliary access
+        // provenance remains structural, but does not create obligations.
+        if at
+            .expression_edges()
+            .iter()
+            .any(|edge| matches!(edge, ExpressionEdge::ArgumentValue(index) if *index != 0))
+        {
             return false;
         }
         match self {
@@ -154,14 +152,8 @@ impl Algebra<Inspect> for UnavailableSearch {
                     args: _,
                     source_line: _,
                 }
-                | Parts::ResolvedCall {
-                    function: _,
-                    functions: _,
-                    args: _,
-                    source_line: _,
-                }
-                | Parts::Access(_)
-                | Parts::Evidence { value: _, edge: _ } => None,
+                | Parts::ResolvedCall(_)
+                | Parts::Access(_) => None,
             }
         } else {
             None

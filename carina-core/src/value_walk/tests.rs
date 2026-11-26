@@ -1,6 +1,18 @@
 use super::*;
 use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, Value, ValueKind};
 
+// Exercise the retained owned engine directly; there is no public Transform root.
+fn rewrite_owned<P: ValueKind, B: BindingAddress, A>(
+    root: WalkRoot<'_>,
+    value: Value<P, B>,
+    algebra: &mut A,
+) -> Result<RewriteProduct<A::Output, P, B>, WalkError>
+where
+    A: BoundTransform<P, B> + BoundTransform<crate::resource::ParserPlaceholder, B>,
+{
+    engine::dispatch_bound(value, root.at(), algebra)
+}
+
 #[derive(Default)]
 struct Count {
     scalars: usize,
@@ -186,21 +198,17 @@ fn kernel_covers_every_value_bearing_edge() {
         inspect(WalkRoot::syntactic(), &value, &mut count)
             .unwrap()
             .into_output(),
-        35
+        29
     );
-    // 12 numbered operand leaves, the condition, and three leaves in each
-    // of the two distinct captured function definitions.
-    assert_eq!(count.scalars, 19, "a value-bearing edge was skipped");
+    // 12 numbered operand leaves and the condition; definitions are not operands.
+    assert_eq!(
+        count.scalars, 13,
+        "a value-bearing operand edge was skipped"
+    );
     assert_eq!(count.secrets, 1);
     assert_eq!(count.placeholder_count, 2);
     assert_eq!(count.reference_count, 2);
-    assert_eq!(
-        count.numbers,
-        (1..=12)
-            .map(|n| (n, 1))
-            .chain((71..=73).map(|n| (n, 2)))
-            .collect()
-    );
+    assert_eq!(count.numbers, (1..=12).map(|n| (n, 1)).collect());
     assert_eq!(
         count.leaves,
         [
@@ -229,12 +237,17 @@ fn kernel_covers_every_value_bearing_edge() {
 #[test]
 fn transform_rewrites_all_operands_and_captured_function_values() {
     let value = every_edge_fixture();
-    let rewritten = transform(WalkRoot::syntactic(), value, &mut ReplaceInts::default())
+    let mut rewrite = ReplaceInts::default();
+    let rewritten = rewrite_owned(WalkRoot::syntactic(), value, &mut rewrite)
         .unwrap()
-        .into_value();
+        .value;
+    assert_eq!(
+        rewrite.integers, 18,
+        "all operands and stored definition fields"
+    );
     let mut count = Count::default();
     inspect(WalkRoot::syntactic(), &rewritten, &mut count).unwrap();
-    assert_eq!(count.numbers, [(41, 18)].into());
+    assert_eq!(count.numbers, [(41, 12)].into());
     assert_eq!(count.secrets, 1);
 }
 
@@ -253,16 +266,6 @@ fn rejecting_secret_cannot_reach_its_child_or_finish_successfully() {
 }
 
 #[test]
-fn located_summary_remembers_secret_descendants() {
-    let value = Value::Concrete(ConcreteValue::List(vec![secret(int(2))]));
-    assert!(
-        inspect(WalkRoot::syntactic(), &value, &mut Count::default())
-            .unwrap()
-            .is_secret()
-    );
-}
-
-#[test]
 fn transform_cannot_forge_validated_arithmetic_with_nonnumeric_operands() {
     use crate::integer_arithmetic::{IntegerOp, IntegerOperatorSpan, ValidatedIntegerExpr};
     let value = secret(Value::Deferred(DeferredValue::IntegerArithmetic(
@@ -275,10 +278,13 @@ fn transform_cannot_forge_validated_arithmetic_with_nonnumeric_operands() {
         .unwrap(),
     )));
     assert!(
-        transform(
+        rewrite_owned(
             WalkRoot::syntactic(),
             value,
-            &mut ReplaceInts { invalid: true }
+            &mut ReplaceInts {
+                invalid: true,
+                ..Default::default()
+            }
         )
         .is_err()
     );
@@ -415,13 +421,13 @@ fn kernel_requires_secret_reentry() {
 
 #[test]
 fn transform_restores_secret_wrapper() {
-    let result = transform(
+    let result = rewrite_owned(
         WalkRoot::syntactic(),
         secret(int(1)),
         &mut ReplaceInts::default(),
     )
     .unwrap()
-    .into_value();
+    .value;
     assert!(matches!(result,
         Value::Deferred(DeferredValue::Secret(payload))
             if payload.plaintext_for_test() == &int(41)
@@ -431,15 +437,22 @@ fn transform_restores_secret_wrapper() {
 #[derive(Default)]
 struct ReplaceInts {
     invalid: bool,
+    integers: usize,
 }
-impl Algebra<Transform> for ReplaceInts {
+impl TransformOutput for ReplaceInts {
     type Output = ();
-    fn scalar<P: ValueKind, B: BindingAddress>(
+}
+impl<P: ValueKind, B: BindingAddress> BoundTransform<P, B> for ReplaceInts {
+    fn function_memo(&self) -> Option<DefinitionMemo<B, Self::Output>> {
+        None
+    }
+    fn scalar(
         &mut self,
         _: &At<'_>,
         scalar: ScopedScalar<'_, Transform, P, B>,
     ) -> Step<Transform, (), P, B> {
         if scalar.kind() == ScalarKind::Int {
+            self.integers += 1;
             if self.invalid {
                 scalar.replace(
                     Value::Concrete(ConcreteValue::String("invalid-operand".into())),
@@ -452,40 +465,45 @@ impl Algebra<Transform> for ReplaceInts {
             scalar.keep(())
         }
     }
-    fn list<P: ValueKind, B: BindingAddress>(
+    fn list(
         &mut self,
         _: &At<'_>,
         children: Children<'_, Transform, P, B>,
     ) -> Step<Transform, (), P, B> {
-        children.transform(self, |_| ())
+        Step::new(children.parts.transform(children.at, self, |_| ()))
     }
-    fn map<P: ValueKind, B: BindingAddress>(
+    fn map(
         &mut self,
         _: &At<'_>,
         children: Children<'_, Transform, P, B>,
     ) -> Step<Transform, (), P, B> {
-        children.transform(self, |_| ())
+        Step::new(children.parts.transform(children.at, self, |_| ()))
     }
-    fn expression<P: ValueKind, B: BindingAddress>(
+    fn expression(
         &mut self,
         _: &At<'_>,
         children: ExprChildren<'_, Transform, P, B>,
     ) -> Step<Transform, (), P, B> {
-        children.transform(self, |_| ())
+        Step::new(
+            children
+                .children
+                .parts
+                .transform(children.children.at, self, |_| ()),
+        )
     }
-    fn placeholder<P: ValueKind, B: BindingAddress>(
+    fn placeholder(
         &mut self,
         _: &At<'_>,
         leaf: ScopedLeaf<'_, Transform, P, B>,
     ) -> Step<Transform, (), P, B> {
         leaf.keep(())
     }
-    fn secret<P: ValueKind, B: BindingAddress>(
+    fn secret(
         &mut self,
         _: &SecretAt<'_>,
         child: SecretChild<'_, Transform, P, B>,
     ) -> SecretStep<Transform, (), P, B> {
-        child.transform(self)
+        child.transform_bound(self)
     }
 }
 
@@ -569,7 +587,80 @@ macro_rules! carry_algebra {
     };
 }
 carry_algebra!(Inspect, finish, inspect);
-carry_algebra!(Transform, keep, transform);
+
+impl TransformOutput for Carry {
+    type Output = Evidence<usize, usize>;
+}
+impl<P: ValueKind, B: BindingAddress> BoundTransform<P, B> for Carry {
+    fn function_memo(&self) -> Option<DefinitionMemo<B, Self::Output>> {
+        None
+    }
+    fn scalar(
+        &mut self,
+        at: &At<'_>,
+        value: ScopedScalar<'_, Transform, P, B>,
+    ) -> Step<Transform, Self::Output, P, B> {
+        let id = self.issue();
+        value.keep(Evidence::at(at, [id], [id + 1000]))
+    }
+    fn list(
+        &mut self,
+        _: &At<'_>,
+        children: Children<'_, Transform, P, B>,
+    ) -> Step<Transform, Self::Output, P, B> {
+        Step::new(children.parts.transform(children.at, self, Evidence::merge))
+    }
+    fn map(
+        &mut self,
+        _: &At<'_>,
+        children: Children<'_, Transform, P, B>,
+    ) -> Step<Transform, Self::Output, P, B> {
+        Step::new(children.parts.transform(children.at, self, Evidence::merge))
+    }
+    fn expression(
+        &mut self,
+        _: &At<'_>,
+        expression: ExprChildren<'_, Transform, P, B>,
+    ) -> Step<Transform, Self::Output, P, B> {
+        self.expressions.push(expression.kind());
+        let id = self.issue();
+        let evidence = Evidence::at(&expression.at, [id], [id + 1000]);
+        Step::new(
+            expression
+                .children
+                .parts
+                .transform(expression.children.at, self, |children| {
+                    Evidence::merge(std::iter::once(evidence).chain(children))
+                }),
+        )
+    }
+    fn placeholder(
+        &mut self,
+        at: &At<'_>,
+        leaf: ScopedLeaf<'_, Transform, P, B>,
+    ) -> Step<Transform, Self::Output, P, B> {
+        let id = self.issue();
+        leaf.with_reference(|reference| {
+            let binding = match reference {
+                Some(ReferenceRef::Resource(path)) => Some(path.binding()),
+                Some(ReferenceRef::Binding(binding)) => Some(binding.as_str()),
+                None => None,
+            };
+            if let Some(binding) = binding {
+                self.references.insert(id, binding.to_owned());
+            }
+        });
+        leaf.keep(Evidence::at(at, [id], [id + 1000]))
+    }
+    fn secret(
+        &mut self,
+        _: &SecretAt<'_>,
+        child: SecretChild<'_, Transform, P, B>,
+    ) -> SecretStep<Transform, Self::Output, P, B> {
+        self.secret_entries += 1;
+        child.transform_bound(self)
+    }
+}
 
 type EvidenceSnapshot = Vec<(usize, LeafPath, Vec<ExpressionEdge>, bool)>;
 fn evidence_snapshot(items: &[Scoped<usize>]) -> EvidenceSnapshot {
@@ -586,25 +677,44 @@ fn evidence_snapshot(items: &[Scoped<usize>]) -> EvidenceSnapshot {
         .collect()
 }
 
+fn operand_snapshot(items: &[Scoped<usize>]) -> Vec<(LeafPath, Vec<ExpressionEdge>, bool)> {
+    evidence_snapshot(items)
+        .into_iter()
+        .filter(|(_, _, edges, _)| {
+            !edges.iter().any(|edge| {
+                matches!(
+                    edge,
+                    ExpressionEdge::FunctionDefinition | ExpressionEdge::FunctionScope(_)
+                )
+            })
+        })
+        .map(|(_, path, edges, secret)| (path, edges, secret))
+        .collect()
+}
+
 #[test]
 fn transform_preserves_evidence_on_every_container_argument_and_expression_edge() {
     let value = every_edge_fixture();
     let inspected = inspect(WalkRoot::syntactic(), &value, &mut Carry::default())
         .unwrap()
         .into_output();
-    let result = transform(WalkRoot::syntactic(), value.clone(), &mut Carry::default()).unwrap();
-    assert!(result.is_secret());
-    let (rewritten, located) = result.into_parts();
-    assert_eq!(format!("{rewritten:?}"), format!("{value:?}"));
-    assert!(located.is_secret());
-    let output = located.into_output();
+    let result =
+        rewrite_owned(WalkRoot::syntactic(), value.clone(), &mut Carry::default()).unwrap();
+    let RewriteProduct {
+        value: rewritten,
+        output,
+        ..
+    } = result;
+    assert!(crate::resource::storage::same_plain_representation(
+        &rewritten, &value
+    ));
     assert_eq!(
-        evidence_snapshot(output.obligations()),
-        evidence_snapshot(inspected.obligations())
+        operand_snapshot(output.obligations()),
+        operand_snapshot(inspected.obligations())
     );
     assert_eq!(
-        evidence_snapshot(output.receipts()),
-        evidence_snapshot(inspected.receipts())
+        operand_snapshot(output.receipts()),
+        operand_snapshot(inspected.receipts())
     );
     assert_eq!(output.receipts().len(), 32);
     assert!(output.receipts().iter().any(|receipt| {
@@ -612,63 +722,6 @@ fn transform_preserves_evidence_on_every_container_argument_and_expression_edge(
             .expression_edges()
             .contains(&ExpressionEdge::Argument(0))
     }));
-}
-
-#[test]
-fn generic_expression_edge_separates_value_obligations_receipts_and_protection() {
-    let value = secret(Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
-        "private.key[0]".into() => Value::Concrete(ConcreteValue::List(vec![int(5)])),
-    })));
-    let result = transform_expression_edge(
-        WalkRoot::syntactic(),
-        ExpressionEdge::EvidenceOperand,
-        value.clone(),
-        [10_000_usize],
-        [20_000_usize],
-        &mut Carry::default(),
-    )
-    .unwrap();
-    let (rewritten, located) = result.into_parts();
-    assert_eq!(format!("{rewritten:?}"), format!("{value:?}"));
-    assert!(located.is_secret());
-    let output = located.into_output();
-    assert_eq!(*output.obligations()[0].output(), 10_000);
-    assert_eq!(*output.receipts()[0].output(), 20_000);
-    // The outer obligation is authored outside Secret, while operand evidence
-    // retains its protected scope and the exact result path inside the value.
-    assert!(!output.obligations()[0].is_secret());
-    assert_eq!(
-        output.obligations()[0].public_path().unwrap().segments(),
-        []
-    );
-    for item in [&output.obligations()[1], &output.receipts()[1]] {
-        assert!(item.is_secret());
-        assert!(item.public_path().is_none());
-        assert_eq!(item.expression_edges(), [ExpressionEdge::EvidenceOperand]);
-        assert_eq!(
-            item.path,
-            LeafPath::from_segments([
-                LeafPathSegment::MapKey("private.key[0]".into()),
-                LeafPathSegment::ListIndex(0),
-            ])
-        );
-    }
-    let mut carry = Carry::default();
-    let inspected = inspect_expression_edge(
-        WalkRoot::syntactic(),
-        ExpressionEdge::EvidenceOperand,
-        &value,
-        [10_000_usize],
-        [20_000_usize],
-        &mut carry,
-    )
-    .unwrap()
-    .into_output();
-    assert_eq!(
-        evidence_snapshot(inspected.receipts()),
-        evidence_snapshot(output.receipts())
-    );
-    assert_eq!(carry.secret_entries, 1);
 }
 
 #[test]
@@ -720,125 +773,13 @@ fn authored_evidence_visits_unselected_branches_and_fallback_without_evaluation(
         item.expression_edges()
             .contains(&ExpressionEdge::CoalesceDefault)
     }));
-    let rewritten = transform(WalkRoot::syntactic(), value.clone(), &mut Carry::default())
+    let rewritten = rewrite_owned(WalkRoot::syntactic(), value.clone(), &mut Carry::default())
         .unwrap()
-        .into_value();
+        .value;
     assert_eq!(
         format!("{rewritten:?}"),
         format!("{value:?}"),
         "structural traversal must retain both unselected computations"
-    );
-}
-
-#[test]
-fn per_element_directive_edge_exposes_unevaluated_body_and_stage_slots() {
-    use crate::{
-        parser::DeferredValueIf,
-        resource::{LifecycleDirective, LoopSlot, RelativeBindingName},
-    };
-    let value: Value<LoopSlot, RelativeBindingName> =
-        Value::Deferred(DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
-            false_condition("loop.crn", 4),
-            Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value))),
-                default: Box::new(Value::Concrete(ConcreteValue::Int(2))),
-            }),
-            Value::Concrete(ConcreteValue::Int(3)),
-        ))));
-    let edge = ExpressionEdge::DirectiveBody(LifecycleDirective::PreventDestroy);
-    let inspected = inspect_expression_edge(
-        WalkRoot::syntactic(),
-        edge.clone(),
-        &value,
-        [100_usize],
-        [],
-        &mut Carry::default(),
-    )
-    .unwrap()
-    .into_output();
-    assert_eq!(inspected.obligations().len(), 7);
-    assert!(
-        inspected
-            .obligations()
-            .iter()
-            .skip(1)
-            .all(|item| item.expression_edges().first() == Some(&edge))
-    );
-    let (rewritten, output) = transform_expression_edge(
-        WalkRoot::syntactic(),
-        edge,
-        value.clone(),
-        [100_usize],
-        [],
-        &mut Carry::default(),
-    )
-    .unwrap()
-    .into_parts();
-    assert_eq!(format!("{rewritten:?}"), format!("{value:?}"));
-    assert_eq!(
-        evidence_snapshot(inspected.obligations()),
-        evidence_snapshot(output.into_output().obligations())
-    );
-}
-
-#[test]
-fn obligation_binding_worklist_preserves_scope_and_leaves_cycle_policy_with_owner() {
-    use crate::resource::RelativeBindingName;
-    type V = Value<NoPlaceholder, RelativeBindingName>;
-    fn binding(name: &str) -> V {
-        Value::Deferred(DeferredValue::BindingRef {
-            binding: name.into(),
-        })
-    }
-    let values = HashMap::from([
-        ("a", binding("b")),
-        (
-            "b",
-            Value::Concrete(ConcreteValue::List(vec![
-                binding("a"),
-                Value::Concrete(ConcreteValue::Int(7)),
-            ])),
-        ),
-    ]);
-    let root = Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
-        "private-map-key".into() => binding("a"),
-    }))
-    .into_secret();
-    let mut carry = Carry::default();
-    let seed = inspect(WalkRoot::syntactic(), &root, &mut carry)
-        .unwrap()
-        .into_output();
-    let mut pending = seed.obligations().to_vec();
-    let mut visited = std::collections::HashSet::new();
-    let mut hops = 0;
-    let mut receipts = Vec::new();
-    while let Some(site) = pending.pop() {
-        let Some(binding) = carry.references.get(site.output()).cloned() else {
-            continue;
-        };
-        assert!(site.is_secret());
-        if !visited.insert((binding.clone(), site.is_secret())) {
-            continue;
-        }
-        hops += 1;
-        let located = site.inspect(&values[binding.as_str()], &mut carry).unwrap();
-        assert!(located.is_secret());
-        let output = located.into_output();
-        pending.extend_from_slice(output.obligations());
-        receipts.extend_from_slice(output.receipts());
-    }
-    assert_eq!(hops, 2);
-    assert_eq!(visited.len(), 2);
-    assert_eq!(carry.secret_entries, 1);
-    assert!(
-        receipts
-            .iter()
-            .all(|item| item.is_secret() && item.public_path().is_none())
-    );
-    assert!(
-        receipts
-            .iter()
-            .any(|item| item.path.segments().last() == Some(&LeafPathSegment::ListIndex(1)))
     );
 }
 
@@ -871,9 +812,9 @@ fn identity_rewrite_preserves_knowledge_classification_on_a_value_table() {
             .knowledge(&KnowledgeContext::validation())
             .unwrap()
             .into_classification();
-        let (rewritten, _) = transform(WalkRoot::syntactic(), value.clone(), &mut Carry::default())
+        let rewritten = rewrite_owned(WalkRoot::syntactic(), value.clone(), &mut Carry::default())
             .unwrap()
-            .into_parts();
+            .value;
         let after = rewritten
             .knowledge(&KnowledgeContext::validation())
             .unwrap()
@@ -934,9 +875,11 @@ fn identity_rewrite_preserves_authored_loop_access_metadata_without_value_equali
         },
         44,
     );
-    let (rewritten, output) = transform(WalkRoot::syntactic(), value, &mut Carry::default())
-        .unwrap()
-        .into_parts();
+    let RewriteProduct {
+        value: rewritten,
+        output,
+        ..
+    } = rewrite_owned(WalkRoot::syntactic(), value, &mut Carry::default()).unwrap();
     assert!(matches!(rewritten,
         Value::Deferred(DeferredValue::Access(access))
             if access.display_root() == Some("item")
@@ -945,7 +888,7 @@ fn identity_rewrite_preserves_authored_loop_access_metadata_without_value_equali
                     crate::resource::ParserPlaceholder::Loop(LoopSlot::Value)
                 )))
     ));
-    assert_eq!(output.into_output().receipts().len(), 2);
+    assert_eq!(output.receipts().len(), 2);
 }
 
 #[test]
@@ -953,6 +896,7 @@ fn kernel_sources_have_no_panicking_dispatch_fallbacks() {
     let forbidden =
         regex::Regex::new(r"\b(?:unreachable|panic|todo|unimplemented)\s*!|\bexpect\s*\(").unwrap();
     let unwrap = regex::Regex::new(r"\.\s*unwrap\s*\(").unwrap();
+    let test_module = regex::Regex::new(r"(?m)^#\[cfg\(test\)\]\nmod \w+ \{").unwrap();
     for name in ["unreachable", "panic", "todo", "unimplemented"] {
         assert!(forbidden.is_match(&format!("{name}!()")));
         assert!(forbidden.is_match(&format!("{name} \n !()")));
@@ -972,8 +916,13 @@ fn kernel_sources_have_no_panicking_dispatch_fallbacks() {
                 .is_some_and(|ext| ext == "rs" || ext == "md")
             {
                 let source = std::fs::read_to_string(&path).unwrap();
+                // Inline test modules can deliberately reject fixtures. Keep
+                // checking every production section, including cfg(test) counters.
+                let production = test_module
+                    .find(&source)
+                    .map_or(source.as_str(), |module| &source[..module.start()]);
                 assert!(
-                    !forbidden.is_match(&source),
+                    !forbidden.is_match(production),
                     "forbidden panic fallback in {}",
                     path.display()
                 );
@@ -981,7 +930,7 @@ fn kernel_sources_have_no_panicking_dispatch_fallbacks() {
                     && path.file_name().is_some_and(|name| name != "tests.rs")
                 {
                     assert!(
-                        !unwrap.is_match(&source),
+                        !unwrap.is_match(production),
                         "unchecked extraction in {}",
                         path.display()
                     );
@@ -1017,14 +966,13 @@ fn typed_interpolation_and_container_parts_preserve_empty_and_mixed_shapes() {
     ];
     for value in values {
         let inspected = inspect(WalkRoot::syntactic(), &value, &mut Carry::default()).unwrap();
-        let (rewritten, transformed) =
-            transform(WalkRoot::syntactic(), value.clone(), &mut Carry::default())
-                .unwrap()
-                .into_parts();
+        let RewriteProduct {
+            value: rewritten,
+            output: transformed,
+            ..
+        } = rewrite_owned(WalkRoot::syntactic(), value.clone(), &mut Carry::default()).unwrap();
         assert_eq!(format!("{rewritten:?}"), format!("{value:?}"));
-        assert_eq!(inspected.is_secret(), transformed.is_secret());
         let inspected = inspected.into_output();
-        let transformed = transformed.into_output();
         assert_eq!(
             evidence_snapshot(inspected.obligations()),
             evidence_snapshot(transformed.obligations())
@@ -1034,223 +982,6 @@ fn typed_interpolation_and_container_parts_preserve_empty_and_mixed_shapes() {
             evidence_snapshot(transformed.receipts())
         );
     }
-}
-
-#[derive(Default)]
-struct Redactor {
-    inventory: Carry,
-    hashed: usize,
-}
-impl Algebra<Transform> for Redactor {
-    type Output = Evidence<usize, usize>;
-    fn scalar<P: ValueKind, B: BindingAddress>(
-        &mut self,
-        at: &At<'_>,
-        value: ScopedScalar<'_, Transform, P, B>,
-    ) -> Step<Transform, Self::Output, P, B> {
-        Algebra::<Transform>::scalar(&mut self.inventory, at, value)
-    }
-    fn list<P: ValueKind, B: BindingAddress>(
-        &mut self,
-        _: &At<'_>,
-        children: Children<'_, Transform, P, B>,
-    ) -> Step<Transform, Self::Output, P, B> {
-        children.transform(self, Evidence::merge)
-    }
-    fn map<P: ValueKind, B: BindingAddress>(
-        &mut self,
-        _: &At<'_>,
-        children: Children<'_, Transform, P, B>,
-    ) -> Step<Transform, Self::Output, P, B> {
-        children.transform(self, Evidence::merge)
-    }
-    fn expression<P: ValueKind, B: BindingAddress>(
-        &mut self,
-        _: &At<'_>,
-        expression: ExprChildren<'_, Transform, P, B>,
-    ) -> Step<Transform, Self::Output, P, B> {
-        let id = self.inventory.issue();
-        expression.with_evidence([id], [id + 1000]).transform(self)
-    }
-    fn placeholder<P: ValueKind, B: BindingAddress>(
-        &mut self,
-        at: &At<'_>,
-        leaf: ScopedLeaf<'_, Transform, P, B>,
-    ) -> Step<Transform, Self::Output, P, B> {
-        Algebra::<Transform>::placeholder(&mut self.inventory, at, leaf)
-    }
-    fn secret<P: ValueKind, B: BindingAddress>(
-        &mut self,
-        _: &SecretAt<'_>,
-        child: SecretChild<'_, Transform, P, B>,
-    ) -> SecretStep<Transform, Self::Output, P, B> {
-        let hashed = &mut self.hashed;
-        child.redact(&mut self.inventory, |protected| {
-            *hashed += 1;
-            protected.hash_snapshot::<NoPlaceholder>(None)
-        })
-    }
-}
-
-fn protected_expression_fixture() -> Value {
-    Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
-        "public".into() => int(1),
-        "payload".into() => secret(Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
-            "private.map.key".into() => Value::Deferred(DeferredValue::FunctionCall {
-                name: crate::builtins::BuiltinFunction::join,
-                args: vec![Value::Concrete(ConcreteValue::String("private-value".into())).into()],
-                source_line: crate::resource::DiagnosticSourceLine::synthetic(),
-            }),
-            "another.private.key".into() => secret(int(2)),
-        }))),
-    }))
-}
-
-#[test]
-fn secret_redaction_enters_first_retains_protected_evidence_and_outputs_only_hashes() {
-    let original = protected_expression_fixture();
-    let snapshot = original.to_snapshot();
-    let expected = inspect(WalkRoot::syntactic(), &snapshot, &mut Carry::default())
-        .unwrap()
-        .into_output();
-    let mut redactor = Redactor::default();
-    let (redacted, located) = transform(WalkRoot::syntactic(), snapshot, &mut redactor)
-        .unwrap()
-        .into_parts();
-    assert!(located.is_secret());
-    let output = located.into_output();
-    assert_eq!(
-        evidence_snapshot(output.obligations()),
-        evidence_snapshot(expected.obligations())
-    );
-    assert_eq!(
-        evidence_snapshot(output.receipts()),
-        evidence_snapshot(expected.receipts())
-    );
-    assert_eq!(redactor.hashed, 1);
-    assert_eq!(
-        redactor.inventory.secret_entries, 1,
-        "nested Secret is inspected before the enclosing hash is produced"
-    );
-    assert!(output.obligations().iter().skip(1).all(Scoped::is_secret));
-    let json = serde_json::to_string(&redacted).unwrap();
-    let debug = format!("{redacted:?}");
-    for forbidden in ["private.map.key", "another.private.key", "private-value"] {
-        assert!(!json.contains(forbidden));
-        assert!(!debug.contains(forbidden));
-    }
-    let hash = redacted.get("payload").unwrap().secret_hash().unwrap();
-    let Value::Concrete(ConcreteValue::Map(map)) = original else {
-        return;
-    };
-    assert!(
-        matches!(&map["payload"], Value::Deferred(DeferredValue::Secret(payload))
-        if payload.verify_hash(hash).unwrap())
-    );
-}
-
-#[test]
-fn redaction_does_not_invoke_the_owner_after_an_inner_rejection() {
-    let payload = protected_expression_fixture().to_snapshot();
-    let child = SecretChild::<Transform, _, _> {
-        payload: Box::new(payload).into(),
-        at: WalkRoot::syntactic().at().protected(),
-    };
-    let mut calls = 0;
-    let step = child.redact(
-        &mut Count {
-            reject_secret: true,
-            ..Count::default()
-        },
-        |protected| {
-            calls += 1;
-            protected.hash_snapshot::<NoPlaceholder>(None)
-        },
-    );
-    assert!(matches!(step.step.result, Err(WalkError::Rejected)));
-    assert_eq!(calls, 0);
-}
-
-#[test]
-fn protected_locator_freezes_without_keys_and_resolves_after_verified_rehydration() {
-    let original = protected_expression_fixture().to_snapshot();
-    let (redacted, output) = transform(
-        WalkRoot::syntactic(),
-        original.clone(),
-        &mut Redactor::default(),
-    )
-    .unwrap()
-    .into_parts();
-    let output = output.into_output();
-    let sites: Vec<_> = output
-        .obligations()
-        .iter()
-        .filter(|site| site.is_secret())
-        .collect();
-    assert!(!sites.is_empty());
-    let frozen: Vec<_> = sites
-        .iter()
-        .map(|site| (*site.output(), site.protected_locator().unwrap().clone()))
-        .collect();
-    let saved = serde_json::to_string(&(redacted, &frozen)).unwrap();
-    for forbidden in ["private.map.key", "another.private.key", "private-value"] {
-        assert!(!saved.contains(forbidden));
-        assert!(!format!("{frozen:?}").contains(forbidden));
-    }
-    let (mut rehydrated, frozen): (
-        crate::resource::SnapshotValue,
-        Vec<(usize, ProtectedLocator)>,
-    ) = serde_json::from_str(&saved).unwrap();
-    for (id, locator) in &frozen {
-        assert!(
-            locator
-                .resolve(WalkRoot::syntactic(), &rehydrated, *id)
-                .is_err(),
-            "hash placeholders are not rehydrated positions"
-        );
-    }
-    // The owner verifies and restores the original Secret material before
-    // asking the kernel to reattach the frozen evidence under the apply lock.
-    let hash = rehydrated
-        .get("payload")
-        .unwrap()
-        .secret_hash()
-        .unwrap()
-        .clone();
-    let original_secret = original.get("payload").unwrap();
-    let expected_hash = transform(
-        WalkRoot::syntactic(),
-        original_secret.clone(),
-        &mut Redactor::default(),
-    )
-    .unwrap()
-    .into_value();
-    let material_hash = expected_hash.secret_hash().unwrap();
-    assert!(
-        matches!(original_secret, Value::Deferred(DeferredValue::Secret(payload))
-        if ProtectedSecret { payload }.hash_snapshot::<NoPlaceholder>(Some(&hash)).unwrap() == hash)
-    );
-    assert!(!material_hash.encoded_digest().is_empty());
-    assert!(matches!(rehydrated, Value::Concrete(ConcreteValue::Map(_))));
-    if let Value::Concrete(ConcreteValue::Map(map)) = &mut rehydrated {
-        map.insert("payload".into(), original_secret.clone());
-    }
-    for ((id, locator), expected) in frozen.into_iter().zip(sites) {
-        let restored = locator
-            .resolve(WalkRoot::syntactic(), &rehydrated, id)
-            .unwrap();
-        assert!(restored.is_secret());
-        assert!(restored.public_path().is_none());
-        assert_eq!(restored.path, expected.path);
-        assert_eq!(restored.expression_edges(), expected.expression_edges());
-        assert_eq!(restored.output(), expected.output());
-    }
-    let forged: ProtectedLocator = serde_json::from_str("[1,[],[]]").unwrap();
-    assert!(
-        forged
-            .resolve(WalkRoot::syntactic(), &rehydrated, 1_usize)
-            .is_err()
-    );
 }
 
 #[derive(Default)]
@@ -1307,53 +1038,61 @@ impl Algebra<Inspect> for LookupReceipts {
     }
 }
 
-impl Algebra<Transform> for LookupReceipts {
+impl TransformOutput for LookupReceipts {
     type Output = Evidence<usize, usize>;
-    fn scalar<P: ValueKind, B: BindingAddress>(
+}
+impl<P: ValueKind, B: BindingAddress> BoundTransform<P, B> for LookupReceipts {
+    fn function_memo(&self) -> Option<DefinitionMemo<B, Self::Output>> {
+        None
+    }
+    fn scalar(
         &mut self,
         at: &At<'_>,
         value: ScopedScalar<'_, Transform, P, B>,
     ) -> Step<Transform, Self::Output, P, B> {
-        Algebra::<Transform>::scalar(&mut self.inventory, at, value)
+        BoundTransform::scalar(&mut self.inventory, at, value)
     }
-    fn list<P: ValueKind, B: BindingAddress>(
+    fn list(
         &mut self,
         _: &At<'_>,
         children: Children<'_, Transform, P, B>,
     ) -> Step<Transform, Self::Output, P, B> {
-        children.transform(self, Evidence::merge)
+        Step::new(children.parts.transform(children.at, self, Evidence::merge))
     }
-    fn map<P: ValueKind, B: BindingAddress>(
+    fn map(
         &mut self,
         _: &At<'_>,
         children: Children<'_, Transform, P, B>,
     ) -> Step<Transform, Self::Output, P, B> {
-        children.transform(self, Evidence::merge)
+        Step::new(children.parts.transform(children.at, self, Evidence::merge))
     }
-    fn expression<P: ValueKind, B: BindingAddress>(
+    fn expression(
         &mut self,
         at: &At<'_>,
         expression: ExprChildren<'_, Transform, P, B>,
     ) -> Step<Transform, Self::Output, P, B> {
-        expression
-            .transform(&mut self.inventory, Evidence::merge)
-            .try_map_output(|evidence| {
-                evidence.reroot_receipts(at, 0, |receipt| *receipt.output() == 1001)
-            })
+        Step::<Transform, _, P, B>::new(expression.children.parts.transform(
+            expression.children.at,
+            &mut self.inventory,
+            Evidence::merge,
+        ))
+        .try_map_output(|evidence| {
+            evidence.reroot_receipts(at, 0, |receipt| *receipt.output() == 1001)
+        })
     }
-    fn placeholder<P: ValueKind, B: BindingAddress>(
+    fn placeholder(
         &mut self,
         at: &At<'_>,
         leaf: ScopedLeaf<'_, Transform, P, B>,
     ) -> Step<Transform, Self::Output, P, B> {
-        Algebra::<Transform>::placeholder(&mut self.inventory, at, leaf)
+        BoundTransform::placeholder(&mut self.inventory, at, leaf)
     }
-    fn secret<P: ValueKind, B: BindingAddress>(
+    fn secret(
         &mut self,
         _: &SecretAt<'_>,
         child: SecretChild<'_, Transform, P, B>,
     ) -> SecretStep<Transform, Self::Output, P, B> {
-        child.transform(self)
+        child.transform_bound(self)
     }
 }
 
@@ -1383,15 +1122,18 @@ fn lookup_reroots_only_selected_receipts_and_never_removes_secret_provenance() {
     )
     .unwrap()
     .into_output();
-    let rewritten = transform(
+    let rewritten = rewrite_owned(
         WalkRoot::syntactic(),
         value.clone(),
         &mut LookupReceipts::default(),
     )
     .unwrap();
-    let (rewritten, owned_output) = rewritten.into_parts();
+    let RewriteProduct {
+        value: rewritten,
+        output: owned_output,
+        ..
+    } = rewritten;
     assert_eq!(format!("{rewritten:?}"), format!("{value:?}"));
-    let owned_output = owned_output.into_output();
     assert_eq!(
         evidence_snapshot(owned_output.receipts()),
         evidence_snapshot(output.receipts())
@@ -1624,61 +1366,7 @@ fn rootless_roots_preserve_validated_types_and_named_definitions() {
     }
 }
 
-#[test]
-fn opaque_snapshot_hashing_preserves_existing_stage_and_binding_hash_material() {
-    use crate::resource::{LoopSlot, ParserPlaceholder, PlaceholderKind};
-    fn check<S: PlaceholderKind + serde::de::DeserializeOwned>(value: Value<S>) {
-        let payload: SecretPayload<S, AbsoluteBindingAddress> = Box::new(value).into();
-        let expected = payload.hash(None).unwrap();
-        let snapshot = Value::Deferred(DeferredValue::Secret(payload)).to_snapshot();
-        assert!(
-            matches!(snapshot, Value::Deferred(DeferredValue::Secret(payload))
-            if ProtectedSecret { payload: &payload }.hash_snapshot::<S>(Some(&expected)).unwrap() == expected)
-        );
-    }
-    check(Value::<NoPlaceholder>::Concrete(ConcreteValue::String(
-        "private-runtime".into(),
-    )));
-    check(Value::<LoopSlot>::Deferred(DeferredValue::Placeholder(
-        LoopSlot::Value,
-    )));
-    check(Value::<ParserPlaceholder>::Deferred(
-        DeferredValue::Placeholder(ParserPlaceholder::FnParam {
-            name: "parameter".into(),
-        }),
-    ));
-    check(Value::<NoPlaceholder>::root_resource_ref(
-        "producer",
-        "id",
-        Vec::new(),
-    ));
-}
-
-#[test]
-fn protected_locator_survives_verified_map_key_reordering() {
-    let original: Value = secret(Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
-        "z-private".into() => int(1), "a-private".into() => int(2),
-    })));
-    let reordered: Value = secret(Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
-        "a-private".into() => int(2), "z-private".into() => int(1),
-    })));
-    assert!(matches!((&original, &reordered),
-        (Value::Deferred(DeferredValue::Secret(left)), Value::Deferred(DeferredValue::Secret(right)))
-            if right.verify_hash(&left.hash(None).unwrap()).unwrap()));
-    let output = inspect(WalkRoot::syntactic(), &original, &mut Carry::default())
-        .unwrap()
-        .into_output();
-    let site = &output.obligations()[0];
-    let wire = serde_json::to_string(site.protected_locator().unwrap()).unwrap();
-    let restored: ProtectedLocator = serde_json::from_str(&wire).unwrap();
-    let restored = restored
-        .resolve(WalkRoot::syntactic(), &reordered, *site.output())
-        .unwrap();
-    assert_eq!(restored.path, site.path);
-    assert_eq!(restored.expression_edges(), site.expression_edges());
-}
-
-// R4 regressions are appended so the previous contract tests remain unchanged.
+// R4 ownership, identity and type-context regressions use the internal owned fold.
 #[derive(Default)]
 struct R4Rewrite {
     replace_placeholders: bool,
@@ -1688,9 +1376,14 @@ struct R4Rewrite {
     pointers: Vec<usize>,
     sites: Vec<Vec<ExpressionEdge>>,
 }
-impl Algebra<Transform> for R4Rewrite {
+impl TransformOutput for R4Rewrite {
     type Output = usize;
-    fn scalar<P: ValueKind, B: BindingAddress>(
+}
+impl<P: ValueKind, B: BindingAddress> BoundTransform<P, B> for R4Rewrite {
+    fn function_memo(&self) -> Option<DefinitionMemo<B, Self::Output>> {
+        None
+    }
+    fn scalar(
         &mut self,
         at: &At<'_>,
         value: ScopedScalar<'_, Transform, P, B>,
@@ -1708,28 +1401,39 @@ impl Algebra<Transform> for R4Rewrite {
         }
         value.keep(1)
     }
-    fn list<P: ValueKind, B: BindingAddress>(
+    fn list(
         &mut self,
         _: &At<'_>,
         children: Children<'_, Transform, P, B>,
     ) -> Step<Transform, usize, P, B> {
-        children.transform(self, |outputs| 1 + outputs.into_iter().sum::<usize>())
+        Step::new(children.parts.transform(children.at, self, |outputs| {
+            1 + outputs.into_iter().sum::<usize>()
+        }))
     }
-    fn map<P: ValueKind, B: BindingAddress>(
+    fn map(
         &mut self,
         _: &At<'_>,
         children: Children<'_, Transform, P, B>,
     ) -> Step<Transform, usize, P, B> {
-        children.transform(self, |outputs| 1 + outputs.into_iter().sum::<usize>())
+        Step::new(children.parts.transform(children.at, self, |outputs| {
+            1 + outputs.into_iter().sum::<usize>()
+        }))
     }
-    fn expression<P: ValueKind, B: BindingAddress>(
+    fn expression(
         &mut self,
         _: &At<'_>,
         expression: ExprChildren<'_, Transform, P, B>,
     ) -> Step<Transform, usize, P, B> {
-        expression.transform(self, |outputs| 1 + outputs.into_iter().sum::<usize>())
+        Step::new(
+            expression
+                .children
+                .parts
+                .transform(expression.children.at, self, |outputs| {
+                    1 + outputs.into_iter().sum::<usize>()
+                }),
+        )
     }
-    fn placeholder<P: ValueKind, B: BindingAddress>(
+    fn placeholder(
         &mut self,
         _: &At<'_>,
         leaf: ScopedLeaf<'_, Transform, P, B>,
@@ -1759,12 +1463,12 @@ impl Algebra<Transform> for R4Rewrite {
         }
         leaf.keep(1)
     }
-    fn secret<P: ValueKind, B: BindingAddress>(
+    fn secret(
         &mut self,
         _: &SecretAt<'_>,
         child: SecretChild<'_, Transform, P, B>,
     ) -> SecretStep<Transform, usize, P, B> {
-        child.transform(self)
+        child.transform_bound(self)
     }
 }
 
@@ -1784,7 +1488,7 @@ fn r4_changed_access_uses_canonical_selection_before_lazy_fallback() {
         AccessMissPolicy::Error,
     )
     .unwrap();
-    let result = transform(
+    let result = rewrite_owned(
         WalkRoot::syntactic(),
         value,
         &mut R4Rewrite {
@@ -1793,7 +1497,7 @@ fn r4_changed_access_uses_canonical_selection_before_lazy_fallback() {
         },
     )
     .unwrap()
-    .into_value();
+    .value;
     assert_eq!(result, Value::Concrete(ConcreteValue::Int(41)));
 }
 
@@ -1808,7 +1512,7 @@ fn r4_changed_loop_access_preserves_rooted_metadata_when_still_deferred() {
         },
         42,
     );
-    let result = transform(
+    let result = rewrite_owned(
         WalkRoot::syntactic(),
         original,
         &mut R4Rewrite {
@@ -1820,49 +1524,11 @@ fn r4_changed_loop_access_preserves_rooted_metadata_when_still_deferred() {
         result.is_ok(),
         "a valid loop-root rewrite must use the existing rebuild seam"
     );
-    let result = result.unwrap().into_value();
+    let result = result.unwrap().value;
     assert!(
         matches!(&result, Value::Deferred(DeferredValue::Access(access))
         if access.display_root() == Some("item") && access.source_line() == 42
             && access.deferred_miss_display_root().is_none())
-    );
-}
-
-#[test]
-fn r4_reentered_secret_locator_cannot_resolve_to_an_unrelated_root_position() {
-    let source = secret(int(111));
-    let source_output = inspect(WalkRoot::syntactic(), &source, &mut Carry::default())
-        .unwrap()
-        .into_output();
-    let inherited_secret = &source_output.obligations()[0];
-    let reentered_plain = inherited_secret
-        .inspect(&int(222), &mut Carry::default())
-        .unwrap()
-        .into_output();
-    assert!(reentered_plain.obligations()[0].is_secret());
-    assert!(
-        reentered_plain.obligations()[0]
-            .protected_locator()
-            .is_some(),
-        "an inherited protected position must retain a typed locator origin"
-    );
-
-    let public = inspect(WalkRoot::syntactic(), &int(0), &mut Carry::default())
-        .unwrap()
-        .into_output();
-    let referenced = secret(int(333));
-    let reentered = public.obligations()[0]
-        .inspect(&referenced, &mut Carry::default())
-        .unwrap()
-        .into_output();
-    let site = &reentered.obligations()[0];
-    let frozen = serde_json::to_string(site.protected_locator().unwrap()).unwrap();
-    let locator: ProtectedLocator = serde_json::from_str(&frozen).unwrap();
-    assert!(
-        locator
-            .resolve(WalkRoot::syntactic(), &source, *site.output())
-            .is_err(),
-        "a persisted re-entry coordinate must never attach to another root's secret"
     );
 }
 
@@ -1922,6 +1588,62 @@ fn inspect_4495_resolved_call_child_length_and_roots_are_operand_only() {
 }
 
 #[test]
+fn inspect_call_projection_keeps_empty_lengths_and_auxiliary_ordinals() {
+    use crate::resource::{AuthoredValue, FunctionArgument};
+    for auxiliary in [false, true] {
+        let mut value = r4_resolved_fixture();
+        if let Value::Deferred(DeferredValue::ResolvedFunctionCall { args, .. }) = &mut value {
+            *args = if auxiliary {
+                vec![FunctionArgument::with_auxiliary_for_inspect_test(
+                    AuthoredValue::Concrete(ConcreteValue::Int(11)),
+                    AuthoredValue::Concrete(ConcreteValue::Int(12)).into_secret(),
+                )]
+            } else {
+                Vec::new()
+            };
+        }
+        if let Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }) = &value
+        {
+            let children = Children::<Inspect, _, _> {
+                parts: Parts::ResolvedCall(<Inspect as sealed::Mode>::resolved_call(
+                    function,
+                    functions,
+                    args,
+                    source_line,
+                )),
+                at: WalkRoot::syntactic().at(),
+            };
+            assert_eq!(children.is_empty(), !auxiliary);
+            assert_eq!(children.len(), if auxiliary { 2 } else { 0 });
+            // Re-enter with a different algebra; it receives the same projection.
+            let (evidence, definitions) = with_function_definition_inspect_count(|| {
+                children
+                    .inspect(&mut Carry::default(), Evidence::merge)
+                    .result
+                    .unwrap()
+            });
+            assert_eq!(definitions, 0);
+            assert_eq!(evidence.obligations().len(), if auxiliary { 2 } else { 0 });
+            for (index, site) in evidence.obligations().iter().enumerate() {
+                assert_eq!(
+                    site.expression_edges(),
+                    [
+                        ExpressionEdge::Argument(0),
+                        ExpressionEdge::ArgumentValue(index)
+                    ]
+                );
+                assert_eq!(site.is_secret(), index == 1);
+            }
+        }
+    }
+}
+
+#[test]
 fn r4_unchanged_resolved_call_preserves_both_arc_identities() {
     let value = r4_resolved_fixture();
     assert!(matches!(
@@ -1936,9 +1658,9 @@ fn r4_unchanged_resolved_call_preserves_both_arc_identities() {
     {
         let original_function = function.clone();
         let original_scope = functions.clone();
-        let rewritten = transform(WalkRoot::syntactic(), value, &mut Carry::default())
+        let rewritten = rewrite_owned(WalkRoot::syntactic(), value, &mut Carry::default())
             .unwrap()
-            .into_value();
+            .value;
         assert!(matches!(
             &rewritten,
             Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
@@ -1971,9 +1693,9 @@ fn r4_distinct_captured_definition_occurrences_are_rewritten_once_each() {
         increment_integers: true,
         ..Default::default()
     };
-    let rewritten = transform(WalkRoot::syntactic(), value, &mut rewrite)
+    let rewritten = rewrite_owned(WalkRoot::syntactic(), value, &mut rewrite)
         .unwrap()
-        .into_value();
+        .value;
     assert_eq!(
         rewrite.integers, 5,
         "three callee fields, one helper body, one argument"
@@ -1996,7 +1718,31 @@ fn r4_distinct_captured_definition_occurrences_are_rewritten_once_each() {
     );
     let mut count = Count::default();
     inspect(WalkRoot::syntactic(), &rewritten, &mut count).unwrap();
-    assert_eq!(count.numbers, (1..=5).map(|number| (number, 1)).collect());
+    assert_eq!(count.numbers, [(5, 1)].into());
+    assert!(matches!(
+        &rewritten,
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+    ));
+    if let Value::Deferred(DeferredValue::ResolvedFunctionCall {
+        function,
+        functions,
+        ..
+    }) = rewritten
+    {
+        assert_eq!(
+            function.params[0].default,
+            Some(Value::Concrete(ConcreteValue::Int(1)))
+        );
+        assert_eq!(
+            function.local_lets[0].1,
+            Value::Concrete(ConcreteValue::Int(2))
+        );
+        assert_eq!(function.body.value, Value::Concrete(ConcreteValue::Int(3)));
+        assert_eq!(
+            functions["helper"].body.value,
+            Value::Concrete(ConcreteValue::Int(4))
+        );
+    }
 }
 
 #[test]
@@ -2037,39 +1783,6 @@ fn r4_canonical_root_does_not_accept_an_authored_block_alias() {
 }
 
 #[test]
-fn r4_nested_module_snapshot_hash_is_identical_to_existing_state_hash() {
-    use crate::resource::{ModuleInstanceScope, RelativeBindingName};
-    let parent = ModuleInstanceScope::for_call("outer", Some("outer"), "outer");
-    let child = ModuleInstanceScope::for_call("inner", Some("inner"), "inner");
-    let scope = parent.with_child(&child);
-    let relative: Value<NoPlaceholder, RelativeBindingName> = Value::Concrete(ConcreteValue::Map(
-        indexmap::indexmap! {
-            "reference".into() => Value::resource_ref("producer", "id", vec![]),
-            "binding".into() => Value::Deferred(DeferredValue::BindingRef { binding: "producer".into() }),
-        },
-    ));
-    let absolute = relative.resolve_module(&scope);
-    assert!(format!("{absolute:?}").contains("outer.inner.producer"));
-    let payload: SecretPayload<NoPlaceholder, AbsoluteBindingAddress> = Box::new(absolute).into();
-    let existing = payload.hash(None).unwrap();
-    let snapshot = Value::Deferred(DeferredValue::Secret(payload)).to_snapshot();
-    assert!(matches!(
-        &snapshot,
-        Value::Deferred(DeferredValue::Secret(_))
-    ));
-    if let Value::Deferred(DeferredValue::Secret(payload)) = &snapshot {
-        let protected = ProtectedSecret { payload };
-        assert_eq!(
-            protected
-                .hash_snapshot::<NoPlaceholder>(Some(&existing))
-                .unwrap(),
-            existing,
-            "the previous state digest must be reused byte-for-byte for nested module bindings"
-        );
-    }
-}
-
-#[test]
 fn r4_parts_length_matches_the_actual_resolved_call_fold_outputs() {
     let value = r4_resolved_fixture();
     assert!(matches!(
@@ -2088,17 +1801,41 @@ fn r4_parts_length_matches_the_actual_resolved_call_fold_outputs() {
             Inspect,
             crate::resource::ParserPlaceholder,
             crate::resource::RelativeBindingName,
-        > = Parts::ResolvedCall {
+        > = Parts::ResolvedCall(<Inspect as sealed::Mode>::resolved_call(
             function,
             functions,
             args,
             source_line,
-        };
+        ));
         let length = parts.len();
         let actual = parts
             .inspect(WalkRoot::syntactic().at(), &mut Count::default())
             .unwrap();
         assert_eq!(length, actual.len());
+    }
+    if let Value::Deferred(DeferredValue::ResolvedFunctionCall {
+        function,
+        functions,
+        args,
+        source_line,
+    }) = value
+    {
+        let parts = Parts::<Transform, _, _>::ResolvedCall(
+            <Transform as sealed::Mode>::resolved_call(function, functions, args, source_line),
+        );
+        let length = parts.len();
+        let actual = parts
+            .transform(
+                WalkRoot::syntactic().at(),
+                &mut R4Rewrite::default(),
+                |outputs| outputs.len(),
+            )
+            .unwrap();
+        assert_eq!(
+            length, 8,
+            "three callee fields, four scope fields, one argument"
+        );
+        assert_eq!(length, actual.output);
     }
 }
 
@@ -2157,7 +1894,6 @@ fn r4_result_branches_retain_destination_types_but_inputs_do_not() {
         ExpressionEdge::Argument(0),
         ExpressionEdge::ArithmeticLeft,
         ExpressionEdge::AccessBase,
-        ExpressionEdge::EvidenceOperand,
     ] {
         assert!(root.operand(edge).effective_type().is_none());
     }
@@ -2252,32 +1988,10 @@ fn r4_owned_argument_arithmetic_and_access_operands_move_without_copying() {
         .unwrap(),
     ]));
     let mut rewrite = R4Rewrite::default();
-    transform(WalkRoot::syntactic(), values, &mut rewrite).unwrap();
+    rewrite_owned(WalkRoot::syntactic(), values, &mut rewrite).unwrap();
     assert_eq!(
         rewrite.pointers, expected,
         "owned operands must reach the algebra without cloning their strings"
-    );
-}
-
-#[test]
-fn r4_persisted_reentry_locator_never_attaches_to_a_different_secret() {
-    let source = secret(int(111));
-    let public = inspect(WalkRoot::syntactic(), &int(0), &mut Carry::default())
-        .unwrap()
-        .into_output();
-    let referenced = secret(int(333));
-    let reentered = public.obligations()[0]
-        .inspect(&referenced, &mut Carry::default())
-        .unwrap()
-        .into_output();
-    let site = &reentered.obligations()[0];
-    let frozen = serde_json::to_string(site.protected_locator().unwrap()).unwrap();
-    let locator: ProtectedLocator = serde_json::from_str(&frozen).unwrap();
-    assert!(
-        locator
-            .resolve(WalkRoot::syntactic(), &source, *site.output())
-            .is_err(),
-        "these relative coordinates otherwise silently resolve to the unrelated secret(111)"
     );
 }
 
@@ -2297,15 +2011,29 @@ fn r4_equal_named_callee_and_scope_entries_are_distinct_stored_definitions() {
             .body
             .value = Value::Concrete(ConcreteValue::Int(999));
     }
-    let rewritten = transform(WalkRoot::syntactic(), value, &mut R4Rewrite::default())
+    let rewritten = rewrite_owned(WalkRoot::syntactic(), value, &mut R4Rewrite::default())
         .unwrap()
-        .into_value();
+        .value;
     let mut count = Count::default();
     inspect(WalkRoot::syntactic(), &rewritten, &mut count).unwrap();
-    assert_eq!(
-        count.numbers,
-        [(1, 1), (71, 2), (72, 2), (73, 1), (74, 1), (999, 1)].into()
-    );
+    assert_eq!(count.numbers, [(1, 1)].into());
+    assert!(matches!(
+        &rewritten,
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+    ));
+    if let Value::Deferred(DeferredValue::ResolvedFunctionCall {
+        function,
+        functions,
+        ..
+    }) = rewritten
+    {
+        assert_eq!(function.body.value, Value::Concrete(ConcreteValue::Int(73)));
+        assert_eq!(
+            functions["called"].body.value,
+            Value::Concrete(ConcreteValue::Int(999))
+        );
+        assert!(!std::ptr::eq(function.as_ref(), &functions["called"]));
+    }
 }
 
 #[test]
@@ -2353,9 +2081,9 @@ fn r4_authored_root_constructors_resolve_aliases_to_canonical_leaf_paths() {
                 false
             )]
         );
-        let rewritten = transform(root, value.clone(), &mut Carry::default())
+        let rewritten = rewrite_owned(root, value.clone(), &mut Carry::default())
             .unwrap()
-            .into_value();
+            .value;
         assert_eq!(
             rewritten, value,
             "path normalization must preserve authored input keys"
@@ -2394,9 +2122,9 @@ fn r4_argument_only_rewrite_preserves_unchanged_function_and_scope_arcs() {
     {
         let old_function = function.clone();
         let old_scope = functions.clone();
-        let rewritten = transform(WalkRoot::syntactic(), value, &mut ReplaceInts::default())
+        let rewritten = rewrite_owned(WalkRoot::syntactic(), value, &mut ReplaceInts::default())
             .unwrap()
-            .into_value();
+            .value;
         if let Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,
@@ -2468,7 +2196,7 @@ fn r4_changed_snapshot_access_uses_the_existing_snapshot_selection_seam() {
     )
     .unwrap()
     .to_snapshot();
-    let result = transform(
+    let result = rewrite_owned(
         WalkRoot::syntactic(),
         value,
         &mut R4Rewrite {
@@ -2477,28 +2205,8 @@ fn r4_changed_snapshot_access_uses_the_existing_snapshot_selection_seam() {
         },
     )
     .unwrap()
-    .into_value();
+    .value;
     assert_eq!(result, Value::Concrete(ConcreteValue::Int(41)));
-}
-
-#[test]
-fn r4_reentry_locator_reports_its_typed_origin_after_persistence() {
-    let source = secret(int(111));
-    let inventory = inspect(WalkRoot::syntactic(), &source, &mut Carry::default())
-        .unwrap()
-        .into_output();
-    let output = inventory.obligations()[0]
-        .inspect(&int(222), &mut Carry::default())
-        .unwrap()
-        .into_output();
-    let saved =
-        serde_json::to_string(output.obligations()[0].protected_locator().unwrap()).unwrap();
-    let restored: ProtectedLocator = serde_json::from_str(&saved).unwrap();
-    assert!(matches!(
-        restored.resolve(WalkRoot::syntactic(), &source, 1_usize),
-        Err(WalkError::ReenteredLocator)
-    ));
-    assert!(!saved.contains("111") && !saved.contains("222"));
 }
 
 #[test]
@@ -2512,7 +2220,7 @@ fn r4_changed_access_only_retains_a_dormant_miss_after_canonical_selection_fails
         },
         42,
     );
-    let result = transform(
+    let result = rewrite_owned(
         WalkRoot::syntactic(),
         value,
         &mut R4Rewrite {
@@ -2521,7 +2229,7 @@ fn r4_changed_access_only_retains_a_dormant_miss_after_canonical_selection_fails
         },
     )
     .unwrap()
-    .into_value();
+    .value;
     assert!(
         matches!(&result, Value::Deferred(DeferredValue::Access(access))
         if access.display_root().is_none() && access.deferred_miss_display_root() == Some("item")
